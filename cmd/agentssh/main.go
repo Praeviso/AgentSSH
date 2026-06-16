@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,9 +11,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Kritoooo/agentssh/internal/audit"
 	"github.com/Kritoooo/agentssh/internal/config"
 	"github.com/Kritoooo/agentssh/internal/executor"
 	"github.com/Kritoooo/agentssh/internal/inventory"
+	"github.com/Kritoooo/agentssh/internal/policy"
+	"github.com/Kritoooo/agentssh/internal/session"
 	"github.com/spf13/cobra"
 )
 
@@ -124,7 +129,7 @@ func newStatusCommand() *cobra.Command {
 		Short: "Show the audit status for a request.",
 		Args:  exactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return printNotImplemented(cmd, "status req=%q json=%t", args[0], jsonOutput)
+			return runStatus(cmd, args[0], jsonOutput)
 		},
 	}
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "emit machine-readable JSON")
@@ -159,17 +164,27 @@ func newPolicyCommand() *cobra.Command {
 		Use:   "policy",
 		Short: "Manage command policy.",
 	}
+	var testHost string
+	testCmd := &cobra.Command{
+		Use:   "test <cmd>",
+		Short: "Evaluate a command against policy.",
+		Args:  minArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runPolicyTest(cmd, testHost, strings.Join(args, " "))
+		},
+	}
+	testCmd.Flags().StringVar(&testHost, "host", "", "include host/group override context")
 	cmd.AddCommand(
-		leafNoArgs("show", "Show policy.yaml.", "policy show"),
-		leafNoArgs("edit", "Edit policy.yaml.", "policy edit"),
 		&cobra.Command{
-			Use:   "test <cmd>",
-			Short: "Evaluate a command against policy.",
-			Args:  minArgs(1),
-			RunE: func(cmd *cobra.Command, args []string) error {
-				return printNotImplemented(cmd, "policy test command=%q", strings.Join(args, " "))
+			Use:   "show",
+			Short: "Show policy.yaml.",
+			Args:  cobra.NoArgs,
+			RunE: func(cmd *cobra.Command, _ []string) error {
+				return runPolicyShow(cmd)
 			},
 		},
+		leafNoArgs("edit", "Edit policy.yaml.", "policy edit"),
+		testCmd,
 	)
 	return cmd
 }
@@ -179,17 +194,36 @@ func newAuditCommand() *cobra.Command {
 		Use:   "audit",
 		Short: "Browse and verify the audit log.",
 	}
+	var filters audit.Filters
+	lsCmd := &cobra.Command{
+		Use:   "ls",
+		Short: "List audit records.",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runAuditLS(cmd, filters)
+		},
+	}
+	lsCmd.Flags().StringVar(&filters.Host, "host", "", "filter by host")
+	lsCmd.Flags().StringVar(&filters.SessionID, "session", "", "filter by session id")
+	lsCmd.Flags().Var((*eventValue)(&filters.Event), "status", "filter by event/status")
 	cmd.AddCommand(
-		leafNoArgs("ls", "List audit records.", "audit ls"),
+		lsCmd,
 		&cobra.Command{
 			Use:   "show <req>",
 			Short: "Show one audit request.",
 			Args:  exactArgs(1),
 			RunE: func(cmd *cobra.Command, args []string) error {
-				return printNotImplemented(cmd, "audit show req=%q", args[0])
+				return runAuditShow(cmd, args[0])
 			},
 		},
-		leafNoArgs("verify", "Verify the audit hash chain.", "audit verify"),
+		&cobra.Command{
+			Use:   "verify",
+			Short: "Verify the audit hash chain.",
+			Args:  cobra.NoArgs,
+			RunE: func(cmd *cobra.Command, _ []string) error {
+				return runAuditVerify(cmd)
+			},
+		},
 	)
 	return cmd
 }
@@ -199,7 +233,14 @@ func newSessionCommand() *cobra.Command {
 		Use:   "session",
 		Short: "Browse audit sessions.",
 	}
-	cmd.AddCommand(leafNoArgs("ls", "List recent sessions.", "session ls"))
+	cmd.AddCommand(&cobra.Command{
+		Use:   "ls",
+		Short: "List recent sessions.",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runSessionLS(cmd)
+		},
+	})
 	return cmd
 }
 
@@ -260,6 +301,8 @@ type runResponse struct {
 	OutputTruncated bool   `json:"output_truncated"`
 	Redactions      int    `json:"redactions"`
 	Skill           string `json:"skill,omitempty"`
+	PolicyAction    string `json:"policy_action,omitempty"`
+	PolicyRule      string `json:"policy_rule,omitempty"`
 }
 
 type usageError string
@@ -350,19 +393,70 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 		return newUsageError("%v", err)
 	}
 
+	engine, err := policy.NewEngine(cfg.Policy, cfg.Inventory)
+	if err != nil {
+		return fmt.Errorf("load policy: %w", err)
+	}
+	sessionCtx, err := session.Resolver{Path: cfg.Paths.SessionFile}.Resolve(flags.session, flags.sessionLabel)
+	if err != nil {
+		return fmt.Errorf("resolve session: %w", err)
+	}
+	store := audit.NewStore(cfg.Paths.AuditFile)
 	ssh := newExecutor()
 	exitCode := exitOK
 	responses := make([]runResponse, 0, len(resolved.Targets))
 	for _, target := range resolved.Targets {
+		reqID, err := newReqID()
+		if err != nil {
+			return err
+		}
+		decision, err := engine.Evaluate(target.Name, remoteCommand)
+		if err != nil {
+			return fmt.Errorf("evaluate policy for %s: %w", target.Name, err)
+		}
+		if decision.Action == policy.ActionDeny {
+			if _, err := store.Append(baseAuditRecord(reqID, sessionCtx, audit.EventDenied, target.Name, remoteCommand, flags.skill, decision, nil, "")); err != nil {
+				return err
+			}
+			response := runResponse{
+				ReqID:        reqID,
+				SessionID:    sessionCtx.ID,
+				Host:         target.Name,
+				Status:       "denied",
+				ExitCode:     exitPolicyDenied,
+				PolicyAction: string(decision.Action),
+				PolicyRule:   decision.Rule,
+				Skill:        flags.skill,
+			}
+			if flags.jsonOutput {
+				responses = append(responses, response)
+			} else {
+				printDenyHuman(cmd, target.Name, remoteCommand, decision)
+			}
+			exitCode = mergeExitCode(exitCode, exitPolicyDenied)
+			continue
+		}
+
+		if _, err := store.Append(baseAuditRecord(reqID, sessionCtx, audit.EventStarted, target.Name, remoteCommand, flags.skill, decision, nil, "")); err != nil {
+			return err
+		}
 		result := ssh.Run(context.Background(), executor.Request{
 			Target:  target,
 			Command: remoteCommand,
 		})
 		status := statusForResult(result)
+		event := audit.EventCompleted
+		if status != "completed" {
+			event = audit.EventFailed
+		}
+		outputHash := audit.ComputeOutputSHA256(result.Stdout, result.Stderr)
+		if _, err := store.Append(baseAuditRecord(reqID, sessionCtx, event, target.Name, remoteCommand, flags.skill, decision, &result.ExitCode, outputHash)); err != nil {
+			return err
+		}
 		if flags.jsonOutput {
 			responses = append(responses, runResponse{
-				ReqID:           "",
-				SessionID:       "",
+				ReqID:           reqID,
+				SessionID:       sessionCtx.ID,
 				Host:            target.Name,
 				Status:          status,
 				ExitCode:        result.ExitCode,
@@ -372,6 +466,8 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 				OutputTruncated: false,
 				Redactions:      0,
 				Skill:           flags.skill,
+				PolicyAction:    string(decision.Action),
+				PolicyRule:      decision.Rule,
 			})
 		} else {
 			printRunHuman(cmd, target.Name, result, flags.skill)
@@ -390,6 +486,9 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 		}
 	}
 
+	if err := (session.Resolver{Path: cfg.Paths.SessionFile}).Update(sessionCtx.ID, time.Now().UTC()); err != nil {
+		return err
+	}
 	if exitCode != exitOK {
 		return commandExitError{Code: exitCode}
 	}
@@ -427,6 +526,12 @@ func printRunHuman(cmd *cobra.Command, host string, result executor.Result, skil
 	}
 }
 
+func printDenyHuman(cmd *cobra.Command, host string, command string, decision policy.Decision) {
+	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "✗ denied by policy · %s · 命中规则 %q\n", host, decision.Rule)
+	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "  %s 属于不可执行的危险命令或未被 allowlist 放行;此拦截无法临场放行。\n", command)
+	_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "  如确需放宽,请人类修改 ~/.agentssh/policy.yaml。")
+}
+
 func statusForResult(result executor.Result) string {
 	if isSSHErrorResult(result) {
 		return "ssh_error"
@@ -458,6 +563,11 @@ func isSSHErrorResult(result executor.Result) bool {
 }
 
 func mergeExitCode(current int, next int) int {
+	// Multi-target runs report the most conservative outcome:
+	// deny(6) > ssh_error(9) > remote_failed(1) > success(0).
+	if current == exitPolicyDenied || next == exitPolicyDenied {
+		return exitPolicyDenied
+	}
 	if current == exitSSHError || next == exitSSHError {
 		return exitSSHError
 	}
@@ -478,4 +588,201 @@ func formatDuration(duration time.Duration) string {
 		return fmt.Sprintf("%dms", duration.Milliseconds())
 	}
 	return fmt.Sprintf("%.1fs", duration.Seconds())
+}
+
+func runPolicyShow(cmd *cobra.Command) error {
+	cfg, err := config.Load()
+	if err != nil {
+		return classifyConfigError(err)
+	}
+	return writeJSON(cmd, cfg.Policy)
+}
+
+func runPolicyTest(cmd *cobra.Command, host string, command string) error {
+	cfg, err := config.Load()
+	if err != nil {
+		return classifyConfigError(err)
+	}
+	engine, err := policy.NewEngine(cfg.Policy, cfg.Inventory)
+	if err != nil {
+		return fmt.Errorf("load policy: %w", err)
+	}
+	decision, err := engine.Evaluate(host, command)
+	if err != nil {
+		return err
+	}
+	if host != "" {
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s · rule=%s · host=%s\n", decision.Action, decision.Rule, host)
+		return nil
+	}
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s · rule=%s\n", decision.Action, decision.Rule)
+	return nil
+}
+
+func runAuditLS(cmd *cobra.Command, filters audit.Filters) error {
+	cfg, err := config.Load()
+	if err != nil {
+		return classifyConfigError(err)
+	}
+	records, err := audit.NewStore(cfg.Paths.AuditFile).ReadAll()
+	if err != nil {
+		return err
+	}
+	records = audit.FilterRecords(records, filters)
+	for _, record := range records {
+		exit := "-"
+		if record.ExitCode != nil {
+			exit = fmt.Sprintf("%d", *record.ExitCode)
+		}
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%d %s %s %s host=%s session=%s policy=%s/%s exit=%s\n", record.Seq, record.TS, record.ReqID, record.Event, record.Host, record.SessionID, record.PolicyAction, record.PolicyRule, exit)
+	}
+	return nil
+}
+
+func runAuditShow(cmd *cobra.Command, reqID string) error {
+	cfg, err := config.Load()
+	if err != nil {
+		return classifyConfigError(err)
+	}
+	records, err := audit.NewStore(cfg.Paths.AuditFile).ReadAll()
+	if err != nil {
+		return err
+	}
+	var matched []audit.Record
+	for _, record := range records {
+		if record.ReqID == reqID {
+			matched = append(matched, record)
+		}
+	}
+	if len(matched) == 0 {
+		return newUsageError("audit request %q not found", reqID)
+	}
+	return writeJSON(cmd, matched)
+}
+
+func runStatus(cmd *cobra.Command, reqID string, jsonOutput bool) error {
+	cfg, err := config.Load()
+	if err != nil {
+		return classifyConfigError(err)
+	}
+	records, err := audit.NewStore(cfg.Paths.AuditFile).ReadAll()
+	if err != nil {
+		return err
+	}
+	var latest *audit.Record
+	for i := range records {
+		if records[i].ReqID == reqID {
+			latest = &records[i]
+		}
+	}
+	if latest == nil {
+		return newUsageError("audit request %q not found", reqID)
+	}
+	status := string(latest.Event)
+	exitCode := 0
+	if latest.ExitCode != nil {
+		exitCode = *latest.ExitCode
+	} else if latest.Event == audit.EventDenied {
+		exitCode = exitPolicyDenied
+	}
+	response := runResponse{
+		ReqID:           latest.ReqID,
+		SessionID:       latest.SessionID,
+		Host:            latest.Host,
+		Status:          status,
+		ExitCode:        exitCode,
+		OutputTruncated: latest.OutputTruncated,
+		Redactions:      latest.Redactions,
+		Skill:           latest.Skill,
+		PolicyAction:    latest.PolicyAction,
+		PolicyRule:      latest.PolicyRule,
+	}
+	if jsonOutput {
+		return writeJSON(cmd, response)
+	}
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s · host=%s · status=%s · exit=%d · policy=%s/%s\n", latest.ReqID, latest.Host, status, exitCode, latest.PolicyAction, latest.PolicyRule)
+	return nil
+}
+
+func runAuditVerify(cmd *cobra.Command) error {
+	cfg, err := config.Load()
+	if err != nil {
+		return classifyConfigError(err)
+	}
+	result, err := audit.NewStore(cfg.Paths.AuditFile).Verify()
+	if err != nil {
+		return err
+	}
+	if result.OK {
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "audit chain ok · records=%d\n", result.Count)
+		return nil
+	}
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "audit chain broken · seq=%d · reason=%s\n", result.BrokenSeq, result.Reason)
+	return commandExitError{Code: exitRemoteFailed}
+}
+
+func runSessionLS(cmd *cobra.Command) error {
+	cfg, err := config.Load()
+	if err != nil {
+		return classifyConfigError(err)
+	}
+	records, err := audit.NewStore(cfg.Paths.AuditFile).ReadAll()
+	if err != nil {
+		return err
+	}
+	for _, summary := range session.Summaries(records) {
+		label := summary.Label
+		if label == "" {
+			label = "(none)"
+		}
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s label=%q start=%s end=%s commands=%d\n", summary.ID, label, summary.Start, summary.End, summary.CommandCount)
+	}
+	return nil
+}
+
+func baseAuditRecord(reqID string, sessionCtx session.Context, event audit.Event, host string, command string, skill string, decision policy.Decision, exitCode *int, outputHash string) audit.Record {
+	return audit.Record{
+		ReqID:           reqID,
+		SessionID:       sessionCtx.ID,
+		SessionLabel:    sessionCtx.Label,
+		Event:           event,
+		Agent:           os.Getenv("AGENTSSH_AGENT"),
+		Skill:           skill,
+		Host:            host,
+		Cmd:             command,
+		PolicyAction:    string(decision.Action),
+		PolicyRule:      decision.Rule,
+		ExitCode:        exitCode,
+		OutputSHA256:    outputHash,
+		OutputTruncated: false,
+		Redactions:      0,
+	}
+}
+
+func newReqID() (string, error) {
+	var bytes [3]byte
+	if _, err := rand.Read(bytes[:]); err != nil {
+		return "", fmt.Errorf("generate request id: %w", err)
+	}
+	return hex.EncodeToString(bytes[:]), nil
+}
+
+type eventValue audit.Event
+
+func (v *eventValue) Set(value string) error {
+	switch audit.Event(value) {
+	case "", audit.EventStarted, audit.EventCompleted, audit.EventFailed, audit.EventDenied:
+		*v = eventValue(value)
+		return nil
+	default:
+		return fmt.Errorf("invalid status %q", value)
+	}
+}
+
+func (v *eventValue) String() string {
+	return string(*v)
+}
+
+func (v *eventValue) Type() string {
+	return "status"
 }

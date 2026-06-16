@@ -111,6 +111,8 @@ nginx.service - A high performance web server
 
 > Agent 据此分流:`6` = 硬边界(别重试同命令,改走手册/换方案);`2` = 用法问题;`1/9` = 操作/环境问题(可诊断重试)。
 
+`run <group>` 涉及多个目标时,整体退出码采用最保守优先级:`deny(6) > ssh_error(9) > remote_failed(1) > success(0)`。也就是说,任一目标被 policy `deny` 时整体返回 6;若无 deny 但有连接/SSH 错误则返回 9;若仅存在远端非零退出则返回 1。
+
 ### A.6 错误信息风格
 
 每条错误 = 「发生了什么 + 为什么 + 下一步」。例:

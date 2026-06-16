@@ -227,6 +227,7 @@ agentssh/
     policy/                # 规则匹配、allow/deny、override、脱敏
     executor/              # SSH shell-out、捕获 stdout/stderr/exit
     audit/                 # JSONL 写入、hash 链、verify
+    session/               # 会话解析(--session / env / 空闲窗口)、聚合
     output/                # 脱敏 + 截断
     tui/                   # bubbletea:审计查看器
     approval/              # (预留,MVP 空)未来 out-of-band 同步审批
