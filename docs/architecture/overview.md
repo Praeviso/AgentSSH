@@ -83,6 +83,7 @@ groups:
 设计要点:
 - **不在此存私钥/口令**。认证走 ssh-agent 或 `~/.ssh/config`(`IdentityFile`、`ProxyJump` 等自然复用)。
 - 分组用 tag 表达,便于 policy 按组施策。
+- `groups.<name>.tags` 为 **AND** 语义:主机必须包含该 group 列出的全部 tag 才入组。
 
 ### 3.2 policy.yaml
 

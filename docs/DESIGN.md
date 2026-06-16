@@ -78,6 +78,8 @@ nginx.service - A high performance web server
 }
 ```
 
+`run --json` 的顶层形状按用户给出的 target 类型决定:target 命中单个 host 时返回单个对象;target 命中 group 时恒返回数组(即使该 group 当前只匹配 1 台主机),避免输出形状随组内主机数量变化。
+
 ### A.4 被 policy 拒绝时 Agent 看到什么
 
 `run` 命中 `deny` 时,**立即**返回(不阻塞),exit 6:
