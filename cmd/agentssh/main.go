@@ -30,6 +30,9 @@ const (
 	exitSSHError     = 9
 )
 
+// version is overridden at build time via -ldflags "-X main.version=<tag>".
+var version = "dev"
+
 var newExecutor = func(cfg *config.Config) executor.Executor {
 	switch selectedTransport(cfg) {
 	case executor.TransportNative:
@@ -96,6 +99,7 @@ func newRootCommand() *cobra.Command {
 		Use:               "agentssh",
 		Short:             "AgentSSH is a local least-privilege SSH gateway for AI agents.",
 		Long:              "AgentSSH exposes policy-checked SSH operations to agents while keeping credentials and audit control local.",
+		Version:           version,
 		SilenceErrors:     true,
 		SilenceUsage:      true,
 		CompletionOptions: cobra.CompletionOptions{DisableDefaultCmd: true},
