@@ -1,6 +1,8 @@
 # 实施计划 — AgentSSH MVP
 
-> 状态:草案 v1 · 更新于 2026-06-16 · 配套:`docs/prds/agentssh.md`、`docs/architecture/overview.md`、`docs/DESIGN.md`
+> 状态:**MVP 完成** ✅(M0–M5 全部实现并提交 main,2026-06-17)· 配套:`docs/prds/agentssh.md`、`docs/architecture/overview.md`、`docs/DESIGN.md`
+>
+> 提交链:`b6c5a87` 设计 → `975b286` M0 → `0c316da` M1 → `1af7647` M2 → `c495a69` M3 → `eea116f` M4 → `8791125` M5。全部包 `go build/vet/test/gofmt` 通过;PRD §10 的 S1–S5 均有 E2E 验收。后续增强见 PRD §11。
 
 ## 0. 技术选型
 
