@@ -17,6 +17,7 @@ import (
 	"github.com/Kritoooo/agentssh/internal/inventory"
 	"github.com/Kritoooo/agentssh/internal/policy"
 	"github.com/Kritoooo/agentssh/internal/session"
+	"github.com/Kritoooo/agentssh/internal/tui"
 	"github.com/spf13/cobra"
 )
 
@@ -142,9 +143,36 @@ func newTUICommand() *cobra.Command {
 		Short: "Open the terminal audit viewer.",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return printNotImplemented(cmd, "tui")
+			return runTUI(cmd)
 		},
 	}
+}
+
+func runTUI(cmd *cobra.Command) error {
+	cfg, err := config.Load()
+	if err != nil {
+		return classifyConfigError(err)
+	}
+	opts := tui.Options{
+		AuditFile: cfg.Paths.AuditFile,
+		Hosts:     hostMetaFromInventory(cfg.Inventory),
+	}
+	err = tui.NewRunner().Run(opts)
+	if tui.IsNotInteractive(err) {
+		// Non-TTY (piped/CI): fall back to the line-oriented commands.
+		_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "tui requires an interactive terminal; showing plain session summary.")
+		_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "use 'agentssh audit ls|show <req>|verify' or 'agentssh session ls' for details.")
+		return runSessionLS(cmd)
+	}
+	return err
+}
+
+func hostMetaFromInventory(inv inventory.Inventory) map[string]tui.HostMeta {
+	hosts := make(map[string]tui.HostMeta, len(inv.Hosts))
+	for name, host := range inv.Hosts {
+		hosts[name] = tui.HostMeta{User: host.User, Addr: host.Addr, Tags: host.Tags}
+	}
+	return hosts
 }
 
 func newInventoryCommand() *cobra.Command {
@@ -415,7 +443,7 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 			return fmt.Errorf("evaluate policy for %s: %w", target.Name, err)
 		}
 		if decision.Action == policy.ActionDeny {
-			if _, err := store.Append(baseAuditRecord(reqID, sessionCtx, audit.EventDenied, target.Name, remoteCommand, flags.skill, decision, nil, "")); err != nil {
+			if _, err := store.Append(baseAuditRecord(reqID, sessionCtx, audit.EventDenied, target.Name, remoteCommand, flags.skill, decision, nil, "", 0)); err != nil {
 				return err
 			}
 			response := runResponse{
@@ -437,7 +465,7 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 			continue
 		}
 
-		if _, err := store.Append(baseAuditRecord(reqID, sessionCtx, audit.EventStarted, target.Name, remoteCommand, flags.skill, decision, nil, "")); err != nil {
+		if _, err := store.Append(baseAuditRecord(reqID, sessionCtx, audit.EventStarted, target.Name, remoteCommand, flags.skill, decision, nil, "", 0)); err != nil {
 			return err
 		}
 		result := ssh.Run(context.Background(), executor.Request{
@@ -450,7 +478,7 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 			event = audit.EventFailed
 		}
 		outputHash := audit.ComputeOutputSHA256(result.Stdout, result.Stderr)
-		if _, err := store.Append(baseAuditRecord(reqID, sessionCtx, event, target.Name, remoteCommand, flags.skill, decision, &result.ExitCode, outputHash)); err != nil {
+		if _, err := store.Append(baseAuditRecord(reqID, sessionCtx, event, target.Name, remoteCommand, flags.skill, decision, &result.ExitCode, outputHash, result.Duration.Milliseconds())); err != nil {
 			return err
 		}
 		if flags.jsonOutput {
@@ -691,6 +719,7 @@ func runStatus(cmd *cobra.Command, reqID string, jsonOutput bool) error {
 		Host:            latest.Host,
 		Status:          status,
 		ExitCode:        exitCode,
+		DurationMS:      latest.DurationMS,
 		OutputTruncated: latest.OutputTruncated,
 		Redactions:      latest.Redactions,
 		Skill:           latest.Skill,
@@ -740,7 +769,7 @@ func runSessionLS(cmd *cobra.Command) error {
 	return nil
 }
 
-func baseAuditRecord(reqID string, sessionCtx session.Context, event audit.Event, host string, command string, skill string, decision policy.Decision, exitCode *int, outputHash string) audit.Record {
+func baseAuditRecord(reqID string, sessionCtx session.Context, event audit.Event, host string, command string, skill string, decision policy.Decision, exitCode *int, outputHash string, durationMS int64) audit.Record {
 	return audit.Record{
 		ReqID:           reqID,
 		SessionID:       sessionCtx.ID,
@@ -756,6 +785,7 @@ func baseAuditRecord(reqID string, sessionCtx session.Context, event audit.Event
 		OutputSHA256:    outputHash,
 		OutputTruncated: false,
 		Redactions:      0,
+		DurationMS:      durationMS,
 	}
 }
 

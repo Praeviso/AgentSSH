@@ -148,7 +148,7 @@ nginx.service - A high performance web server
 ```
 
 - 顶层按**会话**倒序;会话头显示 `id · label · agent · 起止 · 命令数`,折叠态附一行异常摘要(有 deny/失败时)。
-- 展开后是该会话内的 run,时间倒序;状态图标:`✓` 成功 · `✗` 失败/拒绝 · `●` 执行中。
+- 展开后是该会话内的 run,时间倒序;状态图标:`✓` 成功 · `✗` 失败 · `⊘` 拒绝(policy deny)· `●` 执行中。
 - 每行一眼看全:**时间 · 状态 · 主机(prod 加红角标) · 手册 · 真实命令 · policy 判定 · exit/耗时**。
 - 危险/拒绝用红、prod 主机加红色 `prod` 角标、含异常的会话头标红;颜色仅作强调,信息不只靠颜色(同时有文字)。
 
@@ -163,7 +163,7 @@ nginx.service - A high performance web server
 │ Tags     web, prod                                                │
 │ Command  sudo systemctl restart nginx                             │
 │ Policy   allow ← prod/allow_rules[1]                              │
-│ Exit     0 · 412ms · 输出 16KB(truncated) · 脱敏 0 处             │
+│ Exit     0 · 412ms · truncated false · redactions 0              │
 │ Output   sha256 9f2b…(原文不入审计)                              │
 │ Chain    prev 00ab…  hash 7d41…                                  │
 └───────────────────────────────────────────────────────────────────┘
@@ -172,24 +172,31 @@ nginx.service - A high performance web server
 
 - 给出 **policy 判定理由**(命中哪条规则),让人类信任分级。
 - 只展示输出 `sha256`,不展示原文(架构 §6:原文不二次落盘)。
+- M3 实现:Exit 行为 `exit · 时长(duration_ms)· truncated · redactions`,`Output sha256` 单独成行;输出体积(KB)尚未存储,留待 M4 输出处理。
 
 ### B.3 校验与过滤
 
-- `v` 触发 `audit verify`:顶部状态条显示 `链 ✓ 完整 (1..42)` 或 `链 ✗ 断于 seq 17`。
-- `/` 进入过滤:按 session / host / skill / 状态(allow|deny|failed)/ 时间范围筛选。
-- `l` 进会话详情:只看选中会话的全部 run + 会话元数据(label/agent/起止/命令数)。
+- `v` 触发 `audit verify`:**顶部状态条**显示 `链 ✓ 完整 (0..N-1)`(seq 0 基)或 `链 ✗ 断于 seq=K · <原因>`。验证在任意焦点(列表/详情)下都可触发。
+- `/` 进入过滤(顶部状态条显示当前 filter)。语法 = 自由文本 + 可选维度前缀,空格分隔、多条件 AND:
+  - `host:<substr>`、`skill:<substr>`、`session:<substr>`(匹配 id 或 label)
+  - `status:<allow|deny>`(匹配 policy_action)或 `status:<started|completed|failed|denied>`(匹配事件)
+  - `date:<YYYY-MM-DD>`(按 ts 前缀做时间筛选)
+  - 其余裸词为自由文本,在 host/skill/session/cmd/状态/ts/policy/req 各字段做子串匹配
+  - 实时生效;`enter` 提交并回列表(保留过滤),`esc` 取消并还原进入过滤前的查询。
+- `l` 进/出会话焦点:只看选中会话的全部 run + 会话元数据(`(no session)` 合成组不可焦点)。
 
 ### B.4 键位总表
 
 | 键 | 作用 |
 |---|---|
 | `j` `k` / ↑↓ | 上下移动 |
-| `enter` | 展开/折叠会话;在 run 行上看记录详情 |
-| `l` | 进选中会话的详情 |
-| `/` | 过滤(session/host/skill/状态/时间) |
-| `v` | 校验审计链 |
-| `esc` | 返回 |
-| `q` | 退出 |
+| `enter` / `space` | 会话头:展开/折叠;run 行:看记录详情 |
+| `d` | 看选中 run 的记录详情(`enter` 的别名);详情面板内再按一次返回 |
+| `l` | 进/出选中会话焦点 |
+| `/` | 过滤(语法见 §B.3) |
+| `v` | 校验审计链(任意焦点可用) |
+| `esc` | 详情返回 / 取消过滤 / 退出会话焦点 |
+| `q` · `ctrl+c` | 退出 |
 
 ### B.5 可访问性 / 降级
 

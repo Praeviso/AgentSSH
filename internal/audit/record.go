@@ -43,6 +43,7 @@ type Record struct {
 	OutputSHA256    string `json:"output_sha256"`
 	OutputTruncated bool   `json:"output_truncated"`
 	Redactions      int    `json:"redactions"`
+	DurationMS      int64  `json:"duration_ms"`
 	PrevHash        string `json:"prev_hash"`
 	Hash            string `json:"hash"`
 }
@@ -230,6 +231,7 @@ type canonicalRecord struct {
 	OutputSHA256    string `json:"output_sha256"`
 	OutputTruncated bool   `json:"output_truncated"`
 	Redactions      int    `json:"redactions"`
+	DurationMS      int64  `json:"duration_ms"`
 	PrevHash        string `json:"prev_hash"`
 }
 
@@ -251,6 +253,7 @@ func canonicalJSON(record Record) ([]byte, error) {
 		OutputSHA256:    record.OutputSHA256,
 		OutputTruncated: record.OutputTruncated,
 		Redactions:      record.Redactions,
+		DurationMS:      record.DurationMS,
 		PrevHash:        record.PrevHash,
 	})
 }
