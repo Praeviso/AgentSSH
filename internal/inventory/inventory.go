@@ -9,25 +9,25 @@ import (
 
 // Inventory is the parsed inventory.yaml document.
 type Inventory struct {
-	Version       int              `yaml:"version" json:"version"`
-	Transport     string           `yaml:"transport" json:"transport"`
-	HostKeyPolicy string           `yaml:"host_key_policy" json:"host_key_policy"`
-	Hosts         map[string]Host  `yaml:"hosts" json:"hosts"`
-	Groups        map[string]Group `yaml:"groups" json:"groups"`
+	Version       int              `yaml:"version,omitempty" json:"version"`
+	Transport     string           `yaml:"transport,omitempty" json:"transport"`
+	HostKeyPolicy string           `yaml:"host_key_policy,omitempty" json:"host_key_policy"`
+	Hosts         map[string]Host  `yaml:"hosts,omitempty" json:"hosts"`
+	Groups        map[string]Group `yaml:"groups,omitempty" json:"groups"`
 }
 
 // Host describes a named SSH target without storing private keys or passwords.
 type Host struct {
-	Addr           string   `yaml:"addr" json:"addr"`
-	User           string   `yaml:"user" json:"user"`
-	Port           int      `yaml:"port" json:"port"`
-	SSHConfigAlias string   `yaml:"ssh_config_alias" json:"ssh_config_alias"`
-	Tags           []string `yaml:"tags" json:"tags"`
+	Addr           string   `yaml:"addr,omitempty" json:"addr"`
+	User           string   `yaml:"user,omitempty" json:"user"`
+	Port           int      `yaml:"port,omitempty" json:"port"`
+	SSHConfigAlias string   `yaml:"ssh_config_alias,omitempty" json:"ssh_config_alias"`
+	Tags           []string `yaml:"tags,omitempty" json:"tags"`
 }
 
 // Group selects hosts by tag.
 type Group struct {
-	Tags []string `yaml:"tags" json:"tags"`
+	Tags []string `yaml:"tags,omitempty" json:"tags"`
 }
 
 // Target is a resolved host ready for execution.

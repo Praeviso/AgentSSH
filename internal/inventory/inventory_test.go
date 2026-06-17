@@ -1,6 +1,7 @@
 package inventory
 
 import (
+	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -97,6 +98,33 @@ func TestUnknownTarget(t *testing.T) {
 	_, err := resolver.Resolve("web-9")
 	if !IsUnknown(err) {
 		t.Fatalf("Resolve unknown err = %v, want unknown", err)
+	}
+}
+
+func TestMarshalOmitsEmptyInventoryFields(t *testing.T) {
+	inv := Inventory{
+		Version: 1,
+		Hosts: map[string]Host{
+			"web-1": {
+				Addr: "10.0.0.11",
+			},
+			"via-alias": {
+				SSHConfigAlias: "prod-web",
+			},
+		},
+	}
+	data, err := yaml.Marshal(inv)
+	if err != nil {
+		t.Fatalf("marshal inventory: %v", err)
+	}
+	out := string(data)
+	for _, unexpected := range []string{"transport:", "host_key_policy:", "user:", "port: 0", "tags: []"} {
+		if strings.Contains(out, unexpected) {
+			t.Fatalf("marshal output contains %q:\n%s", unexpected, out)
+		}
+	}
+	if !strings.Contains(out, "version: 1") || !strings.Contains(out, "ssh_config_alias: prod-web") {
+		t.Fatalf("marshal output missing expected fields:\n%s", out)
 	}
 }
 

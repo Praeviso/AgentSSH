@@ -23,10 +23,12 @@ import (
 	"github.com/Praeviso/AgentSSH/internal/audit"
 	"github.com/Praeviso/AgentSSH/internal/config"
 	"github.com/Praeviso/AgentSSH/internal/executor"
+	"github.com/Praeviso/AgentSSH/internal/inventory"
 	"github.com/Praeviso/AgentSSH/internal/output"
 	"github.com/Praeviso/AgentSSH/internal/policy"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
+	"gopkg.in/yaml.v3"
 )
 
 func TestExitCodeForResult(t *testing.T) {
@@ -131,6 +133,141 @@ func TestMergeExitCode(t *testing.T) {
 	}
 	if got := mergeExitCode(exitRemoteFailed, exitSSHError); got != exitSSHError {
 		t.Fatalf("merge remote+ssh = %d, want %d", got, exitSSHError)
+	}
+}
+
+func TestInventoryAddFlagPathCreatesInventoryAndList(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("AGENTSSH_HOME", home)
+
+	stdout, stderr, err := runCommandForTest(t, "inventory", "add", "web-1", "--addr", "10.0.0.11", "--user", "deploy", "--tags", "web,prod")
+	if err != nil {
+		t.Fatalf("inventory add err = %v stdout=%s stderr=%s", err, stdout, stderr)
+	}
+	inv := readInventoryFile(t, home)
+	host := inv.Hosts["web-1"]
+	if inv.Version != 1 || host.Addr != "10.0.0.11" || host.User != "deploy" || host.Port != 22 {
+		t.Fatalf("inventory = %#v", inv)
+	}
+	if len(host.Tags) != 2 || host.Tags[0] != "web" || host.Tags[1] != "prod" {
+		t.Fatalf("tags = %#v", host.Tags)
+	}
+	raw := readFileString(t, filepath.Join(home, "inventory.yaml"))
+	if strings.Contains(raw, "transport:") || strings.Contains(raw, "host_key_policy:") || strings.Contains(raw, "ssh_config_alias:") {
+		t.Fatalf("inventory yaml contains empty optional fields:\n%s", raw)
+	}
+
+	stdout, stderr, err = runCommandForTest(t, "inventory", "ls")
+	if err != nil {
+		t.Fatalf("inventory ls err = %v stderr=%s", err, stderr)
+	}
+	for _, want := range []string{"web-1", "addr=10.0.0.11", "user=deploy", "port=22", "tags=web,prod"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("inventory ls missing %q:\n%s", want, stdout)
+		}
+	}
+
+	stdout, stderr, err = runCommandForTest(t, "inventory", "ls", "--json")
+	if err != nil {
+		t.Fatalf("inventory ls --json err = %v stderr=%s", err, stderr)
+	}
+	var decoded inventory.Inventory
+	if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
+		t.Fatalf("decode inventory json: %v\n%s", err, stdout)
+	}
+	if decoded.Hosts["web-1"].Addr != "10.0.0.11" || decoded.Hosts["web-1"].User != "deploy" {
+		t.Fatalf("inventory json = %#v", decoded)
+	}
+}
+
+func TestInventoryAddRejectsDuplicateAndPreservesExisting(t *testing.T) {
+	home := t.TempDir()
+	writeInventory(t, home, `
+version: 1
+transport: native
+hosts:
+  old:
+    addr: 10.0.0.10
+    user: root
+groups:
+  prod:
+    tags: [prod]
+`)
+	t.Setenv("AGENTSSH_HOME", home)
+
+	_, stderr, err := runCommandForTest(t, "inventory", "add", "new", "--addr", "10.0.0.11")
+	if err != nil {
+		t.Fatalf("add new err = %v stderr=%s", err, stderr)
+	}
+	inv := readInventoryFile(t, home)
+	if inv.Transport != "native" || inv.Hosts["old"].Addr != "10.0.0.10" || inv.Hosts["new"].Addr != "10.0.0.11" {
+		t.Fatalf("inventory after add = %#v", inv)
+	}
+
+	_, _, err = runCommandForTest(t, "inventory", "add", "old", "--addr", "10.0.0.12")
+	if err == nil || !isUsageError(err) {
+		t.Fatalf("duplicate err = %T %[1]v, want usageError", err)
+	}
+}
+
+func TestInventoryAddCreatesMissingHomeDirectory(t *testing.T) {
+	root := t.TempDir()
+	home := filepath.Join(root, "missing", "agentssh")
+	t.Setenv("AGENTSSH_HOME", home)
+
+	_, stderr, err := runCommandForTest(t, "inventory", "add", "web-1", "--addr", "10.0.0.11")
+	if err != nil {
+		t.Fatalf("inventory add err = %v stderr=%s", err, stderr)
+	}
+	if _, err := os.Stat(filepath.Join(home, "inventory.yaml")); err != nil {
+		t.Fatalf("inventory file stat: %v", err)
+	}
+}
+
+func TestInventoryAddNonInteractiveRequiresFields(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("AGENTSSH_HOME", home)
+	_, _, err := runCommandForTest(t, "inventory", "add", "--addr", "10.0.0.11")
+	if err == nil || !isUsageError(err) {
+		t.Fatalf("missing name err = %T %[1]v, want usageError", err)
+	}
+	_, _, err = runCommandForTest(t, "inventory", "add", "web-1")
+	if err == nil || !isUsageError(err) {
+		t.Fatalf("missing addr err = %T %[1]v, want usageError", err)
+	}
+}
+
+func TestInventoryAddDoesNotOverwriteMalformedInventory(t *testing.T) {
+	home := t.TempDir()
+	bad := "::: not: yaml: ["
+	if err := os.WriteFile(filepath.Join(home, "inventory.yaml"), []byte(bad), 0o600); err != nil {
+		t.Fatalf("write bad inventory: %v", err)
+	}
+	t.Setenv("AGENTSSH_HOME", home)
+
+	_, _, err := runCommandForTest(t, "inventory", "add", "web-1", "--addr", "10.0.0.11")
+	if err == nil {
+		t.Fatal("add malformed inventory err = nil")
+	}
+	if got := readFileString(t, filepath.Join(home, "inventory.yaml")); got != bad {
+		t.Fatalf("inventory was overwritten: %q", got)
+	}
+}
+
+func TestHostsStillShowsPublicInventoryOnly(t *testing.T) {
+	home := t.TempDir()
+	writeTestInventory(t, home)
+	t.Setenv("AGENTSSH_HOME", home)
+
+	stdout, stderr, err := runCommandForTest(t, "hosts", "--json")
+	if err != nil {
+		t.Fatalf("hosts err = %v stderr=%s", err, stderr)
+	}
+	if strings.Contains(stdout, "10.0.0.11") || strings.Contains(stdout, "deploy") {
+		t.Fatalf("hosts leaked connection details:\n%s", stdout)
+	}
+	if !strings.Contains(stdout, `"name": "web-1"`) || !strings.Contains(stdout, `"tags"`) {
+		t.Fatalf("hosts output missing public fields:\n%s", stdout)
 	}
 }
 
@@ -575,6 +712,28 @@ func writeInventory(t *testing.T, home string, value string) {
 	if err := os.WriteFile(filepath.Join(home, "inventory.yaml"), data, 0o600); err != nil {
 		t.Fatalf("write inventory: %v", err)
 	}
+}
+
+func readInventoryFile(t *testing.T, home string) inventory.Inventory {
+	t.Helper()
+	var inv inventory.Inventory
+	data, err := os.ReadFile(filepath.Join(home, "inventory.yaml"))
+	if err != nil {
+		t.Fatalf("read inventory: %v", err)
+	}
+	if err := yaml.Unmarshal(data, &inv); err != nil {
+		t.Fatalf("unmarshal inventory: %v\n%s", err, data)
+	}
+	return inv
+}
+
+func readFileString(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read file %s: %v", path, err)
+	}
+	return string(data)
 }
 
 func writeTestPolicy(t *testing.T, home string) {

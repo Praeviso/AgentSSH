@@ -8,18 +8,22 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/Praeviso/AgentSSH/internal/audit"
 	"github.com/Praeviso/AgentSSH/internal/config"
 	"github.com/Praeviso/AgentSSH/internal/executor"
+	"github.com/Praeviso/AgentSSH/internal/hostform"
 	"github.com/Praeviso/AgentSSH/internal/inventory"
 	"github.com/Praeviso/AgentSSH/internal/output"
 	"github.com/Praeviso/AgentSSH/internal/policy"
 	"github.com/Praeviso/AgentSSH/internal/session"
 	"github.com/Praeviso/AgentSSH/internal/tui"
 	"github.com/spf13/cobra"
+	"gopkg.in/yaml.v3"
 )
 
 const (
@@ -226,8 +230,38 @@ func newInventoryCommand() *cobra.Command {
 		Use:   "inventory",
 		Short: "Manage host inventory.",
 	}
+	var lsJSON bool
+	lsCmd := &cobra.Command{
+		Use:   "ls [--json]",
+		Short: "List configured inventory entries.",
+		Args:  noArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runInventoryLS(cmd, lsJSON)
+		},
+	}
+	lsCmd.Flags().BoolVar(&lsJSON, "json", false, "emit machine-readable JSON")
+
+	var add inventoryAddOptions
+	addCmd := &cobra.Command{
+		Use:   "add [name] [--addr <addr>] [--user <user>] [--port <port>] [--alias <ssh_config_alias>] [--tags <a,b>]",
+		Short: "Add a host to inventory.yaml.",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(args) > 0 {
+				add.Name = args[0]
+			}
+			return runInventoryAdd(add)
+		},
+	}
+	addCmd.Flags().StringVar(&add.Addr, "addr", "", "host address")
+	addCmd.Flags().StringVar(&add.User, "user", "", "SSH user")
+	addCmd.Flags().IntVar(&add.Port, "port", 0, "SSH port")
+	addCmd.Flags().StringVar(&add.Alias, "alias", "", "ssh_config host alias")
+	addCmd.Flags().StringVar(&add.Tags, "tags", "", "comma-separated tags")
+
 	cmd.AddCommand(
-		leafNoArgs("ls", "List inventory entries.", "view hosts with: agentssh hosts, or read ~/.agentssh/inventory.yaml"),
+		lsCmd,
+		addCmd,
 		leafNoArgs("edit", "Edit inventory.yaml.", "edit ~/.agentssh/inventory.yaml directly"),
 	)
 	return cmd
@@ -443,6 +477,248 @@ func selectedTransport(cfg *config.Config) string {
 	default:
 		return executor.TransportShell
 	}
+}
+
+type inventoryAddOptions struct {
+	Name  string
+	Addr  string
+	User  string
+	Port  int
+	Alias string
+	Tags  string
+}
+
+func runInventoryAdd(opts inventoryAddOptions) error {
+	home, err := config.ResolveHome()
+	if err != nil {
+		return err
+	}
+	paths := config.NewPaths(home)
+	inv, err := loadInventoryForWrite(paths.InventoryFile)
+	if err != nil {
+		return err
+	}
+
+	formOptions := hostform.Options{
+		Name:          opts.Name,
+		Addr:          opts.Addr,
+		User:          opts.User,
+		Port:          opts.Port,
+		Tags:          hostform.SplitTags(opts.Tags),
+		Alias:         opts.Alias,
+		ExistingNames: existingHostNames(inv),
+	}
+	result, err := hostform.Run(formOptions)
+	if hostform.IsNotInteractive(err) {
+		result, err = resultFromFlags(formOptions)
+	}
+	if err != nil {
+		return err
+	}
+	if !result.Submitted {
+		return nil
+	}
+	return addInventoryHost(paths, inv, result)
+}
+
+func resultFromFlags(opts hostform.Options) (hostform.Result, error) {
+	result, errs := hostform.Validate(opts)
+	if len(errs) == 0 {
+		result.Submitted = true
+		return result, nil
+	}
+	if opts.Name == "" {
+		return result, newUsageError("inventory add requires [name] in non-interactive mode; example: agentssh inventory add web-1 --addr 10.0.0.11")
+	}
+	if opts.Addr == "" && opts.Alias == "" {
+		return result, newUsageError("inventory add requires --addr or --alias in non-interactive mode")
+	}
+	return result, newUsageError("invalid inventory host: %s", firstValidationError(errs))
+}
+
+func firstValidationError(errs map[string]string) string {
+	keys := []string{"name", "addr", "user", "port", "tags", "alias"}
+	for _, key := range keys {
+		if errs[key] != "" {
+			return errs[key]
+		}
+	}
+	return "unknown validation error"
+}
+
+func loadInventoryForWrite(path string) (inventory.Inventory, error) {
+	var inv inventory.Inventory
+	file, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return inv, nil
+	}
+	if err != nil {
+		return inv, err
+	}
+	defer func() {
+		_ = file.Close()
+	}()
+	if err := yaml.NewDecoder(file).Decode(&inv); err != nil {
+		return inv, config.ParseError{File: path, Err: err}
+	}
+	return inv, nil
+}
+
+func addInventoryHost(paths config.Paths, inv inventory.Inventory, result hostform.Result) error {
+	if inv.Hosts == nil {
+		inv.Hosts = map[string]inventory.Host{}
+	}
+	if inv.Version == 0 {
+		inv.Version = 1
+	}
+	if _, ok := inv.Hosts[result.Name]; ok {
+		return newUsageError("inventory host %q already exists", result.Name)
+	}
+	inv.Hosts[result.Name] = inventory.Host{
+		Addr:           result.Addr,
+		User:           result.User,
+		Port:           result.Port,
+		SSHConfigAlias: result.Alias,
+		Tags:           result.Tags,
+	}
+	return writeInventoryAtomic(paths.Home, paths.InventoryFile, inv)
+}
+
+func writeInventoryAtomic(home string, path string, inv inventory.Inventory) error {
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		return fmt.Errorf("create inventory directory: %w", err)
+	}
+	data, err := yaml.Marshal(&inv)
+	if err != nil {
+		return fmt.Errorf("marshal inventory: %w", err)
+	}
+	file, err := os.CreateTemp(home, "inventory-*.yaml")
+	if err != nil {
+		return fmt.Errorf("create temporary inventory file: %w", err)
+	}
+	tempName := file.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tempName)
+		}
+	}()
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("chmod temporary inventory file: %w", err)
+	}
+	if _, err := file.Write(data); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("write temporary inventory file: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close temporary inventory file: %w", err)
+	}
+	if err := os.Rename(tempName, path); err != nil {
+		return fmt.Errorf("replace inventory file: %w", err)
+	}
+	cleanup = false
+	return nil
+}
+
+func existingHostNames(inv inventory.Inventory) map[string]struct{} {
+	names := make(map[string]struct{}, len(inv.Hosts))
+	for name := range inv.Hosts {
+		names[name] = struct{}{}
+	}
+	return names
+}
+
+func runInventoryLS(cmd *cobra.Command, jsonOutput bool) error {
+	cfg, err := config.Load()
+	if err != nil {
+		return classifyConfigError(err)
+	}
+	if jsonOutput {
+		return writeJSON(cmd, cfg.Inventory)
+	}
+	printInventory(cmd, cfg.Inventory)
+	return nil
+}
+
+func printInventory(cmd *cobra.Command, inv inventory.Inventory) {
+	out := cmd.OutOrStdout()
+	if inv.Transport != "" || inv.HostKeyPolicy != "" {
+		parts := []string{}
+		if inv.Transport != "" {
+			parts = append(parts, "transport="+inv.Transport)
+		}
+		if inv.HostKeyPolicy != "" {
+			parts = append(parts, "host_key_policy="+inv.HostKeyPolicy)
+		}
+		_, _ = fmt.Fprintln(out, strings.Join(parts, " "))
+	}
+
+	_, _ = fmt.Fprintln(out, "Hosts:")
+	hostNames := sortedHostNamesLocal(inv.Hosts)
+	if len(hostNames) == 0 {
+		_, _ = fmt.Fprintln(out, "  (none)")
+	}
+	for _, name := range hostNames {
+		host := inv.Hosts[name]
+		_, _ = fmt.Fprintf(out, "  %s", name)
+		for _, part := range hostParts(host) {
+			_, _ = fmt.Fprintf(out, " %s", part)
+		}
+		_, _ = fmt.Fprintln(out)
+	}
+
+	_, _ = fmt.Fprintln(out, "Groups:")
+	groupNames := sortedGroupNamesLocal(inv.Groups)
+	if len(groupNames) == 0 {
+		_, _ = fmt.Fprintln(out, "  (none)")
+	}
+	for _, name := range groupNames {
+		group := inv.Groups[name]
+		_, _ = fmt.Fprintf(out, "  %s", name)
+		if len(group.Tags) > 0 {
+			_, _ = fmt.Fprintf(out, " tags=%s", strings.Join(group.Tags, ","))
+		}
+		_, _ = fmt.Fprintln(out)
+	}
+}
+
+func hostParts(host inventory.Host) []string {
+	var parts []string
+	if host.Addr != "" {
+		parts = append(parts, "addr="+host.Addr)
+	}
+	if host.User != "" {
+		parts = append(parts, "user="+host.User)
+	}
+	if host.Port != 0 {
+		parts = append(parts, "port="+strconv.Itoa(host.Port))
+	}
+	if host.SSHConfigAlias != "" {
+		parts = append(parts, "alias="+host.SSHConfigAlias)
+	}
+	if len(host.Tags) > 0 {
+		parts = append(parts, "tags="+strings.Join(host.Tags, ","))
+	}
+	return parts
+}
+
+func sortedHostNamesLocal(hosts map[string]inventory.Host) []string {
+	names := make([]string, 0, len(hosts))
+	for name := range hosts {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func sortedGroupNamesLocal(groups map[string]inventory.Group) []string {
+	names := make([]string, 0, len(groups))
+	for name := range groups {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 func printHosts(cmd *cobra.Command, public inventory.PublicInventory, jsonOutput bool) error {
