@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/Kritoooo/agentssh/internal/audit"
+	"github.com/Kritoooo/agentssh/internal/config"
 	"github.com/Kritoooo/agentssh/internal/executor"
 	"github.com/Kritoooo/agentssh/internal/inventory"
 )
@@ -27,7 +28,7 @@ func setupHome(t *testing.T) string {
 func withFakeExecutor(t *testing.T, fe fakeExecutor) {
 	t.Helper()
 	restore := newExecutor
-	newExecutor = func() executor.Executor { return fe }
+	newExecutor = func(_ *config.Config) executor.Executor { return fe }
 	t.Cleanup(func() { newExecutor = restore })
 }
 

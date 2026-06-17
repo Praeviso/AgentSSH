@@ -9,9 +9,11 @@ import (
 
 // Inventory is the parsed inventory.yaml document.
 type Inventory struct {
-	Version int              `yaml:"version" json:"version"`
-	Hosts   map[string]Host  `yaml:"hosts" json:"hosts"`
-	Groups  map[string]Group `yaml:"groups" json:"groups"`
+	Version       int              `yaml:"version" json:"version"`
+	Transport     string           `yaml:"transport" json:"transport"`
+	HostKeyPolicy string           `yaml:"host_key_policy" json:"host_key_policy"`
+	Hosts         map[string]Host  `yaml:"hosts" json:"hosts"`
+	Groups        map[string]Group `yaml:"groups" json:"groups"`
 }
 
 // Host describes a named SSH target without storing private keys or passwords.

@@ -30,8 +30,17 @@ const (
 	exitSSHError     = 9
 )
 
-var newExecutor = func() executor.Executor {
-	return executor.NewSSHExecutor(nil)
+var newExecutor = func(cfg *config.Config) executor.Executor {
+	switch selectedTransport(cfg) {
+	case executor.TransportNative:
+		options := executor.NativeOptions{}
+		if cfg != nil {
+			options.HostKeyPolicy = cfg.Inventory.HostKeyPolicy
+		}
+		return executor.NewNativeExecutor(options)
+	default:
+		return executor.NewSSHExecutor(nil)
+	}
 }
 
 func main() {
@@ -415,6 +424,23 @@ func classifyConfigError(err error) error {
 	return fmt.Errorf("%w", err)
 }
 
+func selectedTransport(cfg *config.Config) string {
+	transport := ""
+	if env := os.Getenv("AGENTSSH_TRANSPORT"); env != "" {
+		transport = env
+	} else if cfg != nil {
+		transport = cfg.Inventory.Transport
+	}
+	switch transport {
+	case "", executor.TransportShell:
+		return executor.TransportShell
+	case executor.TransportNative:
+		return executor.TransportNative
+	default:
+		return executor.TransportShell
+	}
+}
+
 func printHosts(cmd *cobra.Command, public inventory.PublicInventory, jsonOutput bool) error {
 	if jsonOutput {
 		return writeJSON(cmd, public)
@@ -476,7 +502,7 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 		return fmt.Errorf("resolve session: %w", err)
 	}
 	store := audit.NewStore(cfg.Paths.AuditFile)
-	ssh := newExecutor()
+	ssh := newExecutor(cfg)
 	exitCode := exitOK
 	responses := make([]runResponse, 0, len(resolved.Targets))
 	for _, target := range resolved.Targets {

@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/Kritoooo/agentssh/internal/audit"
+	"github.com/Kritoooo/agentssh/internal/config"
 	"github.com/Kritoooo/agentssh/internal/executor"
 )
 
@@ -45,6 +46,23 @@ func TestExitCodeForResult(t *testing.T) {
 			},
 			want: exitSSHError,
 		},
+		{
+			name: "native remote exit 255 is remote failure",
+			result: executor.Result{
+				ExitCode: 255,
+				Argv:     []string{"native-ssh", "deploy@10.0.0.11:22", "exit255"},
+			},
+			want: exitRemoteFailed,
+		},
+		{
+			name: "native transport error",
+			result: executor.Result{
+				ExitCode: -1,
+				Err:      errors.New("host key rejected"),
+				Argv:     []string{"native-ssh", "deploy@10.0.0.11:22", "uptime"},
+			},
+			want: exitSSHError,
+		},
 	}
 
 	for _, tt := range tests {
@@ -52,6 +70,7 @@ func TestExitCodeForResult(t *testing.T) {
 			if got := exitCodeForResult(tt.result); got != tt.want {
 				t.Fatalf("exitCodeForResult = %d, want %d", got, tt.want)
 			}
+			t.Logf("case=%q status=%q mapped_exit=%d", tt.name, statusForResult(tt.result), tt.want)
 		})
 	}
 }
@@ -64,6 +83,26 @@ func TestStatusForResultSSHExit255(t *testing.T) {
 	if got := statusForResult(result); got != "ssh_error" {
 		t.Fatalf("statusForResult = %q, want ssh_error", got)
 	}
+}
+
+func TestTransportSelection(t *testing.T) {
+	cfg := &config.Config{}
+	defaultExec := newExecutor(cfg)
+	if _, ok := defaultExec.(executor.SSHExecutor); !ok {
+		t.Fatalf("default transport = %T, want shell-out SSHExecutor", defaultExec)
+	}
+	cfg.Inventory.Transport = executor.TransportNative
+	inventoryExec := newExecutor(cfg)
+	if _, ok := inventoryExec.(executor.NativeExecutor); !ok {
+		t.Fatalf("inventory native transport = %T, want NativeExecutor", inventoryExec)
+	}
+	t.Setenv("AGENTSSH_TRANSPORT", executor.TransportNative)
+	cfg.Inventory.Transport = executor.TransportShell
+	envExec := newExecutor(cfg)
+	if _, ok := envExec.(executor.NativeExecutor); !ok {
+		t.Fatalf("env native transport = %T, want NativeExecutor", envExec)
+	}
+	t.Logf("transport default=%T inventory_native=%T env_native_overrides=%T", defaultExec, inventoryExec, envExec)
 }
 
 func TestPrintSSHExit255MappingDemo(t *testing.T) {
@@ -119,7 +158,7 @@ func runJSONShapeDemo(t *testing.T) (string, string, string, string) {
 	t.Setenv("AGENTSSH_HOME", home)
 
 	restoreExecutor := newExecutor
-	newExecutor = func() executor.Executor {
+	newExecutor = func(_ *config.Config) executor.Executor {
 		return fakeExecutor{}
 	}
 	defer func() {
@@ -146,7 +185,7 @@ func TestRunDenyWritesAuditAndDoesNotExecute(t *testing.T) {
 
 	var calls int32
 	restoreExecutor := newExecutor
-	newExecutor = func() executor.Executor {
+	newExecutor = func(_ *config.Config) executor.Executor {
 		return fakeExecutor{calls: &calls}
 	}
 	defer func() {
@@ -182,7 +221,7 @@ func TestRunAllowWritesStartedAndCompleted(t *testing.T) {
 
 	var calls int32
 	restoreExecutor := newExecutor
-	newExecutor = func() executor.Executor {
+	newExecutor = func(_ *config.Config) executor.Executor {
 		return fakeExecutor{calls: &calls}
 	}
 	defer func() {
@@ -216,7 +255,7 @@ func TestRunAppliesOutputFilterToReturnAndAudit(t *testing.T) {
 	t.Setenv("AGENTSSH_SESSION", "s_test")
 
 	restoreExecutor := newExecutor
-	newExecutor = func() executor.Executor {
+	newExecutor = func(_ *config.Config) executor.Executor {
 		return fakeExecutor{stdout: "password=secret123 abcdefghijklmnopqrstuvwxyz\n"}
 	}
 	defer func() {
@@ -257,7 +296,7 @@ func TestPrintM2RunAuditDemo(t *testing.T) {
 
 	var calls int32
 	restoreExecutor := newExecutor
-	newExecutor = func() executor.Executor {
+	newExecutor = func(_ *config.Config) executor.Executor {
 		return fakeExecutor{calls: &calls}
 	}
 	defer func() {
@@ -319,7 +358,7 @@ func TestPrintM4OutputFilterDemo(t *testing.T) {
 	t.Setenv("AGENTSSH_SESSION", "s_m4")
 
 	restoreExecutor := newExecutor
-	newExecutor = func() executor.Executor {
+	newExecutor = func(_ *config.Config) executor.Executor {
 		return fakeExecutor{stdout: "password=secret123 abcdefghijklmnopqrstuvwxyz\n"}
 	}
 	defer func() {
