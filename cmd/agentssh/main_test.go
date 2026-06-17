@@ -414,9 +414,11 @@ func formatExit(exitCode *int) string {
 }
 
 type fakeExecutor struct {
-	calls  *int32
-	stdout string
-	stderr string
+	calls    *int32
+	stdout   string
+	stderr   string
+	exitCode int   // simulated remote/ssh exit code (0 = success)
+	err      error // simulated transport error
 }
 
 func (e fakeExecutor) Run(_ context.Context, request executor.Request) executor.Result {
@@ -424,13 +426,14 @@ func (e fakeExecutor) Run(_ context.Context, request executor.Request) executor.
 		atomic.AddInt32(e.calls, 1)
 	}
 	stdout := e.stdout
-	if stdout == "" {
+	if stdout == "" && e.exitCode == 0 && e.err == nil {
 		stdout = "ok\n"
 	}
 	return executor.Result{
 		Stdout:   stdout,
 		Stderr:   e.stderr,
-		ExitCode: 0,
+		ExitCode: e.exitCode,
+		Err:      e.err,
 		Argv:     []string{"ssh", request.Target.Name, request.Command},
 	}
 }

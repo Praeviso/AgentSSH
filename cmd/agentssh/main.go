@@ -40,19 +40,46 @@ func main() {
 
 func execute() int {
 	root := newRootCommand()
-	if err := root.Execute(); err != nil {
-		if isUsageError(err) {
-			_, _ = fmt.Fprintln(root.ErrOrStderr(), err)
-			return exitUsage
-		}
+	err := root.Execute()
+	code := exitCodeForError(err)
+	if err != nil {
 		var exitErr commandExitError
-		if errors.As(err, &exitErr) {
-			return exitErr.Code
+		if !errors.As(err, &exitErr) {
+			// Surface usage/generic errors. A commandExitError's human-facing
+			// message was already printed by the command itself.
+			_, _ = fmt.Fprintln(root.ErrOrStderr(), err)
 		}
-		_, _ = fmt.Fprintln(root.ErrOrStderr(), err)
-		return exitRemoteFailed
 	}
-	return exitOK
+	return code
+}
+
+// exitCodeForError maps a top-level command error to a process exit code per
+// docs/DESIGN.md §A.5. It is the single source of truth shared by execute()
+// and the exit-code tests.
+func exitCodeForError(err error) int {
+	if err == nil {
+		return exitOK
+	}
+	if isUsageError(err) || isCobraUsageError(err) {
+		return exitUsage
+	}
+	var exitErr commandExitError
+	if errors.As(err, &exitErr) {
+		return exitErr.Code
+	}
+	return exitRemoteFailed
+}
+
+// isCobraUsageError catches cobra/pflag's own validation errors (unknown
+// command/flag) which are not our usageError type, so they still map to exit 2.
+func isCobraUsageError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Flag-parse errors are already converted to usageError by the root's
+	// FlagErrorFunc; only "unknown command" reaches here un-typed. Matching just
+	// that one phrase keeps the string-match false-positive window minimal.
+	return strings.HasPrefix(err.Error(), "unknown command")
 }
 
 func newRootCommand() *cobra.Command {
@@ -64,6 +91,11 @@ func newRootCommand() *cobra.Command {
 		SilenceUsage:      true,
 		CompletionOptions: cobra.CompletionOptions{DisableDefaultCmd: true},
 	}
+	// Map cobra/pflag flag-parse errors (unknown/invalid flag) to our usageError
+	// so they exit 2 instead of falling through to the generic exit 1.
+	cmd.SetFlagErrorFunc(func(_ *cobra.Command, err error) error {
+		return usageError(err.Error())
+	})
 
 	cmd.AddCommand(
 		newHostsCommand(),
@@ -84,7 +116,7 @@ func newHostsCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "hosts [--json]",
 		Short: "List configured hosts and groups.",
-		Args:  cobra.NoArgs,
+		Args:  noArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cfg, err := config.Load()
 			if err != nil {
@@ -142,7 +174,7 @@ func newTUICommand() *cobra.Command {
 	return &cobra.Command{
 		Use:   "tui",
 		Short: "Open the terminal audit viewer.",
-		Args:  cobra.NoArgs,
+		Args:  noArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runTUI(cmd)
 		},
@@ -182,8 +214,8 @@ func newInventoryCommand() *cobra.Command {
 		Short: "Manage host inventory.",
 	}
 	cmd.AddCommand(
-		leafNoArgs("ls", "List inventory entries.", "inventory ls"),
-		leafNoArgs("edit", "Edit inventory.yaml.", "inventory edit"),
+		leafNoArgs("ls", "List inventory entries.", "view hosts with: agentssh hosts, or read ~/.agentssh/inventory.yaml"),
+		leafNoArgs("edit", "Edit inventory.yaml.", "edit ~/.agentssh/inventory.yaml directly"),
 	)
 	return cmd
 }
@@ -207,12 +239,12 @@ func newPolicyCommand() *cobra.Command {
 		&cobra.Command{
 			Use:   "show",
 			Short: "Show policy.yaml.",
-			Args:  cobra.NoArgs,
+			Args:  noArgs,
 			RunE: func(cmd *cobra.Command, _ []string) error {
 				return runPolicyShow(cmd)
 			},
 		},
-		leafNoArgs("edit", "Edit policy.yaml.", "policy edit"),
+		leafNoArgs("edit", "Edit policy.yaml.", "edit ~/.agentssh/policy.yaml directly (validate with: agentssh policy show)"),
 		testCmd,
 	)
 	return cmd
@@ -227,7 +259,7 @@ func newAuditCommand() *cobra.Command {
 	lsCmd := &cobra.Command{
 		Use:   "ls",
 		Short: "List audit records.",
-		Args:  cobra.NoArgs,
+		Args:  noArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runAuditLS(cmd, filters)
 		},
@@ -248,7 +280,7 @@ func newAuditCommand() *cobra.Command {
 		&cobra.Command{
 			Use:   "verify",
 			Short: "Verify the audit hash chain.",
-			Args:  cobra.NoArgs,
+			Args:  noArgs,
 			RunE: func(cmd *cobra.Command, _ []string) error {
 				return runAuditVerify(cmd)
 			},
@@ -265,7 +297,7 @@ func newSessionCommand() *cobra.Command {
 	cmd.AddCommand(&cobra.Command{
 		Use:   "ls",
 		Short: "List recent sessions.",
-		Args:  cobra.NoArgs,
+		Args:  noArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runSessionLS(cmd)
 		},
@@ -273,15 +305,24 @@ func newSessionCommand() *cobra.Command {
 	return cmd
 }
 
-func leafNoArgs(use string, short string, name string) *cobra.Command {
+func leafNoArgs(use string, short string, hint string) *cobra.Command {
 	return &cobra.Command{
 		Use:   use,
 		Short: short,
-		Args:  cobra.NoArgs,
+		Args:  noArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return printNotImplemented(cmd, name)
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "not implemented yet — %s\n", hint)
+			return nil
 		},
 	}
+}
+
+// noArgs is cobra.NoArgs but returns our usageError so extra args exit 2.
+func noArgs(cmd *cobra.Command, args []string) error {
+	if err := cobra.NoArgs(cmd, args); err != nil {
+		return usageError(err.Error())
+	}
+	return nil
 }
 
 func exactArgs(count int) cobra.PositionalArgs {
@@ -300,15 +341,6 @@ func minArgs(count int) cobra.PositionalArgs {
 		}
 		return nil
 	}
-}
-
-func printNotImplemented(cmd *cobra.Command, format string, args ...any) error {
-	if len(args) == 0 {
-		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "not implemented: %s\n", format)
-		return nil
-	}
-	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "not implemented: "+format+"\n", args...)
-	return nil
 }
 
 type runFlags struct {
@@ -372,6 +404,14 @@ func classifyConfigError(err error) error {
 	if errors.As(err, &config.MissingHomeError{}) {
 		return newUsageError("%v", err)
 	}
+	var parseErr config.ParseError
+	if errors.As(err, &parseErr) {
+		return newUsageError("%v\n  fix the YAML in ~/.agentssh and re-run; validate with: agentssh hosts / agentssh policy show", err)
+	}
+	var setupErr config.SetupError
+	if errors.As(err, &setupErr) {
+		return newUsageError("%v\n  fix AGENTSSH_HOME or your ~/.agentssh setup, then re-run", err)
+	}
 	return fmt.Errorf("%w", err)
 }
 
@@ -419,16 +459,17 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 		if inventory.IsUnknown(err) {
 			return newUsageError("%v\n  查看全部: agentssh hosts", err)
 		}
-		return newUsageError("%v", err)
+		// e.g. a group whose tags match no hosts.
+		return newUsageError("%v\n  list hosts and tags with: agentssh hosts", err)
 	}
 
 	engine, err := policy.NewEngine(cfg.Policy, cfg.Inventory)
 	if err != nil {
-		return fmt.Errorf("load policy: %w", err)
+		return newUsageError("policy.yaml is invalid: %v\n  fix the rule in ~/.agentssh/policy.yaml, then re-run (check: agentssh policy show)", err)
 	}
 	outputFilter, err := output.NewFilter(cfg.Policy.Output)
 	if err != nil {
-		return fmt.Errorf("load output filter: %w", err)
+		return newUsageError("invalid output filter in policy.yaml: %v\n  fix the regex under output.redact in ~/.agentssh/policy.yaml", err)
 	}
 	sessionCtx, err := session.Resolver{Path: cfg.Paths.SessionFile}.Resolve(flags.session, flags.sessionLabel)
 	if err != nil {
@@ -557,8 +598,14 @@ func printRunHuman(cmd *cobra.Command, host string, result executor.Result, filt
 			_, _ = fmt.Fprintln(cmd.ErrOrStderr())
 		}
 	}
-	if isSSHErrorResult(result) && result.Err != nil {
-		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "ssh error: %v\n", result.Err)
+	if isSSHErrorResult(result) {
+		hint := "  check host reachability and your SSH key/agent; verify the host with: agentssh hosts"
+		if result.Err != nil {
+			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "ssh connection failed (exit 9): %v\n%s\n", result.Err, hint)
+		} else {
+			// exit-255 with no exec error (ssh's own connection-error code).
+			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "ssh connection failed (exit 9)\n%s\n", hint)
+		}
 	}
 }
 
@@ -641,7 +688,7 @@ func runPolicyTest(cmd *cobra.Command, host string, command string) error {
 	}
 	engine, err := policy.NewEngine(cfg.Policy, cfg.Inventory)
 	if err != nil {
-		return fmt.Errorf("load policy: %w", err)
+		return newUsageError("policy.yaml is invalid: %v\n  fix the rule in ~/.agentssh/policy.yaml, then re-run (check: agentssh policy show)", err)
 	}
 	decision, err := engine.Evaluate(host, command)
 	if err != nil {
@@ -817,7 +864,7 @@ func (v *eventValue) Set(value string) error {
 		*v = eventValue(value)
 		return nil
 	default:
-		return fmt.Errorf("invalid status %q", value)
+		return newUsageError("invalid --status %q; expected one of: started, completed, failed, denied", value)
 	}
 }
 

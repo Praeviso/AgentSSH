@@ -43,6 +43,37 @@ func (e MissingHomeError) Error() string {
 	return fmt.Sprintf("agentssh config directory not found: %s; create it with inventory.yaml and policy.yaml, or set %s to another directory", e.Home, EnvHome)
 }
 
+// ParseError reports a malformed inventory.yaml or policy.yaml. It is a setup
+// problem (the operator hand-edits these files), so callers map it to a usage
+// error rather than a runtime failure.
+type ParseError struct {
+	File string
+	Err  error
+}
+
+func (e ParseError) Error() string {
+	return fmt.Sprintf("failed to parse %s: %v", e.File, e.Err)
+}
+
+func (e ParseError) Unwrap() error { return e.Err }
+
+// SetupError reports a config-home setup problem (the path exists but is not a
+// directory, or it cannot be inspected). Like MissingHomeError it is a usage
+// problem, not a runtime failure, so callers map it to exit 2.
+type SetupError struct {
+	Msg string
+	Err error
+}
+
+func (e SetupError) Error() string {
+	if e.Err != nil {
+		return e.Msg + ": " + e.Err.Error()
+	}
+	return e.Msg
+}
+
+func (e SetupError) Unwrap() error { return e.Err }
+
 // ResolveHome returns the active AgentSSH configuration directory.
 func ResolveHome() (string, error) {
 	if override := os.Getenv(EnvHome); override != "" {
@@ -84,10 +115,10 @@ func Load() (*Config, error) {
 
 	cfg := &Config{Paths: NewPaths(home)}
 	if err := decodeYAMLFile(cfg.Paths.InventoryFile, &cfg.Inventory); err != nil {
-		return nil, fmt.Errorf("parse inventory config: %w", err)
+		return nil, err
 	}
 	if err := decodeYAMLFile(cfg.Paths.PolicyFile, &cfg.Policy); err != nil {
-		return nil, fmt.Errorf("parse policy config: %w", err)
+		return nil, err
 	}
 
 	return cfg, nil
@@ -97,14 +128,14 @@ func requireHome(home string) error {
 	info, err := os.Stat(home)
 	if err == nil {
 		if !info.IsDir() {
-			return fmt.Errorf("agentssh config path is not a directory: %s", home)
+			return SetupError{Msg: fmt.Sprintf("agentssh config path is not a directory: %s", home)}
 		}
 		return nil
 	}
 	if errors.Is(err, os.ErrNotExist) {
 		return MissingHomeError{Home: home}
 	}
-	return fmt.Errorf("inspect agentssh config directory %s: %w", home, err)
+	return SetupError{Msg: fmt.Sprintf("inspect agentssh config directory %s", home), Err: err}
 }
 
 func decodeYAMLFile(path string, target any) error {
@@ -120,7 +151,7 @@ func decodeYAMLFile(path string, target any) error {
 	}()
 
 	if err := yaml.NewDecoder(file).Decode(target); err != nil {
-		return fmt.Errorf("%s: %w", path, err)
+		return ParseError{File: path, Err: err}
 	}
 	return nil
 }

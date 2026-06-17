@@ -103,13 +103,14 @@ nginx.service - A high performance web server
 
 | code | 含义 |
 |---|---|
-| 0 | 命令执行成功(remote exit 0) |
-| 1 | 命令执行了但 remote 非零退出(详见 stderr/json) |
-| 2 | 用法错误(参数/未知主机) |
+| 0 | 命令执行成功(remote exit 0);`audit verify` 链完整 |
+| 1 | 命令执行了但 remote 非零退出(详见 stderr/json);`audit verify` 检出断链(非零=校验失败,符合 verify/check 惯例) |
+| 2 | 用法错误(参数/未知主机/未知命令/未知 flag),以及**配置类 setup 问题**(`inventory.yaml`/`policy.yaml` 解析失败、policy/output 正则非法、配置目录缺失) |
 | 6 | 被 policy `deny` 拒绝(未执行) |
 | 9 | 连接/SSH 错误 |
 
-> Agent 据此分流:`6` = 硬边界(别重试同命令,改走手册/换方案);`2` = 用法问题;`1/9` = 操作/环境问题(可诊断重试)。
+> Agent 据此分流:`6` = 硬边界(别重试同命令,改走手册/换方案);`2` = 用法/配置问题(改输入或让人类修配置,别原样重试);`1/9` = 操作/环境问题(可诊断重试)。
+> cobra/pflag 自身的校验错误(未知命令/flag、参数个数不符)也归 `2`。本地配置错误归 `2` 而非 `1`,因为那是 setup 问题不是远端失败。
 
 `run <group>` 涉及多个目标时,整体退出码采用最保守优先级:`deny(6) > ssh_error(9) > remote_failed(1) > success(0)`。也就是说,任一目标被 policy `deny` 时整体返回 6;若无 deny 但有连接/SSH 错误则返回 9;若仅存在远端非零退出则返回 1。
 

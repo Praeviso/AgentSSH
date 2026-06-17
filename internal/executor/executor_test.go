@@ -77,6 +77,36 @@ func TestSSHExecutorUsesInjectedRunner(t *testing.T) {
 	}
 }
 
+// TestBuildSSHArgvNoRemoteInstall proves PRD §10 S4 at the seam that is testable
+// without a real host: AgentSSH ships NOTHING to the remote — a run is exactly one
+// `ssh <target> <cmd>` invocation, with no upload/install/bootstrap step and the
+// remote command passed verbatim. (Real "no daemon installed" behavior is out of
+// CI scope; this is the no-install contract.)
+func TestBuildSSHArgvNoRemoteInstall(t *testing.T) {
+	target := inventory.Target{
+		Name: "web-1",
+		Host: inventory.Host{Addr: "10.0.0.11", User: "deploy", Port: 22},
+	}
+	command := "systemctl status nginx"
+	argv := BuildSSHArgv(target, command)
+
+	if len(argv) != 3 {
+		t.Fatalf("a default-port run must be exactly [ssh target cmd], got %#v", argv)
+	}
+	if argv[0] != "ssh" {
+		t.Fatalf("argv[0] = %q, want ssh", argv[0])
+	}
+	if argv[len(argv)-1] != command {
+		t.Fatalf("remote command not verbatim: %q", argv[len(argv)-1])
+	}
+	for _, a := range argv {
+		switch a {
+		case "scp", "rsync", "curl", "wget", "install", "bootstrap", "sftp":
+			t.Fatalf("argv contains a transfer/install verb %q: %#v", a, argv)
+		}
+	}
+}
+
 func TestIsProcessExit(t *testing.T) {
 	if !IsProcessExit(Result{ExitCode: 0}) {
 		t.Fatal("nil error should be process exit")

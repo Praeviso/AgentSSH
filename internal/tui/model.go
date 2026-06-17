@@ -391,7 +391,7 @@ func (m model) View() string {
 	} else {
 		right = m.styles.panel.Render(m.detailHint())
 	}
-	left := lipgloss.NewStyle().Width(m.leftWidth()).Render(m.renderList())
+	left := m.styles.normal.Width(m.leftWidth()).Render(m.renderList())
 	body := lipgloss.JoinHorizontal(lipgloss.Top, left, right)
 
 	var bottom string

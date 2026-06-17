@@ -1,10 +1,13 @@
 package tui
 
 import (
+	"io"
 	"strings"
 	"testing"
 
 	"github.com/Kritoooo/agentssh/internal/audit"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 )
 
 func intp(n int) *int { return &n }
@@ -231,6 +234,27 @@ func TestTruncate(t *testing.T) {
 	long := truncate(strings.Repeat("a", 50), 10)
 	if r := []rune(long); len(r) != 10 || !strings.HasSuffix(long, "…") {
 		t.Errorf("truncate should cap to 10 runes ending in ellipsis, got %q (len=%d)", long, len([]rune(long)))
+	}
+}
+
+func TestNoColorStylesEscapeFree(t *testing.T) {
+	r := lipgloss.NewRenderer(io.Discard)
+	r.SetColorProfile(termenv.Ascii) // what tui.run() does when NO_COLOR is set
+	s := newStyles(r)
+	for name, st := range map[string]lipgloss.Style{
+		"header": s.header, "cursor": s.cursor, "dim": s.dim,
+		"prod": s.prod, "ok": s.ok, "bad": s.bad,
+	} {
+		if out := st.Render("x"); strings.Contains(out, "\x1b") {
+			t.Errorf("style %q emitted ANSI escapes under NO_COLOR: %q", name, out)
+		}
+	}
+	// Sanity: the same styles DO emit escapes under a color profile, proving the
+	// test is meaningful (styles are genuinely color-bearing).
+	rc := lipgloss.NewRenderer(io.Discard)
+	rc.SetColorProfile(termenv.TrueColor)
+	if out := newStyles(rc).header.Render("x"); !strings.Contains(out, "\x1b") {
+		t.Errorf("expected ANSI under TrueColor, got %q", out)
 	}
 }
 
