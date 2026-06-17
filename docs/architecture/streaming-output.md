@@ -1,6 +1,8 @@
 # 设计 — 流式输出(native SSH Phase 2a)
 
-> 状态:设计稿 · 2026-06-17 · 关联:PRD §11 #5(native SSH Phase 2)、`docs/architecture/native-ssh.md`、`internal/output`、`internal/executor`
+> 状态:**已实现并提交 main**(design 2097018 / impl e1cb39d)· 2026-06-17 · 关联:PRD §11 #5(native SSH Phase 2)、`docs/architecture/native-ssh.md`、`internal/output`、`internal/executor`
+>
+> 落地:`output.StreamWriter` 行缓冲脱敏(跨 chunk 不泄漏、UTF-8 安全累计截断、Flush 尾行、emitted 累积使审计哈希与缓冲路径一致)、`NewFilter` 拒绝跨行/`(?s)` pattern、`^` 锚定按真正文本起点处理;`StreamingExecutor`(native + shell-out 均实现);`runDirect` 仅 `!json && 单主机` 走流式,其余缓冲不变。`go test -race` 全绿,流式==缓冲等价性多 chunk 切分实测。Phase 2b(连接池)仍未做。
 >
 > 目标:让 `run` 的输出**边跑边回显**(长命令实时可见),同时**严格保持脱敏/截断/审计语义**。核心是一个**行缓冲的脱敏感知 `StreamWriter`** —— 绝不吐出"半行",使任何 redact 匹配无法跨 chunk 边界泄漏。
 >
