@@ -4,12 +4,54 @@ AgentSSH is a local, single-binary SSH gateway for AI agents. It keeps SSH crede
 
 AgentSSH uses standard SSH from the local machine and does not require any agent or daemon on remote hosts. AI agents call `agentssh`; credentials stay in ssh-agent, `~/.ssh/config`, and the local operator environment.
 
-## Install
-
-Build the single binary:
+## Quick Start
 
 ```bash
+# 1. Install (or grab a prebuilt binary from the Releases page)
+go install github.com/Praeviso/AgentSSH/cmd/agentssh@latest
+
+# 2. Define one host and a deny rule. Auth reuses your existing ssh-agent /
+#    ~/.ssh/config — AgentSSH stores no keys of its own.
+mkdir -p ~/.agentssh
+cat > ~/.agentssh/inventory.yaml <<'EOF'
+version: 1
+hosts:
+  web-1: { addr: 10.0.0.11, user: deploy, tags: [prod] }
+EOF
+cat > ~/.agentssh/policy.yaml <<'EOF'
+version: 1
+defaults: { policy: allow }
+rules:
+  - name: catastrophic
+    match: { cmd_regex: '\b(rm\s+-rf|mkfs|dd|shutdown|reboot)' }
+    action: deny
+EOF
+
+# 3. The agent calls agentssh — every command is policy-checked and audited:
+agentssh hosts                                 # discover targets (no credentials shown)
+agentssh run web-1 -- systemctl status nginx   # allowed -> executed over SSH
+agentssh run web-1 -- rm -rf /                 # denied by policy -> exit 6, never runs
+
+# 4. The human reviews everything:
+agentssh tui            # interactive audit viewer, grouped by session
+agentssh audit verify   # confirm the tamper-evident hash chain is intact
+```
+
+That is the whole loop: the agent only ever calls `agentssh`, while the human owns the config and the audit trail. The sections below cover full configuration and the complete command set.
+
+## Install
+
+Pick one:
+
+```bash
+# install from source (needs Go matching the go.mod directive)
+go install github.com/Praeviso/AgentSSH/cmd/agentssh@latest
+
+# or build a single binary from a checkout
 go build -o agentssh ./cmd/agentssh
+
+# or download a prebuilt static binary (linux/macOS, amd64/arm64) from the
+# repo's Releases page.
 ```
 
 Put the binary on the local operator machine where SSH already works.
