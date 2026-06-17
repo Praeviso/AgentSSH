@@ -15,6 +15,7 @@ import (
 	"github.com/Kritoooo/agentssh/internal/config"
 	"github.com/Kritoooo/agentssh/internal/executor"
 	"github.com/Kritoooo/agentssh/internal/inventory"
+	"github.com/Kritoooo/agentssh/internal/output"
 	"github.com/Kritoooo/agentssh/internal/policy"
 	"github.com/Kritoooo/agentssh/internal/session"
 	"github.com/Kritoooo/agentssh/internal/tui"
@@ -425,6 +426,10 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 	if err != nil {
 		return fmt.Errorf("load policy: %w", err)
 	}
+	outputFilter, err := output.NewFilter(cfg.Policy.Output)
+	if err != nil {
+		return fmt.Errorf("load output filter: %w", err)
+	}
 	sessionCtx, err := session.Resolver{Path: cfg.Paths.SessionFile}.Resolve(flags.session, flags.sessionLabel)
 	if err != nil {
 		return fmt.Errorf("resolve session: %w", err)
@@ -477,8 +482,11 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 		if status != "completed" {
 			event = audit.EventFailed
 		}
-		outputHash := audit.ComputeOutputSHA256(result.Stdout, result.Stderr)
-		if _, err := store.Append(baseAuditRecord(reqID, sessionCtx, event, target.Name, remoteCommand, flags.skill, decision, &result.ExitCode, outputHash, result.Duration.Milliseconds())); err != nil {
+		filtered := outputFilter.Apply(result.Stdout, result.Stderr)
+		// The audit hash records the bytes that crossed the trust boundary and
+		// were returned to the agent after output filtering.
+		outputHash := audit.ComputeOutputSHA256(filtered.Stdout, filtered.Stderr)
+		if _, err := store.Append(baseAuditRecord(reqID, sessionCtx, event, target.Name, remoteCommand, flags.skill, decision, &result.ExitCode, outputHash, result.Duration.Milliseconds(), filtered)); err != nil {
 			return err
 		}
 		if flags.jsonOutput {
@@ -489,16 +497,16 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 				Status:          status,
 				ExitCode:        result.ExitCode,
 				DurationMS:      result.Duration.Milliseconds(),
-				Stdout:          result.Stdout,
-				Stderr:          result.Stderr,
-				OutputTruncated: false,
-				Redactions:      0,
+				Stdout:          filtered.Stdout,
+				Stderr:          filtered.Stderr,
+				OutputTruncated: filtered.OutputTruncated,
+				Redactions:      filtered.Redactions,
 				Skill:           flags.skill,
 				PolicyAction:    string(decision.Action),
 				PolicyRule:      decision.Rule,
 			})
 		} else {
-			printRunHuman(cmd, target.Name, result, flags.skill)
+			printRunHuman(cmd, target.Name, result, filtered, flags.skill)
 		}
 
 		exitCode = mergeExitCode(exitCode, exitCodeForResult(result))
@@ -523,7 +531,7 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 	return nil
 }
 
-func printRunHuman(cmd *cobra.Command, host string, result executor.Result, skill string) {
+func printRunHuman(cmd *cobra.Command, host string, result executor.Result, filtered output.FilterResult, skill string) {
 	out := cmd.OutOrStdout()
 	marker := "✓"
 	if isSSHErrorResult(result) {
@@ -537,15 +545,15 @@ func printRunHuman(cmd *cobra.Command, host string, result executor.Result, skil
 		_, _ = fmt.Fprintf(out, " · skill=%s", skill)
 	}
 	_, _ = fmt.Fprintln(out)
-	if result.Stdout != "" {
-		_, _ = fmt.Fprint(out, result.Stdout)
-		if !strings.HasSuffix(result.Stdout, "\n") {
+	if filtered.Stdout != "" {
+		_, _ = fmt.Fprint(out, filtered.Stdout)
+		if !strings.HasSuffix(filtered.Stdout, "\n") {
 			_, _ = fmt.Fprintln(out)
 		}
 	}
-	if result.Stderr != "" {
-		_, _ = fmt.Fprint(cmd.ErrOrStderr(), result.Stderr)
-		if !strings.HasSuffix(result.Stderr, "\n") {
+	if filtered.Stderr != "" {
+		_, _ = fmt.Fprint(cmd.ErrOrStderr(), filtered.Stderr)
+		if !strings.HasSuffix(filtered.Stderr, "\n") {
 			_, _ = fmt.Fprintln(cmd.ErrOrStderr())
 		}
 	}
@@ -769,7 +777,11 @@ func runSessionLS(cmd *cobra.Command) error {
 	return nil
 }
 
-func baseAuditRecord(reqID string, sessionCtx session.Context, event audit.Event, host string, command string, skill string, decision policy.Decision, exitCode *int, outputHash string, durationMS int64) audit.Record {
+func baseAuditRecord(reqID string, sessionCtx session.Context, event audit.Event, host string, command string, skill string, decision policy.Decision, exitCode *int, outputHash string, durationMS int64, filtered ...output.FilterResult) audit.Record {
+	filterResult := output.FilterResult{}
+	if len(filtered) > 0 {
+		filterResult = filtered[0]
+	}
 	return audit.Record{
 		ReqID:           reqID,
 		SessionID:       sessionCtx.ID,
@@ -783,8 +795,8 @@ func baseAuditRecord(reqID string, sessionCtx session.Context, event audit.Event
 		PolicyRule:      decision.Rule,
 		ExitCode:        exitCode,
 		OutputSHA256:    outputHash,
-		OutputTruncated: false,
-		Redactions:      0,
+		OutputTruncated: filterResult.OutputTruncated,
+		Redactions:      filterResult.Redactions,
 		DurationMS:      durationMS,
 	}
 }

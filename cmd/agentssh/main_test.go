@@ -208,6 +208,46 @@ func TestRunAllowWritesStartedAndCompleted(t *testing.T) {
 	}
 }
 
+func TestRunAppliesOutputFilterToReturnAndAudit(t *testing.T) {
+	home := t.TempDir()
+	writeTestInventory(t, home)
+	writeTestPolicy(t, home)
+	t.Setenv("AGENTSSH_HOME", home)
+	t.Setenv("AGENTSSH_SESSION", "s_test")
+
+	restoreExecutor := newExecutor
+	newExecutor = func() executor.Executor {
+		return fakeExecutor{stdout: "password=secret123 abcdefghijklmnopqrstuvwxyz\n"}
+	}
+	defer func() {
+		newExecutor = restoreExecutor
+	}()
+
+	stdout, stderr, err := runCommandForTest(t, "run", "web-1", "--json", "--", "echo", "secret")
+	if err != nil {
+		t.Fatalf("run err = %v stderr=%s", err, stderr)
+	}
+	var response runResponse
+	if err := json.Unmarshal([]byte(stdout), &response); err != nil {
+		t.Fatalf("unmarshal response: %v\n%s", err, stdout)
+	}
+	if strings.Contains(response.Stdout, "secret123") || !strings.Contains(response.Stdout, "«REDACTED»") {
+		t.Fatalf("stdout not redacted: %q", response.Stdout)
+	}
+	if !response.OutputTruncated || response.Redactions != 1 {
+		t.Fatalf("response filter metadata = %#v", response)
+	}
+
+	records := mustReadAudit(t, home)
+	completed := records[len(records)-1]
+	if completed.Redactions != 1 || !completed.OutputTruncated {
+		t.Fatalf("audit filter metadata = %#v", completed)
+	}
+	if completed.OutputSHA256 != audit.ComputeOutputSHA256(response.Stdout, response.Stderr) {
+		t.Fatalf("audit hash = %s, want hash of filtered output", completed.OutputSHA256)
+	}
+}
+
 func TestPrintM2RunAuditDemo(t *testing.T) {
 	home := t.TempDir()
 	writeTestInventory(t, home)
@@ -271,6 +311,38 @@ func TestPrintM2RunAuditDemo(t *testing.T) {
 	fmt.Printf("verify_after_tamper_ok=%t broken_seq=%d reason=%s\n", verify.OK, verify.BrokenSeq, verify.Reason)
 }
 
+func TestPrintM4OutputFilterDemo(t *testing.T) {
+	home := t.TempDir()
+	writeTestInventory(t, home)
+	writeTestPolicy(t, home)
+	t.Setenv("AGENTSSH_HOME", home)
+	t.Setenv("AGENTSSH_SESSION", "s_m4")
+
+	restoreExecutor := newExecutor
+	newExecutor = func() executor.Executor {
+		return fakeExecutor{stdout: "password=secret123 abcdefghijklmnopqrstuvwxyz\n"}
+	}
+	defer func() {
+		newExecutor = restoreExecutor
+	}()
+
+	stdout, stderr, err := runCommandForTest(t, "run", "web-1", "--json", "--", "echo", "secret")
+	if err != nil {
+		t.Fatalf("run err = %v stderr=%s", err, stderr)
+	}
+	fmt.Printf("run_json=%s", stdout)
+	var response runResponse
+	if err := json.Unmarshal([]byte(stdout), &response); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+
+	auditStdout, auditStderr, err := runCommandForTest(t, "audit", "show", response.ReqID)
+	if err != nil {
+		t.Fatalf("audit show err = %v stderr=%s", err, auditStderr)
+	}
+	fmt.Printf("audit_show=%s", auditStdout)
+}
+
 func runCommandForTest(t *testing.T, args ...string) (string, string, error) {
 	t.Helper()
 	root := newRootCommand()
@@ -315,6 +387,10 @@ rules:
   - name: catastrophic
     match: { cmd_regex: 'rm\s+-rf' }
     action: deny
+output:
+  max_bytes: 24
+  redact:
+    - 'password=\S+'
 `)
 	if err := os.WriteFile(filepath.Join(home, "policy.yaml"), data, 0o600); err != nil {
 		t.Fatalf("write policy: %v", err)
@@ -338,15 +414,22 @@ func formatExit(exitCode *int) string {
 }
 
 type fakeExecutor struct {
-	calls *int32
+	calls  *int32
+	stdout string
+	stderr string
 }
 
 func (e fakeExecutor) Run(_ context.Context, request executor.Request) executor.Result {
 	if e.calls != nil {
 		atomic.AddInt32(e.calls, 1)
 	}
+	stdout := e.stdout
+	if stdout == "" {
+		stdout = "ok\n"
+	}
 	return executor.Result{
-		Stdout:   "ok\n",
+		Stdout:   stdout,
+		Stderr:   e.stderr,
 		ExitCode: 0,
 		Argv:     []string{"ssh", request.Target.Name, request.Command},
 	}
