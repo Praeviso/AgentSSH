@@ -15,7 +15,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/Kritoooo/agentssh/internal/inventory"
+	"github.com/Praeviso/AgentSSH/internal/inventory"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
 )

@@ -6,8 +6,8 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/Kritoooo/agentssh/internal/inventory"
-	"github.com/Kritoooo/agentssh/internal/policy"
+	"github.com/Praeviso/AgentSSH/internal/inventory"
+	"github.com/Praeviso/AgentSSH/internal/policy"
 	"gopkg.in/yaml.v3"
 )
 

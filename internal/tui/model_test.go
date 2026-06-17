@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Kritoooo/agentssh/internal/audit"
+	"github.com/Praeviso/AgentSSH/internal/audit"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/termenv"
 )

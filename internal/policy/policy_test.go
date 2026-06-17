@@ -3,7 +3,7 @@ package policy
 import (
 	"testing"
 
-	"github.com/Kritoooo/agentssh/internal/inventory"
+	"github.com/Praeviso/AgentSSH/internal/inventory"
 )
 
 func TestEvaluateRulesAndDefault(t *testing.T) {

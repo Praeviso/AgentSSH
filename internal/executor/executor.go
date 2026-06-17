@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Kritoooo/agentssh/internal/inventory"
+	"github.com/Praeviso/AgentSSH/internal/inventory"
 )
 
 // Request describes a single remote command execution.

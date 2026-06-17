@@ -15,7 +15,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Kritoooo/agentssh/internal/inventory"
+	"github.com/Praeviso/AgentSSH/internal/inventory"
 	sshconfig "github.com/kevinburke/ssh_config"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"

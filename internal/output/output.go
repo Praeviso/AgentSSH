@@ -8,7 +8,7 @@ import (
 	"regexp/syntax"
 	"unicode/utf8"
 
-	"github.com/Kritoooo/agentssh/internal/policy"
+	"github.com/Praeviso/AgentSSH/internal/policy"
 )
 
 const redacted = "«REDACTED»"

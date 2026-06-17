@@ -5,7 +5,7 @@ import (
 	"regexp"
 	"sort"
 
-	"github.com/Kritoooo/agentssh/internal/inventory"
+	"github.com/Praeviso/AgentSSH/internal/inventory"
 )
 
 // Action is the binary policy action used by AgentSSH.

@@ -8,7 +8,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/Kritoooo/agentssh/internal/inventory"
+	"github.com/Praeviso/AgentSSH/internal/inventory"
 )
 
 func TestBuildSSHArgvKeepsRemoteCommandAsSingleArg(t *testing.T) {

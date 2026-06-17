@@ -7,10 +7,10 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/Kritoooo/agentssh/internal/audit"
-	"github.com/Kritoooo/agentssh/internal/config"
-	"github.com/Kritoooo/agentssh/internal/executor"
-	"github.com/Kritoooo/agentssh/internal/inventory"
+	"github.com/Praeviso/AgentSSH/internal/audit"
+	"github.com/Praeviso/AgentSSH/internal/config"
+	"github.com/Praeviso/AgentSSH/internal/executor"
+	"github.com/Praeviso/AgentSSH/internal/inventory"
 )
 
 // setupHome creates a temp $AGENTSSH_HOME with a valid inventory + policy and a

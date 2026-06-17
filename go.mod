@@ -1,4 +1,4 @@
-module github.com/Kritoooo/agentssh
+module github.com/Praeviso/AgentSSH
 
 go 1.25.0
 

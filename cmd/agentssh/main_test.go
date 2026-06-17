@@ -20,11 +20,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Kritoooo/agentssh/internal/audit"
-	"github.com/Kritoooo/agentssh/internal/config"
-	"github.com/Kritoooo/agentssh/internal/executor"
-	"github.com/Kritoooo/agentssh/internal/output"
-	"github.com/Kritoooo/agentssh/internal/policy"
+	"github.com/Praeviso/AgentSSH/internal/audit"
+	"github.com/Praeviso/AgentSSH/internal/config"
+	"github.com/Praeviso/AgentSSH/internal/executor"
+	"github.com/Praeviso/AgentSSH/internal/output"
+	"github.com/Praeviso/AgentSSH/internal/policy"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
 )

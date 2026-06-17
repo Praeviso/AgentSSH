@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Kritoooo/agentssh/internal/policy"
+	"github.com/Praeviso/AgentSSH/internal/policy"
 )
 
 func TestRedactionReplacesMatchesAndCountsBothStreams(t *testing.T) {

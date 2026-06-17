@@ -11,7 +11,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/Kritoooo/agentssh/internal/audit"
+	"github.com/Praeviso/AgentSSH/internal/audit"
 )
 
 const EnvSession = "AGENTSSH_SESSION"

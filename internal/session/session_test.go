@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Kritoooo/agentssh/internal/audit"
+	"github.com/Praeviso/AgentSSH/internal/audit"
 )
 
 func TestResolveOrder(t *testing.T) {

@@ -6,8 +6,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Kritoooo/agentssh/internal/audit"
-	"github.com/Kritoooo/agentssh/internal/session"
+	"github.com/Praeviso/AgentSSH/internal/audit"
+	"github.com/Praeviso/AgentSSH/internal/session"
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
