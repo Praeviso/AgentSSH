@@ -1,6 +1,8 @@
 # 设计 — Native SSH 传输(替代 shell-out)
 
-> 状态:设计稿 · 2026-06-17 · 关联:PRD §11(未来增强 #5)、架构 §7/§9(凭据/执行器)、`internal/executor`
+> 状态:**Phase 1 已实现并提交 main**(10a8b94)· 2026-06-17 · 关联:PRD §11(未来增强 #5)、架构 §7/§9(凭据/执行器)、`internal/executor/native.go`
+>
+> 落地:opt-in(`AGENTSSH_TRANSPORT`/inventory `transport:`,默认仍 shell-out);strict known_hosts、ssh-agent/密钥认证、ProxyJump、ssh_config 别名解析;退出码/错误契约(§6)按表实现并经进程内 SSH server 测试验证;无 InsecureIgnoreHostKey;`go test -race` 全绿。Phase 2(流式 + 连接池)仍未做。
 >
 > 目标:给 executor 增加一个**原生 Go SSH 后端**(`golang.org/x/crypto/ssh`),作为系统 `ssh` shell-out 的**可选替代**,去掉对外部 `ssh` 二进制的依赖,并为后续的流式输出 / 连接复用打基础。**严格保持现有安全语义**(host key 校验、输出脱敏、hash 链审计、退出码契约)。
 
