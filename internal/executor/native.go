@@ -86,7 +86,7 @@ func (e NativeExecutor) runSession(ctx context.Context, request Request, stdout 
 		_ = client.Close()
 	}()
 
-	session, err := client.Client.NewSession()
+	session, err := client.NewSession()
 	if err != nil {
 		return Result{ExitCode: -1, Duration: time.Since(start), Err: err, Argv: argv}
 	}
@@ -204,7 +204,7 @@ func (e NativeExecutor) dial(ctx context.Context, target nativeTarget) (*nativeC
 		return nil, err
 	}
 	if agentCloser != nil {
-		defer agentCloser.Close()
+		defer func() { _ = agentCloser.Close() }()
 	}
 	hostKeyCallback, err := e.hostKeyCallback()
 	if err != nil {
@@ -240,14 +240,14 @@ func (e NativeExecutor) dialWithConfig(ctx context.Context, target nativeTarget,
 		return nil, err
 	}
 	if jumpCloser != nil {
-		defer jumpCloser.Close()
+		defer func() { _ = jumpCloser.Close() }()
 	}
 	jumpCfg.HostKeyCallback = cfg.HostKeyCallback
 	jumpClient, err := e.dialWithConfig(ctx, firstJump, jumpCfg)
 	if err != nil {
 		return nil, fmt.Errorf("proxyjump %s: %w", firstJump.display(), err)
 	}
-	tunnel, err := jumpClient.Client.DialContext(ctx, "tcp", target.address())
+	tunnel, err := jumpClient.DialContext(ctx, "tcp", target.address())
 	if err != nil {
 		_ = jumpClient.Close()
 		return nil, fmt.Errorf("proxyjump tunnel to %s: %w", target.address(), err)

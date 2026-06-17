@@ -246,11 +246,11 @@ func (s *testSSHServer) handle(conn net.Conn) {
 		_ = conn.Close()
 		return
 	}
-	defer sshConn.Close()
+	defer func() { _ = sshConn.Close() }()
 	go ssh.DiscardRequests(reqs)
 	for ch := range chans {
 		if ch.ChannelType() != "session" {
-			ch.Reject(ssh.UnknownChannelType, "session only")
+			_ = ch.Reject(ssh.UnknownChannelType, "session only")
 			continue
 		}
 		channel, requests, err := ch.Accept()
@@ -262,15 +262,15 @@ func (s *testSSHServer) handle(conn net.Conn) {
 }
 
 func handleSession(channel ssh.Channel, requests <-chan *ssh.Request) {
-	defer channel.Close()
+	defer func() { _ = channel.Close() }()
 	for req := range requests {
 		if req.Type != "exec" {
-			req.Reply(false, nil)
+			_ = req.Reply(false, nil)
 			continue
 		}
 		var payload struct{ Command string }
-		ssh.Unmarshal(req.Payload, &payload)
-		req.Reply(true, nil)
+		_ = ssh.Unmarshal(req.Payload, &payload)
+		_ = req.Reply(true, nil)
 		code := uint32(0)
 		if strings.Contains(payload.Command, "stream-secret") {
 			_, _ = channel.Write([]byte("line1\n"))

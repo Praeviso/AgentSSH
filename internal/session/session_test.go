@@ -89,6 +89,6 @@ func (c fixedClock) Now() time.Time {
 }
 
 func TestMain(m *testing.M) {
-	os.Unsetenv(EnvSession)
+	_ = os.Unsetenv(EnvSession)
 	os.Exit(m.Run())
 }

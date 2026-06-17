@@ -54,7 +54,9 @@ jobs:
           cache: true
 
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
+        # v8 installs golangci-lint v2 (built with a current Go); v6 pinned a v1
+        # built with Go 1.24, which refuses to run against this go 1.25 module.
+        uses: golangci/golangci-lint-action@v8
         with:
-          version: latest
+          version: v2.12.2
           args: --timeout=5m
