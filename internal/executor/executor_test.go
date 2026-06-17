@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -74,6 +75,19 @@ func TestSSHExecutorUsesInjectedRunner(t *testing.T) {
 	}
 	if result.Stdout != "ok\n" || result.ExitCode != 0 || result.Err != nil {
 		t.Fatalf("result = %#v", result)
+	}
+}
+
+func TestRunStreamingProcessWritesToProvidedWriters(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	result := runStreamingProcess(context.Background(), []string{"sh", "-c", "printf out; printf err >&2; exit 7"}, &stdout, &stderr)
+
+	if result.ExitCode != 7 || result.Err == nil {
+		t.Fatalf("result = %#v", result)
+	}
+	if stdout.String() != "out" || stderr.String() != "err" {
+		t.Fatalf("stdout=%q stderr=%q", stdout.String(), stderr.String())
 	}
 }
 

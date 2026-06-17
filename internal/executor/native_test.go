@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -47,6 +48,35 @@ func TestNativeExecutorExecSuccessAndRemoteNonZero(t *testing.T) {
 		t.Fatalf("exit7 result = %#v err=%v", result, result.Err)
 	}
 	t.Logf("native exec command=exit7 exit_code=%d err_nil=%t stderr=%q", result.ExitCode, result.Err == nil, result.Stderr)
+}
+
+func TestNativeExecutorRunStreaming(t *testing.T) {
+	home := t.TempDir()
+	clientSigner := writeClientKey(t, home)
+	server := newTestSSHServer(t, clientSigner.PublicKey())
+	defer server.Close()
+
+	writeKnownHosts(t, home, server.Addr(), server.HostSigner.PublicKey())
+
+	exec := NewNativeExecutor(NativeOptions{
+		KnownHostsPath: filepath.Join(home, ".ssh", "known_hosts"),
+		ConfigPath:     filepath.Join(home, ".ssh", "config"),
+	})
+	target := inventory.Target{Name: "test", Host: inventory.Host{Addr: server.Host(), Port: server.Port(), User: "test"}}
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	result := exec.RunStreaming(context.Background(), Request{Target: target, Command: "stream-secret"}, &stdout, &stderr)
+	if result.Err != nil || result.ExitCode != 0 {
+		t.Fatalf("stream result = %#v err=%v", result, result.Err)
+	}
+	if result.Stdout != "" || result.Stderr != "" {
+		t.Fatalf("stream result carries buffered output: %#v", result)
+	}
+	if stdout.String() != "line1\npassword=secret123\nline3\n" || stderr.String() != "warn=secret\n" {
+		t.Fatalf("stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+	t.Logf("native streaming stdout=%q stderr=%q exit_code=%d", stdout.String(), stderr.String(), result.ExitCode)
 }
 
 func TestNativeExecutorHostKeyRejected(t *testing.T) {
@@ -242,7 +272,12 @@ func handleSession(channel ssh.Channel, requests <-chan *ssh.Request) {
 		ssh.Unmarshal(req.Payload, &payload)
 		req.Reply(true, nil)
 		code := uint32(0)
-		if strings.Contains(payload.Command, "exit7") {
+		if strings.Contains(payload.Command, "stream-secret") {
+			_, _ = channel.Write([]byte("line1\n"))
+			_, _ = channel.Write([]byte("password="))
+			_, _ = channel.Write([]byte("secret123\nline3\n"))
+			_, _ = channel.Stderr().Write([]byte("warn=secret\n"))
+		} else if strings.Contains(payload.Command, "exit7") {
 			code = 7
 			_, _ = channel.Stderr().Write([]byte("failed\n"))
 		} else {

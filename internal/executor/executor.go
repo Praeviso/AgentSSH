@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -32,6 +33,14 @@ type Result struct {
 // Executor runs commands against remote hosts.
 type Executor interface {
 	Run(ctx context.Context, request Request) Result
+}
+
+// StreamingExecutor optionally streams stdout/stderr into supplied writers.
+//
+// Result.Stdout and Result.Stderr are empty because the bytes have already been
+// written to the supplied writers. Exit/error semantics match Executor.Run.
+type StreamingExecutor interface {
+	RunStreaming(ctx context.Context, request Request, stdout io.Writer, stderr io.Writer) Result
 }
 
 // Runner executes an argv vector. Tests can inject a runner to avoid real SSH.
@@ -74,6 +83,18 @@ func (e SSHExecutor) Run(ctx context.Context, request Request) Result {
 	return Result{
 		Stdout:   runResult.Stdout,
 		Stderr:   runResult.Stderr,
+		ExitCode: runResult.ExitCode,
+		Duration: time.Since(start),
+		Err:      runResult.Err,
+		Argv:     append([]string{}, argv...),
+	}
+}
+
+func (e SSHExecutor) RunStreaming(ctx context.Context, request Request, stdout io.Writer, stderr io.Writer) Result {
+	start := time.Now()
+	argv := BuildSSHArgv(request.Target, request.Command)
+	runResult := runStreamingProcess(ctx, argv, stdout, stderr)
+	return Result{
 		ExitCode: runResult.ExitCode,
 		Duration: time.Since(start),
 		Err:      runResult.Err,
@@ -132,6 +153,28 @@ func (ExecRunner) Run(ctx context.Context, argv []string) RunResult {
 		ExitCode: exitCode,
 		Err:      err,
 	}
+}
+
+func runStreamingProcess(ctx context.Context, argv []string, stdout io.Writer, stderr io.Writer) RunResult {
+	if len(argv) == 0 {
+		return RunResult{ExitCode: -1, Err: errors.New("empty argv")}
+	}
+
+	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+
+	err := cmd.Run()
+	exitCode := 0
+	if err != nil {
+		exitCode = -1
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			exitCode = exitErr.ExitCode()
+		}
+	}
+
+	return RunResult{ExitCode: exitCode, Err: err}
 }
 
 // IsProcessExit reports whether a result represents a completed remote command.

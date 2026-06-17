@@ -540,6 +540,28 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 		if _, err := store.Append(baseAuditRecord(reqID, sessionCtx, audit.EventStarted, target.Name, remoteCommand, flags.skill, decision, nil, "", 0)); err != nil {
 			return err
 		}
+		streamExec, canStream := ssh.(executor.StreamingExecutor)
+		streamFilter, canStreamFilter := outputFilter.(output.StreamFilter)
+		if canStream && canStreamFilter && shouldStreamRun(flags, resolved) {
+			streamed := runStreaming(cmd, streamExec, target, remoteCommand, streamFilter)
+			result := streamed.Result
+			status := statusForResult(result)
+			event := audit.EventCompleted
+			if status != "completed" {
+				event = audit.EventFailed
+			}
+			outputHash := audit.ComputeOutputSHA256(string(streamed.Stdout), string(streamed.Stderr))
+			filtered := output.FilterResult{
+				OutputTruncated: streamed.OutputTruncated,
+				Redactions:      streamed.Redactions,
+			}
+			if _, err := store.Append(baseAuditRecord(reqID, sessionCtx, event, target.Name, remoteCommand, flags.skill, decision, &result.ExitCode, outputHash, result.Duration.Milliseconds(), filtered)); err != nil {
+				return err
+			}
+			printRunStreamFooter(cmd, target.Name, result, streamed.Stdout, flags.skill)
+			exitCode = mergeExitCode(exitCode, exitCodeForResult(result))
+			continue
+		}
 		result := ssh.Run(context.Background(), executor.Request{
 			Target:  target,
 			Command: remoteCommand,
@@ -630,6 +652,63 @@ func printRunHuman(cmd *cobra.Command, host string, result executor.Result, filt
 			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "ssh connection failed (exit 9): %v\n%s\n", result.Err, hint)
 		} else {
 			// exit-255 with no exec error (ssh's own connection-error code).
+			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "ssh connection failed (exit 9)\n%s\n", hint)
+		}
+	}
+}
+
+type streamingRunResult struct {
+	Result          executor.Result
+	Stdout          []byte
+	Stderr          []byte
+	OutputTruncated bool
+	Redactions      int
+}
+
+func shouldStreamRun(flags runFlags, resolved inventory.ResolvedTarget) bool {
+	return !flags.jsonOutput && len(resolved.Targets) == 1
+}
+
+func runStreaming(cmd *cobra.Command, streamExec executor.StreamingExecutor, target inventory.Target, remoteCommand string, streamFilter output.StreamFilter) streamingRunResult {
+	stdout := streamFilter.NewStreamWriter(cmd.OutOrStdout())
+	stderr := streamFilter.NewStreamWriter(cmd.ErrOrStderr())
+	result := streamExec.RunStreaming(context.Background(), executor.Request{
+		Target:  target,
+		Command: remoteCommand,
+	}, stdout, stderr)
+	stdout.Flush()
+	stderr.Flush()
+	return streamingRunResult{
+		Result:          result,
+		Stdout:          stdout.Emitted(),
+		Stderr:          stderr.Emitted(),
+		OutputTruncated: stdout.Truncated() || stderr.Truncated(),
+		Redactions:      stdout.Redactions() + stderr.Redactions(),
+	}
+}
+
+func printRunStreamFooter(cmd *cobra.Command, host string, result executor.Result, stdout []byte, skill string) {
+	out := cmd.OutOrStdout()
+	marker := "✓"
+	if isSSHErrorResult(result) {
+		marker = "!"
+	} else if result.ExitCode != 0 {
+		marker = "✗"
+	}
+
+	if len(stdout) > 0 && stdout[len(stdout)-1] != '\n' {
+		_, _ = fmt.Fprintln(out)
+	}
+	_, _ = fmt.Fprintf(out, "%s %s · exit %d · %s", marker, host, result.ExitCode, formatDuration(result.Duration))
+	if skill != "" {
+		_, _ = fmt.Fprintf(out, " · skill=%s", skill)
+	}
+	_, _ = fmt.Fprintln(out)
+	if isSSHErrorResult(result) {
+		hint := "  check host reachability and your SSH key/agent; verify the host with: agentssh hosts"
+		if result.Err != nil {
+			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "ssh connection failed (exit 9): %v\n%s\n", result.Err, hint)
+		} else {
 			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "ssh connection failed (exit 9)\n%s\n", hint)
 		}
 	}

@@ -54,6 +54,19 @@ func NewNativeExecutor(options NativeOptions) NativeExecutor {
 }
 
 func (e NativeExecutor) Run(ctx context.Context, request Request) Result {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	result := e.runSession(ctx, request, &stdout, &stderr)
+	result.Stdout = stdout.String()
+	result.Stderr = stderr.String()
+	return result
+}
+
+func (e NativeExecutor) RunStreaming(ctx context.Context, request Request, stdout io.Writer, stderr io.Writer) Result {
+	return e.runSession(ctx, request, stdout, stderr)
+}
+
+func (e NativeExecutor) runSession(ctx context.Context, request Request, stdout io.Writer, stderr io.Writer) Result {
 	start := time.Now()
 	target, err := e.resolveTarget(request.Target)
 	targetDisplay := target.display()
@@ -81,17 +94,15 @@ func (e NativeExecutor) Run(ctx context.Context, request Request) Result {
 		_ = session.Close()
 	}()
 
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	session.Stdout = &stdout
-	session.Stderr = &stderr
+	session.Stdout = stdout
+	session.Stderr = stderr
 
 	runErr := session.Run(request.Command)
 	exitCode, err := nativeExitCode(runErr)
 	if err != nil {
-		return Result{Stdout: stdout.String(), Stderr: stderr.String(), ExitCode: -1, Duration: time.Since(start), Err: err, Argv: argv}
+		return Result{ExitCode: -1, Duration: time.Since(start), Err: err, Argv: argv}
 	}
-	return Result{Stdout: stdout.String(), Stderr: stderr.String(), ExitCode: exitCode, Duration: time.Since(start), Argv: argv}
+	return Result{ExitCode: exitCode, Duration: time.Since(start), Argv: argv}
 }
 
 type nativeTarget struct {
