@@ -23,7 +23,6 @@ import (
 	"github.com/Praeviso/AgentSSH/internal/session"
 	"github.com/Praeviso/AgentSSH/internal/tui"
 	"github.com/spf13/cobra"
-	"gopkg.in/yaml.v3"
 )
 
 const (
@@ -190,7 +189,7 @@ func newStatusCommand() *cobra.Command {
 func newTUICommand() *cobra.Command {
 	return &cobra.Command{
 		Use:   "tui",
-		Short: "Open the terminal audit viewer.",
+		Short: "Open the terminal control console.",
 		Args:  noArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runTUI(cmd)
@@ -204,8 +203,7 @@ func runTUI(cmd *cobra.Command) error {
 		return classifyConfigError(err)
 	}
 	opts := tui.Options{
-		AuditFile: cfg.Paths.AuditFile,
-		Hosts:     hostMetaFromInventory(cfg.Inventory),
+		Paths: cfg.Paths,
 	}
 	err = tui.NewRunner().Run(opts)
 	if tui.IsNotInteractive(err) {
@@ -215,14 +213,6 @@ func runTUI(cmd *cobra.Command) error {
 		return runSessionLS(cmd)
 	}
 	return err
-}
-
-func hostMetaFromInventory(inv inventory.Inventory) map[string]tui.HostMeta {
-	hosts := make(map[string]tui.HostMeta, len(inv.Hosts))
-	for name, host := range inv.Hosts {
-		hosts[name] = tui.HostMeta{User: host.User, Addr: host.Addr, Tags: host.Tags}
-	}
-	return hosts
 }
 
 func newInventoryCommand() *cobra.Command {
@@ -547,86 +537,37 @@ func firstValidationError(errs map[string]string) string {
 }
 
 func loadInventoryForWrite(path string) (inventory.Inventory, error) {
-	var inv inventory.Inventory
-	file, err := os.Open(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return inv, nil
-	}
+	inv, err := inventory.Load(path)
 	if err != nil {
-		return inv, err
-	}
-	defer func() {
-		_ = file.Close()
-	}()
-	if err := yaml.NewDecoder(file).Decode(&inv); err != nil {
 		return inv, config.ParseError{File: path, Err: err}
 	}
 	return inv, nil
 }
 
 func addInventoryHost(paths config.Paths, inv inventory.Inventory, result hostform.Result) error {
-	if inv.Hosts == nil {
-		inv.Hosts = map[string]inventory.Host{}
-	}
-	if inv.Version == 0 {
-		inv.Version = 1
-	}
-	if _, ok := inv.Hosts[result.Name]; ok {
-		return newUsageError("inventory host %q already exists", result.Name)
-	}
-	inv.Hosts[result.Name] = inventory.Host{
+	next, err := inventory.AddHost(inv, result.Name, inventory.Host{
 		Addr:           result.Addr,
 		User:           result.User,
 		Port:           result.Port,
 		SSHConfigAlias: result.Alias,
 		Tags:           result.Tags,
+	})
+	if errors.Is(err, inventory.ErrHostExists) {
+		return newUsageError("inventory host %q already exists", result.Name)
 	}
-	return writeInventoryAtomic(paths.Home, paths.InventoryFile, inv)
+	if err != nil {
+		return err
+	}
+	return writeInventoryAtomic(paths.Home, paths.InventoryFile, next)
 }
 
 func writeInventoryAtomic(home string, path string, inv inventory.Inventory) error {
-	if err := os.MkdirAll(home, 0o700); err != nil {
-		return fmt.Errorf("create inventory directory: %w", err)
-	}
-	data, err := yaml.Marshal(&inv)
-	if err != nil {
-		return fmt.Errorf("marshal inventory: %w", err)
-	}
-	file, err := os.CreateTemp(home, "inventory-*.yaml")
-	if err != nil {
-		return fmt.Errorf("create temporary inventory file: %w", err)
-	}
-	tempName := file.Name()
-	cleanup := true
-	defer func() {
-		if cleanup {
-			_ = os.Remove(tempName)
-		}
-	}()
-	if err := file.Chmod(0o600); err != nil {
-		_ = file.Close()
-		return fmt.Errorf("chmod temporary inventory file: %w", err)
-	}
-	if _, err := file.Write(data); err != nil {
-		_ = file.Close()
-		return fmt.Errorf("write temporary inventory file: %w", err)
-	}
-	if err := file.Close(); err != nil {
-		return fmt.Errorf("close temporary inventory file: %w", err)
-	}
-	if err := os.Rename(tempName, path); err != nil {
-		return fmt.Errorf("replace inventory file: %w", err)
-	}
-	cleanup = false
-	return nil
+	_ = home
+	return inventory.Save(path, inv)
 }
 
 func existingHostNames(inv inventory.Inventory) map[string]struct{} {
-	names := make(map[string]struct{}, len(inv.Hosts))
-	for name := range inv.Hosts {
-		names[name] = struct{}{}
-	}
-	return names
+	return inventory.HostNames(inv)
 }
 
 func runInventoryLS(cmd *cobra.Command, jsonOutput bool) error {

@@ -53,30 +53,26 @@ const (
 )
 
 type keyMap struct {
-	Up        key.Binding
-	Down      key.Binding
-	Toggle    key.Binding
-	Detail    key.Binding
-	Session   key.Binding
-	Verify    key.Binding
-	Filter    key.Binding
-	Back      key.Binding
-	Quit      key.Binding
-	ForceQuit key.Binding
+	Up      key.Binding
+	Down    key.Binding
+	Toggle  key.Binding
+	Detail  key.Binding
+	Session key.Binding
+	Verify  key.Binding
+	Filter  key.Binding
+	Back    key.Binding
 }
 
 func defaultKeys() keyMap {
 	return keyMap{
-		Up:        key.NewBinding(key.WithKeys("up", "k")),
-		Down:      key.NewBinding(key.WithKeys("down", "j")),
-		Toggle:    key.NewBinding(key.WithKeys("enter", " ")),
-		Detail:    key.NewBinding(key.WithKeys("d")),
-		Session:   key.NewBinding(key.WithKeys("l")),
-		Verify:    key.NewBinding(key.WithKeys("v")),
-		Filter:    key.NewBinding(key.WithKeys("/")),
-		Back:      key.NewBinding(key.WithKeys("esc")),
-		Quit:      key.NewBinding(key.WithKeys("q")),
-		ForceQuit: key.NewBinding(key.WithKeys("ctrl+c")),
+		Up:      key.NewBinding(key.WithKeys("up", "k")),
+		Down:    key.NewBinding(key.WithKeys("down", "j")),
+		Toggle:  key.NewBinding(key.WithKeys("enter", " ")),
+		Detail:  key.NewBinding(key.WithKeys("d")),
+		Session: key.NewBinding(key.WithKeys("l")),
+		Verify:  key.NewBinding(key.WithKeys("v")),
+		Filter:  key.NewBinding(key.WithKeys("/")),
+		Back:    key.NewBinding(key.WithKeys("esc")),
 	}
 }
 
@@ -205,6 +201,22 @@ func (m model) verifyCommand() tea.Cmd {
 
 func (m model) Init() tea.Cmd { return nil }
 
+func (m model) title() string { return "Audit" }
+
+func (m model) capturing() bool { return m.focus == focusFilter }
+
+func (m model) withSessionFilter(id string) model {
+	m.sessionFocus = id
+	m.filterQuery = ""
+	m.prevFilterQuery = ""
+	m.filter.SetValue("")
+	m.filter.Blur()
+	m.focus = focusList
+	m.cursor = 0
+	m.rebuildGroups()
+	return m
+}
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -228,9 +240,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.applyVerify(msg)
 		return m, nil
 	case tea.KeyMsg:
-		if key.Matches(msg, m.keys.ForceQuit) {
-			return m, tea.Quit
-		}
 		switch m.focus {
 		case focusFilter:
 			return m.updateFilter(msg)
@@ -252,8 +261,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch {
-	case key.Matches(msg, m.keys.Quit):
-		return m, tea.Quit
 	case key.Matches(msg, m.keys.Up):
 		if m.cursor > 0 {
 			m.cursor--
@@ -329,7 +336,7 @@ func (m *model) openDetail(r row) {
 
 func (m model) updateDetail(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch {
-	case key.Matches(msg, m.keys.Back), key.Matches(msg, m.keys.Detail), key.Matches(msg, m.keys.Quit):
+	case key.Matches(msg, m.keys.Back), key.Matches(msg, m.keys.Detail):
 		m.focus = focusList
 		return m, nil
 	case key.Matches(msg, m.keys.Verify):
@@ -438,9 +445,9 @@ func (m model) chainStatus() string {
 
 func (m model) helpLine() string {
 	if m.sessionFocus != "" {
-		return "↑/↓ move · enter/d detail · v verify · esc exit focus · q quit"
+		return "↑/↓ move · enter/d detail · v verify · esc exit focus"
 	}
-	return "↑/↓ move · enter expand · d detail · l focus session · v verify · / filter · q quit"
+	return "↑/↓ move · enter expand · d detail · l focus session · v verify · / filter"
 }
 
 func (m model) detailHint() string {

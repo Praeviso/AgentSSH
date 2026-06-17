@@ -2,10 +2,9 @@ package tui
 
 import (
 	"errors"
-	"fmt"
 	"os"
 
-	"github.com/Praeviso/AgentSSH/internal/audit"
+	"github.com/Praeviso/AgentSSH/internal/config"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/termenv"
@@ -20,20 +19,18 @@ type HostMeta struct {
 	Tags []string
 }
 
-// Options configures the terminal audit viewer.
+// Options configures the terminal console.
 type Options struct {
-	// AuditFile is the path to the append-only audit log to read.
-	AuditFile string
-	// Hosts maps a host name to its inventory metadata (used for display only).
-	Hosts map[string]HostMeta
+	// Paths contains the AgentSSH home layout used by the console sections.
+	Paths config.Paths
 }
 
-// Runner starts the terminal audit viewer.
+// Runner starts the terminal console.
 type Runner interface {
 	Run(options Options) error
 }
 
-// NewRunner returns the default terminal audit viewer.
+// NewRunner returns the default terminal console.
 func NewRunner() Runner { return runner{} }
 
 type runner struct{}
@@ -59,16 +56,8 @@ func run(options Options) error {
 		renderer.SetColorProfile(termenv.Ascii)
 	}
 
-	store := audit.NewStore(options.AuditFile)
-	records, err := store.ReadAll()
-	if err != nil {
-		return fmt.Errorf("read audit log: %w", err)
-	}
-
-	m := newModel(records, options.Hosts, newStyles(renderer), func() (audit.VerifyResult, error) {
-		return store.Verify()
-	})
-	_, err = tea.NewProgram(m, tea.WithAltScreen()).Run()
+	m := newAppModel(options.Paths, renderer)
+	_, err := tea.NewProgram(m, tea.WithAltScreen()).Run()
 	return err
 }
 

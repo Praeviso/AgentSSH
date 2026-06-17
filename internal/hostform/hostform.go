@@ -81,17 +81,36 @@ func Run(opts Options) (Result, error) {
 	if _, ok := os.LookupEnv("NO_COLOR"); ok {
 		renderer.SetColorProfile(termenv.Ascii)
 	}
-	initial := newModel(opts, newStyles(renderer))
+	initial := runModel{model: New(opts, renderer)}
 	final, err := tea.NewProgram(initial).Run()
 	if err != nil {
 		return Result{}, err
 	}
-	m, ok := final.(model)
+	m, ok := final.(runModel)
 	if !ok {
 		return Result{}, fmt.Errorf("host form returned unexpected model %T", final)
 	}
-	return m.result, nil
+	return m.model.Result(), nil
 }
+
+type runModel struct {
+	model Model
+}
+
+func (m runModel) Init() tea.Cmd { return m.model.Init() }
+
+func (m runModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	next, cmd := m.model.Update(msg)
+	if model, ok := next.(Model); ok {
+		m.model = model
+	}
+	if m.model.Done() {
+		return m, tea.Quit
+	}
+	return m, cmd
+}
+
+func (m runModel) View() string { return m.model.View() }
 
 type formValues struct {
 	name  string
@@ -213,7 +232,8 @@ func newStyles(r *lipgloss.Renderer) styles {
 	}
 }
 
-type model struct {
+// Model is the embeddable add-host form model.
+type Model struct {
 	inputs   []textinput.Model
 	focus    field
 	errs     []string
@@ -221,9 +241,18 @@ type model struct {
 	styles   styles
 	existing map[string]struct{}
 	result   Result
+	done     bool
 }
 
-func newModel(opts Options, st styles) model {
+// New constructs an add-host form without starting a Bubble Tea program.
+func New(opts Options, r *lipgloss.Renderer) Model {
+	if r == nil {
+		r = lipgloss.NewRenderer(os.Stdout)
+	}
+	return newModel(opts, newStyles(r))
+}
+
+func newModel(opts Options, st styles) Model {
 	inputs := make([]textinput.Model, fieldCount)
 	placeholders := []string{"web-1", "10.0.0.11", "$USER", "22", "web,prod", "ssh-config-host"}
 	values := []string{opts.Name, opts.Addr, opts.User, portString(opts.Port), strings.Join(opts.Tags, ","), opts.Alias}
@@ -235,7 +264,7 @@ func newModel(opts Options, st styles) model {
 	}
 	_ = inputs[fieldName].Focus()
 
-	return model{
+	return Model{
 		inputs:   inputs,
 		keys:     defaultKeys(),
 		styles:   st,
@@ -244,16 +273,17 @@ func newModel(opts Options, st styles) model {
 	}
 }
 
-func (m model) Init() tea.Cmd {
+func (m Model) Init() tea.Cmd {
 	return textinput.Blink
 }
 
-func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if keyMsg, ok := msg.(tea.KeyMsg); ok {
 		switch {
 		case key.Matches(keyMsg, m.keys.Cancel), key.Matches(keyMsg, m.keys.ForceQuit):
 			m.result = Result{Submitted: false}
-			return m, tea.Quit
+			m.done = true
+			return m, nil
 		case key.Matches(keyMsg, m.keys.Next):
 			return m.move(1)
 		case key.Matches(keyMsg, m.keys.Prev):
@@ -268,7 +298,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-func (m model) View() string {
+// Done reports whether the form has been submitted or cancelled.
+func (m Model) Done() bool { return m.done }
+
+// Result returns the normalized submitted value; Submitted is false on cancel.
+func (m Model) Result() Result { return m.result }
+
+func (m Model) View() string {
 	var b strings.Builder
 	b.WriteString(m.styles.title.Render("Add inventory host"))
 	b.WriteString("\n\n")
@@ -287,7 +323,7 @@ func (m model) View() string {
 	return b.String()
 }
 
-func (m model) move(delta int) (tea.Model, tea.Cmd) {
+func (m Model) move(delta int) (tea.Model, tea.Cmd) {
 	m.validateField(m.focus)
 	m.inputs[m.focus].Blur()
 	next := (int(m.focus) + delta + int(fieldCount)) % int(fieldCount)
@@ -296,13 +332,14 @@ func (m model) move(delta int) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-func (m model) submit() (tea.Model, tea.Cmd) {
+func (m Model) submit() (tea.Model, tea.Cmd) {
 	result, errs := validateValues(m.values(), m.existing)
 	m.result = result
 	m.clearErrors()
 	if len(errs) == 0 {
 		m.result.Submitted = true
-		return m, tea.Quit
+		m.done = true
+		return m, nil
 	}
 	for i, key := range fieldKeys {
 		m.errs[i] = errs[key]
@@ -317,12 +354,12 @@ func (m model) submit() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m *model) validateField(f field) {
+func (m *Model) validateField(f field) {
 	_, errs := validateValues(m.values(), m.existing)
 	m.errs[f] = errs[fieldKeys[f]]
 }
 
-func (m model) values() formValues {
+func (m Model) values() formValues {
 	return formValues{
 		name:  m.inputs[fieldName].Value(),
 		addr:  m.inputs[fieldAddr].Value(),
@@ -333,7 +370,7 @@ func (m model) values() formValues {
 	}
 }
 
-func (m *model) clearErrors() {
+func (m *Model) clearErrors() {
 	for i := range m.errs {
 		m.errs[i] = ""
 	}
