@@ -10,14 +10,14 @@ AgentSSH uses standard SSH from the local machine and does not require any agent
 # 1. Install (or grab a prebuilt binary from the Releases page)
 go install github.com/Praeviso/AgentSSH/cmd/agentssh@latest
 
-# 2. Define one host and a deny rule. Auth reuses your existing ssh-agent /
-#    ~/.ssh/config — AgentSSH stores no keys of its own.
+# 2. Add a host. Run with no flags to open an interactive form, or pass flags
+#    to script it. Auth reuses your existing ssh-agent / ~/.ssh/config —
+#    AgentSSH stores no keys of its own.
+agentssh inventory add                                       # interactive TUI form
+agentssh inventory add web-1 --addr 10.0.0.11 --user deploy --tags prod
+
+# 3. Define a deny rule (hard, unoverridable boundary):
 mkdir -p ~/.agentssh
-cat > ~/.agentssh/inventory.yaml <<'EOF'
-version: 1
-hosts:
-  web-1: { addr: 10.0.0.11, user: deploy, tags: [prod] }
-EOF
 cat > ~/.agentssh/policy.yaml <<'EOF'
 version: 1
 defaults: { policy: allow }
@@ -27,13 +27,13 @@ rules:
     action: deny
 EOF
 
-# 3. The agent calls agentssh — every command is policy-checked and audited:
+# 4. The agent calls agentssh — every command is policy-checked and audited:
 agentssh hosts                                 # discover targets (no credentials shown)
 agentssh run web-1 -- systemctl status nginx   # allowed -> executed over SSH
 agentssh run web-1 -- rm -rf /                 # denied by policy -> exit 6, never runs
 
-# 4. The human reviews everything:
-agentssh tui            # interactive audit viewer, grouped by session
+# 5. The human reviews everything:
+agentssh tui            # unified console: Hosts, Audit, Policy, Sessions
 agentssh audit verify   # confirm the tamper-evident hash chain is intact
 ```
 
@@ -120,7 +120,7 @@ agentssh status <req_id>
 
 ## Human Commands
 
-Review and verify activity:
+Open the unified console (Hosts / Audit / Policy / Sessions in one full-screen app), or use the individual subcommands:
 
 ```bash
 agentssh tui
@@ -137,7 +137,15 @@ agentssh policy show
 agentssh policy test --host web-1 'rm -rf /'
 ```
 
-`inventory edit` and `policy edit` are command placeholders for the MVP.
+Manage inventory from the CLI (or do it visually in `agentssh tui`):
+
+```bash
+agentssh inventory add          # interactive form
+agentssh inventory ls
+```
+
+`inventory edit` and `policy edit` are still placeholders — edit
+`~/.agentssh/inventory.yaml` / `policy.yaml` directly for now.
 
 ## Output Filtering
 
