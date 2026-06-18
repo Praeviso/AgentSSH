@@ -13,11 +13,13 @@ AgentSSH uses standard SSH from the local machine (its built-in Go SSH client by
 
 ```bash
 # 1. Install — static binary, no Go required (see "Install" for macOS / arm64).
-curl -fsSL https://github.com/Praeviso/AgentSSH/releases/download/v0.4.0/agentssh_v0.4.0_linux_amd64.tar.gz \
-  | sudo tar xz --strip-components=1 -C /usr/local/bin agentssh_v0.4.0_linux_amd64/agentssh
+curl -fsSL https://github.com/Praeviso/AgentSSH/releases/download/v0.4.1/agentssh_v0.4.1_linux_amd64.tar.gz \
+  | sudo tar xz --strip-components=1 -C /usr/local/bin agentssh_v0.4.1_linux_amd64/agentssh
 
 # 2. Open the console — this is your main entry point:
 agentssh tui
+#   On first run it creates ~/.agentssh/ with a starter inventory.yaml and a
+#   policy.yaml (allow by default, catastrophic commands denied). Nothing to set up.
 #   In the Hosts tab:
 #     d  discover the SSH hosts you can already reach (from ~/.ssh/config + known_hosts),
 #        select with space, p to probe, enter to import
@@ -25,16 +27,13 @@ agentssh tui
 #     t  test connectivity to the selected host
 #   Switch tabs with 1-4 or tab: Hosts · Audit · Policy · Sessions.
 
-# 3. Add a deny rule (a hard, unoverridable boundary; policy is a file for now):
-mkdir -p ~/.agentssh
-cat > ~/.agentssh/policy.yaml <<'EOF'
-version: 1
-defaults: { policy: allow }
-rules:
-  - name: catastrophic
-    match: { cmd_regex: '\b(rm\s+-rf|mkfs|dd|shutdown|reboot)' }
-    action: deny
-EOF
+# 3. Tune the deny rules (a hard, unoverridable boundary; policy is a file for now).
+#    The seeded ~/.agentssh/policy.yaml already contains:
+#      rules:
+#        - name: catastrophic
+#          match: { cmd_regex: '\b(rm\s+-rf|mkfs|dd|shutdown|reboot|init\s+0|userdel)' }
+#          action: deny
+#    Edit that file to add your own rules.
 
 # 4. The agent calls agentssh — every command is policy-checked and audited:
 agentssh hosts                                 # discover targets (no credentials shown)
@@ -74,23 +73,23 @@ Static binaries (`CGO_ENABLED=0`, no runtime deps). Pick your platform; each is 
 
 ```bash
 # Linux x86_64
-curl -fsSL https://github.com/Praeviso/AgentSSH/releases/download/v0.4.0/agentssh_v0.4.0_linux_amd64.tar.gz \
-  | sudo tar xz --strip-components=1 -C /usr/local/bin agentssh_v0.4.0_linux_amd64/agentssh
+curl -fsSL https://github.com/Praeviso/AgentSSH/releases/download/v0.4.1/agentssh_v0.4.1_linux_amd64.tar.gz \
+  | sudo tar xz --strip-components=1 -C /usr/local/bin agentssh_v0.4.1_linux_amd64/agentssh
 
 # Linux arm64
-curl -fsSL https://github.com/Praeviso/AgentSSH/releases/download/v0.4.0/agentssh_v0.4.0_linux_arm64.tar.gz \
-  | sudo tar xz --strip-components=1 -C /usr/local/bin agentssh_v0.4.0_linux_arm64/agentssh
+curl -fsSL https://github.com/Praeviso/AgentSSH/releases/download/v0.4.1/agentssh_v0.4.1_linux_arm64.tar.gz \
+  | sudo tar xz --strip-components=1 -C /usr/local/bin agentssh_v0.4.1_linux_arm64/agentssh
 
 # macOS Apple Silicon (arm64)
-curl -fsSL https://github.com/Praeviso/AgentSSH/releases/download/v0.4.0/agentssh_v0.4.0_darwin_arm64.tar.gz \
-  | sudo tar xz --strip-components=1 -C /usr/local/bin agentssh_v0.4.0_darwin_arm64/agentssh
+curl -fsSL https://github.com/Praeviso/AgentSSH/releases/download/v0.4.1/agentssh_v0.4.1_darwin_arm64.tar.gz \
+  | sudo tar xz --strip-components=1 -C /usr/local/bin agentssh_v0.4.1_darwin_arm64/agentssh
 
 # macOS Intel (amd64)
-curl -fsSL https://github.com/Praeviso/AgentSSH/releases/download/v0.4.0/agentssh_v0.4.0_darwin_amd64.tar.gz \
-  | sudo tar xz --strip-components=1 -C /usr/local/bin agentssh_v0.4.0_darwin_amd64/agentssh
+curl -fsSL https://github.com/Praeviso/AgentSSH/releases/download/v0.4.1/agentssh_v0.4.1_darwin_amd64.tar.gz \
+  | sudo tar xz --strip-components=1 -C /usr/local/bin agentssh_v0.4.1_darwin_amd64/agentssh
 ```
 
-Verify: `agentssh --version`. (Bump `v0.4.0` for a different release; checksums are in `SHA256SUMS.txt` on the Releases page.)
+Verify: `agentssh --version`. (Bump `v0.4.1` for a different release; checksums are in `SHA256SUMS.txt` on the Releases page.)
 
 ### From source (needs Go matching the go.mod directive)
 
@@ -103,12 +102,12 @@ Put the binary on the local operator machine where SSH already works.
 
 ## Configure
 
-AgentSSH reads `~/.agentssh/` by default. Set `AGENTSSH_HOME` to use another directory.
+AgentSSH reads `~/.agentssh/` by default. Set `AGENTSSH_HOME` to use another directory. The first run of `agentssh tui` creates the directory and seeds `inventory.yaml` + `policy.yaml` for you (existing files are never overwritten), so you can skip the manual setup below and just edit what it wrote.
 
 ```text
 ~/.agentssh/
-  inventory.yaml   # hosts (managed via the TUI or `agentssh inventory`)
-  policy.yaml      # allow/deny rules + output filtering
+  inventory.yaml   # hosts (seeded on first `tui`; managed via the TUI or `agentssh inventory`)
+  policy.yaml      # allow/deny rules + output filtering (seeded on first `tui`)
   secrets.enc      # encrypted SSH passwords (created on first `secret set`)
   audit.log        # created automatically
   session          # created automatically

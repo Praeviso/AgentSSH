@@ -208,6 +208,17 @@ func newTUICommand() *cobra.Command {
 }
 
 func runTUI(cmd *cobra.Command) error {
+	home, err := config.ResolveHome()
+	if err != nil {
+		return err
+	}
+	created, err := config.EnsureHome(home)
+	if err != nil {
+		return classifyConfigError(err)
+	}
+	if created {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "initialized %s with starter inventory.yaml and policy.yaml\n", home)
+	}
 	cfg, err := config.Load()
 	if err != nil {
 		return classifyConfigError(err)
