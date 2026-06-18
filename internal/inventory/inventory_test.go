@@ -69,6 +69,7 @@ func TestPublicInventoryOmitsConnectionDetails(t *testing.T) {
 				User:           "deploy",
 				Port:           2222,
 				SSHConfigAlias: "prod-web",
+				IdentityFile:   "~/.ssh/prod_ed25519",
 				Tags:           []string{"prod", "web"},
 			},
 		},
@@ -125,6 +126,23 @@ func TestMarshalOmitsEmptyInventoryFields(t *testing.T) {
 	}
 	if !strings.Contains(out, "version: 1") || !strings.Contains(out, "ssh_config_alias: prod-web") {
 		t.Fatalf("marshal output missing expected fields:\n%s", out)
+	}
+}
+
+func TestMarshalIncludesIdentityFileWhenPresent(t *testing.T) {
+	inv := Inventory{
+		Version: 1,
+		Hosts: map[string]Host{
+			"web-1": {Addr: "10.0.0.11", IdentityFile: "~/.ssh/prod_ed25519"},
+		},
+	}
+	data, err := yaml.Marshal(inv)
+	if err != nil {
+		t.Fatalf("marshal inventory: %v", err)
+	}
+	out := string(data)
+	if !strings.Contains(out, "identity_file: ~/.ssh/prod_ed25519") {
+		t.Fatalf("marshal output missing identity_file:\n%s", out)
 	}
 }
 

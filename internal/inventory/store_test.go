@@ -73,7 +73,7 @@ func TestSaveLoadRoundTripAndOmitEmptyFields(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "nested", "inventory.yaml")
 	inv := Inventory{
 		Hosts: map[string]Host{
-			"web-1": {Addr: "10.0.0.11", User: "deploy", Port: 22},
+			"web-1": {Addr: "10.0.0.11", User: "deploy", Port: 22, IdentityFile: "~/.ssh/web-1"},
 		},
 	}
 	next, err := AddHost(inv, "via-alias", Host{SSHConfigAlias: "prod-web"})
@@ -88,16 +88,19 @@ func TestSaveLoadRoundTripAndOmitEmptyFields(t *testing.T) {
 		t.Fatalf("read saved inventory: %v", err)
 	}
 	text := string(raw)
-	for _, unexpected := range []string{"transport:", "host_key_policy:", "tags: []", "addr: \"\""} {
+	for _, unexpected := range []string{"transport:", "host_key_policy:", "tags: []", "addr: \"\"", "identity_file: \"\""} {
 		if strings.Contains(text, unexpected) {
 			t.Fatalf("saved inventory contains %q:\n%s", unexpected, text)
 		}
+	}
+	if !strings.Contains(text, "identity_file: ~/.ssh/web-1") {
+		t.Fatalf("saved inventory missing identity_file:\n%s", text)
 	}
 	loaded, err := Load(path)
 	if err != nil {
 		t.Fatalf("Load saved: %v", err)
 	}
-	if loaded.Hosts["web-1"].User != "deploy" || loaded.Hosts["via-alias"].SSHConfigAlias != "prod-web" {
+	if loaded.Hosts["web-1"].User != "deploy" || loaded.Hosts["web-1"].IdentityFile != "~/.ssh/web-1" || loaded.Hosts["via-alias"].SSHConfigAlias != "prod-web" {
 		t.Fatalf("loaded = %#v", loaded)
 	}
 }

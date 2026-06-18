@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/Praeviso/AgentSSH/internal/audit"
 	"github.com/Praeviso/AgentSSH/internal/config"
+	"github.com/Praeviso/AgentSSH/internal/discovery"
 	"github.com/Praeviso/AgentSSH/internal/executor"
 	"github.com/Praeviso/AgentSSH/internal/hostform"
 	"github.com/Praeviso/AgentSSH/internal/inventory"
@@ -233,7 +235,7 @@ func newInventoryCommand() *cobra.Command {
 
 	var add inventoryAddOptions
 	addCmd := &cobra.Command{
-		Use:   "add [name] [--addr <addr>] [--user <user>] [--port <port>] [--alias <ssh_config_alias>] [--tags <a,b>]",
+		Use:   "add [name] [--addr <addr>] [--user <user>] [--port <port>] [--alias <ssh_config_alias>] [--identity-file <path>] [--tags <a,b>]",
 		Short: "Add a host to inventory.yaml.",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -247,11 +249,36 @@ func newInventoryCommand() *cobra.Command {
 	addCmd.Flags().StringVar(&add.User, "user", "", "SSH user")
 	addCmd.Flags().IntVar(&add.Port, "port", 0, "SSH port")
 	addCmd.Flags().StringVar(&add.Alias, "alias", "", "ssh_config host alias")
+	addCmd.Flags().StringVar(&add.IdentityFile, "identity-file", "", "identity file path")
 	addCmd.Flags().StringVar(&add.Tags, "tags", "", "comma-separated tags")
+
+	var discover inventoryDiscoverOptions
+	discoverCmd := &cobra.Command{
+		Use:   "discover [--probe] [--json] [--import]",
+		Short: "Discover SSH hosts from local SSH config and known_hosts.",
+		Args:  noArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runInventoryDiscover(cmd, discover)
+		},
+	}
+	discoverCmd.Flags().BoolVar(&discover.Probe, "probe", false, "dial and authenticate discovered hosts")
+	discoverCmd.Flags().BoolVar(&discover.JSON, "json", false, "emit machine-readable JSON")
+	discoverCmd.Flags().BoolVar(&discover.Import, "import", false, "import connectable hosts not already in inventory")
+
+	testCmd := &cobra.Command{
+		Use:   "test <name>",
+		Short: "Test native SSH connectivity for an inventory host.",
+		Args:  exactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runInventoryTest(cmd, args[0])
+		},
+	}
 
 	cmd.AddCommand(
 		lsCmd,
 		addCmd,
+		discoverCmd,
+		testCmd,
 		leafNoArgs("edit", "Edit inventory.yaml.", "edit ~/.agentssh/inventory.yaml directly"),
 	)
 	return cmd
@@ -470,12 +497,19 @@ func selectedTransport(cfg *config.Config) string {
 }
 
 type inventoryAddOptions struct {
-	Name  string
-	Addr  string
-	User  string
-	Port  int
-	Alias string
-	Tags  string
+	Name         string
+	Addr         string
+	User         string
+	Port         int
+	Alias        string
+	IdentityFile string
+	Tags         string
+}
+
+type inventoryDiscoverOptions struct {
+	Probe  bool
+	JSON   bool
+	Import bool
 }
 
 func runInventoryAdd(opts inventoryAddOptions) error {
@@ -508,7 +542,7 @@ func runInventoryAdd(opts inventoryAddOptions) error {
 	if !result.Submitted {
 		return nil
 	}
-	return addInventoryHost(paths, inv, result)
+	return addInventoryHost(paths, inv, result, strings.TrimSpace(opts.IdentityFile))
 }
 
 func resultFromFlags(opts hostform.Options) (hostform.Result, error) {
@@ -544,12 +578,13 @@ func loadInventoryForWrite(path string) (inventory.Inventory, error) {
 	return inv, nil
 }
 
-func addInventoryHost(paths config.Paths, inv inventory.Inventory, result hostform.Result) error {
+func addInventoryHost(paths config.Paths, inv inventory.Inventory, result hostform.Result, identityFile string) error {
 	next, err := inventory.AddHost(inv, result.Name, inventory.Host{
 		Addr:           result.Addr,
 		User:           result.User,
 		Port:           result.Port,
 		SSHConfigAlias: result.Alias,
+		IdentityFile:   identityFile,
 		Tags:           result.Tags,
 	})
 	if errors.Is(err, inventory.ErrHostExists) {
@@ -638,10 +673,197 @@ func hostParts(host inventory.Host) []string {
 	if host.SSHConfigAlias != "" {
 		parts = append(parts, "alias="+host.SSHConfigAlias)
 	}
+	if host.IdentityFile != "" {
+		parts = append(parts, "identity_file="+host.IdentityFile)
+	}
 	if len(host.Tags) > 0 {
 		parts = append(parts, "tags="+strings.Join(host.Tags, ","))
 	}
 	return parts
+}
+
+func runInventoryDiscover(cmd *cobra.Command, opts inventoryDiscoverOptions) error {
+	cfg, err := config.Load()
+	if err != nil {
+		return classifyConfigError(err)
+	}
+	result, err := discovery.Static(discovery.Options{
+		ConfigPath:     filepath.Join(os.Getenv("HOME"), ".ssh", "config"),
+		KnownHostsPath: filepath.Join(os.Getenv("HOME"), ".ssh", "known_hosts"),
+		Home:           os.Getenv("HOME"),
+		Inventory:      cfg.Inventory,
+	})
+	if err != nil {
+		return err
+	}
+	if opts.Probe {
+		exec := executor.NewNativeExecutor(executor.NativeOptions{
+			ConfigPath:     filepath.Join(os.Getenv("HOME"), ".ssh", "config"),
+			KnownHostsPath: filepath.Join(os.Getenv("HOME"), ".ssh", "known_hosts"),
+			ConnectTimeout: 5 * time.Second,
+			HostKeyPolicy:  cfg.Inventory.HostKeyPolicy,
+		})
+		result.Candidates = discovery.Probe(context.Background(), result.Candidates, discovery.ProbeOptions{
+			Executor:    exec,
+			Timeout:     5 * time.Second,
+			Concurrency: 4,
+		})
+	}
+	imported := 0
+	if opts.Import {
+		next := cfg.Inventory
+		seen := endpointKeys(cfg.Inventory)
+		for _, candidate := range result.Candidates {
+			if candidate.InInventory || candidate.ProbeStatus != executor.ProbeConnectable {
+				continue
+			}
+			// Endpoint (not just name) de-dup: a discovered alias that resolves to
+			// a machine already in inventory must not be added again, or group/tag
+			// runs would execute the same host twice.
+			key := endpointKey(candidate.Addr, candidate.Port)
+			if key != "" && seen[key] {
+				continue
+			}
+			var addErr error
+			next, addErr = inventory.AddHost(next, candidate.Name, importHost(candidate))
+			if errors.Is(addErr, inventory.ErrHostExists) {
+				continue
+			}
+			if addErr != nil {
+				return addErr
+			}
+			if key != "" {
+				seen[key] = true
+			}
+			imported++
+		}
+		if imported > 0 {
+			if err := inventory.Save(cfg.Paths.InventoryFile, next); err != nil {
+				return err
+			}
+		}
+	}
+	if opts.JSON {
+		return writeJSON(cmd, result)
+	}
+	printDiscovery(cmd, result, imported)
+	return nil
+}
+
+// importHost builds the inventory entry to persist for a discovered candidate.
+// ssh_config-sourced hosts are stored by alias so the operator's real route
+// (ProxyJump, multiple/tokenized IdentityFile) is preserved instead of a
+// flattened addr/user/port that would drop those directives.
+func importHost(c discovery.Candidate) inventory.Host {
+	if c.Source == discovery.SourceSSHConfig {
+		return inventory.Host{SSHConfigAlias: c.Name}
+	}
+	return inventory.Host{Addr: c.Addr, User: c.User, Port: c.Port, IdentityFile: c.IdentityFile}
+}
+
+// endpointKey normalizes addr+port into a comparison key for de-dup. Returns ""
+// for hosts without a concrete addr (e.g. alias-only), which therefore cannot be
+// endpoint-deduped here.
+func endpointKey(addr string, port int) string {
+	addr = strings.ToLower(strings.TrimSpace(addr))
+	if addr == "" {
+		return ""
+	}
+	if port == 0 {
+		port = 22
+	}
+	return addr + ":" + strconv.Itoa(port)
+}
+
+func endpointKeys(inv inventory.Inventory) map[string]bool {
+	keys := map[string]bool{}
+	for _, h := range inv.Hosts {
+		if k := endpointKey(h.Addr, h.Port); k != "" {
+			keys[k] = true
+		}
+	}
+	return keys
+}
+
+func printDiscovery(cmd *cobra.Command, result discovery.Result, imported int) {
+	out := cmd.OutOrStdout()
+	_, _ = fmt.Fprintln(out, "NAME\tSOURCE\tADDR\tKEY\tKNOWN_HOSTS\tINVENTORY\tSTATUS")
+	for _, candidate := range result.Candidates {
+		key := "-"
+		if candidate.HasKey {
+			key = "yes"
+		}
+		known := "no"
+		if candidate.InKnownHosts {
+			known = "yes"
+		}
+		inv := "no"
+		if candidate.InInventory {
+			inv = "yes"
+		}
+		_, _ = fmt.Fprintf(out, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", candidate.Name, candidate.Source, formatCandidateAddr(candidate), key, known, inv, candidateStatus(candidate))
+		if candidate.Hint != "" {
+			_, _ = fmt.Fprintf(out, "  %s\n", candidate.Hint)
+		}
+	}
+	for _, note := range result.Notes {
+		_, _ = fmt.Fprintf(out, "note: %s\n", note)
+	}
+	if imported > 0 {
+		_, _ = fmt.Fprintf(out, "imported=%d\n", imported)
+	}
+}
+
+func candidateStatus(candidate discovery.Candidate) string {
+	if candidate.ProbeStatus != "" {
+		return string(candidate.ProbeStatus)
+	}
+	if candidate.InInventory {
+		return "imported"
+	}
+	if candidate.HasKey {
+		return "looks-connectable"
+	}
+	return "needs-auth"
+}
+
+func formatCandidateAddr(candidate discovery.Candidate) string {
+	if candidate.Port == 0 || candidate.Port == 22 {
+		return candidate.Addr
+	}
+	return fmt.Sprintf("%s:%d", candidate.Addr, candidate.Port)
+}
+
+func runInventoryTest(cmd *cobra.Command, name string) error {
+	cfg, err := config.Load()
+	if err != nil {
+		return classifyConfigError(err)
+	}
+	resolved, err := inventory.NewResolver(cfg.Inventory).Resolve(name)
+	if err != nil {
+		if inventory.IsUnknown(err) {
+			return newUsageError("%v\n  查看全部: agentssh hosts", err)
+		}
+		return newUsageError("%v\n  choose a concrete host, not an empty group", err)
+	}
+	if resolved.Kind != inventory.TargetKindHost || len(resolved.Targets) != 1 {
+		return newUsageError("inventory test requires a host name, got group %q", name)
+	}
+	exec := executor.NewNativeExecutor(executor.NativeOptions{
+		ConnectTimeout: 5 * time.Second,
+		HostKeyPolicy:  cfg.Inventory.HostKeyPolicy,
+	})
+	result := exec.Probe(context.Background(), resolved.Targets[0])
+	if result.Err == nil && result.ExitCode == 0 {
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "OK %s\n", name)
+		return nil
+	}
+	if result.Err != nil {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "FAILED %s: %v\n%s\n", name, result.Err, executor.ConnectHint(result.Err))
+	} else {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "FAILED %s: probe command exited %d\n", name, result.ExitCode)
+	}
+	return commandExitError{Code: exitSSHError}
 }
 
 func sortedHostNamesLocal(hosts map[string]inventory.Host) []string {
@@ -815,6 +1037,9 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 				PolicyAction:    string(decision.Action),
 				PolicyRule:      decision.Rule,
 			})
+			if isSSHErrorResult(result) {
+				printSSHErrorHint(cmd, result)
+			}
 		} else {
 			printRunHuman(cmd, target.Name, result, filtered, flags.skill)
 		}
@@ -868,13 +1093,7 @@ func printRunHuman(cmd *cobra.Command, host string, result executor.Result, filt
 		}
 	}
 	if isSSHErrorResult(result) {
-		hint := "  check host reachability and your SSH key/agent; verify the host with: agentssh hosts"
-		if result.Err != nil {
-			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "ssh connection failed (exit 9): %v\n%s\n", result.Err, hint)
-		} else {
-			// exit-255 with no exec error (ssh's own connection-error code).
-			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "ssh connection failed (exit 9)\n%s\n", hint)
-		}
+		printSSHErrorHint(cmd, result)
 	}
 }
 
@@ -926,13 +1145,22 @@ func printRunStreamFooter(cmd *cobra.Command, host string, result executor.Resul
 	}
 	_, _ = fmt.Fprintln(out)
 	if isSSHErrorResult(result) {
-		hint := "  check host reachability and your SSH key/agent; verify the host with: agentssh hosts"
-		if result.Err != nil {
-			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "ssh connection failed (exit 9): %v\n%s\n", result.Err, hint)
-		} else {
-			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "ssh connection failed (exit 9)\n%s\n", hint)
-		}
+		printSSHErrorHint(cmd, result)
 	}
+}
+
+func printSSHErrorHint(cmd *cobra.Command, result executor.Result) {
+	// `run` is agent-facing: its stderr must not leak operator-only details
+	// (identity-file paths, resolved addresses) that the dehydrated hosts/Public()
+	// boundary withholds. Print only the credential-free hint. Operators who need
+	// the verbatim transport error should use `agentssh inventory test <host>`,
+	// which is operator-facing and prints it in full.
+	_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "ssh connection failed (exit 9)")
+	hint := executor.ConnectHint(result.Err)
+	if hint == "" {
+		hint = "hint: SSH connection failed; check addr, port, network, host key trust, and available SSH keys."
+	}
+	_, _ = fmt.Fprintln(cmd.ErrOrStderr(), hint)
 }
 
 func printDenyHuman(cmd *cobra.Command, host string, command string, decision policy.Decision) {

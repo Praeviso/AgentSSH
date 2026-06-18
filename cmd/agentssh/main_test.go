@@ -22,10 +22,12 @@ import (
 
 	"github.com/Praeviso/AgentSSH/internal/audit"
 	"github.com/Praeviso/AgentSSH/internal/config"
+	"github.com/Praeviso/AgentSSH/internal/discovery"
 	"github.com/Praeviso/AgentSSH/internal/executor"
 	"github.com/Praeviso/AgentSSH/internal/inventory"
 	"github.com/Praeviso/AgentSSH/internal/output"
 	"github.com/Praeviso/AgentSSH/internal/policy"
+	"github.com/spf13/cobra"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
 	"gopkg.in/yaml.v3"
@@ -177,6 +179,36 @@ func TestInventoryAddFlagPathCreatesInventoryAndList(t *testing.T) {
 	}
 	if decoded.Hosts["web-1"].Addr != "10.0.0.11" || decoded.Hosts["web-1"].User != "deploy" {
 		t.Fatalf("inventory json = %#v", decoded)
+	}
+}
+
+func TestInventoryAddIdentityFileFlagAndHostsDoNotLeakIt(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("AGENTSSH_HOME", home)
+
+	stdout, stderr, err := runCommandForTest(t, "inventory", "add", "web-1", "--addr", "10.0.0.11", "--identity-file", "~/.ssh/web-1")
+	if err != nil {
+		t.Fatalf("inventory add err = %v stdout=%s stderr=%s", err, stdout, stderr)
+	}
+	inv := readInventoryFile(t, home)
+	if inv.Hosts["web-1"].IdentityFile != "~/.ssh/web-1" {
+		t.Fatalf("identity_file = %q", inv.Hosts["web-1"].IdentityFile)
+	}
+
+	stdout, stderr, err = runCommandForTest(t, "inventory", "ls")
+	if err != nil {
+		t.Fatalf("inventory ls err = %v stderr=%s", err, stderr)
+	}
+	if !strings.Contains(stdout, "identity_file=~/.ssh/web-1") {
+		t.Fatalf("inventory ls missing identity_file:\n%s", stdout)
+	}
+
+	stdout, stderr, err = runCommandForTest(t, "hosts", "--json")
+	if err != nil {
+		t.Fatalf("hosts err = %v stderr=%s", err, stderr)
+	}
+	if strings.Contains(stdout, "identity_file") || strings.Contains(stdout, "web-1") && strings.Contains(stdout, ".ssh") {
+		t.Fatalf("hosts leaked identity file:\n%s", stdout)
 	}
 }
 
@@ -578,6 +610,71 @@ groups:
 		t.Fatalf("completed audit = %#v", completed)
 	}
 	t.Logf("native run streaming stdout=%q stderr=%q redactions=%d truncated=%t", stdout, stderr, completed.Redactions, completed.OutputTruncated)
+}
+
+func TestInventoryTestNativeEndToEnd(t *testing.T) {
+	home := t.TempDir()
+	clientSigner := writeSSHClientKey(t, home)
+	server := newCLITestSSHServer(t, clientSigner.PublicKey())
+	defer server.Close()
+
+	writeKnownHostsLine(t, home, server.Addr(), server.HostSigner.PublicKey())
+	writeInventory(t, home, fmt.Sprintf(`
+version: 1
+transport: native
+hosts:
+  web-1:
+    addr: %s
+    port: %d
+    user: test
+`, server.Host(), server.Port()))
+	writeTestPolicy(t, home)
+	t.Setenv("AGENTSSH_HOME", home)
+
+	stdout, stderr, err := runCommandForTest(t, "inventory", "test", "web-1")
+	if err != nil {
+		t.Fatalf("inventory test err = %v stderr=%s", err, stderr)
+	}
+	if !strings.Contains(stdout, "OK web-1") {
+		t.Fatalf("stdout = %q", stdout)
+	}
+}
+
+func TestInventoryDiscoverProbeAndImport(t *testing.T) {
+	home := t.TempDir()
+	clientSigner := writeSSHClientKey(t, home)
+	server := newCLITestSSHServer(t, clientSigner.PublicKey())
+	defer server.Close()
+
+	writeKnownHostsLine(t, home, server.Addr(), server.HostSigner.PublicKey())
+	sshDir := filepath.Join(home, ".ssh")
+	if err := os.WriteFile(filepath.Join(sshDir, "config"), []byte(fmt.Sprintf(`
+Host web-1
+  HostName %s
+  Port %d
+  User test
+`, server.Host(), server.Port())), 0o600); err != nil {
+		t.Fatalf("write ssh config: %v", err)
+	}
+	writeInventory(t, home, "version: 1\n")
+	writeTestPolicy(t, home)
+	t.Setenv("AGENTSSH_HOME", home)
+
+	stdout, stderr, err := runCommandForTest(t, "inventory", "discover", "--probe", "--import")
+	if err != nil {
+		t.Fatalf("discover err = %v stdout=%s stderr=%s", err, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "web-1") || !strings.Contains(stdout, "connectable") || !strings.Contains(stdout, "imported=1") {
+		t.Fatalf("discover stdout = %q", stdout)
+	}
+	inv := readInventoryFile(t, home)
+	host := inv.Hosts["web-1"]
+	// ssh_config-sourced candidates are imported by alias so the operator's real
+	// route (ProxyJump, multiple/tokenized IdentityFile) is preserved instead of a
+	// flattened addr/user/port snapshot.
+	if host.SSHConfigAlias != "web-1" || host.Addr != "" || host.Port != 0 {
+		t.Fatalf("imported host = %#v", host)
+	}
 }
 
 func TestPrintM2RunAuditDemo(t *testing.T) {
@@ -1016,5 +1113,60 @@ func writeKnownHostsLine(t *testing.T, home string, addr string, key ssh.PublicK
 	line := knownhosts.Line([]string{addr}, key)
 	if err := os.WriteFile(filepath.Join(dir, "known_hosts"), []byte(line+"\n"), 0o600); err != nil {
 		t.Fatalf("write known_hosts: %v", err)
+	}
+}
+
+func TestEndpointKeyNormalization(t *testing.T) {
+	if got := endpointKey("  10.0.0.11 ", 0); got != "10.0.0.11:22" {
+		t.Fatalf("default port = %q", got)
+	}
+	if got := endpointKey("HOST.Example", 2222); got != "host.example:2222" {
+		t.Fatalf("normalize = %q", got)
+	}
+	if got := endpointKey("", 22); got != "" {
+		t.Fatalf("empty addr should yield empty key, got %q", got)
+	}
+}
+
+func TestEndpointKeysSkipsAliasOnlyHosts(t *testing.T) {
+	inv := inventory.Inventory{Hosts: map[string]inventory.Host{
+		"web-1":      {Addr: "10.0.0.11"},
+		"alias-only": {SSHConfigAlias: "gw"},
+	}}
+	keys := endpointKeys(inv)
+	if !keys["10.0.0.11:22"] {
+		t.Fatalf("missing concrete endpoint: %#v", keys)
+	}
+	if len(keys) != 1 {
+		t.Fatalf("alias-only host should not contribute an endpoint key: %#v", keys)
+	}
+}
+
+func TestImportHostUsesAliasForSSHConfig(t *testing.T) {
+	h := importHost(discovery.Candidate{Source: discovery.SourceSSHConfig, Name: "prod-web", Addr: "10.0.0.11", Port: 22})
+	if h.SSHConfigAlias != "prod-web" || h.Addr != "" {
+		t.Fatalf("ssh_config import should reference the alias: %#v", h)
+	}
+	h2 := importHost(discovery.Candidate{Source: discovery.SourceKnownHosts, Addr: "10.0.0.20", Port: 2222, IdentityFile: "~/.ssh/db"})
+	if h2.Addr != "10.0.0.20" || h2.Port != 2222 || h2.IdentityFile != "~/.ssh/db" || h2.SSHConfigAlias != "" {
+		t.Fatalf("known_hosts import should be a concrete host: %#v", h2)
+	}
+}
+
+func TestPrintSSHErrorHintDoesNotLeakOperatorDetails(t *testing.T) {
+	cmd := &cobra.Command{}
+	var buf bytes.Buffer
+	cmd.SetErr(&buf)
+	// Native transport errors can embed operator-only details (key paths, addrs).
+	result := executor.Result{Err: errors.New("read identity file /home/op/.ssh/web1: dial tcp 10.0.0.11:22: connection refused")}
+	printSSHErrorHint(cmd, result)
+	out := buf.String()
+	for _, leak := range []string{"/home/op/.ssh/web1", "10.0.0.11"} {
+		if strings.Contains(out, leak) {
+			t.Fatalf("agent-facing ssh error leaked %q:\n%s", leak, out)
+		}
+	}
+	if !strings.Contains(out, "exit 9") || !strings.Contains(out, "hint:") {
+		t.Fatalf("expected exit marker + hint, got:\n%s", out)
 	}
 }

@@ -114,6 +114,16 @@ type nativeTarget struct {
 	ProxyJump     string
 }
 
+// ProbeStatus is the coarse connection outcome used by discovery and tests.
+type ProbeStatus string
+
+const (
+	ProbeConnectable  ProbeStatus = "connectable"
+	ProbeAuthFailed   ProbeStatus = "auth-failed"
+	ProbeHostKeyIssue ProbeStatus = "host-key-issue"
+	ProbeUnreachable  ProbeStatus = "unreachable"
+)
+
 func (t nativeTarget) address() string {
 	return net.JoinHostPort(t.HostName, strconv.Itoa(t.Port))
 }
@@ -140,7 +150,11 @@ func (e NativeExecutor) resolveTarget(target inventory.Target) (nativeTarget, er
 	if host.Port == 0 {
 		host.Port = 22
 	}
-	return nativeTarget{Name: target.Name, HostName: host.Addr, Port: host.Port, User: userName}, nil
+	var identityFiles []string
+	if host.IdentityFile != "" {
+		identityFiles = append(identityFiles, expandHome(host.IdentityFile))
+	}
+	return nativeTarget{Name: target.Name, HostName: host.Addr, Port: host.Port, User: userName, IdentityFiles: identityFiles}, nil
 }
 
 func (e NativeExecutor) resolveAlias(name string, alias string) (nativeTarget, error) {
@@ -332,13 +346,76 @@ func (e NativeExecutor) clientConfig(userName string, identityFiles []string) (*
 		return nil, nil, err
 	}
 	if len(authMethods) == 0 {
-		return nil, closer, errors.New("no SSH auth methods available (start ssh-agent or configure IdentityFile)")
+		return nil, closer, errors.New("no SSH auth methods available (set identity_file, start ssh-agent, or load a key with ssh-add)")
 	}
 	timeout := e.Options.ConnectTimeout
 	if timeout == 0 {
 		timeout = 10 * time.Second
 	}
 	return &ssh.ClientConfig{User: userName, Auth: authMethods, Timeout: timeout}, closer, nil
+}
+
+// Probe opens a native SSH session and runs a no-op command. It is intended for
+// explicit operator diagnostics; callers must gate it behind a user action.
+func (e NativeExecutor) Probe(ctx context.Context, target inventory.Target) Result {
+	return e.Run(ctx, Request{Target: target, Command: "true"})
+}
+
+// ProbeStatusForError maps a transport error into the probe status vocabulary.
+func ProbeStatusForError(err error) ProbeStatus {
+	if err == nil {
+		return ProbeConnectable
+	}
+	var keyErr *knownhosts.KeyError
+	if errors.As(err, &keyErr) {
+		return ProbeHostKeyIssue
+	}
+	message := strings.ToLower(err.Error())
+	if strings.Contains(message, "authenticate") || strings.Contains(message, "auth methods") {
+		return ProbeAuthFailed
+	}
+	return ProbeUnreachable
+}
+
+// ConnectHint maps connection failures to credential-free operator guidance.
+func ConnectHint(err error) string {
+	if err == nil {
+		return ""
+	}
+	var keyErr *knownhosts.KeyError
+	if errors.As(err, &keyErr) {
+		if len(keyErr.Want) == 0 {
+			return "hint: unknown host key; connect once with ssh to trust this host, or set host_key_policy: accept-new."
+		}
+		return "hint: host key changed; possible MITM. Verify the fingerprint before trusting this host."
+	}
+	if isConnectionRefused(err) || isTimeout(err) {
+		return "hint: cannot reach SSH; check addr, port, network route, and firewall rules."
+	}
+	message := strings.ToLower(err.Error())
+	if strings.Contains(message, "no ssh auth methods available") || strings.Contains(message, "no auth methods available") {
+		return "hint: no SSH credentials available; set identity_file for this host, load a key with ssh-add, or register a password in a future AgentSSH secrets phase."
+	}
+	if strings.Contains(message, "unable to authenticate") || strings.Contains(message, "attempted methods") || strings.Contains(message, "authenticate") {
+		return "hint: SSH authentication failed; set identity_file, load a key with ssh-add, or register a password in a future AgentSSH secrets phase. Ensure the remote account and authorized_keys are already configured; AgentSSH never changes the remote host."
+	}
+	return "hint: SSH connection failed; check addr, port, network, host key trust, and available SSH keys."
+}
+
+func isTimeout(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+func isConnectionRefused(err error) bool {
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		var syscallErr *os.SyscallError
+		if errors.As(opErr.Err, &syscallErr) {
+			return errors.Is(syscallErr.Err, syscall.ECONNREFUSED)
+		}
+	}
+	return errors.Is(err, syscall.ECONNREFUSED) || strings.Contains(strings.ToLower(err.Error()), "connection refused")
 }
 
 func (e NativeExecutor) authMethods(identityFiles []string) ([]ssh.AuthMethod, io.Closer, error) {

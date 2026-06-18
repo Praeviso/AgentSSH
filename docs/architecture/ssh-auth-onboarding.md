@@ -180,7 +180,22 @@ agentssh secret rm <host>
 - **hints**:错误→提示映射表。
 - **回归**:既有传输选择/退出码契约/输出脱敏/审计 hash 链全不破;`go test -race` 全绿;gofmt/vet/golangci-lint v2 干净。
 
-## 12. 待确认
+## 12. 实现说明(Phase 1,2026-06-18)
+
+Phase 1 已实现并经对抗式审查 + 修复:`Host.identity_file`、native per-host 私钥接线、`ConnectHint`/`ProbeStatusForError`、`internal/discovery`、`inventory discover [--probe] [--json] [--import]`、`inventory test`。新增加密/密码/TUI 仍未做(Phase 2/3)。
+
+审查发现并已修:
+- **`run` 错误输出脱敏**:`run` 是 agent 面命令,其 stderr 之前会 `%v` 打印 `result.Err`(可能含 identity_file 路径、解析后的 addr),与 `hosts/Public()` 脱水边界矛盾。改为只打印**无凭据信息**的 `ConnectHint`;operator 要看原始错误用 `inventory test`。
+- **`--import` 按端点去重**:之前只按 name/alias 去重,同一 `addr:port` 可被不同名导入两次 → group/tag 运行会重复执行同一机器。改为按 `addr:port` 端点去重(原有 + 增量)。
+- **ssh_config 候选走别名探测/导入**:之前把 ssh_config 主机拍平成 addr/user/port 直连,丢了 ProxyJump/多 IdentityFile → 误报 + 导入后路由不可复现。改为 ssh_config 来源的候选**用 `ssh_config_alias` 探测与导入**,交给 native `resolveAlias` 复刻真实路由。
+- **known_hosts 通配跳过**:`*.corp`、`!neg` 等 match-only 模式不再被当作可拨号候选枚举。
+
+已知限制(留待后续/文档明示):
+- IdentityFile 的 OpenSSH token(`%h/%p/%r/%u`)不展开;ssh_config 候选靠别名探测规避,但 `has_key` 展示对多 IdentityFile 仅尽力而为。
+- known_hosts 通配条目不参与 `InKnownHosts` 匹配判定(保守地报 `no`,不会误报 `yes`)。
+- 仅有 `ssh_config_alias`(无 addr)的既有 inventory 主机不参与端点去重(无法在此廉价解析别名→addr)。
+
+## 13. 待确认
 
 1. **加密库**:age(推荐)vs 手搓 scrypt+chacha20poly1305。
 2. 主口令是否提供"仅 TTY、不读 env"的严格模式作为默认(更安全但无人值守用不了密码 host)。

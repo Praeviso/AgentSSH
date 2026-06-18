@@ -22,6 +22,7 @@ type Host struct {
 	User           string   `yaml:"user,omitempty" json:"user"`
 	Port           int      `yaml:"port,omitempty" json:"port"`
 	SSHConfigAlias string   `yaml:"ssh_config_alias,omitempty" json:"ssh_config_alias"`
+	IdentityFile   string   `yaml:"identity_file,omitempty" json:"identity_file"`
 	Tags           []string `yaml:"tags,omitempty" json:"tags"`
 }
 

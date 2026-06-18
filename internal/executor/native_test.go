@@ -7,6 +7,7 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -172,6 +173,66 @@ Host prod-web
 	}
 }
 
+func TestResolveTargetAddsPerHostIdentityFile(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	exec := NewNativeExecutor(NativeOptions{})
+	target, err := exec.resolveTarget(inventory.Target{
+		Name: "web-1",
+		Host: inventory.Host{Addr: "10.0.0.11", User: "deploy", IdentityFile: "~/keys/web-1"},
+	})
+	if err != nil {
+		t.Fatalf("resolve target: %v", err)
+	}
+	want := filepath.Join(home, "keys", "web-1")
+	if len(target.IdentityFiles) != 1 || target.IdentityFiles[0] != want {
+		t.Fatalf("identity files = %#v, want %s", target.IdentityFiles, want)
+	}
+}
+
+func TestNativeExecutorUsesPerHostIdentityBeforeDefault(t *testing.T) {
+	home := t.TempDir()
+	defaultSigner := writeClientKey(t, home)
+	perHostSigner := writePrivateKey(t, filepath.Join(home, "keys", "web-1"))
+	server := newTestSSHServer(t, perHostSigner.PublicKey())
+	defer server.Close()
+
+	writeKnownHosts(t, home, server.Addr(), server.HostSigner.PublicKey())
+	exec := NewNativeExecutor(NativeOptions{
+		KnownHostsPath: filepath.Join(home, ".ssh", "known_hosts"),
+		ConfigPath:     filepath.Join(home, ".ssh", "config"),
+	})
+	target := inventory.Target{Name: "test", Host: inventory.Host{Addr: server.Host(), Port: server.Port(), User: "test", IdentityFile: "~/keys/web-1"}}
+	result := exec.Run(context.Background(), Request{Target: target, Command: "ok"})
+	if result.Err != nil || result.ExitCode != 0 {
+		t.Fatalf("per-host identity result = %#v err=%v", result, result.Err)
+	}
+	if string(defaultSigner.PublicKey().Marshal()) == string(perHostSigner.PublicKey().Marshal()) {
+		t.Fatal("test signers unexpectedly match")
+	}
+}
+
+func TestConnectHintMapping(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{name: "no auth", err: errors.New("no SSH auth methods available"), want: "identity_file"},
+		{name: "auth failed", err: errors.New("ssh: handshake failed: ssh: unable to authenticate, attempted methods [none publickey]"), want: "AgentSSH never changes the remote host"},
+		{name: "unknown host", err: &knownhosts.KeyError{}, want: "unknown host key"},
+		{name: "changed host", err: &knownhosts.KeyError{Want: []knownhosts.KnownKey{{}}}, want: "possible MITM"},
+		{name: "refused", err: errors.New("dial tcp 127.0.0.1:22: connect: connection refused"), want: "addr, port"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ConnectHint(tt.err); !strings.Contains(got, tt.want) {
+				t.Fatalf("ConnectHint(%v) = %q, want contains %q", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
 type testSSHServer struct {
 	Listener   net.Listener
 	HostSigner ssh.Signer
@@ -290,6 +351,14 @@ func handleSession(channel ssh.Channel, requests <-chan *ssh.Request) {
 
 func writeClientKey(t *testing.T, home string) ssh.Signer {
 	t.Helper()
+	signer := writePrivateKey(t, filepath.Join(home, ".ssh", "id_rsa"))
+	t.Setenv("HOME", home)
+	t.Setenv("SSH_AUTH_SOCK", "")
+	return signer
+}
+
+func writePrivateKey(t *testing.T, path string) ssh.Signer {
+	t.Helper()
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		t.Fatalf("generate client key: %v", err)
@@ -298,16 +367,14 @@ func writeClientKey(t *testing.T, home string) ssh.Signer {
 	if err != nil {
 		t.Fatalf("client signer: %v", err)
 	}
-	dir := filepath.Join(home, ".ssh")
+	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		t.Fatalf("mkdir .ssh: %v", err)
+		t.Fatalf("mkdir key dir: %v", err)
 	}
 	data := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
-	if err := os.WriteFile(filepath.Join(dir, "id_rsa"), data, 0o600); err != nil {
+	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatalf("write key: %v", err)
 	}
-	t.Setenv("HOME", home)
-	t.Setenv("SSH_AUTH_SOCK", "")
 	return signer
 }
 
