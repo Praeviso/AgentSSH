@@ -9,7 +9,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/Praeviso/AgentSSH/internal/audit"
 	"github.com/Praeviso/AgentSSH/internal/config"
@@ -497,13 +496,13 @@ func (s hostsSection) probeDiscoveryCmd(candidates []discovery.Candidate) tea.Cm
 		exec := executor.NewNativeExecutor(executor.NativeOptions{
 			ConfigPath:     cfgPath,
 			KnownHostsPath: knownHostsPath,
-			ConnectTimeout: 5 * time.Second,
+			ConnectTimeout: executor.ProbeTimeout,
 			HostKeyPolicy:  s.inventory.HostKeyPolicy,
 			PasswordSource: secrets.EnvPasswordSource(s.paths.SecretsFile),
 		})
 		probed := discovery.Probe(context.Background(), candidates, discovery.ProbeOptions{
 			Executor:    exec,
-			Timeout:     5 * time.Second,
+			Timeout:     executor.ProbeTimeout,
 			Concurrency: 4,
 		})
 		return discoveryProbedMsg{runID: runID, candidates: probed}
@@ -517,11 +516,11 @@ func (s hostsSection) probeHostCmd(name string) tea.Cmd {
 		exec := executor.NewNativeExecutor(executor.NativeOptions{
 			ConfigPath:     cfgPath,
 			KnownHostsPath: knownHostsPath,
-			ConnectTimeout: 5 * time.Second,
+			ConnectTimeout: executor.ProbeTimeout,
 			HostKeyPolicy:  s.inventory.HostKeyPolicy,
 			PasswordSource: secrets.EnvPasswordSource(s.paths.SecretsFile),
 		})
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), executor.ProbeTimeout)
 		defer cancel()
 		result := exec.Probe(ctx, inventory.Target{Name: name, Host: host})
 		if result.Err == nil && result.ExitCode == 0 {

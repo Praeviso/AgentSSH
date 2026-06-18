@@ -3,6 +3,7 @@ package executor
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
@@ -12,6 +13,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -587,6 +589,60 @@ func writeKnownHosts(t *testing.T, home string, addr string, key ssh.PublicKey) 
 	line := knownhosts.Line([]string{addr}, key)
 	if err := os.WriteFile(filepath.Join(dir, "known_hosts"), []byte(line+"\n"), 0o600); err != nil {
 		t.Fatalf("write known_hosts: %v", err)
+	}
+}
+
+func TestKnownHostKeyAlgorithmsPrefersStoredType(t *testing.T) {
+	edPub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate ed25519: %v", err)
+	}
+	edKey, err := ssh.NewPublicKey(edPub)
+	if err != nil {
+		t.Fatalf("ssh public key: %v", err)
+	}
+	khPath := filepath.Join(t.TempDir(), "known_hosts")
+	line := knownhosts.Line([]string{"example.com:22"}, edKey)
+	if err := os.WriteFile(khPath, []byte(line+"\n"), 0o600); err != nil {
+		t.Fatalf("write known_hosts: %v", err)
+	}
+
+	e := NewNativeExecutor(NativeOptions{KnownHostsPath: khPath})
+
+	// A host with only an ed25519 entry must constrain negotiation to ed25519, so
+	// a server also offering ecdsa/rsa isn't negotiated onto an untrusted type and
+	// falsely flagged as a key mismatch.
+	if got := e.knownHostKeyAlgorithms("example.com:22"); !reflect.DeepEqual(got, []string{ssh.KeyAlgoED25519}) {
+		t.Fatalf("known ed25519 host: got %v, want [%s]", got, ssh.KeyAlgoED25519)
+	}
+
+	// Unknown host: return nil so the caller leaves HostKeyAlgorithms unset and
+	// default negotiation applies (needed for first-time / accept-new connects).
+	if got := e.knownHostKeyAlgorithms("unknown.example.com:22"); got != nil {
+		t.Fatalf("unknown host: got %v, want nil", got)
+	}
+}
+
+func TestKnownHostKeyAlgorithmsExpandsRSA(t *testing.T) {
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate rsa: %v", err)
+	}
+	pub, err := ssh.NewPublicKey(&rsaKey.PublicKey)
+	if err != nil {
+		t.Fatalf("ssh public key: %v", err)
+	}
+	khPath := filepath.Join(t.TempDir(), "known_hosts")
+	line := knownhosts.Line([]string{"rsa.example.com:22"}, pub)
+	if err := os.WriteFile(khPath, []byte(line+"\n"), 0o600); err != nil {
+		t.Fatalf("write known_hosts: %v", err)
+	}
+
+	e := NewNativeExecutor(NativeOptions{KnownHostsPath: khPath})
+	got := e.knownHostKeyAlgorithms("rsa.example.com:22")
+	want := []string{ssh.KeyAlgoRSASHA512, ssh.KeyAlgoRSASHA256, ssh.KeyAlgoRSA}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("rsa host: got %v, want %v", got, want)
 	}
 }
 

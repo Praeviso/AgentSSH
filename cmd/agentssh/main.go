@@ -921,7 +921,7 @@ func runInventoryDiscover(cmd *cobra.Command, opts inventoryDiscoverOptions) err
 		exec := executor.NewNativeExecutor(executor.NativeOptions{
 			ConfigPath:     filepath.Join(os.Getenv("HOME"), ".ssh", "config"),
 			KnownHostsPath: filepath.Join(os.Getenv("HOME"), ".ssh", "known_hosts"),
-			ConnectTimeout: 5 * time.Second,
+			ConnectTimeout: executor.ProbeTimeout,
 			HostKeyPolicy:  cfg.Inventory.HostKeyPolicy,
 			// Use stored passwords so a password-only host probes the same way it
 			// will run (env-only master; no prompting across many candidates).
@@ -929,7 +929,7 @@ func runInventoryDiscover(cmd *cobra.Command, opts inventoryDiscoverOptions) err
 		})
 		result.Candidates = discovery.Probe(context.Background(), result.Candidates, discovery.ProbeOptions{
 			Executor:    exec,
-			Timeout:     5 * time.Second,
+			Timeout:     executor.ProbeTimeout,
 			Concurrency: 4,
 		})
 	}
@@ -1039,7 +1039,7 @@ func runInventoryTest(cmd *cobra.Command, name string) error {
 		return newUsageError("inventory test requires a host name, got group %q", name)
 	}
 	exec := executor.NewNativeExecutor(executor.NativeOptions{
-		ConnectTimeout: 5 * time.Second,
+		ConnectTimeout: executor.ProbeTimeout,
 		HostKeyPolicy:  cfg.Inventory.HostKeyPolicy,
 		// Test the same credentials `run` will use, including a stored password
 		// (env-only master).

@@ -3,6 +3,7 @@ package executor
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"io"
@@ -28,6 +29,13 @@ const (
 	TransportNative = "native"
 	nativeArgv0     = "native-ssh"
 )
+
+// ProbeTimeout bounds connectivity probes (inventory test, discover --probe, the
+// TUI t/probe actions). It matches the default Run connect budget so a probe
+// fails only when a real run would: a shorter cap produced false "cannot reach
+// SSH" reports for legitimate but distant / high-latency hosts whose handshake
+// takes several seconds.
+const ProbeTimeout = 10 * time.Second
 
 // NativeOptions configures the native Go SSH executor.
 type NativeOptions struct {
@@ -226,6 +234,9 @@ func (e NativeExecutor) dial(ctx context.Context, target nativeTarget) (*nativeC
 		return nil, err
 	}
 	cfg.HostKeyCallback = hostKeyCallback
+	if algos := e.knownHostKeyAlgorithms(target.address()); len(algos) > 0 {
+		cfg.HostKeyAlgorithms = algos
+	}
 	return e.dialWithConfig(ctx, target, cfg)
 }
 
@@ -258,6 +269,9 @@ func (e NativeExecutor) dialWithConfig(ctx context.Context, target nativeTarget,
 		defer func() { _ = jumpCloser.Close() }()
 	}
 	jumpCfg.HostKeyCallback = cfg.HostKeyCallback
+	if algos := e.knownHostKeyAlgorithms(firstJump.address()); len(algos) > 0 {
+		jumpCfg.HostKeyAlgorithms = algos
+	}
 	jumpClient, err := e.dialWithConfig(ctx, firstJump, jumpCfg)
 	if err != nil {
 		return nil, fmt.Errorf("proxyjump %s: %w", firstJump.display(), err)
@@ -526,6 +540,63 @@ func (e NativeExecutor) hostKeyCallback() (ssh.HostKeyCallback, error) {
 		}
 		return err
 	}, nil
+}
+
+// knownHostKeyAlgorithms returns the host-key algorithms already recorded for
+// addr in known_hosts, in client-preference order, so the handshake negotiates a
+// key type we actually trust. Without this, a server offering several host-key
+// types (e.g. ecdsa + ed25519) can get negotiated onto a type absent from
+// known_hosts and be falsely reported as a key mismatch — OpenSSH avoids this by
+// preferring algorithms it already has a key for, and so do we.
+//
+// It returns nil when the host is unknown (no recorded keys) so the caller leaves
+// ClientConfig.HostKeyAlgorithms unset and default negotiation applies, which is
+// what first-time / accept-new connections need. It probes a fresh strict
+// callback (never the accept-new wrapper) so the probe can never append a key.
+func (e NativeExecutor) knownHostKeyAlgorithms(addr string) []string {
+	path := e.Options.KnownHostsPath
+	if path == "" {
+		path = expandHome("~/.ssh/known_hosts")
+	}
+	strict, err := knownhosts.New(path)
+	if err != nil {
+		return nil
+	}
+	// An all-zero ed25519 key is a valid placeholder for marshaling; it will not
+	// equal any real stored key, so the callback returns a KeyError whose Want
+	// lists every host key recorded for addr.
+	fakeKey, err := ssh.NewPublicKey(ed25519.PublicKey(make([]byte, ed25519.PublicKeySize)))
+	if err != nil {
+		return nil
+	}
+	probeErr := strict(addr, &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 22}, fakeKey)
+	var keyErr *knownhosts.KeyError
+	if !errors.As(probeErr, &keyErr) || len(keyErr.Want) == 0 {
+		return nil
+	}
+
+	seen := map[string]bool{}
+	var algos []string
+	add := func(a string) {
+		if a == "" || seen[a] {
+			return
+		}
+		seen[a] = true
+		algos = append(algos, a)
+	}
+	for _, want := range keyErr.Want {
+		switch want.Key.Type() {
+		case ssh.KeyAlgoRSA:
+			// Servers sign with the SHA-2 variants now; offer them ahead of the
+			// legacy ssh-rsa name, which shares the same stored key.
+			add(ssh.KeyAlgoRSASHA512)
+			add(ssh.KeyAlgoRSASHA256)
+			add(ssh.KeyAlgoRSA)
+		default:
+			add(want.Key.Type())
+		}
+	}
+	return algos
 }
 
 func ensureKnownHosts(path string) error {
