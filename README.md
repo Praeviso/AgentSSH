@@ -7,8 +7,10 @@ AgentSSH uses standard SSH from the local machine and does not require any agent
 ## Quick Start
 
 ```bash
-# 1. Install (or grab a prebuilt binary from the Releases page)
-go install github.com/Praeviso/AgentSSH/cmd/agentssh@latest
+# 1. Install — download the static binary for your platform (no Go required).
+#    Linux x86_64 shown; see "Install" below for macOS and arm64.
+curl -fsSL https://github.com/Praeviso/AgentSSH/releases/download/v0.3.0/agentssh_v0.3.0_linux_amd64.tar.gz \
+  | sudo tar xz --strip-components=1 -C /usr/local/bin agentssh_v0.3.0_linux_amd64/agentssh
 
 # 2. Add a host. Run with no flags to open an interactive form, or pass flags
 #    to script it. Auth reuses your existing ssh-agent / ~/.ssh/config —
@@ -41,17 +43,38 @@ That is the whole loop: the agent only ever calls `agentssh`, while the human ow
 
 ## Install
 
-Pick one:
+### Prebuilt binary (recommended — no Go needed)
+
+The release ships a single static binary per platform (`CGO_ENABLED=0`, no
+runtime dependencies). Pick yours — each is one command that drops `agentssh`
+into `/usr/local/bin`:
 
 ```bash
-# install from source (needs Go matching the go.mod directive)
-go install github.com/Praeviso/AgentSSH/cmd/agentssh@latest
+# Linux x86_64
+curl -fsSL https://github.com/Praeviso/AgentSSH/releases/download/v0.3.0/agentssh_v0.3.0_linux_amd64.tar.gz \
+  | sudo tar xz --strip-components=1 -C /usr/local/bin agentssh_v0.3.0_linux_amd64/agentssh
 
-# or build a single binary from a checkout
-go build -o agentssh ./cmd/agentssh
+# Linux arm64
+curl -fsSL https://github.com/Praeviso/AgentSSH/releases/download/v0.3.0/agentssh_v0.3.0_linux_arm64.tar.gz \
+  | sudo tar xz --strip-components=1 -C /usr/local/bin agentssh_v0.3.0_linux_arm64/agentssh
 
-# or download a prebuilt static binary (linux/macOS, amd64/arm64) from the
-# repo's Releases page.
+# macOS Apple Silicon (arm64)
+curl -fsSL https://github.com/Praeviso/AgentSSH/releases/download/v0.3.0/agentssh_v0.3.0_darwin_arm64.tar.gz \
+  | sudo tar xz --strip-components=1 -C /usr/local/bin agentssh_v0.3.0_darwin_arm64/agentssh
+
+# macOS Intel (amd64)
+curl -fsSL https://github.com/Praeviso/AgentSSH/releases/download/v0.3.0/agentssh_v0.3.0_darwin_amd64.tar.gz \
+  | sudo tar xz --strip-components=1 -C /usr/local/bin agentssh_v0.3.0_darwin_amd64/agentssh
+```
+
+Verify it: `agentssh --version`. (Bump `v0.3.0` to install a different release;
+checksums for every asset are in `SHA256SUMS.txt` on the Releases page.)
+
+### From source (needs Go matching the go.mod directive)
+
+```bash
+go install github.com/Praeviso/AgentSSH/cmd/agentssh@latest   # into $GOBIN
+go build -o agentssh ./cmd/agentssh                           # single binary from a checkout
 ```
 
 Put the binary on the local operator machine where SSH already works.
@@ -82,6 +105,24 @@ hosts:
 groups:
   prod: { tags: [prod] }
 ```
+
+### Transport
+
+By default AgentSSH connects with its **built-in Go SSH client** (no system
+`ssh` binary required). It still reuses your ssh-agent, key files, `~/.ssh/config`
+aliases, and `ProxyJump`, and verifies host keys against `~/.ssh/known_hosts`
+with **strict** checking — a host you have never connected to must already be in
+`known_hosts`, or set `host_key_policy: accept-new` to trust on first use.
+
+```yaml
+version: 1
+transport: native            # default; use "ssh" to shell out to the system ssh client
+host_key_policy: strict      # or "accept-new" for trust-on-first-use
+hosts:
+  web-1: { addr: 10.0.0.11, user: deploy, tags: [prod] }
+```
+
+Override per-invocation with `AGENTSSH_TRANSPORT=ssh|native`.
 
 Example `policy.yaml`:
 
