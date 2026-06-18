@@ -27,6 +27,7 @@ import (
 	"github.com/Praeviso/AgentSSH/internal/inventory"
 	"github.com/Praeviso/AgentSSH/internal/output"
 	"github.com/Praeviso/AgentSSH/internal/policy"
+	"github.com/Praeviso/AgentSSH/internal/secrets"
 	"github.com/spf13/cobra"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
@@ -209,6 +210,91 @@ func TestInventoryAddIdentityFileFlagAndHostsDoNotLeakIt(t *testing.T) {
 	}
 	if strings.Contains(stdout, "identity_file") || strings.Contains(stdout, "web-1") && strings.Contains(stdout, ".ssh") {
 		t.Fatalf("hosts leaked identity file:\n%s", stdout)
+	}
+}
+
+func TestSecretSetListRemoveRoundTripDoesNotPrintValues(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("AGENTSSH_HOME", home)
+	t.Setenv(envMasterPassword, "master")
+	restorePrompt := readSecretNoEcho
+	readSecretNoEcho = func(prompt string) (string, error) {
+		if !strings.Contains(prompt, "web-1") {
+			t.Fatalf("prompt = %q", prompt)
+		}
+		return "ssh-password-value", nil
+	}
+	defer func() {
+		readSecretNoEcho = restorePrompt
+	}()
+
+	stdout, stderr, err := runCommandForTest(t, "secret", "set", "web-1")
+	if err != nil {
+		t.Fatalf("secret set err = %v stdout=%s stderr=%s", err, stdout, stderr)
+	}
+	if strings.Contains(stdout+stderr, "ssh-password-value") {
+		t.Fatalf("secret set leaked password stdout=%q stderr=%q", stdout, stderr)
+	}
+	store, err := secrets.Open(filepath.Join(home, "secrets.enc"), "master")
+	if err != nil {
+		t.Fatalf("open secrets: %v", err)
+	}
+	if got, ok := store.Password("web-1"); !ok || got != "ssh-password-value" {
+		t.Fatalf("stored password = %q %t", got, ok)
+	}
+
+	stdout, stderr, err = runCommandForTest(t, "secret", "ls")
+	if err != nil {
+		t.Fatalf("secret ls err = %v stderr=%s", err, stderr)
+	}
+	if !strings.Contains(stdout, "web-1") || strings.Contains(stdout, "ssh-password-value") {
+		t.Fatalf("secret ls stdout = %q", stdout)
+	}
+	stdout, stderr, err = runCommandForTest(t, "secret", "ls", "--json")
+	if err != nil {
+		t.Fatalf("secret ls json err = %v stderr=%s", err, stderr)
+	}
+	if !strings.Contains(stdout, `"web-1"`) || strings.Contains(stdout, "ssh-password-value") {
+		t.Fatalf("secret ls json stdout = %q", stdout)
+	}
+
+	stdout, stderr, err = runCommandForTest(t, "secret", "rm", "web-1")
+	if err != nil {
+		t.Fatalf("secret rm err = %v stdout=%s stderr=%s", err, stdout, stderr)
+	}
+	store, err = secrets.Open(filepath.Join(home, "secrets.enc"), "master")
+	if err != nil {
+		t.Fatalf("open after rm: %v", err)
+	}
+	if _, ok := store.Password("web-1"); ok {
+		t.Fatal("password still present after rm")
+	}
+}
+
+func TestInventoryAddPasswordStoresSecretNotInventory(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("AGENTSSH_HOME", home)
+	t.Setenv(envMasterPassword, "master")
+	restorePrompt := readSecretNoEcho
+	readSecretNoEcho = func(string) (string, error) { return "ssh-password-value", nil }
+	defer func() {
+		readSecretNoEcho = restorePrompt
+	}()
+
+	stdout, stderr, err := runCommandForTest(t, "inventory", "add", "web-1", "--addr", "10.0.0.11", "--user", "deploy", "--password")
+	if err != nil {
+		t.Fatalf("inventory add --password err = %v stdout=%s stderr=%s", err, stdout, stderr)
+	}
+	rawInventory := readFileString(t, filepath.Join(home, "inventory.yaml"))
+	if strings.Contains(rawInventory, "ssh-password-value") || strings.Contains(rawInventory, "password") {
+		t.Fatalf("inventory leaked password data:\n%s", rawInventory)
+	}
+	store, err := secrets.Open(filepath.Join(home, "secrets.enc"), "master")
+	if err != nil {
+		t.Fatalf("open secrets: %v", err)
+	}
+	if got, ok := store.Password("web-1"); !ok || got != "ssh-password-value" {
+		t.Fatalf("stored password = %q %t", got, ok)
 	}
 }
 
@@ -612,6 +698,48 @@ groups:
 	t.Logf("native run streaming stdout=%q stderr=%q redactions=%d truncated=%t", stdout, stderr, completed.Redactions, completed.OutputTruncated)
 }
 
+func TestRunNativeUsesEncryptedPasswordFromEnvOnly(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	server := newCLIPasswordSSHServer(t, nil, "ssh-password-value")
+	defer server.Close()
+
+	writeKnownHostsLine(t, home, server.Addr(), server.HostSigner.PublicKey())
+	writeInventory(t, home, fmt.Sprintf(`
+version: 1
+transport: native
+hosts:
+  web-1:
+    addr: %s
+    port: %d
+    user: test
+`, server.Host(), server.Port()))
+	writeTestPolicy(t, home)
+	store, err := secrets.Open(filepath.Join(home, "secrets.enc"), "master")
+	if err != nil {
+		t.Fatalf("open missing secrets: %v", err)
+	}
+	store.Set("web-1", "ssh-password-value")
+	if err := store.Save("master"); err != nil {
+		t.Fatalf("save secrets: %v", err)
+	}
+	t.Setenv("AGENTSSH_HOME", home)
+	t.Setenv("AGENTSSH_SESSION", "s_password")
+	t.Setenv(envMasterPassword, "master")
+	t.Setenv("SSH_AUTH_SOCK", "")
+
+	stdout, stderr, err := runCommandForTest(t, "run", "web-1", "--", "ok")
+	if err != nil {
+		t.Fatalf("run password err = %v stdout=%s stderr=%s", err, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "ok\n") || strings.Contains(stdout+stderr, "ssh-password-value") {
+		t.Fatalf("run output stdout=%q stderr=%q", stdout, stderr)
+	}
+	if got := atomic.LoadInt32(&server.passwordAttempts); got != 1 {
+		t.Fatalf("password attempts = %d, want 1", got)
+	}
+}
+
 func TestInventoryTestNativeEndToEnd(t *testing.T) {
 	home := t.TempDir()
 	clientSigner := writeSSHClientKey(t, home)
@@ -978,6 +1106,104 @@ type cliTestSSHServer struct {
 	wg         sync.WaitGroup
 }
 
+type cliPasswordSSHServer struct {
+	Listener         net.Listener
+	HostSigner       ssh.Signer
+	allowedKey       ssh.PublicKey
+	password         string
+	wg               sync.WaitGroup
+	passwordAttempts int32
+}
+
+func newCLIPasswordSSHServer(t *testing.T, allowedKey ssh.PublicKey, password string) *cliPasswordSSHServer {
+	t.Helper()
+	hostKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate host key: %v", err)
+	}
+	hostSigner, err := ssh.NewSignerFromKey(hostKey)
+	if err != nil {
+		t.Fatalf("host signer: %v", err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	server := &cliPasswordSSHServer{Listener: ln, HostSigner: hostSigner, allowedKey: allowedKey, password: password}
+	server.wg.Add(1)
+	go server.accept()
+	return server
+}
+
+func (s *cliPasswordSSHServer) Addr() string { return s.Listener.Addr().String() }
+
+func (s *cliPasswordSSHServer) Host() string {
+	host, _, _ := net.SplitHostPort(s.Addr())
+	return host
+}
+
+func (s *cliPasswordSSHServer) Port() int {
+	_, portValue, _ := net.SplitHostPort(s.Addr())
+	var port int
+	_, _ = fmt.Sscanf(portValue, "%d", &port)
+	return port
+}
+
+func (s *cliPasswordSSHServer) Close() {
+	_ = s.Listener.Close()
+	s.wg.Wait()
+}
+
+func (s *cliPasswordSSHServer) accept() {
+	defer s.wg.Done()
+	for {
+		conn, err := s.Listener.Accept()
+		if err != nil {
+			return
+		}
+		s.wg.Add(1)
+		go s.handle(conn)
+	}
+}
+
+func (s *cliPasswordSSHServer) handle(conn net.Conn) {
+	defer s.wg.Done()
+	cfg := &ssh.ServerConfig{
+		PublicKeyCallback: func(_ ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+			if s.allowedKey != nil && string(key.Marshal()) == string(s.allowedKey.Marshal()) {
+				return nil, nil
+			}
+			return nil, fmt.Errorf("unexpected public key")
+		},
+		PasswordCallback: func(_ ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
+			atomic.AddInt32(&s.passwordAttempts, 1)
+			if string(password) == s.password {
+				return nil, nil
+			}
+			return nil, fmt.Errorf("unexpected password")
+		},
+	}
+	cfg.AddHostKey(s.HostSigner)
+	sshConn, chans, reqs, err := ssh.NewServerConn(conn, cfg)
+	if err != nil {
+		_ = conn.Close()
+		return
+	}
+	defer func() { _ = sshConn.Close() }()
+	go ssh.DiscardRequests(reqs)
+	for ch := range chans {
+		if ch.ChannelType() != "session" {
+			_ = ch.Reject(ssh.UnknownChannelType, "session only")
+			continue
+		}
+		channel, requests, err := ch.Accept()
+		if err != nil {
+			continue
+		}
+		go handleCLITestSession(channel, requests)
+	}
+}
+
 func newCLITestSSHServer(t *testing.T, allowedKey ssh.PublicKey) *cliTestSSHServer {
 	t.Helper()
 	hostKey, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -1168,5 +1394,60 @@ func TestPrintSSHErrorHintDoesNotLeakOperatorDetails(t *testing.T) {
 	}
 	if !strings.Contains(out, "exit 9") || !strings.Contains(out, "hint:") {
 		t.Fatalf("expected exit marker + hint, got:\n%s", out)
+	}
+}
+
+func TestInventoryAddPasswordNonInteractiveNoMasterDoesNotPersistHost(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("AGENTSSH_HOME", home)
+	// No AGENTSSH_MASTER_PASSWORD and no TTY: the credential preflight must fail
+	// BEFORE the host is written, so inventory and secrets stay consistent.
+	_, _, err := runCommandForTest(t, "inventory", "add", "web-1", "--addr", "10.0.0.11", "--password")
+	if err == nil {
+		t.Fatal("expected `inventory add --password` to fail without a master password")
+	}
+	if _, statErr := os.Stat(filepath.Join(home, "inventory.yaml")); statErr == nil {
+		raw := readFileString(t, filepath.Join(home, "inventory.yaml"))
+		if strings.Contains(raw, "web-1") {
+			t.Fatalf("host persisted despite failed --password preflight:\n%s", raw)
+		}
+	}
+}
+
+func TestInventoryTestUsesEncryptedPasswordEndToEnd(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	server := newCLIPasswordSSHServer(t, nil, "ssh-password-value")
+	defer server.Close()
+
+	writeKnownHostsLine(t, home, server.Addr(), server.HostSigner.PublicKey())
+	writeInventory(t, home, fmt.Sprintf(`
+version: 1
+transport: native
+hosts:
+  web-1:
+    addr: %s
+    port: %d
+    user: test
+`, server.Host(), server.Port()))
+	writeTestPolicy(t, home)
+	store, err := secrets.Open(filepath.Join(home, "secrets.enc"), "master")
+	if err != nil {
+		t.Fatalf("open secrets: %v", err)
+	}
+	store.Set("web-1", "ssh-password-value")
+	if err := store.Save("master"); err != nil {
+		t.Fatalf("save secrets: %v", err)
+	}
+	t.Setenv("AGENTSSH_HOME", home)
+	t.Setenv(envMasterPassword, "master")
+	t.Setenv("SSH_AUTH_SOCK", "")
+
+	stdout, stderr, err := runCommandForTest(t, "inventory", "test", "web-1")
+	if err != nil {
+		t.Fatalf("inventory test err = %v stdout=%s stderr=%s", err, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "OK") || strings.Contains(stdout+stderr, "ssh-password-value") {
+		t.Fatalf("inventory test stdout=%q stderr=%q", stdout, stderr)
 	}
 }

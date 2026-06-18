@@ -25,6 +25,7 @@ type Paths struct {
 	PolicyFile    string
 	AuditFile     string
 	SessionFile   string
+	SecretsFile   string
 }
 
 // Config is the parsed local configuration set.
@@ -96,6 +97,7 @@ func NewPaths(home string) Paths {
 		PolicyFile:    filepath.Join(home, "policy.yaml"),
 		AuditFile:     filepath.Join(home, "audit.log"),
 		SessionFile:   filepath.Join(home, "session"),
+		SecretsFile:   filepath.Join(home, "secrets.enc"),
 	}
 }
 

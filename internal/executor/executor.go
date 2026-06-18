@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -132,6 +133,7 @@ func (ExecRunner) Run(ctx context.Context, argv []string) RunResult {
 	}
 
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd.Env = scrubbedEnv()
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -161,6 +163,7 @@ func runStreamingProcess(ctx context.Context, argv []string, stdout io.Writer, s
 	}
 
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd.Env = scrubbedEnv()
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 
@@ -175,6 +178,24 @@ func runStreamingProcess(ctx context.Context, argv []string, stdout io.Writer, s
 	}
 
 	return RunResult{ExitCode: exitCode, Err: err}
+}
+
+// scrubbedEnv returns the process environment with AgentSSH secret-bearing
+// variables removed, so the shell-out ssh subprocess (and anything it spawns via
+// ssh_config ProxyCommand/LocalCommand) never inherits the secrets-store master
+// password. The shell transport cannot use the encrypted store anyway, so there
+// is no reason for it to see the master. SSH_AUTH_SOCK and the rest of the
+// environment are preserved so normal key/agent auth keeps working.
+func scrubbedEnv() []string {
+	env := os.Environ()
+	out := env[:0:0]
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "AGENTSSH_MASTER_PASSWORD=") {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
 }
 
 // IsProcessExit reports whether a result represents a completed remote command.

@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/Praeviso/AgentSSH/internal/inventory"
@@ -212,6 +213,105 @@ func TestNativeExecutorUsesPerHostIdentityBeforeDefault(t *testing.T) {
 	}
 }
 
+func TestNativeExecutorPasswordSourceAppendedOnlyWhenPresent(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("SSH_AUTH_SOCK", "")
+	exec := NewNativeExecutor(NativeOptions{})
+	target := nativeTarget{Name: "web-1", User: "test"}
+	methods, closer, err := exec.authMethods(target)
+	if err != nil {
+		t.Fatalf("authMethods without password: %v", err)
+	}
+	if closer != nil {
+		_ = closer.Close()
+	}
+	if len(methods) != 0 {
+		t.Fatalf("auth methods without keys/password = %d, want 0", len(methods))
+	}
+
+	var seen []string
+	exec = NewNativeExecutor(NativeOptions{PasswordSource: func(host string) (string, bool) {
+		seen = append(seen, host)
+		return "pw", true
+	}})
+	methods, closer, err = exec.authMethods(target)
+	if err != nil {
+		t.Fatalf("authMethods with password: %v", err)
+	}
+	if closer != nil {
+		_ = closer.Close()
+	}
+	if len(methods) != 1 || len(seen) != 1 || seen[0] != "web-1" {
+		t.Fatalf("methods=%d seen=%#v", len(methods), seen)
+	}
+
+	writePrivateKey(t, filepath.Join(home, ".ssh", "id_rsa"))
+	methods, closer, err = exec.authMethods(target)
+	if err != nil {
+		t.Fatalf("authMethods with key+password: %v", err)
+	}
+	if closer != nil {
+		_ = closer.Close()
+	}
+	if len(methods) != 2 {
+		t.Fatalf("methods with key+password = %d, want 2", len(methods))
+	}
+}
+
+func TestNativeExecutorPasswordAuthEndToEnd(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("SSH_AUTH_SOCK", "")
+	server := newPasswordTestSSHServer(t, nil, "secretpw")
+	defer server.Close()
+
+	writeKnownHosts(t, home, server.Addr(), server.HostSigner.PublicKey())
+	exec := NewNativeExecutor(NativeOptions{
+		KnownHostsPath: filepath.Join(home, ".ssh", "known_hosts"),
+		ConfigPath:     filepath.Join(home, ".ssh", "config"),
+		PasswordSource: func(host string) (string, bool) {
+			if host != "web-1" {
+				t.Fatalf("password source host = %q", host)
+			}
+			return "secretpw", true
+		},
+	})
+	target := inventory.Target{Name: "web-1", Host: inventory.Host{Addr: server.Host(), Port: server.Port(), User: "test"}}
+	result := exec.Run(context.Background(), Request{Target: target, Command: "ok"})
+	if result.Err != nil || result.ExitCode != 0 || result.Stdout != "ok\n" {
+		t.Fatalf("password auth result = %#v err=%v", result, result.Err)
+	}
+	if got := atomic.LoadInt32(&server.passwordAttempts); got != 1 {
+		t.Fatalf("password attempts = %d, want 1", got)
+	}
+}
+
+func TestNativeExecutorPrefersKeyAuthBeforePassword(t *testing.T) {
+	home := t.TempDir()
+	clientSigner := writeClientKey(t, home)
+	server := newPasswordTestSSHServer(t, clientSigner.PublicKey(), "secretpw")
+	defer server.Close()
+
+	writeKnownHosts(t, home, server.Addr(), server.HostSigner.PublicKey())
+	exec := NewNativeExecutor(NativeOptions{
+		KnownHostsPath: filepath.Join(home, ".ssh", "known_hosts"),
+		ConfigPath:     filepath.Join(home, ".ssh", "config"),
+		PasswordSource: func(string) (string, bool) { return "secretpw", true },
+	})
+	target := inventory.Target{Name: "web-1", Host: inventory.Host{Addr: server.Host(), Port: server.Port(), User: "test"}}
+	result := exec.Run(context.Background(), Request{Target: target, Command: "ok"})
+	if result.Err != nil || result.ExitCode != 0 {
+		t.Fatalf("key preferred result = %#v err=%v", result, result.Err)
+	}
+	if got := atomic.LoadInt32(&server.publicKeyAttempts); got == 0 {
+		t.Fatal("public key was not attempted")
+	}
+	if got := atomic.LoadInt32(&server.passwordAttempts); got != 0 {
+		t.Fatalf("password attempts = %d, want 0 when key succeeds", got)
+	}
+}
+
 func TestConnectHintMapping(t *testing.T) {
 	tests := []struct {
 		name string
@@ -238,6 +338,106 @@ type testSSHServer struct {
 	HostSigner ssh.Signer
 	wg         sync.WaitGroup
 	allowedKey ssh.PublicKey
+}
+
+type passwordTestSSHServer struct {
+	Listener          net.Listener
+	HostSigner        ssh.Signer
+	wg                sync.WaitGroup
+	allowedKey        ssh.PublicKey
+	password          string
+	publicKeyAttempts int32
+	passwordAttempts  int32
+}
+
+func newPasswordTestSSHServer(t *testing.T, allowedKey ssh.PublicKey, password string) *passwordTestSSHServer {
+	t.Helper()
+	hostKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate host key: %v", err)
+	}
+	hostSigner, err := ssh.NewSignerFromKey(hostKey)
+	if err != nil {
+		t.Fatalf("host signer: %v", err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	server := &passwordTestSSHServer{Listener: ln, HostSigner: hostSigner, allowedKey: allowedKey, password: password}
+	server.wg.Add(1)
+	go server.accept()
+	return server
+}
+
+func (s *passwordTestSSHServer) Addr() string { return s.Listener.Addr().String() }
+
+func (s *passwordTestSSHServer) Host() string {
+	host, _, _ := net.SplitHostPort(s.Addr())
+	return host
+}
+
+func (s *passwordTestSSHServer) Port() int {
+	_, portValue, _ := net.SplitHostPort(s.Addr())
+	var port int
+	_, _ = fmt.Sscanf(portValue, "%d", &port)
+	return port
+}
+
+func (s *passwordTestSSHServer) Close() {
+	_ = s.Listener.Close()
+	s.wg.Wait()
+}
+
+func (s *passwordTestSSHServer) accept() {
+	defer s.wg.Done()
+	for {
+		conn, err := s.Listener.Accept()
+		if err != nil {
+			return
+		}
+		s.wg.Add(1)
+		go s.handle(conn)
+	}
+}
+
+func (s *passwordTestSSHServer) handle(conn net.Conn) {
+	defer s.wg.Done()
+	cfg := &ssh.ServerConfig{
+		PublicKeyCallback: func(_ ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+			atomic.AddInt32(&s.publicKeyAttempts, 1)
+			if s.allowedKey != nil && string(key.Marshal()) == string(s.allowedKey.Marshal()) {
+				return nil, nil
+			}
+			return nil, fmt.Errorf("unexpected public key")
+		},
+		PasswordCallback: func(_ ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
+			atomic.AddInt32(&s.passwordAttempts, 1)
+			if string(password) == s.password {
+				return nil, nil
+			}
+			return nil, fmt.Errorf("unexpected password")
+		},
+	}
+	cfg.AddHostKey(s.HostSigner)
+	sshConn, chans, reqs, err := ssh.NewServerConn(conn, cfg)
+	if err != nil {
+		_ = conn.Close()
+		return
+	}
+	defer func() { _ = sshConn.Close() }()
+	go ssh.DiscardRequests(reqs)
+	for ch := range chans {
+		if ch.ChannelType() != "session" {
+			_ = ch.Reject(ssh.UnknownChannelType, "session only")
+			continue
+		}
+		channel, requests, err := ch.Accept()
+		if err != nil {
+			continue
+		}
+		go handleSession(channel, requests)
+	}
 }
 
 func newTestSSHServer(t *testing.T, allowedKey ssh.PublicKey) *testSSHServer {
@@ -387,5 +587,25 @@ func writeKnownHosts(t *testing.T, home string, addr string, key ssh.PublicKey) 
 	line := knownhosts.Line([]string{addr}, key)
 	if err := os.WriteFile(filepath.Join(dir, "known_hosts"), []byte(line+"\n"), 0o600); err != nil {
 		t.Fatalf("write known_hosts: %v", err)
+	}
+}
+
+func TestScrubbedEnvRemovesMasterPassword(t *testing.T) {
+	t.Setenv("AGENTSSH_MASTER_PASSWORD", "supersecret")
+	t.Setenv("SSH_AUTH_SOCK", "/tmp/agent.sock")
+	env := scrubbedEnv()
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "AGENTSSH_MASTER_PASSWORD=") {
+			t.Fatalf("scrubbedEnv leaked the master password into the subprocess env")
+		}
+	}
+	found := false
+	for _, kv := range env {
+		if kv == "SSH_AUTH_SOCK=/tmp/agent.sock" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("scrubbedEnv dropped SSH_AUTH_SOCK, which key/agent auth needs")
 	}
 }

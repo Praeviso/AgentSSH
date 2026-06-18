@@ -180,9 +180,9 @@ agentssh secret rm <host>
 - **hints**:错误→提示映射表。
 - **回归**:既有传输选择/退出码契约/输出脱敏/审计 hash 链全不破;`go test -race` 全绿;gofmt/vet/golangci-lint v2 干净。
 
-## 12. 实现说明(Phase 1,2026-06-18)
+## 12. 实现说明(Phase 1-2,2026-06-18)
 
-Phase 1 已实现并经对抗式审查 + 修复:`Host.identity_file`、native per-host 私钥接线、`ConnectHint`/`ProbeStatusForError`、`internal/discovery`、`inventory discover [--probe] [--json] [--import]`、`inventory test`。新增加密/密码/TUI 仍未做(Phase 2/3)。
+Phase 1 已实现并经对抗式审查 + 修复:`Host.identity_file`、native per-host 私钥接线、`ConnectHint`/`ProbeStatusForError`、`internal/discovery`、`inventory discover [--probe] [--json] [--import]`、`inventory test`。TUI 仍未做(Phase 3)。
 
 审查发现并已修:
 - **`run` 错误输出脱敏**:`run` 是 agent 面命令,其 stderr 之前会 `%v` 打印 `result.Err`(可能含 identity_file 路径、解析后的 addr),与 `hosts/Public()` 脱水边界矛盾。改为只打印**无凭据信息**的 `ConnectHint`;operator 要看原始错误用 `inventory test`。
@@ -194,6 +194,29 @@ Phase 1 已实现并经对抗式审查 + 修复:`Host.identity_file`、native pe
 - IdentityFile 的 OpenSSH token(`%h/%p/%r/%u`)不展开;ssh_config 候选靠别名探测规避,但 `has_key` 展示对多 IdentityFile 仅尽力而为。
 - known_hosts 通配条目不参与 `InKnownHosts` 匹配判定(保守地报 `no`,不会误报 `yes`)。
 - 仅有 `ssh_config_alias`(无 addr)的既有 inventory 主机不参与端点去重(无法在此廉价解析别名→addr)。
+
+Phase 2 已实现:`internal/secrets` 使用 `filippo.io/age` passphrase/scrypt 加密 `~/.agentssh/secrets.enc`,明文结构为 `{"version":1,"passwords":{...}}`,磁盘写入为 0600 + temp/rename 原子替换;`config.Paths` 增加 `SecretsFile`;native executor 增加 `NativeOptions.PasswordSource` 并把 `ssh.Password` 追加在 agent、per-host `identity_file`、默认私钥之后;`agentssh secret set|ls|rm` 与 `agentssh inventory add --password` 已接入。
+
+Phase 2 安全约束:
+- `secret ls` 文本/JSON 只输出 host 名称,不输出密码值。
+- operator 命令的 master password 来源为 `AGENTSSH_MASTER_PASSWORD` 或无回显 TTY prompt;SSH password 录入也只走无回显 TTY prompt。
+- `run` 路径只读取 `AGENTSSH_MASTER_PASSWORD`,不会 prompt;环境变量缺失、主口令错误、密文损坏或打开失败时只是不提供 password auth,继续按 key auth 尝试。
+- 密码不写入 `inventory.yaml`,不进入 audit record,也不进入 run/secret 命令输出。
+
+Phase 2 偏差/澄清:
+- §3.3 早期草案里的 `Set/Delete` 返回 `error`、`Save()` 无参数已按 Phase 2 交付要求调整为 `Set/Delete` 无返回值、`Save(master string) error`。
+- `inventory add --password` 不接受命令行明文密码;即使已有 `AGENTSSH_MASTER_PASSWORD`,SSH 登录密码本身仍必须通过无回显 TTY 录入。
+- TUI 仍未接入密码或 discovery 表单能力,按分期留到 Phase 3。
+
+Phase 2 对抗式审查修复(2026-06-18):
+- **shell-out 子进程剥离主口令**:`ExecRunner`(buffered + streaming)现在用 `scrubbedEnv()` 设置子进程环境,删除 `AGENTSSH_MASTER_PASSWORD`,避免在 `transport: ssh` 时把主口令泄漏给外部 `ssh` 及其 `ProxyCommand`/`LocalCommand`(shell 传输本就用不了加密库)。
+- **secrets 目录信任边界**:`secrets.Save` 在 temp+rename 前 `ensureSafeDir` 校验目录归属当前用户且无 group/other 写位,否则 fail-closed(目录是原子写的信任根,仅文件 0600 不够;AEAD 能拒随机篡改但挡不住回滚替换)。
+- **probe/test 使用已存密码**:`inventory discover --probe` 与 `inventory test` 现在注入 `passwordSourceForRun`(env-only master),使 password-only 主机能被正确探测/诊断/导入。
+- **`add --password` 事务化**:先预检 master+密码录入(失败则不写 inventory),再写 host,最后存密码;存密码失败回滚 inventory 条目,保持两库一致。
+
+已知限制(Phase 2):
+- **ProxyJump 跳板的密码查找**按合成的 nativeTarget.Name(原始 ProxyJump token,如 `jump@bastion:2200`)作 key;若把跳板密码存在其自然主机名/别名下则查不到(静默回落 key auth)。password-only 跳板属边缘组合,留待后续做稳定 keying;当前需把跳板密码存在与 ProxyJump token 一致的 key 下。
+- age scrypt KDF 故意慢,导致 secrets/cmd 测试较耗时(每次派生数百 ms)。
 
 ## 13. 待确认
 

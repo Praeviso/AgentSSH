@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Praeviso/AgentSSH/internal/audit"
@@ -22,9 +23,11 @@ import (
 	"github.com/Praeviso/AgentSSH/internal/inventory"
 	"github.com/Praeviso/AgentSSH/internal/output"
 	"github.com/Praeviso/AgentSSH/internal/policy"
+	"github.com/Praeviso/AgentSSH/internal/secrets"
 	"github.com/Praeviso/AgentSSH/internal/session"
 	"github.com/Praeviso/AgentSSH/internal/tui"
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 )
 
 const (
@@ -35,6 +38,8 @@ const (
 	exitSSHError     = 9
 )
 
+const envMasterPassword = "AGENTSSH_MASTER_PASSWORD"
+
 // version is overridden at build time via -ldflags "-X main.version=<tag>".
 var version = "dev"
 
@@ -44,12 +49,15 @@ var newExecutor = func(cfg *config.Config) executor.Executor {
 		options := executor.NativeOptions{}
 		if cfg != nil {
 			options.HostKeyPolicy = cfg.Inventory.HostKeyPolicy
+			options.PasswordSource = passwordSourceForRun(cfg.Paths)
 		}
 		return executor.NewNativeExecutor(options)
 	default:
 		return executor.NewSSHExecutor(nil)
 	}
 }
+
+var readSecretNoEcho = readSecretFromTTY
 
 func main() {
 	os.Exit(execute())
@@ -121,6 +129,7 @@ func newRootCommand() *cobra.Command {
 		newStatusCommand(),
 		newTUICommand(),
 		newInventoryCommand(),
+		newSecretCommand(),
 		newPolicyCommand(),
 		newAuditCommand(),
 		newSessionCommand(),
@@ -250,6 +259,7 @@ func newInventoryCommand() *cobra.Command {
 	addCmd.Flags().IntVar(&add.Port, "port", 0, "SSH port")
 	addCmd.Flags().StringVar(&add.Alias, "alias", "", "ssh_config host alias")
 	addCmd.Flags().StringVar(&add.IdentityFile, "identity-file", "", "identity file path")
+	addCmd.Flags().BoolVar(&add.Password, "password", false, "prompt for and store an encrypted SSH password")
 	addCmd.Flags().StringVar(&add.Tags, "tags", "", "comma-separated tags")
 
 	var discover inventoryDiscoverOptions
@@ -281,6 +291,47 @@ func newInventoryCommand() *cobra.Command {
 		testCmd,
 		leafNoArgs("edit", "Edit inventory.yaml.", "edit ~/.agentssh/inventory.yaml directly"),
 	)
+	return cmd
+}
+
+func newSecretCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "secret",
+		Short: "Manage encrypted SSH passwords.",
+	}
+	cmd.AddCommand(
+		&cobra.Command{
+			Use:   "set <host>",
+			Short: "Prompt for and store an encrypted SSH password.",
+			Args:  exactArgs(1),
+			RunE: func(cmd *cobra.Command, args []string) error {
+				return runSecretSet(cmd, args[0])
+			},
+		},
+		newSecretLSCommand(),
+		&cobra.Command{
+			Use:   "rm <host>",
+			Short: "Remove a stored SSH password.",
+			Args:  exactArgs(1),
+			RunE: func(cmd *cobra.Command, args []string) error {
+				return runSecretRM(cmd, args[0])
+			},
+		},
+	)
+	return cmd
+}
+
+func newSecretLSCommand() *cobra.Command {
+	var jsonOutput bool
+	cmd := &cobra.Command{
+		Use:   "ls [--json]",
+		Short: "List hosts with stored SSH passwords.",
+		Args:  noArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runSecretLS(cmd, jsonOutput)
+		},
+	}
+	cmd.Flags().BoolVar(&jsonOutput, "json", false, "emit machine-readable JSON")
 	return cmd
 }
 
@@ -503,6 +554,7 @@ type inventoryAddOptions struct {
 	Port         int
 	Alias        string
 	IdentityFile string
+	Password     bool
 	Tags         string
 }
 
@@ -542,7 +594,45 @@ func runInventoryAdd(opts inventoryAddOptions) error {
 	if !result.Submitted {
 		return nil
 	}
-	return addInventoryHost(paths, inv, result, strings.TrimSpace(opts.IdentityFile))
+	if !opts.Password {
+		return addInventoryHost(paths, inv, result, strings.TrimSpace(opts.IdentityFile))
+	}
+
+	// --password: collect and validate the credential BEFORE mutating inventory,
+	// so a failed prompt / missing-or-wrong master / corrupt store never leaves a
+	// half-added host. Then add the host and persist the secret, rolling back the
+	// inventory entry if the secret write fails, so the two stores stay consistent.
+	store, master, err := openSecretsForOperator(paths.SecretsFile)
+	if err != nil {
+		return err
+	}
+	password, err := readSecretNoEcho(fmt.Sprintf("Enter SSH password for %s: ", result.Name))
+	if err != nil {
+		return err
+	}
+	if err := addInventoryHost(paths, inv, result, strings.TrimSpace(opts.IdentityFile)); err != nil {
+		return err
+	}
+	store.Set(result.Name, password)
+	if err := store.Save(master); err != nil {
+		if rbErr := removeInventoryHostByName(paths, result.Name); rbErr != nil {
+			return fmt.Errorf("failed to store password (%v) and to roll back inventory add: %w", err, rbErr)
+		}
+		return fmt.Errorf("failed to store password; rolled back inventory add: %w", err)
+	}
+	return nil
+}
+
+func removeInventoryHostByName(paths config.Paths, name string) error {
+	inv, err := loadInventoryForWrite(paths.InventoryFile)
+	if err != nil {
+		return err
+	}
+	next, err := inventory.RemoveHost(inv, name)
+	if err != nil {
+		return err
+	}
+	return writeInventoryAtomic(paths.Home, paths.InventoryFile, next)
 }
 
 func resultFromFlags(opts hostform.Options) (hostform.Result, error) {
@@ -599,6 +689,149 @@ func addInventoryHost(paths config.Paths, inv inventory.Inventory, result hostfo
 func writeInventoryAtomic(home string, path string, inv inventory.Inventory) error {
 	_ = home
 	return inventory.Save(path, inv)
+}
+
+func runSecretSet(cmd *cobra.Command, host string) error {
+	paths, err := resolvePathsForWrite()
+	if err != nil {
+		return err
+	}
+	if err := setHostPassword(paths.SecretsFile, host); err != nil {
+		return err
+	}
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "stored password for %s\n", host)
+	return nil
+}
+
+func runSecretLS(cmd *cobra.Command, jsonOutput bool) error {
+	paths, err := resolvePathsForWrite()
+	if err != nil {
+		return err
+	}
+	store, _, err := openSecretsForOperator(paths.SecretsFile)
+	if err != nil {
+		return err
+	}
+	names := store.Names()
+	if jsonOutput {
+		return writeJSON(cmd, names)
+	}
+	out := cmd.OutOrStdout()
+	for _, name := range names {
+		_, _ = fmt.Fprintln(out, name)
+	}
+	return nil
+}
+
+func runSecretRM(cmd *cobra.Command, host string) error {
+	paths, err := resolvePathsForWrite()
+	if err != nil {
+		return err
+	}
+	store, master, err := openSecretsForOperator(paths.SecretsFile)
+	if err != nil {
+		return err
+	}
+	store.Delete(host)
+	if err := store.Save(master); err != nil {
+		return err
+	}
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "removed password for %s\n", host)
+	return nil
+}
+
+func setHostPassword(path string, host string) error {
+	store, master, err := openSecretsForOperator(path)
+	if err != nil {
+		return err
+	}
+	password, err := readSecretNoEcho(fmt.Sprintf("Enter SSH password for %s: ", host))
+	if err != nil {
+		return err
+	}
+	store.Set(host, password)
+	return store.Save(master)
+}
+
+func openSecretsForOperator(path string) (*secrets.Store, string, error) {
+	master, err := resolveOperatorMaster()
+	if err != nil {
+		return nil, "", err
+	}
+	store, err := secrets.Open(path, master)
+	if errors.Is(err, secrets.ErrWrongMaster) {
+		return nil, "", newUsageError("cannot open secrets: wrong master password or corrupt secrets file")
+	}
+	if err != nil {
+		return nil, "", err
+	}
+	return store, master, nil
+}
+
+func resolvePathsForWrite() (config.Paths, error) {
+	home, err := config.ResolveHome()
+	if err != nil {
+		return config.Paths{}, err
+	}
+	return config.NewPaths(home), nil
+}
+
+func resolveOperatorMaster() (string, error) {
+	if master := os.Getenv(envMasterPassword); master != "" {
+		return master, nil
+	}
+	if !term.IsTerminal(int(os.Stdin.Fd())) {
+		return "", newUsageError("%s is required in non-interactive mode", envMasterPassword)
+	}
+	master, err := readSecretNoEcho("Enter AgentSSH master password: ")
+	if err != nil {
+		return "", err
+	}
+	if master == "" {
+		return "", newUsageError("%s is required or enter a master password from an interactive TTY", envMasterPassword)
+	}
+	return master, nil
+}
+
+func resolveAgentMaster() (string, bool) {
+	master := os.Getenv(envMasterPassword)
+	return master, master != ""
+}
+
+func passwordSourceForRun(paths config.Paths) func(string) (string, bool) {
+	var once sync.Once
+	var store *secrets.Store
+	return func(host string) (string, bool) {
+		once.Do(func() {
+			master, ok := resolveAgentMaster()
+			if !ok {
+				return
+			}
+			opened, err := secrets.Open(paths.SecretsFile, master)
+			if err != nil {
+				return
+			}
+			store = opened
+		})
+		if store == nil {
+			return "", false
+		}
+		return store.Password(host)
+	}
+}
+
+func readSecretFromTTY(prompt string) (string, error) {
+	fd := int(os.Stdin.Fd())
+	if !term.IsTerminal(fd) {
+		return "", newUsageError("interactive TTY is required to read secrets without echo")
+	}
+	_, _ = fmt.Fprint(os.Stderr, prompt)
+	value, err := term.ReadPassword(fd)
+	_, _ = fmt.Fprintln(os.Stderr)
+	if err != nil {
+		return "", fmt.Errorf("read secret: %w", err)
+	}
+	return string(value), nil
 }
 
 func existingHostNames(inv inventory.Inventory) map[string]struct{} {
@@ -702,6 +935,9 @@ func runInventoryDiscover(cmd *cobra.Command, opts inventoryDiscoverOptions) err
 			KnownHostsPath: filepath.Join(os.Getenv("HOME"), ".ssh", "known_hosts"),
 			ConnectTimeout: 5 * time.Second,
 			HostKeyPolicy:  cfg.Inventory.HostKeyPolicy,
+			// Use stored passwords so a password-only host probes the same way it
+			// will run (env-only master; no prompting across many candidates).
+			PasswordSource: passwordSourceForRun(cfg.Paths),
 		})
 		result.Candidates = discovery.Probe(context.Background(), result.Candidates, discovery.ProbeOptions{
 			Executor:    exec,
@@ -852,6 +1088,9 @@ func runInventoryTest(cmd *cobra.Command, name string) error {
 	exec := executor.NewNativeExecutor(executor.NativeOptions{
 		ConnectTimeout: 5 * time.Second,
 		HostKeyPolicy:  cfg.Inventory.HostKeyPolicy,
+		// Test the same credentials `run` will use, including a stored password
+		// (env-only master).
+		PasswordSource: passwordSourceForRun(cfg.Paths),
 	})
 	result := exec.Probe(context.Background(), resolved.Targets[0])
 	if result.Err == nil && result.ExitCode == 0 {

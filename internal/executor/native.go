@@ -35,6 +35,7 @@ type NativeOptions struct {
 	KnownHostsPath string
 	ConnectTimeout time.Duration
 	HostKeyPolicy  string // strict | accept-new
+	PasswordSource func(host string) (string, bool)
 }
 
 // NativeExecutor executes commands using golang.org/x/crypto/ssh.
@@ -213,7 +214,7 @@ func (e NativeExecutor) userSettings() (*sshconfig.UserSettings, error) {
 }
 
 func (e NativeExecutor) dial(ctx context.Context, target nativeTarget) (*nativeClient, error) {
-	cfg, agentCloser, err := e.clientConfig(target.User, target.IdentityFiles)
+	cfg, agentCloser, err := e.clientConfig(target)
 	if err != nil {
 		return nil, err
 	}
@@ -249,7 +250,7 @@ func (e NativeExecutor) dialWithConfig(ctx context.Context, target nativeTarget,
 	if len(jumps) > 1 {
 		firstJump.ProxyJump = strings.Join(jumps[1:], ",")
 	}
-	jumpCfg, jumpCloser, err := e.clientConfig(firstJump.User, firstJump.IdentityFiles)
+	jumpCfg, jumpCloser, err := e.clientConfig(firstJump)
 	if err != nil {
 		return nil, err
 	}
@@ -340,19 +341,19 @@ func (e NativeExecutor) parseJump(value string) (nativeTarget, error) {
 	return nativeTarget{Name: value, HostName: hostName, Port: port, User: userName}, nil
 }
 
-func (e NativeExecutor) clientConfig(userName string, identityFiles []string) (*ssh.ClientConfig, io.Closer, error) {
-	authMethods, closer, err := e.authMethods(identityFiles)
+func (e NativeExecutor) clientConfig(target nativeTarget) (*ssh.ClientConfig, io.Closer, error) {
+	authMethods, closer, err := e.authMethods(target)
 	if err != nil {
 		return nil, nil, err
 	}
 	if len(authMethods) == 0 {
-		return nil, closer, errors.New("no SSH auth methods available (set identity_file, start ssh-agent, or load a key with ssh-add)")
+		return nil, closer, errors.New("no SSH auth methods available (set identity_file, start ssh-agent, load a key with ssh-add, or register a password with agentssh secret set)")
 	}
 	timeout := e.Options.ConnectTimeout
 	if timeout == 0 {
 		timeout = 10 * time.Second
 	}
-	return &ssh.ClientConfig{User: userName, Auth: authMethods, Timeout: timeout}, closer, nil
+	return &ssh.ClientConfig{User: target.User, Auth: authMethods, Timeout: timeout}, closer, nil
 }
 
 // Probe opens a native SSH session and runs a no-op command. It is intended for
@@ -394,10 +395,10 @@ func ConnectHint(err error) string {
 	}
 	message := strings.ToLower(err.Error())
 	if strings.Contains(message, "no ssh auth methods available") || strings.Contains(message, "no auth methods available") {
-		return "hint: no SSH credentials available; set identity_file for this host, load a key with ssh-add, or register a password in a future AgentSSH secrets phase."
+		return "hint: no SSH credentials available; set identity_file for this host, load a key with ssh-add, or register a password with agentssh secret set <host>."
 	}
 	if strings.Contains(message, "unable to authenticate") || strings.Contains(message, "attempted methods") || strings.Contains(message, "authenticate") {
-		return "hint: SSH authentication failed; set identity_file, load a key with ssh-add, or register a password in a future AgentSSH secrets phase. Ensure the remote account and authorized_keys are already configured; AgentSSH never changes the remote host."
+		return "hint: SSH authentication failed; set identity_file, load a key with ssh-add, or register a password with agentssh secret set <host>. Ensure the remote account and authorized_keys are already configured; AgentSSH never changes the remote host."
 	}
 	return "hint: SSH connection failed; check addr, port, network, host key trust, and available SSH keys."
 }
@@ -418,7 +419,7 @@ func isConnectionRefused(err error) bool {
 	return errors.Is(err, syscall.ECONNREFUSED) || strings.Contains(strings.ToLower(err.Error()), "connection refused")
 }
 
-func (e NativeExecutor) authMethods(identityFiles []string) ([]ssh.AuthMethod, io.Closer, error) {
+func (e NativeExecutor) authMethods(target nativeTarget) ([]ssh.AuthMethod, io.Closer, error) {
 	var methods []ssh.AuthMethod
 	var agentConn io.Closer
 	if sock := os.Getenv("SSH_AUTH_SOCK"); sock != "" {
@@ -430,7 +431,7 @@ func (e NativeExecutor) authMethods(identityFiles []string) ([]ssh.AuthMethod, i
 		}
 	}
 
-	files := append([]string{}, identityFiles...)
+	files := append([]string{}, target.IdentityFiles...)
 	files = append(files, defaultIdentityFiles()...)
 	signers, err := signersFromFiles(files)
 	if err != nil {
@@ -438,6 +439,11 @@ func (e NativeExecutor) authMethods(identityFiles []string) ([]ssh.AuthMethod, i
 	}
 	if len(signers) > 0 {
 		methods = append(methods, ssh.PublicKeys(signers...))
+	}
+	if e.Options.PasswordSource != nil {
+		if password, ok := e.Options.PasswordSource(target.Name); ok {
+			methods = append(methods, ssh.Password(password))
+		}
 	}
 	return methods, agentConn, nil
 }
