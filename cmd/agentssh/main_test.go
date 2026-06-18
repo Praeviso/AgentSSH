@@ -102,21 +102,21 @@ func TestStatusForResultSSHExit255(t *testing.T) {
 func TestTransportSelection(t *testing.T) {
 	cfg := &config.Config{}
 	defaultExec := newExecutor(cfg)
-	if _, ok := defaultExec.(executor.SSHExecutor); !ok {
-		t.Fatalf("default transport = %T, want shell-out SSHExecutor", defaultExec)
+	if _, ok := defaultExec.(executor.NativeExecutor); !ok {
+		t.Fatalf("default transport = %T, want built-in NativeExecutor", defaultExec)
 	}
-	cfg.Inventory.Transport = executor.TransportNative
-	inventoryExec := newExecutor(cfg)
-	if _, ok := inventoryExec.(executor.NativeExecutor); !ok {
-		t.Fatalf("inventory native transport = %T, want NativeExecutor", inventoryExec)
-	}
-	t.Setenv("AGENTSSH_TRANSPORT", executor.TransportNative)
 	cfg.Inventory.Transport = executor.TransportShell
-	envExec := newExecutor(cfg)
-	if _, ok := envExec.(executor.NativeExecutor); !ok {
-		t.Fatalf("env native transport = %T, want NativeExecutor", envExec)
+	shellExec := newExecutor(cfg)
+	if _, ok := shellExec.(executor.SSHExecutor); !ok {
+		t.Fatalf("inventory shell transport = %T, want shell-out SSHExecutor", shellExec)
 	}
-	t.Logf("transport default=%T inventory_native=%T env_native_overrides=%T", defaultExec, inventoryExec, envExec)
+	t.Setenv("AGENTSSH_TRANSPORT", executor.TransportShell)
+	cfg.Inventory.Transport = executor.TransportNative
+	envExec := newExecutor(cfg)
+	if _, ok := envExec.(executor.SSHExecutor); !ok {
+		t.Fatalf("env shell transport = %T, want SSHExecutor override", envExec)
+	}
+	t.Logf("transport default=%T inventory_shell=%T env_shell_overrides=%T", defaultExec, shellExec, envExec)
 }
 
 func TestPrintSSHExit255MappingDemo(t *testing.T) {

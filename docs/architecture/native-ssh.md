@@ -2,7 +2,7 @@
 
 > 状态:**Phase 1 已实现并提交 main**(10a8b94)· 2026-06-17 · 关联:PRD §11(未来增强 #5)、架构 §7/§9(凭据/执行器)、`internal/executor/native.go`
 >
-> 落地:opt-in(`AGENTSSH_TRANSPORT`/inventory `transport:`,默认仍 shell-out);strict known_hosts、ssh-agent/密钥认证、ProxyJump、ssh_config 别名解析;退出码/错误契约(§6)按表实现并经进程内 SSH server 测试验证;无 InsecureIgnoreHostKey;`go test -race` 全绿。Phase 2(流式 + 连接池)仍未做。
+> 落地:可切换传输(`AGENTSSH_TRANSPORT`/inventory `transport:`;**默认 native** — 2026-06-18 post-v0.1.0 翻默认,`transport: ssh` 切回 shell-out);strict known_hosts、ssh-agent/密钥认证、ProxyJump、ssh_config 别名解析;退出码/错误契约(§6)按表实现并经进程内 SSH server 测试验证;无 InsecureIgnoreHostKey;`go test -race` 全绿。Phase 2(流式 + 连接池)仍未做。
 >
 > 目标:给 executor 增加一个**原生 Go SSH 后端**(`golang.org/x/crypto/ssh`),作为系统 `ssh` shell-out 的**可选替代**,去掉对外部 `ssh` 二进制的依赖,并为后续的流式输出 / 连接复用打基础。**严格保持现有安全语义**(host key 校验、输出脱敏、hash 链审计、退出码契约)。
 
@@ -10,7 +10,7 @@
 
 **Phase 1(本次实现)**:
 - 原生 SSH 后端:拨号 + ssh-agent/密钥认证 + **known_hosts 主机密钥校验** + 单命令缓冲执行 + ProxyJump。
-- **可选传输切换**(默认仍走 shell-out `ssh`,native 显式开启)。
+- **可选传输切换**(Phase 1 落地时默认 shell-out + native opt-in;**2026-06-18 已翻默认为 native**,`transport: ssh` 切回)。
 - `ssh_config` 别名解析(`ssh_config_alias` 设置时)。
 - **drop-in**:实现 `executor.Executor`,返回相同的 `executor.Result`,使 policy/audit/output/tui/退出码**全部不变**。
 - 进程内 SSH 测试服务器做真实 E2E 测试。
@@ -21,8 +21,8 @@
 
 ## 2. 传输选择
 
-- 选择来源(优先级):环境变量 `AGENTSSH_TRANSPORT`(`ssh` | `native`)> inventory.yaml 顶层 `transport:` 字段 > 默认 `ssh`。
-- **默认 `ssh`(shell-out)不变**,native 为显式 opt-in;待成熟后未来版本再考虑翻默认。
+- 选择来源(优先级):环境变量 `AGENTSSH_TRANSPORT`(`ssh` | `native`)> inventory.yaml 顶层 `transport:` 字段 > 默认 `native`。
+- **默认已翻为 `native`(2026-06-18,post-v0.1.0)**:内置 Go SSH 后端,无需系统 `ssh` 二进制。`transport: ssh`(或 `AGENTSSH_TRANSPORT=ssh`)显式切回 shell-out。Phase 1 设计时默认为 shell-out opt-in,经测试稳定后翻默认。
 - 落点(见 seam):把 `cmd/agentssh/main.go` 的 `newExecutor` 改为接收 `*config.Config` 并据 transport 返回 `executor.NewSSHExecutor(nil)` 或 `executor.NewNativeExecutor(...)`。`runDirect` 的单一调用点(`ssh := newExecutor(cfg)`)不变;测试仍可整体替换 `newExecutor` 注入 fake(需同步更新 `main_test.go`/`m5_test.go` 的签名)。
 
 ## 3. 包结构

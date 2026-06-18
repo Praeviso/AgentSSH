@@ -460,12 +460,12 @@ func selectedTransport(cfg *config.Config) string {
 		transport = cfg.Inventory.Transport
 	}
 	switch transport {
-	case "", executor.TransportShell:
-		return executor.TransportShell
-	case executor.TransportNative:
+	case "", executor.TransportNative:
 		return executor.TransportNative
-	default:
+	case executor.TransportShell:
 		return executor.TransportShell
+	default:
+		return executor.TransportNative
 	}
 }
 
