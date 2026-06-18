@@ -1343,13 +1343,13 @@ func writeKnownHostsLine(t *testing.T, home string, addr string, key ssh.PublicK
 }
 
 func TestEndpointKeyNormalization(t *testing.T) {
-	if got := endpointKey("  10.0.0.11 ", 0); got != "10.0.0.11:22" {
+	if got := discovery.EndpointKey("  10.0.0.11 ", 0); got != "10.0.0.11:22" {
 		t.Fatalf("default port = %q", got)
 	}
-	if got := endpointKey("HOST.Example", 2222); got != "host.example:2222" {
+	if got := discovery.EndpointKey("HOST.Example", 2222); got != "host.example:2222" {
 		t.Fatalf("normalize = %q", got)
 	}
-	if got := endpointKey("", 22); got != "" {
+	if got := discovery.EndpointKey("", 22); got != "" {
 		t.Fatalf("empty addr should yield empty key, got %q", got)
 	}
 }
@@ -1359,7 +1359,7 @@ func TestEndpointKeysSkipsAliasOnlyHosts(t *testing.T) {
 		"web-1":      {Addr: "10.0.0.11"},
 		"alias-only": {SSHConfigAlias: "gw"},
 	}}
-	keys := endpointKeys(inv)
+	keys := discovery.EndpointKeys(inv)
 	if !keys["10.0.0.11:22"] {
 		t.Fatalf("missing concrete endpoint: %#v", keys)
 	}
@@ -1369,11 +1369,11 @@ func TestEndpointKeysSkipsAliasOnlyHosts(t *testing.T) {
 }
 
 func TestImportHostUsesAliasForSSHConfig(t *testing.T) {
-	h := importHost(discovery.Candidate{Source: discovery.SourceSSHConfig, Name: "prod-web", Addr: "10.0.0.11", Port: 22})
+	h := discovery.ImportHost(discovery.Candidate{Source: discovery.SourceSSHConfig, Name: "prod-web", Addr: "10.0.0.11", Port: 22})
 	if h.SSHConfigAlias != "prod-web" || h.Addr != "" {
 		t.Fatalf("ssh_config import should reference the alias: %#v", h)
 	}
-	h2 := importHost(discovery.Candidate{Source: discovery.SourceKnownHosts, Addr: "10.0.0.20", Port: 2222, IdentityFile: "~/.ssh/db"})
+	h2 := discovery.ImportHost(discovery.Candidate{Source: discovery.SourceKnownHosts, Addr: "10.0.0.20", Port: 2222, IdentityFile: "~/.ssh/db"})
 	if h2.Addr != "10.0.0.20" || h2.Port != 2222 || h2.IdentityFile != "~/.ssh/db" || h2.SSHConfigAlias != "" {
 		t.Fatalf("known_hosts import should be a concrete host: %#v", h2)
 	}

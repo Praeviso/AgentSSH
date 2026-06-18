@@ -40,6 +40,42 @@ type Candidate struct {
 	Hint         string               `json:"hint,omitempty"`
 }
 
+// ImportHost builds the inventory entry to persist for a discovered candidate.
+// ssh_config-sourced hosts are stored by alias so the operator's real route
+// (ProxyJump, multiple/tokenized IdentityFile) is preserved instead of a
+// flattened addr/user/port that would drop those directives.
+func ImportHost(c Candidate) inventory.Host {
+	if c.Source == SourceSSHConfig {
+		return inventory.Host{SSHConfigAlias: c.Name}
+	}
+	return inventory.Host{Addr: c.Addr, User: c.User, Port: c.Port, IdentityFile: c.IdentityFile}
+}
+
+// EndpointKey normalizes addr+port into a comparison key. It returns "" for
+// hosts without a concrete addr (e.g. alias-only), which therefore cannot be
+// endpoint-deduped cheaply.
+func EndpointKey(addr string, port int) string {
+	addr = strings.ToLower(strings.TrimSpace(addr))
+	if addr == "" {
+		return ""
+	}
+	if port == 0 {
+		port = 22
+	}
+	return addr + ":" + strconv.Itoa(port)
+}
+
+// EndpointKeys returns normalized endpoint keys already present in inventory.
+func EndpointKeys(inv inventory.Inventory) map[string]bool {
+	keys := map[string]bool{}
+	for _, h := range inv.Hosts {
+		if k := EndpointKey(h.Addr, h.Port); k != "" {
+			keys[k] = true
+		}
+	}
+	return keys
+}
+
 // Result is the full static/probe discovery report.
 type Result struct {
 	Candidates []Candidate `json:"candidates"`
@@ -399,6 +435,14 @@ func splitKnownHost(value string) (name string, addr string, port int) {
 
 func isConcreteHostPattern(pattern string) bool {
 	return pattern != "" && !strings.ContainsAny(pattern, "*?!")
+}
+
+// InInventory reports whether name already exists as an inventory host or as the
+// ssh_config alias of some host. Callers re-checking import eligibility against a
+// freshly reloaded inventory should use this (endpoint keys can't see alias-only
+// hosts, and AddHost only rejects an exact name collision).
+func InInventory(inv inventory.Inventory, name string) bool {
+	return inInventory(inv, name)
 }
 
 func inInventory(inv inventory.Inventory, name string) bool {

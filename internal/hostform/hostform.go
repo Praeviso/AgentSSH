@@ -32,6 +32,7 @@ type Options struct {
 	Port          int
 	Tags          []string
 	Alias         string
+	IdentityFile  string
 	ExistingNames map[string]struct{}
 }
 
@@ -43,18 +44,21 @@ type Result struct {
 	Port      int
 	Tags      []string
 	Alias     string
+	Identity  string
+	Password  string
 	Submitted bool
 }
 
 // Validate normalizes and validates host fields.
 func Validate(opts Options) (Result, map[string]string) {
 	values := formValues{
-		name:  strings.TrimSpace(opts.Name),
-		addr:  strings.TrimSpace(opts.Addr),
-		user:  strings.TrimSpace(opts.User),
-		port:  portString(opts.Port),
-		tags:  strings.Join(opts.Tags, ","),
-		alias: strings.TrimSpace(opts.Alias),
+		name:     strings.TrimSpace(opts.Name),
+		addr:     strings.TrimSpace(opts.Addr),
+		user:     strings.TrimSpace(opts.User),
+		port:     portString(opts.Port),
+		tags:     strings.Join(opts.Tags, ","),
+		alias:    strings.TrimSpace(opts.Alias),
+		identity: strings.TrimSpace(opts.IdentityFile),
 	}
 	return validateValues(values, opts.ExistingNames)
 }
@@ -113,12 +117,14 @@ func (m runModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m runModel) View() string { return m.model.View() }
 
 type formValues struct {
-	name  string
-	addr  string
-	user  string
-	port  string
-	tags  string
-	alias string
+	name     string
+	addr     string
+	user     string
+	port     string
+	tags     string
+	alias    string
+	identity string
+	password string
 }
 
 func validateValues(values formValues, existing map[string]struct{}) (Result, map[string]string) {
@@ -165,6 +171,8 @@ func validateValues(values formValues, existing map[string]struct{}) (Result, ma
 		Port:      port,
 		Tags:      SplitTags(values.tags),
 		Alias:     alias,
+		Identity:  strings.TrimSpace(values.identity),
+		Password:  values.password,
 		Submitted: len(errs) == 0,
 	}
 	if len(errs) > 0 {
@@ -193,10 +201,12 @@ const (
 	fieldPort
 	fieldTags
 	fieldAlias
+	fieldIdentity
+	fieldPassword
 	fieldCount
 )
 
-var fieldKeys = []string{"name", "addr", "user", "port", "tags", "alias"}
+var fieldKeys = []string{"name", "addr", "user", "port", "tags", "alias", "identity", "password"}
 
 type keyMap struct {
 	Next      key.Binding
@@ -254,12 +264,15 @@ func New(opts Options, r *lipgloss.Renderer) Model {
 
 func newModel(opts Options, st styles) Model {
 	inputs := make([]textinput.Model, fieldCount)
-	placeholders := []string{"web-1", "10.0.0.11", "$USER", "22", "web,prod", "ssh-config-host"}
-	values := []string{opts.Name, opts.Addr, opts.User, portString(opts.Port), strings.Join(opts.Tags, ","), opts.Alias}
+	placeholders := []string{"web-1", "10.0.0.11", "$USER", "22", "web,prod", "ssh-config-host", "~/.ssh/web-1", "optional"}
+	values := []string{opts.Name, opts.Addr, opts.User, portString(opts.Port), strings.Join(opts.Tags, ","), opts.Alias, opts.IdentityFile, ""}
 	for i := range inputs {
 		ti := textinput.New()
 		ti.Placeholder = placeholders[i]
 		ti.SetValue(values[i])
+		if field(i) == fieldPassword {
+			ti.EchoMode = textinput.EchoPassword
+		}
 		inputs[i] = ti
 	}
 	_ = inputs[fieldName].Focus()
@@ -308,7 +321,7 @@ func (m Model) View() string {
 	var b strings.Builder
 	b.WriteString(m.styles.title.Render("Add inventory host"))
 	b.WriteString("\n\n")
-	labels := []string{"name", "addr", "user", "port", "tags", "ssh_config_alias"}
+	labels := []string{"name", "addr", "user", "port", "tags", "ssh_config_alias", "identity_file", "password (optional)"}
 	for i := range m.inputs {
 		b.WriteString(m.styles.label.Render(labels[i]))
 		b.WriteString("\n")
@@ -361,12 +374,14 @@ func (m *Model) validateField(f field) {
 
 func (m Model) values() formValues {
 	return formValues{
-		name:  m.inputs[fieldName].Value(),
-		addr:  m.inputs[fieldAddr].Value(),
-		user:  m.inputs[fieldUser].Value(),
-		port:  m.inputs[fieldPort].Value(),
-		tags:  m.inputs[fieldTags].Value(),
-		alias: m.inputs[fieldAlias].Value(),
+		name:     m.inputs[fieldName].Value(),
+		addr:     m.inputs[fieldAddr].Value(),
+		user:     m.inputs[fieldUser].Value(),
+		port:     m.inputs[fieldPort].Value(),
+		tags:     m.inputs[fieldTags].Value(),
+		alias:    m.inputs[fieldAlias].Value(),
+		identity: m.inputs[fieldIdentity].Value(),
+		password: m.inputs[fieldPassword].Value(),
 	}
 }
 

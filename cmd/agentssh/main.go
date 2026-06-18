@@ -12,7 +12,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/Praeviso/AgentSSH/internal/audit"
@@ -582,6 +581,7 @@ func runInventoryAdd(opts inventoryAddOptions) error {
 		Port:          opts.Port,
 		Tags:          hostform.SplitTags(opts.Tags),
 		Alias:         opts.Alias,
+		IdentityFile:  strings.TrimSpace(opts.IdentityFile),
 		ExistingNames: existingHostNames(inv),
 	}
 	result, err := hostform.Run(formOptions)
@@ -595,7 +595,7 @@ func runInventoryAdd(opts inventoryAddOptions) error {
 		return nil
 	}
 	if !opts.Password {
-		return addInventoryHost(paths, inv, result, strings.TrimSpace(opts.IdentityFile))
+		return addInventoryHost(paths, inv, result)
 	}
 
 	// --password: collect and validate the credential BEFORE mutating inventory,
@@ -610,7 +610,7 @@ func runInventoryAdd(opts inventoryAddOptions) error {
 	if err != nil {
 		return err
 	}
-	if err := addInventoryHost(paths, inv, result, strings.TrimSpace(opts.IdentityFile)); err != nil {
+	if err := addInventoryHost(paths, inv, result); err != nil {
 		return err
 	}
 	store.Set(result.Name, password)
@@ -668,13 +668,13 @@ func loadInventoryForWrite(path string) (inventory.Inventory, error) {
 	return inv, nil
 }
 
-func addInventoryHost(paths config.Paths, inv inventory.Inventory, result hostform.Result, identityFile string) error {
+func addInventoryHost(paths config.Paths, inv inventory.Inventory, result hostform.Result) error {
 	next, err := inventory.AddHost(inv, result.Name, inventory.Host{
 		Addr:           result.Addr,
 		User:           result.User,
 		Port:           result.Port,
 		SSHConfigAlias: result.Alias,
-		IdentityFile:   identityFile,
+		IdentityFile:   result.Identity,
 		Tags:           result.Tags,
 	})
 	if errors.Is(err, inventory.ErrHostExists) {
@@ -793,31 +793,8 @@ func resolveOperatorMaster() (string, error) {
 	return master, nil
 }
 
-func resolveAgentMaster() (string, bool) {
-	master := os.Getenv(envMasterPassword)
-	return master, master != ""
-}
-
 func passwordSourceForRun(paths config.Paths) func(string) (string, bool) {
-	var once sync.Once
-	var store *secrets.Store
-	return func(host string) (string, bool) {
-		once.Do(func() {
-			master, ok := resolveAgentMaster()
-			if !ok {
-				return
-			}
-			opened, err := secrets.Open(paths.SecretsFile, master)
-			if err != nil {
-				return
-			}
-			store = opened
-		})
-		if store == nil {
-			return "", false
-		}
-		return store.Password(host)
-	}
+	return secrets.EnvPasswordSource(paths.SecretsFile)
 }
 
 func readSecretFromTTY(prompt string) (string, error) {
@@ -948,7 +925,7 @@ func runInventoryDiscover(cmd *cobra.Command, opts inventoryDiscoverOptions) err
 	imported := 0
 	if opts.Import {
 		next := cfg.Inventory
-		seen := endpointKeys(cfg.Inventory)
+		seen := discovery.EndpointKeys(cfg.Inventory)
 		for _, candidate := range result.Candidates {
 			if candidate.InInventory || candidate.ProbeStatus != executor.ProbeConnectable {
 				continue
@@ -956,12 +933,12 @@ func runInventoryDiscover(cmd *cobra.Command, opts inventoryDiscoverOptions) err
 			// Endpoint (not just name) de-dup: a discovered alias that resolves to
 			// a machine already in inventory must not be added again, or group/tag
 			// runs would execute the same host twice.
-			key := endpointKey(candidate.Addr, candidate.Port)
+			key := discovery.EndpointKey(candidate.Addr, candidate.Port)
 			if key != "" && seen[key] {
 				continue
 			}
 			var addErr error
-			next, addErr = inventory.AddHost(next, candidate.Name, importHost(candidate))
+			next, addErr = inventory.AddHost(next, candidate.Name, discovery.ImportHost(candidate))
 			if errors.Is(addErr, inventory.ErrHostExists) {
 				continue
 			}
@@ -984,41 +961,6 @@ func runInventoryDiscover(cmd *cobra.Command, opts inventoryDiscoverOptions) err
 	}
 	printDiscovery(cmd, result, imported)
 	return nil
-}
-
-// importHost builds the inventory entry to persist for a discovered candidate.
-// ssh_config-sourced hosts are stored by alias so the operator's real route
-// (ProxyJump, multiple/tokenized IdentityFile) is preserved instead of a
-// flattened addr/user/port that would drop those directives.
-func importHost(c discovery.Candidate) inventory.Host {
-	if c.Source == discovery.SourceSSHConfig {
-		return inventory.Host{SSHConfigAlias: c.Name}
-	}
-	return inventory.Host{Addr: c.Addr, User: c.User, Port: c.Port, IdentityFile: c.IdentityFile}
-}
-
-// endpointKey normalizes addr+port into a comparison key for de-dup. Returns ""
-// for hosts without a concrete addr (e.g. alias-only), which therefore cannot be
-// endpoint-deduped here.
-func endpointKey(addr string, port int) string {
-	addr = strings.ToLower(strings.TrimSpace(addr))
-	if addr == "" {
-		return ""
-	}
-	if port == 0 {
-		port = 22
-	}
-	return addr + ":" + strconv.Itoa(port)
-}
-
-func endpointKeys(inv inventory.Inventory) map[string]bool {
-	keys := map[string]bool{}
-	for _, h := range inv.Hosts {
-		if k := endpointKey(h.Addr, h.Port); k != "" {
-			keys[k] = true
-		}
-	}
-	return keys
 }
 
 func printDiscovery(cmd *cobra.Command, result discovery.Result, imported int) {

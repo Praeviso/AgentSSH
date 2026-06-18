@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 	"syscall"
 
 	"filippo.io/age"
@@ -19,6 +20,8 @@ import (
 var ErrWrongMaster = errors.New("wrong master password or corrupt secrets file")
 
 const storeVersion = 1
+
+const envMasterPassword = "AGENTSSH_MASTER_PASSWORD"
 
 type filePayload struct {
 	Version   int               `json:"version"`
@@ -67,6 +70,32 @@ func Open(path, master string) (*Store, error) {
 		payload.Passwords = map[string]string{}
 	}
 	return &Store{path: path, passwords: payload.Passwords}, nil
+}
+
+// EnvPasswordSource returns a password source suitable for non-interactive agent
+// paths. It reads AGENTSSH_MASTER_PASSWORD only, opens the encrypted store at
+// most once, and silently disables password auth on any failure. It never
+// prompts because TUI/agent callers own or lack the TTY.
+func EnvPasswordSource(path string) func(string) (string, bool) {
+	var once sync.Once
+	var store *Store
+	return func(host string) (string, bool) {
+		once.Do(func() {
+			master := os.Getenv(envMasterPassword)
+			if master == "" {
+				return
+			}
+			opened, err := Open(path, master)
+			if err != nil {
+				return
+			}
+			store = opened
+		})
+		if store == nil {
+			return "", false
+		}
+		return store.Password(host)
+	}
 }
 
 // ensureSafeDir refuses to write the secrets store into a directory that another

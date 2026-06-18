@@ -180,9 +180,9 @@ agentssh secret rm <host>
 - **hints**:错误→提示映射表。
 - **回归**:既有传输选择/退出码契约/输出脱敏/审计 hash 链全不破;`go test -race` 全绿;gofmt/vet/golangci-lint v2 干净。
 
-## 12. 实现说明(Phase 1-2,2026-06-18)
+## 12. 实现说明(Phase 1-3,2026-06-18)
 
-Phase 1 已实现并经对抗式审查 + 修复:`Host.identity_file`、native per-host 私钥接线、`ConnectHint`/`ProbeStatusForError`、`internal/discovery`、`inventory discover [--probe] [--json] [--import]`、`inventory test`。TUI 仍未做(Phase 3)。
+Phase 1 已实现并经对抗式审查 + 修复:`Host.identity_file`、native per-host 私钥接线、`ConnectHint`/`ProbeStatusForError`、`internal/discovery`、`inventory discover [--probe] [--json] [--import]`、`inventory test`。
 
 审查发现并已修:
 - **`run` 错误输出脱敏**:`run` 是 agent 面命令,其 stderr 之前会 `%v` 打印 `result.Err`(可能含 identity_file 路径、解析后的 addr),与 `hosts/Public()` 脱水边界矛盾。改为只打印**无凭据信息**的 `ConnectHint`;operator 要看原始错误用 `inventory test`。
@@ -206,7 +206,7 @@ Phase 2 安全约束:
 Phase 2 偏差/澄清:
 - §3.3 早期草案里的 `Set/Delete` 返回 `error`、`Save()` 无参数已按 Phase 2 交付要求调整为 `Set/Delete` 无返回值、`Save(master string) error`。
 - `inventory add --password` 不接受命令行明文密码;即使已有 `AGENTSSH_MASTER_PASSWORD`,SSH 登录密码本身仍必须通过无回显 TTY 录入。
-- TUI 仍未接入密码或 discovery 表单能力,按分期留到 Phase 3。
+- TUI 密码主口令只读 `AGENTSSH_MASTER_PASSWORD`,不会在 Bubble Tea 内 prompt(避免抢占 TTY);未设置时,带密码的 add 表单提交会拒绝并提示改用环境变量或 `agentssh secret set <host>`。
 
 Phase 2 对抗式审查修复(2026-06-18):
 - **shell-out 子进程剥离主口令**:`ExecRunner`(buffered + streaming)现在用 `scrubbedEnv()` 设置子进程环境,删除 `AGENTSSH_MASTER_PASSWORD`,避免在 `transport: ssh` 时把主口令泄漏给外部 `ssh` 及其 `ProxyCommand`/`LocalCommand`(shell 传输本就用不了加密库)。
@@ -217,6 +217,13 @@ Phase 2 对抗式审查修复(2026-06-18):
 已知限制(Phase 2):
 - **ProxyJump 跳板的密码查找**按合成的 nativeTarget.Name(原始 ProxyJump token,如 `jump@bastion:2200`)作 key;若把跳板密码存在其自然主机名/别名下则查不到(静默回落 key auth)。password-only 跳板属边缘组合,留待后续做稳定 keying;当前需把跳板密码存在与 ProxyJump token 一致的 key 下。
 - age scrypt KDF 故意慢,导致 secrets/cmd 测试较耗时(每次派生数百 ms)。
+
+Phase 3 已实现:统一 TUI Hosts 区接入 `d` Discover overlay、候选多选/`p` async probe、`enter`/`i` 导入 connectable 且未入库的候选,导入复用 Phase 1 的 endpoint 去重与 ssh_config alias 规则;`t` 对当前 host async test 并显示 OK 或 `executor.ConnectHint`;add 表单新增 `identity_file` 与 masked password 字段。TUI probe/test 使用 `internal/secrets.EnvPasswordSource` 读取 env-only master,不阻塞 Update loop,不改变 secrets crypto、auth chain、exit code 或输出/audit 合约。
+
+Phase 3 对抗式审查修复(2026-06-18):
+- **async 结果按身份归并**:`mergeProbedCandidates` 改为按候选身份(source+name)归并 probe 结果,不再依赖可变的 selection 索引,避免探测进行中改选导致结果落到错误行。
+- **stale overlay 防护**:`discoveryOverlay` 加单调 `runID`,`loadDiscoveryCmd`/`probeDiscoveryCmd` 携带该 ID;`discoveryLoadedMsg`/`discoveryProbedMsg` 处理时校验 `active && runID 匹配`,丢弃已关闭/被取代的 overlay 的迟到结果。
+- **导入按重载库复检成员**:`importDiscoverySelected` 用 `discovery.InInventory(reloaded, name)` 复检(覆盖 alias-only 主机),不再信任发现时捕获的 `InInventory` 旧值,避免并发外部编辑导致重复导入。
 
 ## 13. 待确认
 

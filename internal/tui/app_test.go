@@ -1,14 +1,21 @@
 package tui
 
 import (
+	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/Praeviso/AgentSSH/internal/audit"
 	"github.com/Praeviso/AgentSSH/internal/config"
+	"github.com/Praeviso/AgentSSH/internal/discovery"
+	"github.com/Praeviso/AgentSSH/internal/executor"
+	"github.com/Praeviso/AgentSSH/internal/hostform"
 	"github.com/Praeviso/AgentSSH/internal/inventory"
 	"github.com/Praeviso/AgentSSH/internal/policy"
+	"github.com/Praeviso/AgentSSH/internal/secrets"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -52,6 +59,11 @@ func TestSectionsTitleAndCapturing(t *testing.T) {
 	if !hosts.capturing() {
 		t.Fatal("hosts should capture during a delete confirm (else tab/q abandons it)")
 	}
+	hosts.confirm = false
+	hosts.discover.active = true
+	if !hosts.capturing() {
+		t.Fatal("hosts should capture while discovery overlay is active")
+	}
 
 	pol := newPolicySection("", inventory.Inventory{}, policy.Config{}, st, nil)
 	if pol.title() != "Policy" || pol.capturing() {
@@ -66,6 +78,163 @@ func TestSectionsTitleAndCapturing(t *testing.T) {
 	sessions := newSessionsSection(nil, st, nil)
 	if sessions.title() != "Sessions" || sessions.capturing() {
 		t.Fatalf("sessions title/capturing = %q/%t", sessions.title(), sessions.capturing())
+	}
+}
+
+func TestHostsDiscoverOpensOverlayAndToggleSelection(t *testing.T) {
+	st := testAppStyles()
+	section := newHostsSection(testPaths(t), lipgloss.NewRenderer(io.Discard), st, inventory.Inventory{}, nil)
+	updated, cmd := section.Update(keyMsg("d"))
+	hosts, ok := updated.(hostsSection)
+	if !ok {
+		t.Fatalf("updated = %T", updated)
+	}
+	if !hosts.discover.active || !hosts.capturing() || cmd == nil {
+		t.Fatalf("discover not active/capturing/cmd: active=%t capturing=%t cmdNil=%t", hosts.discover.active, hosts.capturing(), cmd == nil)
+	}
+	hosts.discover.loading = false
+	hosts.discover.candidates = []discovery.Candidate{{Name: "web-1", Addr: "10.0.0.11"}}
+	hosts.discover.selected = map[int]bool{0: true}
+	updated, _ = hosts.Update(keyMsg(" "))
+	hosts = updated.(hostsSection)
+	if hosts.discover.selected[0] {
+		t.Fatal("space should toggle selected candidate off")
+	}
+}
+
+func TestHostsDiscoverImportDedupsEndpointAndUsesAlias(t *testing.T) {
+	paths := testPaths(t)
+	base := inventory.Inventory{Hosts: map[string]inventory.Host{
+		"existing": {Addr: "10.0.0.11", Port: 22},
+	}}
+	if err := inventory.Save(paths.InventoryFile, base); err != nil {
+		t.Fatal(err)
+	}
+	section := newHostsSection(paths, lipgloss.NewRenderer(io.Discard), testAppStyles(), base, nil)
+	section.discover = discoveryOverlay{
+		active: true,
+		candidates: []discovery.Candidate{
+			{Name: "dupe", Source: discovery.SourceKnownHosts, Addr: "10.0.0.11", Port: 22, ProbeStatus: executor.ProbeConnectable},
+			{Name: "prod-web", Source: discovery.SourceSSHConfig, Addr: "10.0.0.12", Port: 22, ProbeStatus: executor.ProbeConnectable},
+		},
+		selected: map[int]bool{0: true, 1: true},
+	}
+	updated, cmd := section.Update(keyMsg("enter"))
+	hosts := updated.(hostsSection)
+	if cmd == nil {
+		t.Fatal("successful import should emit inventoryChangedMsg")
+	}
+	msg, ok := cmd().(inventoryChangedMsg)
+	if !ok {
+		t.Fatalf("cmd msg = %T", cmd())
+	}
+	if _, ok := msg.inventory.Hosts["dupe"]; ok {
+		t.Fatalf("endpoint duplicate imported: %#v", msg.inventory.Hosts)
+	}
+	if got := msg.inventory.Hosts["prod-web"].SSHConfigAlias; got != "prod-web" {
+		t.Fatalf("ssh_config candidate should import by alias, got %#v", msg.inventory.Hosts["prod-web"])
+	}
+	if hosts.discover.active {
+		t.Fatal("discovery overlay should close after successful import")
+	}
+}
+
+func TestHostsTestActionProducesProbeCommandAndRendersResult(t *testing.T) {
+	section := newHostsSection(testPaths(t), lipgloss.NewRenderer(io.Discard), testAppStyles(), inventory.Inventory{
+		Hosts: map[string]inventory.Host{"web-1": {Addr: "127.0.0.1", Port: 1}},
+	}, nil)
+	updated, cmd := section.Update(keyMsg("t"))
+	hosts := updated.(hostsSection)
+	if cmd == nil || !strings.Contains(hosts.status, "testing web-1") {
+		t.Fatalf("test action status=%q cmdNil=%t", hosts.status, cmd == nil)
+	}
+	updated, _ = hosts.Update(hostProbeMsg{name: "web-1", ok: true})
+	hosts = updated.(hostsSection)
+	if !strings.Contains(hosts.View(), "OK web-1") {
+		t.Fatalf("OK result not rendered: %q", hosts.View())
+	}
+	updated, _ = hosts.Update(hostProbeMsg{name: "web-1", err: errors.New("no SSH auth methods available")})
+	hosts = updated.(hostsSection)
+	if !strings.Contains(hosts.View(), "no SSH credentials available") {
+		t.Fatalf("hint not rendered: %q", hosts.View())
+	}
+}
+
+func TestHostsAddStoresIdentityAndPasswordWithoutInventoryLeak(t *testing.T) {
+	paths := testPaths(t)
+	t.Setenv("AGENTSSH_MASTER_PASSWORD", "master")
+	section := newHostsSection(paths, lipgloss.NewRenderer(io.Discard), testAppStyles(), inventory.Inventory{}, nil)
+	err := section.addHost(hostform.Result{
+		Name: "web-1", Addr: "10.0.0.11", User: "deploy", Port: 22,
+		Identity: "~/.ssh/web-1", Password: "ssh-password", Submitted: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := inventory.Load(paths.InventoryFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Hosts["web-1"].IdentityFile != "~/.ssh/web-1" {
+		t.Fatalf("identity_file = %#v", loaded.Hosts["web-1"])
+	}
+	data, err := os.ReadFile(paths.InventoryFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "ssh-password") || strings.Contains(string(data), "password") {
+		t.Fatalf("password leaked into inventory.yaml: %s", data)
+	}
+	store, err := secrets.Open(paths.SecretsFile, "master")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := store.Password("web-1"); !ok || got != "ssh-password" {
+		t.Fatalf("stored password = %q/%t", got, ok)
+	}
+}
+
+func TestHostsAddPasswordWithoutMasterRefusesHost(t *testing.T) {
+	paths := testPaths(t)
+	section := newHostsSection(paths, lipgloss.NewRenderer(io.Discard), testAppStyles(), inventory.Inventory{}, nil)
+	err := section.addHost(hostform.Result{Name: "web-1", Addr: "10.0.0.11", Port: 22, Password: "ssh-password", Submitted: true})
+	if err == nil || !strings.Contains(err.Error(), "set AGENTSSH_MASTER_PASSWORD") {
+		t.Fatalf("err = %v", err)
+	}
+	loaded, loadErr := inventory.Load(paths.InventoryFile)
+	if loadErr != nil {
+		t.Fatal(loadErr)
+	}
+	if len(loaded.Hosts) != 0 {
+		t.Fatalf("host persisted despite missing master: %#v", loaded.Hosts)
+	}
+}
+
+func TestHostsAddPasswordWrongMasterAborts(t *testing.T) {
+	paths := testPaths(t)
+	if err := os.MkdirAll(paths.Home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store, err := secrets.Open(paths.SecretsFile, "right")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.Set("existing", "pw")
+	if err := store.Save("right"); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AGENTSSH_MASTER_PASSWORD", "wrong")
+	section := newHostsSection(paths, lipgloss.NewRenderer(io.Discard), testAppStyles(), inventory.Inventory{}, nil)
+	err = section.addHost(hostform.Result{Name: "web-1", Addr: "10.0.0.11", Port: 22, Password: "ssh-password", Submitted: true})
+	if err == nil || !strings.Contains(err.Error(), "wrong master password") {
+		t.Fatalf("err = %v", err)
+	}
+	loaded, loadErr := inventory.Load(paths.InventoryFile)
+	if loadErr != nil {
+		t.Fatal(loadErr)
+	}
+	if len(loaded.Hosts) != 0 {
+		t.Fatalf("host persisted despite wrong master: %#v", loaded.Hosts)
 	}
 }
 
@@ -141,5 +310,85 @@ func keyMsg(value string) tea.KeyMsg {
 		return tea.KeyMsg{Type: tea.KeyEnter}
 	default:
 		return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(value)}
+	}
+}
+
+func testPaths(t *testing.T) config.Paths {
+	t.Helper()
+	home := t.TempDir()
+	return config.Paths{
+		Home:          home,
+		InventoryFile: filepath.Join(home, "inventory.yaml"),
+		PolicyFile:    filepath.Join(home, "policy.yaml"),
+		AuditFile:     filepath.Join(home, "audit.log"),
+		SessionFile:   filepath.Join(home, "session"),
+		SecretsFile:   filepath.Join(home, "secrets.enc"),
+	}
+}
+
+func TestMergeProbedCandidatesMatchesByIdentityNotPosition(t *testing.T) {
+	current := []discovery.Candidate{
+		{Source: discovery.SourceSSHConfig, Name: "a"},
+		{Source: discovery.SourceSSHConfig, Name: "b"},
+	}
+	// Only b was probed; a must stay untouched even though b is at index 1.
+	probed := []discovery.Candidate{
+		{Source: discovery.SourceSSHConfig, Name: "b", ProbeStatus: executor.ProbeConnectable},
+	}
+	merged := mergeProbedCandidates(current, probed)
+	if merged[0].ProbeStatus != "" {
+		t.Fatalf("row a should be untouched, got %#v", merged[0])
+	}
+	if merged[1].ProbeStatus != executor.ProbeConnectable {
+		t.Fatalf("row b should carry its own probe result, got %#v", merged[1])
+	}
+}
+
+func TestDiscoveryProbedMsgIgnoredWhenStaleOrInactive(t *testing.T) {
+	st := testAppStyles()
+	s := newHostsSection(config.Paths{}, lipgloss.NewRenderer(io.Discard), st, inventory.Inventory{}, nil)
+	s.discover = discoveryOverlay{
+		active:     true,
+		runID:      2,
+		candidates: []discovery.Candidate{{Name: "a", Source: discovery.SourceSSHConfig}},
+	}
+	probed := discoveryProbedMsg{runID: 1, candidates: []discovery.Candidate{{Name: "a", Source: discovery.SourceSSHConfig, ProbeStatus: executor.ProbeConnectable}}}
+	updated, _ := s.Update(probed)
+	if hs := updated.(hostsSection); hs.discover.candidates[0].ProbeStatus != "" {
+		t.Fatalf("stale-runID probe result must be ignored, got %#v", hs.discover.candidates[0])
+	}
+
+	s.discover.active = false
+	s.discover.runID = 2
+	updated2, _ := s.Update(discoveryProbedMsg{runID: 2, candidates: []discovery.Candidate{{Name: "a", Source: discovery.SourceSSHConfig, ProbeStatus: executor.ProbeConnectable}}})
+	if hs := updated2.(hostsSection); hs.discover.candidates[0].ProbeStatus != "" {
+		t.Fatalf("probe result for inactive overlay must be ignored")
+	}
+}
+
+func TestImportDiscoverySelectedSkipsAliasOnlyDuplicate(t *testing.T) {
+	home := t.TempDir()
+	paths := config.NewPaths(home)
+	// An existing alias-only host under a different name, aliasing "web-1".
+	base := inventory.Inventory{Version: 1, Hosts: map[string]inventory.Host{
+		"existing": {SSHConfigAlias: "web-1"},
+	}}
+	if err := inventory.Save(paths.InventoryFile, base); err != nil {
+		t.Fatalf("save inventory: %v", err)
+	}
+	s := newHostsSection(paths, lipgloss.NewRenderer(io.Discard), testAppStyles(), base, nil)
+	s.discover = discoveryOverlay{
+		active: true,
+		candidates: []discovery.Candidate{
+			{Name: "web-1", Source: discovery.SourceSSHConfig, Addr: "10.0.0.11", Port: 22, ProbeStatus: executor.ProbeConnectable},
+		},
+		selected: map[int]bool{0: true},
+	}
+	changed, err := s.importDiscoverySelected()
+	if err != nil {
+		t.Fatalf("import err: %v", err)
+	}
+	if changed {
+		t.Fatal("a candidate already present as an alias-only host must not be imported")
 	}
 }

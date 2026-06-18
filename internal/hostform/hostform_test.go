@@ -1,6 +1,13 @@
 package hostform
 
-import "testing"
+import (
+	"io"
+	"strings"
+	"testing"
+
+	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/lipgloss"
+)
 
 func TestValidateNormalizesHostFields(t *testing.T) {
 	t.Setenv("USER", "alice")
@@ -27,6 +34,28 @@ func TestValidateAllowsAliasWithoutAddr(t *testing.T) {
 	}
 	if result.Alias != "prod-web" || result.Addr != "" {
 		t.Fatalf("result = %#v", result)
+	}
+}
+
+func TestValidateIdentityFileRoundTrip(t *testing.T) {
+	result, errs := Validate(Options{Name: "web-1", Addr: "10.0.0.11", IdentityFile: " ~/.ssh/web-1 "})
+	if len(errs) != 0 {
+		t.Fatalf("errs = %#v", errs)
+	}
+	if result.Identity != "~/.ssh/web-1" {
+		t.Fatalf("identity = %q", result.Identity)
+	}
+}
+
+func TestPasswordFieldMaskedAndNotRendered(t *testing.T) {
+	model := New(Options{Name: "web-1", Addr: "10.0.0.11"}, lipgloss.NewRenderer(io.Discard))
+	model.inputs[fieldPassword].SetValue("super-secret")
+	if model.inputs[fieldPassword].EchoMode != textinput.EchoPassword {
+		t.Fatalf("password echo mode = %v, want EchoPassword", model.inputs[fieldPassword].EchoMode)
+	}
+	view := model.View()
+	if strings.Contains(view, "super-secret") {
+		t.Fatalf("password leaked into view: %q", view)
 	}
 }
 
