@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Praeviso/AgentSSH/internal/audit"
 	"github.com/Praeviso/AgentSSH/internal/config"
@@ -92,6 +93,20 @@ const (
 	minFrameHeight = 11 // leave room for the status bar + footer + the error/confirm cards
 )
 
+const toastTTL = 3 * time.Second
+
+// toastMsg asks the shell to show a transient success confirmation in the footer.
+// Sections emit it via toastCmd instead of pinning a sticky status line.
+type toastMsg struct{ text string }
+
+// toastExpiredMsg clears the toast if it is still the current one (id guards
+// against an older timer clearing a newer toast).
+type toastExpiredMsg struct{ id int }
+
+func toastCmd(text string) tea.Cmd {
+	return func() tea.Msg { return toastMsg{text: text} }
+}
+
 type appModel struct {
 	paths    config.Paths
 	renderer *lipgloss.Renderer
@@ -99,6 +114,8 @@ type appModel struct {
 	sections []section
 	active   int
 	help     help.Model
+	toast    string // transient confirmation shown in the footer-right
+	toastID  int
 	w, h     int
 	ready    bool
 	firstRun bool // show the one-time welcome banner until the first keypress
@@ -236,6 +253,16 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case inventoryChangedMsg:
 		m.applyInventoryChange(msg.inventory)
+		return m, nil
+	case toastMsg:
+		m.toastID++
+		m.toast = msg.text
+		id := m.toastID
+		return m, tea.Tick(toastTTL, func(time.Time) tea.Msg { return toastExpiredMsg{id: id} })
+	case toastExpiredMsg:
+		if msg.id == m.toastID {
+			m.toast = ""
+		}
 		return m, nil
 	case verifyMsg:
 		// Deliver to Audit even when it isn't the active tab — the launch-time
@@ -411,10 +438,52 @@ func (m appModel) renderStatusBar() string {
 }
 
 // renderFooter is the persistent bottom rail: the active section's key bindings
-// plus the global ones, via one bubbles/help model (? toggles full help).
+// plus the global ones (via one bubbles/help model; ? toggles full help), with a
+// transient toast right-aligned when present.
 func (m appModel) renderFooter() string {
 	km := combinedHelp{section: m.sections[m.active].helpKeyMap(), global: globalHelpKeys()}
-	return m.help.View(km)
+	if m.toast == "" || m.w <= 0 {
+		return m.help.View(km)
+	}
+	toast := m.styles.ok.Render(m.styles.glyphs.Check + " " + m.toast)
+	toastW := lipgloss.Width(toast)
+	helpW := m.w - toastW - 2 // 1 gutter + 1 col of slack so the toast never clips
+	if helpW < 1 {
+		return m.help.View(km) // no room; the toast is non-essential
+	}
+	// bubbles/help doesn't truncate to its Width, so render a width-bounded short
+	// help ourselves to leave room for the right-aligned toast.
+	helpView := shortHelpFit(m.styles, km.ShortHelp(), helpW)
+	pad := m.w - lipgloss.Width(helpView) - toastW
+	if pad < 1 {
+		pad = 1
+	}
+	return helpView + strings.Repeat(" ", pad) + toast
+}
+
+// shortHelpFit renders "key desc • key desc …" bounded to maxW columns, appending
+// an ellipsis when bindings are dropped. Used only when a toast needs footer room.
+func shortHelpFit(st appStyles, bindings []key.Binding, maxW int) string {
+	var parts []string
+	used := 0
+	for _, kb := range bindings {
+		h := kb.Help()
+		if h.Key == "" && h.Desc == "" {
+			continue
+		}
+		item := h.Key + " " + h.Desc
+		cost := lipgloss.Width(item)
+		if len(parts) > 0 {
+			cost += 3 // " • " separator
+		}
+		if used+cost+2 > maxW { // +2 reserves room for the ellipsis
+			parts = append(parts, "…")
+			break
+		}
+		parts = append(parts, item)
+		used += cost
+	}
+	return st.dim.Render(strings.Join(parts, " • "))
 }
 
 func switchTarget(active, n int, msg tea.KeyMsg) (int, bool) {
@@ -689,9 +758,8 @@ func (s hostsSection) updateForm(msg tea.Msg) (tea.Model, tea.Cmd) {
 		s.status = ""
 		return s, nil
 	}
-	s.status = "host added: " + result.Name
 	s.err = nil
-	return s, inventoryChangedCmd(s.inventory)
+	return s, tea.Batch(inventoryChangedCmd(s.inventory), toastCmd("host added: "+result.Name))
 }
 
 func (s hostsSection) updateConfirm(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -701,10 +769,14 @@ func (s hostsSection) updateConfirm(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 	switch keyMsg.String() {
 	case "y":
+		name := ""
+		if len(s.names) > 0 {
+			name = s.names[s.cursor]
+		}
 		removed := s.removeSelected()
 		s.focus = hostFocusList
 		if removed {
-			return s, inventoryChangedCmd(s.inventory)
+			return s, tea.Batch(inventoryChangedCmd(s.inventory), toastCmd("host removed: "+name))
 		}
 		return s, nil
 	case "n", "esc":
@@ -792,9 +864,8 @@ func (s hostsSection) reloadInventory() (tea.Model, tea.Cmd) {
 	s.inventory = inv
 	s.loadErr = nil
 	s.err = nil
-	s.status = "inventory reloaded"
 	s.rebuildNames()
-	return s, inventoryChangedCmd(inv)
+	return s, tea.Batch(inventoryChangedCmd(inv), toastCmd("inventory reloaded"))
 }
 
 func inventoryChangedCmd(inv inventory.Inventory) tea.Cmd {
@@ -932,7 +1003,9 @@ func (s hostsSection) updateDiscovery(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if changed {
 			s.discover.active = false
 			s.focus = hostFocusList
-			return s, inventoryChangedCmd(s.inventory)
+			imported := s.status // importDiscoverySelected set the "imported N host(s)" message
+			s.status = ""
+			return s, tea.Batch(inventoryChangedCmd(s.inventory), toastCmd(imported))
 		}
 	case "esc", "q":
 		s.discover = discoveryOverlay{}
@@ -1129,7 +1202,6 @@ func (s *hostsSection) removeSelected() bool {
 	s.inventory = next
 	s.rebuildNames()
 	s.err = nil
-	s.status = "host removed: " + name
 	return true
 }
 

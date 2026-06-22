@@ -126,12 +126,9 @@ func TestHostsDiscoverImportDedupsEndpointAndUsesAlias(t *testing.T) {
 	}
 	updated, cmd := section.Update(keyMsg("enter"))
 	hosts := updated.(hostsSection)
-	if cmd == nil {
-		t.Fatal("successful import should emit inventoryChangedMsg")
-	}
-	msg, ok := cmd().(inventoryChangedMsg)
+	msg, ok := firstMsgOfType[inventoryChangedMsg](cmd)
 	if !ok {
-		t.Fatalf("cmd msg = %T", cmd())
+		t.Fatal("successful import should emit inventoryChangedMsg")
 	}
 	if _, ok := msg.inventory.Hosts["dupe"]; ok {
 		t.Fatalf("endpoint duplicate imported: %#v", msg.inventory.Hosts)
@@ -324,6 +321,35 @@ func TestHostsListChromeShrinksWithMoreLines(t *testing.T) {
 	s.status = "testing…"
 	if s.listChromeHeight() <= base {
 		t.Fatalf("a status line should grow chrome (shrinking the table): base=%d with-status=%d", base, s.listChromeHeight())
+	}
+}
+
+func TestToastShownAndExpires(t *testing.T) {
+	app := newAppModel(testPaths(t), lipgloss.NewRenderer(io.Discard))
+	app.w, app.help.Width = 120, 120
+
+	updated, cmd := app.Update(toastMsg{text: "host added: web-1"})
+	app = updated.(appModel)
+	if app.toast != "host added: web-1" {
+		t.Fatalf("toastMsg should set the toast, got %q", app.toast)
+	}
+	if cmd == nil {
+		t.Fatal("a toast should schedule an expiry tick")
+	}
+	if !strings.Contains(app.renderFooter(), "host added: web-1") {
+		t.Fatalf("footer should show the toast:\n%s", app.renderFooter())
+	}
+
+	updated, _ = app.Update(toastExpiredMsg{id: app.toastID})
+	if updated.(appModel).toast != "" {
+		t.Fatal("a matching expiry should clear the toast")
+	}
+
+	// A stale expiry (older id) must not clear a newer toast.
+	app.toast, app.toastID = "newer toast", 5
+	updated, _ = app.Update(toastExpiredMsg{id: 4})
+	if updated.(appModel).toast != "newer toast" {
+		t.Fatal("a stale expiry must not clear a newer toast")
 	}
 }
 
@@ -695,6 +721,26 @@ func TestHostProbeMsgRoutedToHostsWhileAnotherTabActive(t *testing.T) {
 	if !ok || !strings.Contains(hosts.status, "OK web-1") {
 		t.Fatalf("hostProbeMsg did not reach the inactive Hosts section: %T status=%q", next.sections[sectionHosts], hosts.status)
 	}
+}
+
+// firstMsgOfType runs a command (recursing into tea.Batch) and returns the first
+// produced message of type T — used now that handlers batch a result with a toast.
+func firstMsgOfType[T tea.Msg](cmd tea.Cmd) (T, bool) {
+	var zero T
+	if cmd == nil {
+		return zero, false
+	}
+	switch m := cmd().(type) {
+	case T:
+		return m, true
+	case tea.BatchMsg:
+		for _, c := range m {
+			if found, ok := firstMsgOfType[T](c); ok {
+				return found, true
+			}
+		}
+	}
+	return zero, false
 }
 
 func keyMsg(value string) tea.KeyMsg {
