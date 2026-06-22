@@ -85,6 +85,13 @@ const (
 	sectionSessions
 )
 
+// Minimum usable frame. Below this the two-rail chrome leaves no room for
+// content, so we show a "resize" card instead of a broken layout.
+const (
+	minFrameWidth  = 40
+	minFrameHeight = 9
+)
+
 type appModel struct {
 	paths    config.Paths
 	renderer *lipgloss.Renderer
@@ -318,6 +325,9 @@ func (m appModel) View() string {
 	if len(m.sections) == 0 {
 		return "loading..."
 	}
+	if m.ready && (m.w < minFrameWidth || m.h < minFrameHeight) {
+		return m.tooSmallView()
+	}
 	statusBar := m.renderStatusBar()
 	footer := m.renderFooter()
 	body := m.sections[m.active].View()
@@ -331,16 +341,18 @@ func (m appModel) View() string {
 	}
 
 	// Pin the footer to the bottom by filling the space between the status bar
-	// and the footer (also clamps an over-tall body so it can't push the footer
-	// off-screen). Full measured layout per section is P1#9.
-	if m.h > 0 {
+	// and the footer, and clamp the body to the frame so it can never push the
+	// footer off-screen or overflow horizontally.
+	if m.w > 0 && m.h > 0 {
 		used := lipgloss.Height(statusBar) + lipgloss.Height(footer)
 		if welcome != "" {
 			used += lipgloss.Height(welcome)
 		}
-		if bodyH := m.h - used; bodyH > 0 {
-			body = lipgloss.NewStyle().Height(bodyH).MaxHeight(bodyH).Render(body)
+		bodyH := m.h - used
+		if bodyH < 1 {
+			bodyH = 1
 		}
+		body = lipgloss.NewStyle().Height(bodyH).MaxHeight(bodyH).MaxWidth(m.w).Render(body)
 	}
 
 	parts := make([]string, 0, 4)
@@ -349,6 +361,13 @@ func (m appModel) View() string {
 	}
 	parts = append(parts, statusBar, body, footer)
 	return lipgloss.JoinVertical(lipgloss.Left, parts...)
+}
+
+// tooSmallView replaces the whole frame on a terminal too small to render it.
+func (m appModel) tooSmallView() string {
+	msg := fmt.Sprintf("Terminal too small.\nResize to at least %d×%d (have %d×%d).",
+		minFrameWidth, minFrameHeight, m.w, m.h)
+	return lipgloss.Place(m.w, m.h, lipgloss.Center, lipgloss.Center, m.styles.dim.Render(msg))
 }
 
 // renderStatusBar is the persistent full-width top rail: tab pips with the
@@ -1118,11 +1137,19 @@ func (s hostsSection) discoveryView() string {
 }
 
 func (s hostsSection) discoverWindow() (candidates []discovery.Candidate, start int) {
-	height := s.h - 8
+	chrome := 3 // "Discover Hosts" header + table header + a reserved hint line
+	if s.discover.err != nil {
+		chrome++
+	}
+	if s.discover.status != "" {
+		chrome++
+	}
+	chrome += len(s.discover.notes)
+	height := s.h - chrome
 	if s.h <= 0 {
 		height = len(s.discover.candidates) // size unknown: show all
-	} else if height < 3 {
-		height = 3
+	} else if height < 1 {
+		height = 1
 	}
 	start, end := scrollWindow(s.discover.cursor, len(s.discover.candidates), height)
 	return s.discover.candidates[start:end], start
@@ -1199,14 +1226,34 @@ func discoveryStatusCell(g theme.Glyphs, candidate discovery.Candidate) string {
 // hostWindow returns the visible slice of host names and its start offset, so
 // the table cursor can be expressed relative to the window.
 func (s hostsSection) hostWindow() (names []string, start int) {
-	height := s.h - 8
+	height := s.h - s.listChromeHeight()
 	if s.h <= 0 {
 		height = len(s.names) // size unknown: show all
-	} else if height < 3 {
-		height = 3
+	} else if height < 1 {
+		height = 1
 	}
 	start, end := scrollWindow(s.cursor, len(s.names), height)
 	return s.names[start:end], start
+}
+
+// listChromeHeight counts the non-table lines the Hosts view renders around the
+// host table, so the table fills exactly the rest of the body (replaces a magic
+// constant; must track hostsSection.View).
+func (s hostsSection) listChromeHeight() int {
+	h := 2 // section header + the table's own header row
+	if s.inventory.Transport != "" || s.inventory.HostKeyPolicy != "" {
+		h++
+	}
+	if s.err != nil {
+		h++
+	}
+	if s.status != "" {
+		h++
+	}
+	if len(s.inventory.Groups) > 0 {
+		h += 2 + len(s.inventory.Groups) // blank + "Groups" header + one line per group
+	}
+	return h
 }
 
 var hostColumns = []tableColumn{
@@ -1557,11 +1604,15 @@ func sessionRow(summary session.Summary) []string {
 }
 
 func (s sessionsSection) sessionWindow() (summaries []session.Summary, start int) {
-	height := s.h - 4
+	chrome := 2 // section header + the table's own header row
+	if s.err != nil {
+		chrome++
+	}
+	height := s.h - chrome
 	if s.h <= 0 {
 		height = len(s.summaries) // size unknown: show all
-	} else if height < 3 {
-		height = 3
+	} else if height < 1 {
+		height = 1
 	}
 	start, end := scrollWindow(s.cursor, len(s.summaries), height)
 	return s.summaries[start:end], start

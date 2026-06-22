@@ -302,6 +302,28 @@ func TestInventoryChangedUpdatesAuditAndPolicySections(t *testing.T) {
 	}
 }
 
+func TestTooSmallTerminalShowsResizeCard(t *testing.T) {
+	app := newAppModel(testPaths(t), lipgloss.NewRenderer(io.Discard))
+	app.w, app.h, app.ready = 20, 5, true
+	if v := app.View(); !strings.Contains(v, "too small") {
+		t.Fatalf("a tiny terminal should show the resize card:\n%s", v)
+	}
+	app.w, app.h = 80, 24
+	if v := app.View(); strings.Contains(v, "too small") {
+		t.Fatal("an adequate terminal must not show the resize card")
+	}
+}
+
+func TestHostsListChromeShrinksWithMoreLines(t *testing.T) {
+	s := newHostsSection(testPaths(t), lipgloss.NewRenderer(io.Discard), testAppStyles(),
+		inventory.Inventory{Transport: "native", Hosts: map[string]inventory.Host{"a": {Addr: "1"}}}, nil)
+	base := s.listChromeHeight()
+	s.status = "testing…"
+	if s.listChromeHeight() <= base {
+		t.Fatalf("a status line should grow chrome (shrinking the table): base=%d with-status=%d", base, s.listChromeHeight())
+	}
+}
+
 func TestFooterShowsSectionAndGlobalKeys(t *testing.T) {
 	app := newAppModel(testPaths(t), lipgloss.NewRenderer(io.Discard))
 	app.help.Width = 200 // wide enough that short help shows every binding

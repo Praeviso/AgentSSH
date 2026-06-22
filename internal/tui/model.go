@@ -492,7 +492,12 @@ func (m model) leftWidth() int {
 }
 
 func (m model) listHeight() int {
-	h := m.h - 4
+	// The audit body is the status bar line plus the list (plus the filter input
+	// when filtering); m.h is the height the shell allocated to this section.
+	h := m.h - 1
+	if m.focus == focusFilter {
+		h--
+	}
 	if h < 1 {
 		h = 1
 	}
