@@ -413,6 +413,19 @@ func switchTarget(active, n int, msg tea.KeyMsg) (int, bool) {
 	return active, false
 }
 
+// hostFocus is the single mutually-exclusive interaction mode of the Hosts tab,
+// replacing the old adding/confirm/discover bool soup so key handling dispatches
+// from one place and modes can't silently overlap.
+type hostFocus int
+
+const (
+	hostFocusList     hostFocus = iota // browsing the host table (default)
+	hostFocusDetail                    // the right detail panel is focused (P1#10)
+	hostFocusForm                      // the add-host form owns the screen
+	hostFocusConfirm                   // a destructive-delete confirmation is pending
+	hostFocusDiscover                  // the discover overlay owns the screen
+)
+
 type hostsSection struct {
 	paths       config.Paths
 	renderer    *lipgloss.Renderer
@@ -423,8 +436,7 @@ type hostsSection struct {
 	status      string
 	err         error
 	form        hostform.Model
-	adding      bool
-	confirm     bool
+	focus       hostFocus
 	testing     bool // a host connectivity probe is in flight
 	discover    discoveryOverlay
 	discoverSeq int
@@ -487,15 +499,20 @@ func newHostsSection(paths config.Paths, renderer *lipgloss.Renderer, st appStyl
 
 func (s hostsSection) title() string { return "Hosts" }
 
-func (s hostsSection) capturing() bool { return s.adding || s.confirm || s.discover.active }
+// capturing reports whether the section owns the keyboard (a modal/text mode),
+// so the shell must not steal tab/q/?. The detail panel is non-modal (it scrolls
+// but still allows tab-switch), so it does not capture.
+func (s hostsSection) capturing() bool {
+	return s.focus == hostFocusForm || s.focus == hostFocusConfirm || s.focus == hostFocusDiscover
+}
 
 func (s hostsSection) helpKeyMap() help.KeyMap {
-	switch {
-	case s.adding:
+	switch s.focus {
+	case hostFocusForm:
 		return helpMap{short: []key.Binding{hk("tab", "next"), hk("shift+tab", "prev"), hk("enter", "save"), hk("esc", "cancel")}}
-	case s.discover.active:
+	case hostFocusDiscover:
 		return helpMap{short: []key.Binding{hk("j/k", "move"), hk("space", "select"), hk("p", "probe"), hk("enter", "import"), hk("esc", "close")}}
-	case s.confirm:
+	case hostFocusConfirm:
 		return helpMap{short: []key.Binding{hk("y", "confirm"), hk("n/esc", "cancel")}}
 	default:
 		return helpMap{short: []key.Binding{hk("j/k", "move"), hk("a", "add"), hk("d", "discover"), hk("t", "test"), hk("r/x", "remove")}}
@@ -506,35 +523,12 @@ func (s hostsSection) Init() tea.Cmd { return nil }
 
 func (s hostsSection) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if ws, ok := msg.(tea.WindowSizeMsg); ok {
-		// Keep the size current even while the add-form owns the screen, so the
-		// list viewport is sized correctly after the form closes.
+		// Keep the size current even while a modal owns the screen, so the list is
+		// sized correctly once it closes.
 		s.w, s.h = ws.Width, ws.Height
 	}
-	if s.adding {
-		updated, cmd := s.form.Update(msg)
-		if form, ok := updated.(hostform.Model); ok {
-			s.form = form
-		}
-		if s.form.Done() {
-			result := s.form.Result()
-			s.adding = false
-			s.form = hostform.Model{}
-			if result.Submitted {
-				if err := s.addHost(result); err != nil {
-					s.err = err
-					s.status = ""
-				} else {
-					s.status = "host added: " + result.Name
-					s.err = nil
-					return s, inventoryChangedCmd(s.inventory)
-				}
-			} else {
-				s.status = "add cancelled"
-			}
-			return s, nil
-		}
-		return s, cmd
-	}
+
+	// Async results and the spinner tick are handled regardless of focus.
 	switch msg := msg.(type) {
 	case spinner.TickMsg:
 		// Keep ticking only while an async op is in flight; once it lands, the
@@ -591,82 +585,128 @@ func (s hostsSection) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return s, nil
 	}
-	if s.discover.active {
+
+	// Key/other handling dispatches on the current focus — one place, no overlap.
+	switch s.focus {
+	case hostFocusForm:
+		return s.updateForm(msg)
+	case hostFocusDiscover:
 		return s.updateDiscovery(msg)
+	case hostFocusConfirm:
+		return s.updateConfirm(msg)
+	default:
+		return s.updateList(msg)
 	}
-	switch msg := msg.(type) {
-	case tea.WindowSizeMsg:
-		s.w, s.h = msg.Width, msg.Height
-	case tea.KeyMsg:
-		switch msg.String() {
-		case "j", "down":
-			if s.cursor < len(s.names)-1 {
-				s.cursor++
-			}
-			s.confirm = false
-		case "k", "up":
-			if s.cursor > 0 {
-				s.cursor--
-			}
-			s.confirm = false
-		case "a":
-			if s.err != nil {
-				s.status = "fix inventory.yaml before editing hosts"
-				return s, nil
-			}
-			s.adding = true
-			s.confirm = false
-			s.form = hostform.New(hostform.Options{ExistingNames: inventory.HostNames(s.inventory)}, s.renderer)
-			return s, s.form.Init()
-		case "d":
-			if s.err != nil {
-				s.status = "fix inventory.yaml before discovering hosts"
-				return s, nil
-			}
-			s.confirm = false
-			s.discoverSeq++
-			s.discover = discoveryOverlay{
-				active:   true,
-				loading:  true,
-				runID:    s.discoverSeq,
-				selected: map[int]bool{},
-				status:   "discovering from ssh config and known_hosts…",
-			}
-			return s, tea.Batch(s.loadDiscoveryCmd(), s.spinner.Tick)
-		case "t":
-			if s.testing {
-				// A probe is already in flight; ignore re-presses so we don't
-				// double-start the spinner tick loop (it would then run at 2x).
-				return s, nil
-			}
-			if len(s.names) == 0 {
-				s.status = "no host selected"
-				return s, nil
-			}
-			name := s.names[s.cursor]
-			s.status = "testing " + name + "…"
-			s.err = nil
-			s.testing = true
-			return s, tea.Batch(s.probeHostCmd(name), s.spinner.Tick)
-		case "r", "x":
-			if s.err != nil {
-				s.status = "fix inventory.yaml before editing hosts"
-				return s, nil
-			}
-			if len(s.names) > 0 {
-				s.confirm = true
-				s.status = "remove " + s.names[s.cursor] + "? press y to confirm, n/esc to cancel"
-			}
-		case "y":
-			if s.confirm {
-				if s.removeSelected() {
-					return s, inventoryChangedCmd(s.inventory)
-				}
-			}
-		case "n", "esc":
-			s.confirm = false
-			s.status = ""
+}
+
+func (s hostsSection) updateForm(msg tea.Msg) (tea.Model, tea.Cmd) {
+	updated, cmd := s.form.Update(msg)
+	if form, ok := updated.(hostform.Model); ok {
+		s.form = form
+	}
+	if !s.form.Done() {
+		return s, cmd
+	}
+	result := s.form.Result()
+	s.focus = hostFocusList
+	s.form = hostform.Model{}
+	if !result.Submitted {
+		s.status = "add cancelled"
+		return s, nil
+	}
+	if err := s.addHost(result); err != nil {
+		s.err = err
+		s.status = ""
+		return s, nil
+	}
+	s.status = "host added: " + result.Name
+	s.err = nil
+	return s, inventoryChangedCmd(s.inventory)
+}
+
+func (s hostsSection) updateConfirm(msg tea.Msg) (tea.Model, tea.Cmd) {
+	keyMsg, ok := msg.(tea.KeyMsg)
+	if !ok {
+		return s, nil
+	}
+	switch keyMsg.String() {
+	case "y":
+		removed := s.removeSelected()
+		s.focus = hostFocusList
+		if removed {
+			return s, inventoryChangedCmd(s.inventory)
 		}
+		return s, nil
+	case "n", "esc":
+		s.focus = hostFocusList
+		s.status = ""
+	}
+	return s, nil
+}
+
+func (s hostsSection) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
+	keyMsg, ok := msg.(tea.KeyMsg)
+	if !ok {
+		return s, nil
+	}
+	switch keyMsg.String() {
+	case "j", "down":
+		if s.cursor < len(s.names)-1 {
+			s.cursor++
+		}
+	case "k", "up":
+		if s.cursor > 0 {
+			s.cursor--
+		}
+	case "a":
+		if s.err != nil {
+			s.status = "fix inventory.yaml before editing hosts"
+			return s, nil
+		}
+		s.focus = hostFocusForm
+		s.form = hostform.New(hostform.Options{ExistingNames: inventory.HostNames(s.inventory)}, s.renderer)
+		return s, s.form.Init()
+	case "d":
+		if s.err != nil {
+			s.status = "fix inventory.yaml before discovering hosts"
+			return s, nil
+		}
+		s.focus = hostFocusDiscover
+		s.discoverSeq++
+		s.discover = discoveryOverlay{
+			active:   true,
+			loading:  true,
+			runID:    s.discoverSeq,
+			selected: map[int]bool{},
+			status:   "discovering from ssh config and known_hosts…",
+		}
+		return s, tea.Batch(s.loadDiscoveryCmd(), s.spinner.Tick)
+	case "t":
+		if s.testing {
+			// A probe is already in flight; ignore re-presses so we don't
+			// double-start the spinner tick loop (it would then run at 2x).
+			return s, nil
+		}
+		if len(s.names) == 0 {
+			s.status = "no host selected"
+			return s, nil
+		}
+		name := s.names[s.cursor]
+		s.status = "testing " + name + "…"
+		s.err = nil
+		s.testing = true
+		return s, tea.Batch(s.probeHostCmd(name), s.spinner.Tick)
+	case "r", "x":
+		if s.err != nil {
+			s.status = "fix inventory.yaml before editing hosts"
+			return s, nil
+		}
+		if len(s.names) > 0 {
+			s.focus = hostFocusConfirm
+			s.status = "remove " + s.names[s.cursor] + "? press y to confirm, n/esc to cancel"
+		}
+	case "esc":
+		s.status = ""
 	}
 	return s, nil
 }
@@ -805,10 +845,12 @@ func (s hostsSection) updateDiscovery(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if changed {
 			s.discover.active = false
+			s.focus = hostFocusList
 			return s, inventoryChangedCmd(s.inventory)
 		}
 	case "esc", "q":
 		s.discover = discoveryOverlay{}
+		s.focus = hostFocusList
 		s.status = "discover cancelled"
 	}
 	return s, nil
@@ -985,25 +1027,21 @@ func (s *hostsSection) removeSelected() bool {
 	if err != nil {
 		s.err = err
 		s.status = ""
-		s.confirm = false
 		return false
 	}
 	next, err := inventory.RemoveHost(base, name)
 	if err != nil {
 		s.err = err
 		s.status = ""
-		s.confirm = false
 		return false
 	}
 	if err := inventory.Save(s.paths.InventoryFile, next); err != nil {
 		s.err = err
 		s.status = ""
-		s.confirm = false
 		return false
 	}
 	s.inventory = next
 	s.rebuildNames()
-	s.confirm = false
 	s.err = nil
 	s.status = "host removed: " + name
 	return true
@@ -1020,10 +1058,10 @@ func (s *hostsSection) rebuildNames() {
 }
 
 func (s hostsSection) View() string {
-	if s.adding {
+	if s.focus == hostFocusForm {
 		return s.form.View()
 	}
-	if s.discover.active {
+	if s.focus == hostFocusDiscover {
 		return s.discoveryView()
 	}
 	var b strings.Builder
@@ -1046,7 +1084,7 @@ func (s hostsSection) View() string {
 	}
 	if s.status != "" {
 		style := s.styles.ok
-		if s.confirm {
+		if s.focus == hostFocusConfirm {
 			style = s.styles.confirm
 		}
 		if s.testing {

@@ -52,19 +52,21 @@ func TestSectionsTitleAndCapturing(t *testing.T) {
 	if hosts.title() != "Hosts" || hosts.capturing() {
 		t.Fatalf("hosts title/capturing = %q/%t", hosts.title(), hosts.capturing())
 	}
-	hosts.adding = true
+	hosts.focus = hostFocusForm
 	if !hosts.capturing() {
 		t.Fatal("hosts should capture while form is active")
 	}
-	hosts.adding = false
-	hosts.confirm = true
+	hosts.focus = hostFocusConfirm
 	if !hosts.capturing() {
 		t.Fatal("hosts should capture during a delete confirm (else tab/q abandons it)")
 	}
-	hosts.confirm = false
-	hosts.discover.active = true
+	hosts.focus = hostFocusDiscover
 	if !hosts.capturing() {
 		t.Fatal("hosts should capture while discovery overlay is active")
+	}
+	hosts.focus = hostFocusDetail
+	if hosts.capturing() {
+		t.Fatal("the detail panel is non-modal and must not capture the keyboard")
 	}
 
 	pol := newPolicySection("", inventory.Inventory{}, policy.Config{}, st, nil)
@@ -113,6 +115,7 @@ func TestHostsDiscoverImportDedupsEndpointAndUsesAlias(t *testing.T) {
 		t.Fatal(err)
 	}
 	section := newHostsSection(paths, lipgloss.NewRenderer(io.Discard), testAppStyles(), base, nil)
+	section.focus = hostFocusDiscover
 	section.discover = discoveryOverlay{
 		active: true,
 		candidates: []discovery.Candidate{
@@ -338,7 +341,7 @@ func TestFooterShowsSectionAndGlobalKeys(t *testing.T) {
 
 func TestHostsFooterIsContextual(t *testing.T) {
 	s := newHostsSection(testPaths(t), lipgloss.NewRenderer(io.Discard), testAppStyles(), inventory.Inventory{}, nil)
-	s.discover.active = true
+	s.focus = hostFocusDiscover
 	hasDesc := func(km interface{ ShortHelp() []key.Binding }, desc string) bool {
 		for _, b := range km.ShortHelp() {
 			if b.Help().Desc == desc {
@@ -350,7 +353,7 @@ func TestHostsFooterIsContextual(t *testing.T) {
 	if !hasDesc(s.helpKeyMap(), "import") {
 		t.Fatalf("discover-active footer should advertise import, got %+v", s.helpKeyMap().ShortHelp())
 	}
-	s.discover.active = false
+	s.focus = hostFocusList
 	if !hasDesc(s.helpKeyMap(), "add") {
 		t.Fatalf("list footer should advertise add")
 	}
@@ -476,6 +479,35 @@ func TestFirstRunSwallowsQuitKeyButCtrlCStillQuits(t *testing.T) {
 	}
 	if _, ok := quit().(tea.QuitMsg); !ok {
 		t.Fatalf("ctrl+c should produce tea.QuitMsg, got %T", quit())
+	}
+}
+
+func TestDeleteConfirmSurvivesCursorKeys(t *testing.T) {
+	s := newHostsSection(testPaths(t), lipgloss.NewRenderer(io.Discard), testAppStyles(), inventory.Inventory{
+		Hosts: map[string]inventory.Host{"web-1": {Addr: "10.0.0.11"}, "db-2": {Addr: "10.0.0.31"}},
+	}, nil)
+
+	updated, _ := s.Update(keyMsg("r"))
+	hs := updated.(hostsSection)
+	if hs.focus != hostFocusConfirm {
+		t.Fatalf("'r' should enter the confirm focus, got %v", hs.focus)
+	}
+	cur := hs.cursor
+
+	// The footgun fix: a cursor key during confirm must neither move the cursor
+	// nor silently cancel the pending delete.
+	updated, _ = hs.Update(keyMsg("j"))
+	hs = updated.(hostsSection)
+	if hs.focus != hostFocusConfirm {
+		t.Fatal("a cursor key must not cancel a pending delete confirm")
+	}
+	if hs.cursor != cur {
+		t.Fatal("the cursor must not move while a confirm is pending")
+	}
+
+	updated, _ = hs.Update(keyMsg("n"))
+	if updated.(hostsSection).focus != hostFocusList {
+		t.Fatal("'n' should cancel the confirm and return to the list")
 	}
 }
 
