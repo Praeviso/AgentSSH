@@ -528,6 +528,63 @@ func TestHostsEnterFocusesDetailWhenWide(t *testing.T) {
 	}
 }
 
+func TestErrorCardShownForLoadError(t *testing.T) {
+	s := newHostsSection(testPaths(t), lipgloss.NewRenderer(io.Discard), testAppStyles(), inventory.Inventory{}, errors.New("yaml: line 1: bad"))
+	s.w, s.h = 80, 20
+	v := s.View()
+	for _, want := range []string{"Inventory error", "yaml: line 1: bad", "reload"} {
+		if !strings.Contains(v, want) {
+			t.Fatalf("error card missing %q:\n%s", want, v)
+		}
+	}
+	found := false
+	for _, b := range s.helpKeyMap().ShortHelp() {
+		if b.Help().Desc == "reload inventory" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("footer should offer reload on a load error")
+	}
+}
+
+func TestReloadInventoryClearsLoadError(t *testing.T) {
+	paths := testPaths(t)
+	if err := inventory.Save(paths.InventoryFile, inventory.Inventory{Version: 1, Hosts: map[string]inventory.Host{"web-1": {Addr: "10.0.0.11"}}}); err != nil {
+		t.Fatal(err)
+	}
+	s := newHostsSection(paths, lipgloss.NewRenderer(io.Discard), testAppStyles(), inventory.Inventory{}, errors.New("stale parse error"))
+	updated, cmd := s.Update(keyMsg("r"))
+	hs := updated.(hostsSection)
+	if hs.loadErr != nil {
+		t.Fatalf("reload should clear loadErr, got %v", hs.loadErr)
+	}
+	if len(hs.names) != 1 || hs.names[0] != "web-1" {
+		t.Fatalf("reload should repopulate names from disk: %v", hs.names)
+	}
+	if cmd == nil {
+		t.Fatal("reload should propagate an inventoryChangedMsg to the other tabs")
+	}
+}
+
+func TestConfirmCardNamesTargetAndKeys(t *testing.T) {
+	s := newHostsSection(testPaths(t), lipgloss.NewRenderer(io.Discard), testAppStyles(), inventory.Inventory{
+		Hosts: map[string]inventory.Host{"db-2": {Addr: "10.0.0.31"}},
+	}, nil)
+	s.w, s.h = 80, 20
+	updated, _ := s.Update(keyMsg("x"))
+	hs := updated.(hostsSection)
+	if hs.focus != hostFocusConfirm {
+		t.Fatal("'x' should enter the confirm focus")
+	}
+	v := hs.View()
+	for _, want := range []string{"Remove host", "db-2", "secret rm", "confirm"} {
+		if !strings.Contains(v, want) {
+			t.Fatalf("confirm card missing %q:\n%s", want, v)
+		}
+	}
+}
+
 func TestDeleteConfirmSurvivesCursorKeys(t *testing.T) {
 	s := newHostsSection(testPaths(t), lipgloss.NewRenderer(io.Discard), testAppStyles(), inventory.Inventory{
 		Hosts: map[string]inventory.Host{"web-1": {Addr: "10.0.0.11"}, "db-2": {Addr: "10.0.0.31"}},

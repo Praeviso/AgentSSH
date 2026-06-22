@@ -434,7 +434,8 @@ type hostsSection struct {
 	names       []string
 	cursor      int
 	status      string
-	err         error
+	err         error // transient operation error (shown inline)
+	loadErr     error // inventory load/parse error (blocking; shows the error card)
 	form        hostform.Model
 	focus       hostFocus
 	testing     bool // a host connectivity probe is in flight
@@ -487,7 +488,7 @@ type hostProbeMsg struct {
 }
 
 func newHostsSection(paths config.Paths, renderer *lipgloss.Renderer, st appStyles, inv inventory.Inventory, loadErr error) hostsSection {
-	s := hostsSection{paths: paths, renderer: renderer, styles: st, inventory: inv, err: loadErr}
+	s := hostsSection{paths: paths, renderer: renderer, styles: st, inventory: inv, loadErr: loadErr}
 	sp := spinner.New(spinner.WithSpinner(spinner.Line)) // ASCII frames degrade cleanly under NO_COLOR
 	if renderer != nil {
 		sp.Style = renderer.NewStyle().Foreground(lipgloss.Color("212"))
@@ -507,6 +508,9 @@ func (s hostsSection) capturing() bool {
 }
 
 func (s hostsSection) helpKeyMap() help.KeyMap {
+	if s.loadErr != nil {
+		return helpMap{short: []key.Binding{hk("r", "reload inventory")}}
+	}
 	switch s.focus {
 	case hostFocusForm:
 		return helpMap{short: []key.Binding{hk("tab", "next"), hk("shift+tab", "prev"), hk("enter", "save"), hk("esc", "cancel")}}
@@ -689,6 +693,14 @@ func (s hostsSection) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if !ok {
 		return s, nil
 	}
+	// A blocking inventory load error pins the tab to the error card; the only
+	// action is to fix the file and reload.
+	if s.loadErr != nil {
+		if keyMsg.String() == "r" {
+			return s.reloadInventory()
+		}
+		return s, nil
+	}
 	switch keyMsg.String() {
 	case "j", "down":
 		if s.cursor < len(s.names)-1 {
@@ -699,18 +711,10 @@ func (s hostsSection) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 			s.cursor--
 		}
 	case "a":
-		if s.err != nil {
-			s.status = "fix inventory.yaml before editing hosts"
-			return s, nil
-		}
 		s.focus = hostFocusForm
 		s.form = hostform.New(hostform.Options{ExistingNames: inventory.HostNames(s.inventory)}, s.renderer)
 		return s, s.form.Init()
 	case "d":
-		if s.err != nil {
-			s.status = "fix inventory.yaml before discovering hosts"
-			return s, nil
-		}
 		s.focus = hostFocusDiscover
 		s.discoverSeq++
 		s.discover = discoveryOverlay{
@@ -737,13 +741,8 @@ func (s hostsSection) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 		s.testing = true
 		return s, tea.Batch(s.probeHostCmd(name), s.spinner.Tick)
 	case "r", "x":
-		if s.err != nil {
-			s.status = "fix inventory.yaml before editing hosts"
-			return s, nil
-		}
 		if len(s.names) > 0 {
 			s.focus = hostFocusConfirm
-			s.status = "remove " + s.names[s.cursor] + "? press y to confirm, n/esc to cancel"
 		}
 	case "enter", "i":
 		if s.detailVisible() && len(s.names) > 0 {
@@ -753,6 +752,23 @@ func (s hostsSection) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 		s.status = ""
 	}
 	return s, nil
+}
+
+// reloadInventory re-reads inventory.yaml after the operator fixes a parse error
+// in their editor, clearing the error on success and propagating the fresh
+// inventory to the other tabs.
+func (s hostsSection) reloadInventory() (tea.Model, tea.Cmd) {
+	inv, err := inventory.Load(s.paths.InventoryFile)
+	if err != nil {
+		s.loadErr = err
+		return s, nil
+	}
+	s.inventory = inv
+	s.loadErr = nil
+	s.err = nil
+	s.status = "inventory reloaded"
+	s.rebuildNames()
+	return s, inventoryChangedCmd(inv)
 }
 
 func inventoryChangedCmd(inv inventory.Inventory) tea.Cmd {
@@ -1108,6 +1124,12 @@ func (s hostsSection) View() string {
 	if s.focus == hostFocusDiscover {
 		return s.discoveryView()
 	}
+	if s.loadErr != nil {
+		return s.errorCardView()
+	}
+	if s.focus == hostFocusConfirm {
+		return s.confirmCardView()
+	}
 	var b strings.Builder
 	b.WriteString(s.styles.header.Render("Hosts"))
 	b.WriteString("\n")
@@ -1184,6 +1206,48 @@ func (s hostsSection) View() string {
 		}
 	}
 	return b.String()
+}
+
+// centeredCard places a bordered card in the middle of the section body.
+func (s hostsSection) centeredCard(card string) string {
+	if s.w > 0 && s.h > 0 {
+		return lipgloss.Place(s.w, s.h, lipgloss.Center, lipgloss.Center, card)
+	}
+	return card
+}
+
+// errorCardView replaces the Hosts tab when inventory.yaml won't parse: a Danger
+// card naming the file and the recovery key, instead of a raw error dump.
+func (s hostsSection) errorCardView() string {
+	var b strings.Builder
+	b.WriteString(s.styles.err.Render(s.styles.glyphs.Fail + " Inventory error"))
+	b.WriteString("\n\n")
+	b.WriteString(s.loadErr.Error())
+	b.WriteString("\n\n")
+	b.WriteString(s.styles.dim.Render("File: " + s.paths.InventoryFile))
+	b.WriteString("\n")
+	b.WriteString("Fix it in your editor, then " + keyHint(s.styles, "r", "reload"))
+	card := s.styles.panel.BorderForeground(theme.Danger).Render(b.String())
+	return s.centeredCard(card)
+}
+
+// confirmCardView is the centered Warn-bordered modal for a destructive delete;
+// it names the target and the credential side-effect on its own channel.
+func (s hostsSection) confirmCardView() string {
+	name := ""
+	if len(s.names) > 0 {
+		name = s.names[s.cursor]
+	}
+	var b strings.Builder
+	b.WriteString(s.styles.confirm.Render(s.styles.glyphs.Warn + " Remove host"))
+	b.WriteString("\n\n")
+	b.WriteString("Delete " + s.styles.header.Render(name) + " from inventory.yaml?")
+	b.WriteString("\n")
+	b.WriteString(s.styles.dim.Render("A stored password (if any) stays in secrets.enc — remove with `agentssh secret rm`."))
+	b.WriteString("\n\n")
+	b.WriteString(keyHint(s.styles, "y", "confirm") + "    " + keyHint(s.styles, "n/esc", "cancel"))
+	card := s.styles.panel.BorderForeground(theme.Warn).Render(b.String())
+	return s.centeredCard(card)
 }
 
 func (s hostsSection) discoveryView() string {

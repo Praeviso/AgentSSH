@@ -220,11 +220,20 @@ func runTUI(cmd *cobra.Command) error {
 		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "initialized %s with starter inventory.yaml and policy.yaml\n", home)
 	}
 	cfg, err := config.Load()
+	paths := config.NewPaths(home)
 	if err != nil {
-		return classifyConfigError(err)
+		// A malformed inventory.yaml/policy.yaml must not lock the operator out of
+		// the console — launch so the Hosts/Policy tabs can show a fixable error
+		// card. (The agent-facing commands still treat this as a setup error.)
+		var parseErr config.ParseError
+		if !errors.As(err, &parseErr) {
+			return classifyConfigError(err)
+		}
+	} else {
+		paths = cfg.Paths
 	}
 	opts := tui.Options{
-		Paths:    cfg.Paths,
+		Paths:    paths,
 		FirstRun: created,
 	}
 	err = tui.NewRunner().Run(opts)
