@@ -482,6 +482,52 @@ func TestFirstRunSwallowsQuitKeyButCtrlCStillQuits(t *testing.T) {
 	}
 }
 
+func TestHostsMasterDetailShowsCardWhenWide(t *testing.T) {
+	s := newHostsSection(testPaths(t), lipgloss.NewRenderer(io.Discard), testAppStyles(), inventory.Inventory{
+		Hosts: map[string]inventory.Host{"web-1": {Addr: "10.0.0.11", User: "deploy", IdentityFile: "~/.ssh/web-1", Tags: []string{"prod"}}},
+	}, nil)
+	s.w, s.h = 100, 20
+	v := s.View()
+	for _, want := range []string{"10.0.0.11", "deploy", "[key]", "[PROD]", "~/.ssh/web-1"} {
+		if !strings.Contains(v, want) {
+			t.Fatalf("wide Hosts view should show %q in the detail card:\n%s", want, v)
+		}
+	}
+	s.w = 50
+	if s.detailVisible() {
+		t.Fatal("the detail panel must hide on a narrow terminal")
+	}
+}
+
+func TestHostsEnterFocusesDetailWhenWide(t *testing.T) {
+	s := newHostsSection(testPaths(t), lipgloss.NewRenderer(io.Discard), testAppStyles(), inventory.Inventory{
+		Hosts: map[string]inventory.Host{"web-1": {Addr: "10.0.0.11"}, "db-2": {Addr: "10.0.0.31"}},
+	}, nil)
+	s.w, s.h = 100, 20
+
+	updated, _ := s.Update(keyMsg("enter"))
+	hs := updated.(hostsSection)
+	if hs.focus != hostFocusDetail {
+		t.Fatal("enter should focus the detail panel when it is visible")
+	}
+	cur := hs.cursor
+	updated, _ = hs.Update(keyMsg("j"))
+	hs = updated.(hostsSection)
+	if hs.cursor == cur {
+		t.Fatal("j while detail-focused should still browse host selection")
+	}
+	updated, _ = hs.Update(keyMsg("esc"))
+	if updated.(hostsSection).focus != hostFocusList {
+		t.Fatal("esc should return focus to the list")
+	}
+
+	s.w = 50 // narrow: enter must not focus a hidden panel
+	updated, _ = s.Update(keyMsg("enter"))
+	if updated.(hostsSection).focus == hostFocusDetail {
+		t.Fatal("enter must not focus the detail panel when it is hidden")
+	}
+}
+
 func TestDeleteConfirmSurvivesCursorKeys(t *testing.T) {
 	s := newHostsSection(testPaths(t), lipgloss.NewRenderer(io.Discard), testAppStyles(), inventory.Inventory{
 		Hosts: map[string]inventory.Host{"web-1": {Addr: "10.0.0.11"}, "db-2": {Addr: "10.0.0.31"}},

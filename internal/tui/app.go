@@ -514,8 +514,14 @@ func (s hostsSection) helpKeyMap() help.KeyMap {
 		return helpMap{short: []key.Binding{hk("j/k", "move"), hk("space", "select"), hk("p", "probe"), hk("enter", "import"), hk("esc", "close")}}
 	case hostFocusConfirm:
 		return helpMap{short: []key.Binding{hk("y", "confirm"), hk("n/esc", "cancel")}}
+	case hostFocusDetail:
+		return helpMap{short: []key.Binding{hk("j/k", "browse"), hk("t", "test"), hk("esc", "list")}}
 	default:
-		return helpMap{short: []key.Binding{hk("j/k", "move"), hk("a", "add"), hk("d", "discover"), hk("t", "test"), hk("r/x", "remove")}}
+		hints := []key.Binding{hk("j/k", "move"), hk("a", "add"), hk("d", "discover"), hk("t", "test"), hk("r/x", "remove")}
+		if s.detailVisible() {
+			hints = append(hints, hk("enter", "inspect"))
+		}
+		return helpMap{short: hints}
 	}
 }
 
@@ -594,9 +600,43 @@ func (s hostsSection) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return s.updateDiscovery(msg)
 	case hostFocusConfirm:
 		return s.updateConfirm(msg)
+	case hostFocusDetail:
+		return s.updateDetail(msg)
 	default:
 		return s.updateList(msg)
 	}
+}
+
+// updateDetail handles keys while the right host-detail panel is focused: j/k
+// browse hosts (the card follows), t tests the shown host, esc/i return to the
+// list. It is non-modal, so the shell's tab/q/? still work over it.
+func (s hostsSection) updateDetail(msg tea.Msg) (tea.Model, tea.Cmd) {
+	keyMsg, ok := msg.(tea.KeyMsg)
+	if !ok {
+		return s, nil
+	}
+	switch keyMsg.String() {
+	case "j", "down":
+		if s.cursor < len(s.names)-1 {
+			s.cursor++
+		}
+	case "k", "up":
+		if s.cursor > 0 {
+			s.cursor--
+		}
+	case "esc", "i":
+		s.focus = hostFocusList
+	case "t":
+		if s.testing || len(s.names) == 0 {
+			return s, nil
+		}
+		name := s.names[s.cursor]
+		s.status = "testing " + name + "…"
+		s.err = nil
+		s.testing = true
+		return s, tea.Batch(s.probeHostCmd(name), s.spinner.Tick)
+	}
+	return s, nil
 }
 
 func (s hostsSection) updateForm(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -704,6 +744,10 @@ func (s hostsSection) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if len(s.names) > 0 {
 			s.focus = hostFocusConfirm
 			s.status = "remove " + s.names[s.cursor] + "? press y to confirm, n/esc to cancel"
+		}
+	case "enter", "i":
+		if s.detailVisible() && len(s.names) > 0 {
+			s.focus = hostFocusDetail
 		}
 	case "esc":
 		s.status = ""
@@ -1101,6 +1145,21 @@ func (s hostsSection) View() string {
 		b.WriteString("    ")
 		b.WriteString(keyHint(s.styles, "d", "discover hosts you can already reach"))
 		b.WriteString("\n")
+	} else if s.detailVisible() {
+		// Master-detail: a compact table on the left, the full host card on the right.
+		window, start := s.hostWindow()
+		rows := make([][]string, 0, len(window))
+		for _, name := range window {
+			rows = append(rows, hostRowCompact(name, s.inventory.Hosts[name]))
+		}
+		left := renderTable(s.styles, hostColumnsCompact, rows, s.cursor-start)
+		rightW := s.w - lipgloss.Width(left) - 3
+		if rightW < 24 {
+			rightW = 24
+		}
+		right := s.hostDetailView(rightW, s.focus == hostFocusDetail)
+		b.WriteString(lipgloss.JoinHorizontal(lipgloss.Top, left, " ", right))
+		b.WriteString("\n")
 	} else {
 		window, start := s.hostWindow()
 		rows := make([][]string, 0, len(window))
@@ -1339,6 +1398,85 @@ func hostHasTag(host inventory.Host, tag string) bool {
 		}
 	}
 	return false
+}
+
+// Compact columns for master-detail mode, where the right panel carries the full
+// per-host detail so the left table only needs to identify the row.
+var hostColumnsCompact = []tableColumn{
+	{header: "NAME"},
+	{header: "ADDR"},
+	{header: "PORT", right: true},
+}
+
+func hostRowCompact(name string, host inventory.Host) []string {
+	display := name
+	if hostHasTag(host, "prod") {
+		display += " [prod]"
+	}
+	port := "22"
+	if host.Port != 0 {
+		port = strconv.Itoa(host.Port)
+	}
+	return []string{
+		truncate(display, 26),
+		truncate(orDash(host.Addr), 22),
+		port,
+	}
+}
+
+// detailVisible reports whether there's room for the master-detail right panel.
+func (s hostsSection) detailVisible() bool { return s.w >= 72 }
+
+// hostDetailView renders the selected host's full detail card for the right pane.
+// It surfaces identity_file as a PATH (never a secret) and the prod marker; the
+// panel border accents when focused.
+func (s hostsSection) hostDetailView(width int, focused bool) string {
+	if len(s.names) == 0 {
+		return ""
+	}
+	name := s.names[s.cursor]
+	host := s.inventory.Hosts[name]
+
+	var b strings.Builder
+	marker := " "
+	if focused {
+		marker = s.styles.glyphs.Marker
+	}
+	b.WriteString(s.styles.header.Render(marker + " " + name))
+	b.WriteString("\n\n")
+	field := func(label, val string) {
+		fmt.Fprintf(&b, "%s %s\n", s.styles.dim.Render(fmt.Sprintf("%-9s", label)), val)
+	}
+	port := "22"
+	if host.Port != 0 {
+		port = strconv.Itoa(host.Port)
+	}
+	field("addr", orDash(host.Addr))
+	field("user", orDash(host.User))
+	field("port", port)
+	field("alias", orDash(host.SSHConfigAlias))
+	identity := orDash(host.IdentityFile)
+	if host.IdentityFile != "" {
+		identity += " " + s.styles.dim.Render("[key]")
+	}
+	field("identity", identity)
+	field("tags", orDash(strings.Join(host.Tags, ", ")))
+	if hostHasTag(host, "prod") {
+		b.WriteString(s.styles.prod.Render("[PROD]"))
+		b.WriteString("\n")
+	}
+	b.WriteString("\n")
+	b.WriteString(s.styles.dim.Render("password managed via `agentssh secret`"))
+	b.WriteString("\n")
+	b.WriteString(s.styles.dim.Render("press t to test connectivity"))
+
+	panel := s.styles.panel.Width(width)
+	if focused {
+		panel = panel.BorderForeground(theme.Accent)
+	} else {
+		panel = panel.BorderForeground(theme.Border)
+	}
+	return panel.Render(b.String())
 }
 
 type policySection struct {
