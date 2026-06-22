@@ -494,8 +494,49 @@ func TestHostsMasterDetailShowsCardWhenWide(t *testing.T) {
 		}
 	}
 	s.w = 50
-	if s.detailVisible() {
+	if s.detailShown() {
 		t.Fatal("the detail panel must hide on a narrow terminal")
+	}
+}
+
+func TestHostsDetailFocusDemotedOnResizeToNarrow(t *testing.T) {
+	s := newHostsSection(testPaths(t), lipgloss.NewRenderer(io.Discard), testAppStyles(), inventory.Inventory{
+		Hosts: map[string]inventory.Host{"web-1": {Addr: "10.0.0.11"}},
+	}, nil)
+	s.w, s.h = 100, 20
+	updated, _ := s.Update(keyMsg("enter"))
+	s = updated.(hostsSection)
+	if s.focus != hostFocusDetail {
+		t.Fatal("enter should focus detail when wide")
+	}
+	// Shrinking below the master-detail threshold must demote focus back to the
+	// list, else add/discover/remove would silently go dead.
+	updated, _ = s.Update(tea.WindowSizeMsg{Width: 50, Height: 20})
+	if updated.(hostsSection).focus != hostFocusList {
+		t.Fatal("resizing narrow must demote a stuck detail focus to the list")
+	}
+}
+
+func TestMasterDetailDoesNotOverflowInNarrowBand(t *testing.T) {
+	// Long host names push the compact table wide; in the 72-79 col band the
+	// detail card must be dropped rather than overflow and clip its border.
+	s := newHostsSection(testPaths(t), lipgloss.NewRenderer(io.Discard), testAppStyles(), inventory.Inventory{
+		Hosts: map[string]inventory.Host{"a-very-long-production-hostname-1": {Addr: "203.0.113.51", Port: 22}},
+	}, nil)
+	for w := 72; w <= 110; w++ {
+		s.w, s.h = w, 20
+		_, rightW, ok := s.detailLayout()
+		if ok {
+			// The joined row must fit exactly within the frame.
+			left, rw, _ := s.detailLayout()
+			total := lipgloss.Width(left) + 1 + rw + 2 // gutter + card borders
+			if total > w {
+				t.Fatalf("w=%d: master-detail row width %d overflows frame", w, total)
+			}
+			if rightW < minDetailWidth {
+				t.Fatalf("w=%d: shown card narrower than min (%d)", w, rightW)
+			}
+		}
 	}
 }
 
@@ -525,6 +566,18 @@ func TestHostsEnterFocusesDetailWhenWide(t *testing.T) {
 	updated, _ = s.Update(keyMsg("enter"))
 	if updated.(hostsSection).focus == hostFocusDetail {
 		t.Fatal("enter must not focus the detail panel when it is hidden")
+	}
+}
+
+func TestInventoryChangeClearsStalePolicyError(t *testing.T) {
+	app := newAppModel(config.Paths{}, lipgloss.NewRenderer(io.Discard))
+	if pol, ok := app.sections[sectionPolicy].(policySection); ok {
+		pol.err = errors.New("failed to parse inventory.yaml")
+		app.sections[sectionPolicy] = pol
+	}
+	app.applyInventoryChange(inventory.Inventory{Hosts: map[string]inventory.Host{"web-1": {Addr: "10.0.0.11"}}})
+	if pol := app.sections[sectionPolicy].(policySection); pol.err != nil {
+		t.Fatalf("a successful inventory change should clear the stale policy error, got %v", pol.err)
 	}
 }
 

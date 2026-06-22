@@ -89,7 +89,7 @@ const (
 // content, so we show a "resize" card instead of a broken layout.
 const (
 	minFrameWidth  = 40
-	minFrameHeight = 9
+	minFrameHeight = 11 // leave room for the status bar + footer + the error/confirm cards
 )
 
 type appModel struct {
@@ -230,20 +230,7 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.w, m.h, m.ready = msg.Width, msg.Height, true
 		m.help.Width = msg.Width
-		inner := msg
-		inner.Height -= lipgloss.Height(m.renderStatusBar()) + 1 // status bar + footer line
-		if inner.Height < 1 {
-			inner.Height = 1
-		}
-		var cmds []tea.Cmd
-		for i, activeSection := range m.sections {
-			updated, cmd := activeSection.Update(inner)
-			if next, ok := updated.(section); ok {
-				m.sections[i] = next
-			}
-			cmds = append(cmds, cmd)
-		}
-		return m, tea.Batch(cmds...)
+		return m.propagateSize()
 	case sessionSelectedMsg:
 		m.focusAuditSession(msg.id)
 		return m, nil
@@ -268,14 +255,17 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.firstRun {
 			// The welcome banner says "press any key to begin"; consume that one
-			// keystroke so a natural 'q' doesn't quit the app just initialized.
+			// keystroke so a natural 'q' doesn't quit the app just initialized, and
+			// re-propagate sizes since the banner (and its line) is now gone.
 			m.firstRun = false
-			return m, nil
+			return m.propagateSize()
 		}
 		if !m.sections[m.active].capturing() {
 			if msg.String() == "?" {
+				// Toggling full help changes the footer height, so re-propagate the
+				// new body height to sections (else their content gets clipped).
 				m.help.ShowAll = !m.help.ShowAll
-				return m, nil
+				return m.propagateSize()
 			}
 			if next, ok := switchTarget(m.active, len(m.sections), msg); ok {
 				m.active = next
@@ -291,6 +281,43 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m appModel) updateActive(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m.updateSection(m.active, msg)
+}
+
+// propagateSize forwards the current body dimensions to every section. Called on
+// resize and whenever the chrome height changes (full help toggled, welcome
+// dismissed), so each section's measured layout matches the shell's clamped body.
+func (m appModel) propagateSize() (appModel, tea.Cmd) {
+	if m.w <= 0 || m.h <= 0 {
+		return m, nil
+	}
+	inner := tea.WindowSizeMsg{Width: m.w, Height: m.bodyHeight()}
+	var cmds []tea.Cmd
+	for i, sec := range m.sections {
+		updated, cmd := sec.Update(inner)
+		if next, ok := updated.(section); ok {
+			m.sections[i] = next
+		}
+		cmds = append(cmds, cmd)
+	}
+	return m, tea.Batch(cmds...)
+}
+
+// bodyHeight is the height available to the active section: the frame minus the
+// status bar, the footer (which grows when full help is shown), and the one-time
+// welcome banner. It's the single source the View clamp and propagateSize share.
+func (m appModel) bodyHeight() int {
+	h := m.h - lipgloss.Height(m.renderStatusBar()) - lipgloss.Height(m.renderFooter())
+	if m.firstRun {
+		h -= lipgloss.Height(m.welcomeBanner())
+	}
+	if h < 1 {
+		h = 1
+	}
+	return h
+}
+
+func (m appModel) welcomeBanner() string {
+	return m.styles.ok.Render(m.styles.glyphs.Check + " Welcome to AgentSSH — created a starter inventory.yaml + policy.yaml. Press any key to begin.")
 }
 
 // updateSection delivers a message to a specific section by index, regardless of
@@ -317,6 +344,10 @@ func (m *appModel) applyInventoryChange(inv inventory.Inventory) {
 	}
 	if policyModel, ok := m.sections[sectionPolicy].(policySection); ok {
 		policyModel.inventory = inv
+		// A successful inventory change means inventory.yaml now parses, so clear a
+		// stale inventory parse error mirrored onto this tab (a real policy error
+		// resurfaces on the next policy test, which reloads policy.yaml).
+		policyModel.err = nil
 		m.sections[sectionPolicy] = policyModel
 	}
 }
@@ -335,29 +366,18 @@ func (m appModel) View() string {
 		body = "loading..."
 	}
 
-	var welcome string
-	if m.firstRun {
-		welcome = m.styles.ok.Render(m.styles.glyphs.Check + " Welcome to AgentSSH — created a starter inventory.yaml + policy.yaml. Press any key to begin.")
-	}
-
 	// Pin the footer to the bottom by filling the space between the status bar
-	// and the footer, and clamp the body to the frame so it can never push the
-	// footer off-screen or overflow horizontally.
+	// and the footer (bodyHeight is shared with propagateSize so sections size to
+	// the same budget), and clamp so the body can't push the footer off-screen or
+	// overflow horizontally.
 	if m.w > 0 && m.h > 0 {
-		used := lipgloss.Height(statusBar) + lipgloss.Height(footer)
-		if welcome != "" {
-			used += lipgloss.Height(welcome)
-		}
-		bodyH := m.h - used
-		if bodyH < 1 {
-			bodyH = 1
-		}
+		bodyH := m.bodyHeight()
 		body = lipgloss.NewStyle().Height(bodyH).MaxHeight(bodyH).MaxWidth(m.w).Render(body)
 	}
 
 	parts := make([]string, 0, 4)
-	if welcome != "" {
-		parts = append(parts, welcome)
+	if m.firstRun {
+		parts = append(parts, m.welcomeBanner())
 	}
 	parts = append(parts, statusBar, body, footer)
 	return lipgloss.JoinVertical(lipgloss.Left, parts...)
@@ -522,7 +542,7 @@ func (s hostsSection) helpKeyMap() help.KeyMap {
 		return helpMap{short: []key.Binding{hk("j/k", "browse"), hk("t", "test"), hk("esc", "list")}}
 	default:
 		hints := []key.Binding{hk("j/k", "move"), hk("a", "add"), hk("d", "discover"), hk("t", "test"), hk("r/x", "remove")}
-		if s.detailVisible() {
+		if s.detailShown() {
 			hints = append(hints, hk("enter", "inspect"))
 		}
 		return helpMap{short: hints}
@@ -536,6 +556,12 @@ func (s hostsSection) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Keep the size current even while a modal owns the screen, so the list is
 		// sized correctly once it closes.
 		s.w, s.h = ws.Width, ws.Height
+		// Demote a now-invalid detail focus: if the terminal shrank below the
+		// master-detail threshold, the panel is hidden, so return to the list —
+		// otherwise add/discover/remove would silently go dead.
+		if s.focus == hostFocusDetail && !s.detailShown() {
+			s.focus = hostFocusList
+		}
 	}
 
 	// Async results and the spinner tick are handled regardless of focus.
@@ -745,7 +771,7 @@ func (s hostsSection) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 			s.focus = hostFocusConfirm
 		}
 	case "enter", "i":
-		if s.detailVisible() && len(s.names) > 0 {
+		if s.detailShown() {
 			s.focus = hostFocusDetail
 		}
 	case "esc":
@@ -1167,18 +1193,10 @@ func (s hostsSection) View() string {
 		b.WriteString("    ")
 		b.WriteString(keyHint(s.styles, "d", "discover hosts you can already reach"))
 		b.WriteString("\n")
-	} else if s.detailVisible() {
-		// Master-detail: a compact table on the left, the full host card on the right.
-		window, start := s.hostWindow()
-		rows := make([][]string, 0, len(window))
-		for _, name := range window {
-			rows = append(rows, hostRowCompact(name, s.inventory.Hosts[name]))
-		}
-		left := renderTable(s.styles, hostColumnsCompact, rows, s.cursor-start)
-		rightW := s.w - lipgloss.Width(left) - 3
-		if rightW < 24 {
-			rightW = 24
-		}
+	} else if left, rightW, ok := s.detailLayout(); ok {
+		// Master-detail: a compact table on the left, the full host card on the
+		// right. rightW exactly fills s.w − leftWidth − gutter (no floor), so the
+		// joined row never overflows the frame and the card border isn't clipped.
 		right := s.hostDetailView(rightW, s.focus == hostFocusDetail)
 		b.WriteString(lipgloss.JoinHorizontal(lipgloss.Top, left, " ", right))
 		b.WriteString("\n")
@@ -1222,7 +1240,13 @@ func (s hostsSection) errorCardView() string {
 	var b strings.Builder
 	b.WriteString(s.styles.err.Render(s.styles.glyphs.Fail + " Inventory error"))
 	b.WriteString("\n\n")
-	b.WriteString(s.loadErr.Error())
+	// Show only the first line of the parse error; the actionable info is the
+	// file path + reload, and a multi-line dump would blow out the card.
+	msg := s.loadErr.Error()
+	if i := strings.IndexByte(msg, '\n'); i >= 0 {
+		msg = msg[:i]
+	}
+	b.WriteString(truncate(msg, 60))
 	b.WriteString("\n\n")
 	b.WriteString(s.styles.dim.Render("File: " + s.paths.InventoryFile))
 	b.WriteString("\n")
@@ -1489,7 +1513,36 @@ func hostRowCompact(name string, host inventory.Host) []string {
 }
 
 // detailVisible reports whether there's room for the master-detail right panel.
-func (s hostsSection) detailVisible() bool { return s.w >= 72 }
+// minDetailWidth is the narrowest usable detail card (content width).
+const minDetailWidth = 28
+
+// detailLayout renders the compact left table and computes the right-pane width
+// that exactly fills the rest of the row. ok is false when the terminal is too
+// narrow for both panes, so the caller falls back to the full-width table. It
+// renders the table (cheap) so the decision matches exactly what View draws.
+func (s hostsSection) detailLayout() (left string, rightW int, ok bool) {
+	if s.w < 72 || len(s.names) == 0 {
+		return "", 0, false
+	}
+	window, start := s.hostWindow()
+	rows := make([][]string, 0, len(window))
+	for _, name := range window {
+		rows = append(rows, hostRowCompact(name, s.inventory.Hosts[name]))
+	}
+	left = renderTable(s.styles, hostColumnsCompact, rows, s.cursor-start)
+	rightW = s.w - lipgloss.Width(left) - 3 // 1 gutter + 2 card border columns
+	if rightW < minDetailWidth {
+		return "", 0, false
+	}
+	return left, rightW, true
+}
+
+// detailShown reports whether the master-detail panel is currently rendered, so
+// focus transitions stay consistent with what's on screen.
+func (s hostsSection) detailShown() bool {
+	_, _, ok := s.detailLayout()
+	return ok
+}
 
 // hostDetailView renders the selected host's full detail card for the right pane.
 // It surfaces identity_file as a PATH (never a secret) and the prod marker; the
