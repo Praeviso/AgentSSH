@@ -19,6 +19,7 @@ import (
 	"github.com/Praeviso/AgentSSH/internal/policy"
 	"github.com/Praeviso/AgentSSH/internal/secrets"
 	"github.com/Praeviso/AgentSSH/internal/session"
+	"github.com/Praeviso/AgentSSH/internal/theme"
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -61,30 +62,38 @@ type appStyles struct {
 	dim        lipgloss.Style
 	panel      lipgloss.Style
 	confirm    lipgloss.Style
+	deny       lipgloss.Style
+	prod       lipgloss.Style
 	background lipgloss.Style
 	// table cell styles, shared by the aligned list renderer (see table.go).
 	tableHeader lipgloss.Style
 	tableSel    lipgloss.Style
 	tableCell   lipgloss.Style
+	// glyphs is the renderer-resolved status-glyph set (ASCII under NO_COLOR).
+	glyphs theme.Glyphs
 }
 
 func newAppStyles(r *lipgloss.Renderer) appStyles {
 	return appStyles{
 		tabs:       r.NewStyle().Padding(0, 1).Bold(true),
-		activeTab:  r.NewStyle().Padding(0, 1).Bold(true).Foreground(lipgloss.Color("15")).Background(lipgloss.Color("63")),
-		inactive:   r.NewStyle().Padding(0, 1).Foreground(lipgloss.Color("244")),
-		err:        r.NewStyle().Foreground(lipgloss.Color("196")).Bold(true),
-		ok:         r.NewStyle().Foreground(lipgloss.Color("42")).Bold(true),
-		header:     r.NewStyle().Bold(true).Foreground(lipgloss.Color("63")),
-		cursor:     r.NewStyle().Foreground(lipgloss.Color("212")).Bold(true),
-		dim:        r.NewStyle().Foreground(lipgloss.Color("241")),
+		activeTab:  r.NewStyle().Padding(0, 1).Bold(true).Foreground(theme.AccentText).Background(theme.Accent),
+		inactive:   r.NewStyle().Padding(0, 1).Foreground(theme.Dim),
+		err:        r.NewStyle().Foreground(theme.Danger).Bold(true),
+		ok:         r.NewStyle().Foreground(theme.Success).Bold(true),
+		header:     r.NewStyle().Bold(true).Foreground(theme.Accent),
+		cursor:     r.NewStyle().Foreground(theme.Cursor).Bold(true),
+		dim:        r.NewStyle().Foreground(theme.Dim),
 		panel:      r.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1),
-		confirm:    r.NewStyle().Foreground(lipgloss.Color("220")).Bold(true),
+		confirm:    r.NewStyle().Foreground(theme.Warn).Bold(true),
+		deny:       r.NewStyle().Foreground(theme.Deny).Bold(true),
+		prod:       r.NewStyle().Foreground(theme.Prod).Bold(true),
 		background: r.NewStyle(),
 
-		tableHeader: r.NewStyle().Padding(0, 1).Bold(true).Foreground(lipgloss.Color("241")),
-		tableSel:    r.NewStyle().Padding(0, 1).Background(lipgloss.Color("237")),
+		tableHeader: r.NewStyle().Padding(0, 1).Bold(true).Foreground(theme.Dim),
+		tableSel:    r.NewStyle().Padding(0, 1).Background(theme.SelBg),
 		tableCell:   r.NewStyle().Padding(0, 1),
+
+		glyphs: theme.GlyphsFor(r),
 	}
 }
 
@@ -990,7 +999,7 @@ func (s hostsSection) discoveryView() string {
 		window, start := s.discoverWindow()
 		rows := make([][]string, 0, len(window))
 		for i, candidate := range window {
-			rows = append(rows, discoverRow(candidate, s.discover.selected[start+i]))
+			rows = append(rows, discoverRow(s.styles.glyphs, candidate, s.discover.selected[start+i]))
 		}
 		b.WriteString(renderTable(s.styles, discoverColumns, rows, s.discover.cursor-start))
 		b.WriteString("\n")
@@ -1033,7 +1042,7 @@ var discoverColumns = []tableColumn{
 	{header: "STATUS"},
 }
 
-func discoverRow(candidate discovery.Candidate, selected bool) []string {
+func discoverRow(g theme.Glyphs, candidate discovery.Candidate, selected bool) []string {
 	sel := "[ ]"
 	if selected {
 		sel = "[x]"
@@ -1043,10 +1052,10 @@ func discoverRow(candidate discovery.Candidate, selected bool) []string {
 		truncate(candidate.Name, 22),
 		candidate.Source,
 		truncate(formatDiscoveryAddr(candidate), 22),
-		glyphBool(candidate.HasKey),
-		glyphBool(candidate.InKnownHosts),
-		glyphBool(candidate.InInventory),
-		discoveryStatusCell(candidate),
+		glyphBool(g, candidate.HasKey),
+		glyphBool(g, candidate.InKnownHosts),
+		glyphBool(g, candidate.InInventory),
+		discoveryStatusCell(g, candidate),
 	}
 }
 
@@ -1057,35 +1066,36 @@ func formatDiscoveryAddr(candidate discovery.Candidate) string {
 	return fmt.Sprintf("%s:%d", candidate.Addr, candidate.Port)
 }
 
-// glyphBool renders a present/absent column as a glyph (color comes in P1; the
-// glyph alone carries meaning, and survives NO_COLOR as plain text).
-func glyphBool(ok bool) string {
+// glyphBool renders a present/absent column as a glyph that survives NO_COLOR
+// (the glyph itself degrades to ASCII via the resolver).
+func glyphBool(g theme.Glyphs, ok bool) string {
 	if ok {
-		return "●"
+		return g.OK
 	}
-	return "·"
+	return g.Absent
 }
 
 // discoveryStatusCell renders the probe/known state as a glyph + word so the
-// STATUS column is scannable. Coloring per status lands with the P1 StatusCell.
-func discoveryStatusCell(candidate discovery.Candidate) string {
+// STATUS column is scannable. Per-cell coloring is a lipgloss/table limitation;
+// the glyph + word carries the meaning.
+func discoveryStatusCell(g theme.Glyphs, candidate discovery.Candidate) string {
 	switch candidate.ProbeStatus {
 	case executor.ProbeConnectable:
-		return "● reachable"
+		return g.OK + " reachable"
 	case executor.ProbeAuthFailed:
-		return "▲ auth-failed"
+		return g.Warn + " auth-failed"
 	case executor.ProbeHostKeyIssue:
-		return "▲ host-key"
+		return g.Warn + " host-key"
 	case executor.ProbeUnreachable:
-		return "✖ unreachable"
+		return g.Fail + " unreachable"
 	}
 	switch {
 	case candidate.InInventory:
-		return "· in inventory"
+		return g.Absent + " in inventory"
 	case candidate.HasKey:
-		return "○ looks-connectable"
+		return g.Maybe + " looks-connectable"
 	default:
-		return "· needs-auth"
+		return g.Absent + " needs-auth"
 	}
 }
 
@@ -1261,7 +1271,7 @@ func (s policySection) View() string {
 	if s.result != "" {
 		style := s.styles.ok
 		if strings.HasPrefix(s.result, string(policy.ActionDeny)) {
-			style = s.styles.err
+			style = s.styles.deny
 		}
 		b.WriteString(style.Render(s.result))
 		b.WriteString("\n")
@@ -1287,12 +1297,12 @@ var policyRuleColumns = []tableColumn{
 }
 
 // policyActionCell renders a policy action as a glyph + word so deny reads as a
-// distinct verdict (coloring lands with the P1 StatusCell/theme).
-func policyActionCell(action policy.Action) string {
+// distinct verdict (per-cell coloring is a lipgloss/table limitation).
+func policyActionCell(g theme.Glyphs, action policy.Action) string {
 	if action == policy.ActionDeny {
-		return "⊘ DENY"
+		return g.Deny + " DENY"
 	}
-	return "● ALLOW"
+	return g.OK + " ALLOW"
 }
 
 func renderPolicyConfig(st appStyles, cfg policy.Config) string {
@@ -1301,7 +1311,7 @@ func renderPolicyConfig(st appStyles, cfg policy.Config) string {
 	if defaultPolicy == "" {
 		defaultPolicy = policy.ActionAllow
 	}
-	fmt.Fprintf(&b, "default posture: %s\n\n", policyActionCell(defaultPolicy))
+	fmt.Fprintf(&b, "default posture: %s\n\n", policyActionCell(st.glyphs, defaultPolicy))
 
 	if len(cfg.Rules) == 0 {
 		b.WriteString(st.dim.Render("rules: (none)"))
@@ -1315,7 +1325,7 @@ func renderPolicyConfig(st appStyles, cfg policy.Config) string {
 			}
 			rows = append(rows, []string{
 				truncate(name, 22),
-				policyActionCell(rule.Action),
+				policyActionCell(st.glyphs, rule.Action),
 				truncate(rule.Match.CmdRegex, 44),
 			})
 		}
@@ -1330,7 +1340,7 @@ func renderPolicyConfig(st appStyles, cfg policy.Config) string {
 		for _, name := range sortedOverrideNames(cfg.HostOverrides) {
 			override := cfg.HostOverrides[name]
 			fmt.Fprintf(&b, "  %s → %s (%d allow rules)\n",
-				name, policyActionCell(override.Policy), len(override.AllowRules))
+				name, policyActionCell(st.glyphs, override.Policy), len(override.AllowRules))
 		}
 	}
 	fmt.Fprintf(&b, "\noutput: max_bytes=%d · redactions=%d\n", cfg.Output.MaxBytes, len(cfg.Output.Redact))

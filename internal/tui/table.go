@@ -53,7 +53,7 @@ func renderTable(st appStyles, cols []tableColumn, rows [][]string, cursor int) 
 	for i, r := range rows {
 		marker := " "
 		if i == cursor {
-			marker = "▌"
+			marker = st.glyphs.Marker
 		}
 		data[i] = append([]string{marker}, r...)
 	}

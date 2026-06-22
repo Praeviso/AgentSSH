@@ -8,6 +8,7 @@ import (
 
 	"github.com/Praeviso/AgentSSH/internal/audit"
 	"github.com/Praeviso/AgentSSH/internal/session"
+	"github.com/Praeviso/AgentSSH/internal/theme"
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
@@ -86,19 +87,23 @@ type styles struct {
 	prod   lipgloss.Style
 	ok     lipgloss.Style
 	bad    lipgloss.Style
+	deny   lipgloss.Style
+	glyphs theme.Glyphs
 }
 
 func newStyles(r *lipgloss.Renderer) styles {
 	return styles{
 		bar:    r.NewStyle().Bold(true),
-		header: r.NewStyle().Bold(true).Foreground(lipgloss.Color("63")),
-		cursor: r.NewStyle().Foreground(lipgloss.Color("212")).Bold(true),
-		dim:    r.NewStyle().Foreground(lipgloss.Color("241")),
+		header: r.NewStyle().Bold(true).Foreground(theme.Accent),
+		cursor: r.NewStyle().Foreground(theme.Cursor).Bold(true),
+		dim:    r.NewStyle().Foreground(theme.Dim),
 		normal: r.NewStyle(),
 		panel:  r.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1),
-		prod:   r.NewStyle().Foreground(lipgloss.Color("203")).Bold(true),
-		ok:     r.NewStyle().Foreground(lipgloss.Color("42")).Bold(true),
-		bad:    r.NewStyle().Foreground(lipgloss.Color("196")).Bold(true),
+		prod:   r.NewStyle().Foreground(theme.Prod).Bold(true),
+		ok:     r.NewStyle().Foreground(theme.Success).Bold(true),
+		bad:    r.NewStyle().Foreground(theme.Danger).Bold(true),
+		deny:   r.NewStyle().Foreground(theme.Deny).Bold(true),
+		glyphs: theme.GlyphsFor(r),
 	}
 }
 
@@ -451,11 +456,11 @@ func (m model) chainStatus() string {
 	}
 	if m.verifyResult.OK {
 		if m.verifyResult.Count == 0 {
-			return m.styles.ok.Render("链 ✓ 完整 (empty)")
+			return m.styles.ok.Render("链 " + m.styles.glyphs.Check + " 完整 (empty)")
 		}
-		return m.styles.ok.Render(fmt.Sprintf("链 ✓ 完整 (0..%d)", m.verifyResult.Count-1))
+		return m.styles.ok.Render(fmt.Sprintf("链 %s 完整 (0..%d)", m.styles.glyphs.Check, m.verifyResult.Count-1))
 	}
-	return m.styles.bad.Render(fmt.Sprintf("链 ✗ 断于 seq=%d · %s", m.verifyResult.BrokenSeq, reasonText(m.verifyResult.Reason)))
+	return m.styles.bad.Render(fmt.Sprintf("链 %s 断于 seq=%d · %s", m.styles.glyphs.Cross, m.verifyResult.BrokenSeq, reasonText(m.verifyResult.Reason)))
 }
 
 func (m model) helpLine() string {
@@ -551,14 +556,17 @@ func (m model) renderRow(i int) string {
 		exit = strconv.Itoa(*rec.ExitCode)
 	}
 	body := fmt.Sprintf("    %s %s  %s  %s  %s  %s/%s · exit %s · %s",
-		iconFor(rec.Event), clockOf(rec.TS), host, skill, truncate(rec.Cmd, 40),
+		iconFor(m.styles.glyphs, rec.Event), clockOf(rec.TS), host, skill, truncate(rec.Cmd, 40),
 		rec.PolicyAction, rec.PolicyRule, exit, durStr(rec.DurationMS))
 
 	style := m.styles.normal
-	if m.brokenSeq != nil && *m.brokenSeq == rec.Seq {
-		body += "  ⚠ TAMPERED"
+	switch {
+	case m.brokenSeq != nil && *m.brokenSeq == rec.Seq:
+		body += "  " + m.styles.glyphs.Warn + " TAMPERED"
 		style = m.styles.bad
-	} else if rec.Event == audit.EventDenied || rec.Event == audit.EventFailed {
+	case rec.Event == audit.EventDenied:
+		style = m.styles.deny
+	case rec.Event == audit.EventFailed:
 		style = m.styles.bad
 	}
 	return cursor + style.Render(body)
@@ -748,18 +756,18 @@ func reasonText(reason string) string {
 	}
 }
 
-func iconFor(event audit.Event) string {
+func iconFor(g theme.Glyphs, event audit.Event) string {
 	switch event {
 	case audit.EventCompleted:
-		return "✓"
+		return g.Check
 	case audit.EventFailed:
-		return "✗"
+		return g.Cross
 	case audit.EventDenied:
-		return "⊘"
+		return g.Deny
 	case audit.EventStarted:
-		return "●"
+		return g.OK
 	default:
-		return "·"
+		return g.Absent
 	}
 }
 

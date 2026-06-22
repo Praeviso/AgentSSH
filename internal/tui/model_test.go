@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/Praeviso/AgentSSH/internal/audit"
+	"github.com/Praeviso/AgentSSH/internal/theme"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/termenv"
 )
@@ -198,14 +199,15 @@ func TestReasonText(t *testing.T) {
 }
 
 func TestIconFor(t *testing.T) {
+	g := theme.GlyphsFor(nil) // Unicode set
 	cases := map[audit.Event]string{
-		audit.EventCompleted: "✓",
-		audit.EventFailed:    "✗",
-		audit.EventDenied:    "⊘",
-		audit.EventStarted:   "●",
+		audit.EventCompleted: g.Check,
+		audit.EventFailed:    g.Cross,
+		audit.EventDenied:    g.Deny,
+		audit.EventStarted:   g.OK,
 	}
 	for event, want := range cases {
-		if got := iconFor(event); got != want {
+		if got := iconFor(g, event); got != want {
 			t.Errorf("iconFor(%q) = %q, want %q", event, got, want)
 		}
 	}

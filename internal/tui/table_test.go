@@ -9,6 +9,7 @@ import (
 	"github.com/Praeviso/AgentSSH/internal/executor"
 	"github.com/Praeviso/AgentSSH/internal/inventory"
 	"github.com/Praeviso/AgentSSH/internal/policy"
+	"github.com/Praeviso/AgentSSH/internal/theme"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/termenv"
 )
@@ -39,7 +40,9 @@ func TestScrollWindow(t *testing.T) {
 }
 
 func TestRenderTableMarksCursorAndKeepsHeaders(t *testing.T) {
-	st := newAppStyles(lipgloss.NewRenderer(io.Discard))
+	r := lipgloss.NewRenderer(io.Discard)
+	st := newAppStyles(r)
+	marker := theme.GlyphsFor(r).Marker
 	cols := []tableColumn{{header: "NAME"}, {header: "PORT", right: true}}
 	rows := [][]string{{"web-1", "22"}, {"db-2", "5432"}}
 	out := renderTable(st, cols, rows, 1)
@@ -47,19 +50,21 @@ func TestRenderTableMarksCursorAndKeepsHeaders(t *testing.T) {
 	if !strings.Contains(out, "NAME") || !strings.Contains(out, "PORT") {
 		t.Fatalf("headers missing:\n%s", out)
 	}
-	if sel := lineWith(out, "db-2"); !strings.Contains(sel, "▌") {
-		t.Fatalf("selected row should carry the ▌ marker:\n%s", out)
+	if sel := lineWith(out, "db-2"); !strings.Contains(sel, marker) {
+		t.Fatalf("selected row should carry the %q marker:\n%s", marker, out)
 	}
-	if other := lineWith(out, "web-1"); strings.Contains(other, "▌") {
+	if other := lineWith(out, "web-1"); strings.Contains(other, marker) {
 		t.Fatalf("non-selected row must not carry the marker:\n%s", out)
 	}
 	t.Logf("\n%s", out) // eyeball alignment in -v
 }
 
 func TestRenderTableNoCursorHasNoMarker(t *testing.T) {
-	st := newAppStyles(lipgloss.NewRenderer(io.Discard))
-	out := renderTable(st, policyRuleColumns, [][]string{{"r1", "● ALLOW", "^ls"}}, -1)
-	if strings.Contains(out, "▌") {
+	r := lipgloss.NewRenderer(io.Discard)
+	st := newAppStyles(r)
+	marker := theme.GlyphsFor(r).Marker
+	out := renderTable(st, policyRuleColumns, [][]string{{"r1", "ALLOW", "^ls"}}, -1)
+	if strings.Contains(out, marker) {
 		t.Fatalf("cursor=-1 must not mark any row:\n%s", out)
 	}
 }
@@ -106,32 +111,34 @@ func TestHostRowDefaultsPortAndAlias(t *testing.T) {
 }
 
 func TestDiscoveryStatusCellMapping(t *testing.T) {
+	g := theme.GlyphsFor(nil) // Unicode set
 	cases := []struct {
 		c    discovery.Candidate
 		want string
 	}{
-		{discovery.Candidate{ProbeStatus: executor.ProbeConnectable}, "● reachable"},
-		{discovery.Candidate{ProbeStatus: executor.ProbeUnreachable}, "✖ unreachable"},
-		{discovery.Candidate{ProbeStatus: executor.ProbeAuthFailed}, "▲ auth-failed"},
-		{discovery.Candidate{InInventory: true}, "· in inventory"},
-		{discovery.Candidate{HasKey: true}, "○ looks-connectable"},
-		{discovery.Candidate{}, "· needs-auth"},
+		{discovery.Candidate{ProbeStatus: executor.ProbeConnectable}, g.OK + " reachable"},
+		{discovery.Candidate{ProbeStatus: executor.ProbeUnreachable}, g.Fail + " unreachable"},
+		{discovery.Candidate{ProbeStatus: executor.ProbeAuthFailed}, g.Warn + " auth-failed"},
+		{discovery.Candidate{InInventory: true}, g.Absent + " in inventory"},
+		{discovery.Candidate{HasKey: true}, g.Maybe + " looks-connectable"},
+		{discovery.Candidate{}, g.Absent + " needs-auth"},
 	}
 	for _, tc := range cases {
-		if got := discoveryStatusCell(tc.c); got != tc.want {
+		if got := discoveryStatusCell(g, tc.c); got != tc.want {
 			t.Errorf("discoveryStatusCell(%+v) = %q, want %q", tc.c, got, tc.want)
 		}
 	}
-	if glyphBool(true) != "●" || glyphBool(false) != "·" {
-		t.Errorf("glyphBool glyphs wrong: %q %q", glyphBool(true), glyphBool(false))
+	if glyphBool(g, true) != g.OK || glyphBool(g, false) != g.Absent {
+		t.Errorf("glyphBool glyphs wrong: %q %q", glyphBool(g, true), glyphBool(g, false))
 	}
 }
 
 func TestPolicyActionCell(t *testing.T) {
-	if policyActionCell(policy.ActionDeny) != "⊘ DENY" {
-		t.Errorf("deny cell = %q", policyActionCell(policy.ActionDeny))
+	g := theme.GlyphsFor(nil)
+	if policyActionCell(g, policy.ActionDeny) != g.Deny+" DENY" {
+		t.Errorf("deny cell = %q", policyActionCell(g, policy.ActionDeny))
 	}
-	if policyActionCell(policy.ActionAllow) != "● ALLOW" {
-		t.Errorf("allow cell = %q", policyActionCell(policy.ActionAllow))
+	if policyActionCell(g, policy.ActionAllow) != g.OK+" ALLOW" {
+		t.Errorf("allow cell = %q", policyActionCell(g, policy.ActionAllow))
 	}
 }

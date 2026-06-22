@@ -8,6 +8,7 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/Praeviso/AgentSSH/internal/theme"
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -236,9 +237,9 @@ type styles struct {
 func newStyles(r *lipgloss.Renderer) styles {
 	return styles{
 		title: r.NewStyle().Bold(true),
-		label: r.NewStyle().Foreground(lipgloss.Color("63")),
-		help:  r.NewStyle().Foreground(lipgloss.Color("241")),
-		err:   r.NewStyle().Foreground(lipgloss.Color("196")),
+		label: r.NewStyle().Foreground(theme.Accent),
+		help:  r.NewStyle().Foreground(theme.Dim),
+		err:   r.NewStyle().Foreground(theme.Danger),
 	}
 }
 
