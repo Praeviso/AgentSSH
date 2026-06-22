@@ -359,6 +359,58 @@ func TestProbeShowsSpinnerUntilResult(t *testing.T) {
 	}
 }
 
+func TestSpinnerTickRoutedToHostsWhileAnotherTabActive(t *testing.T) {
+	app := newAppModel(testPaths(t), lipgloss.NewRenderer(io.Discard))
+	// Put the Hosts section into an in-flight probe, then switch away.
+	hs := app.sections[sectionHosts].(hostsSection)
+	hs.testing = true
+	app.sections[sectionHosts] = hs
+	app.active = sectionAudit
+
+	_, cmd := app.Update(spinner.TickMsg{})
+	if cmd == nil {
+		t.Fatal("spinner tick must route to the Hosts section and reschedule even when another tab is active")
+	}
+}
+
+func TestProbeReentryDoesNotRestartSpinner(t *testing.T) {
+	section := newHostsSection(testPaths(t), lipgloss.NewRenderer(io.Discard), testAppStyles(), inventory.Inventory{
+		Hosts: map[string]inventory.Host{"web-1": {Addr: "127.0.0.1", Port: 1}},
+	}, nil)
+	updated, cmd := section.Update(keyMsg("t"))
+	hs := updated.(hostsSection)
+	if !hs.testing || cmd == nil {
+		t.Fatalf("first probe should start: testing=%t cmdNil=%t", hs.testing, cmd == nil)
+	}
+	// A second 't' while the probe is in flight must be ignored (no fresh tick).
+	if _, cmd2 := hs.Update(keyMsg("t")); cmd2 != nil {
+		t.Fatal("re-pressing t while a probe is in flight must not emit a second spinner tick")
+	}
+}
+
+func TestFirstRunSwallowsQuitKeyButCtrlCStillQuits(t *testing.T) {
+	app := newAppModel(testPaths(t), lipgloss.NewRenderer(io.Discard))
+	app.firstRun = true
+	updated, cmd := app.Update(keyMsg("q"))
+	app = updated.(appModel)
+	if cmd != nil {
+		t.Fatal("q on the first-run banner should be swallowed, not quit the app")
+	}
+	if app.firstRun {
+		t.Fatal("the dismiss keystroke should clear firstRun")
+	}
+
+	fresh := newAppModel(testPaths(t), lipgloss.NewRenderer(io.Discard))
+	fresh.firstRun = true
+	_, quit := fresh.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	if quit == nil {
+		t.Fatal("ctrl+c must still quit even on the first-run banner")
+	}
+	if _, ok := quit().(tea.QuitMsg); !ok {
+		t.Fatalf("ctrl+c should produce tea.QuitMsg, got %T", quit())
+	}
+}
+
 func TestVerifyMsgRoutedToAuditWhileAnotherTabActive(t *testing.T) {
 	app := newAppModel(config.Paths{}, lipgloss.NewRenderer(io.Discard))
 	app.active = sectionHosts // launch lands here; auto-verify targets Audit

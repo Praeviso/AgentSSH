@@ -12,6 +12,27 @@ type tableColumn struct {
 	right  bool
 }
 
+// scrollWindow returns the [start,end) bounds of a vertical scroll window of the
+// given visible height that keeps cursor in view. A height <= 0 or >= n shows all
+// rows. It centralizes the windowing math shared by the Hosts, Sessions, and
+// Discover lists.
+func scrollWindow(cursor, n, height int) (start, end int) {
+	if n == 0 {
+		return 0, 0
+	}
+	if height <= 0 || height >= n {
+		return 0, n
+	}
+	if cursor >= height {
+		start = cursor - height + 1
+	}
+	end = start + height
+	if end > n {
+		end = n
+	}
+	return start, end
+}
+
 // renderTable renders an aligned, borderless table from the given columns and
 // the visible window of rows. cursor is the index (within rows) of the selected
 // row, or -1 for a non-navigable list. A leading "▌" marker column keeps the

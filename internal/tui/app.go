@@ -189,15 +189,22 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// auto-verify (model.Init) lands while Hosts is active, and a manual
 		// re-verify result can arrive after the operator has switched away.
 		return m.updateSection(sectionAudit, msg)
-	case hostProbeMsg, discoveryLoadedMsg, discoveryProbedMsg:
-		// Async Hosts results must reach the Hosts section regardless of the
-		// active tab; a probe blocks up to ProbeTimeout, during which the
-		// operator can switch tabs. runID guards make stale delivery safe.
+	case hostProbeMsg, discoveryLoadedMsg, discoveryProbedMsg, spinner.TickMsg:
+		// Async Hosts results — and the spinner tick that animates them — must
+		// reach the Hosts section regardless of the active tab; a probe blocks up
+		// to ProbeTimeout, during which the operator can switch tabs. Routing the
+		// tick here keeps the spinner chain alive (its busy() gate stops it once
+		// the op lands); runID guards make stale result delivery safe.
 		return m.updateSection(sectionHosts, msg)
 	case tea.KeyMsg:
-		m.firstRun = false // any keypress dismisses the welcome banner
 		if msg.Type == tea.KeyCtrlC {
 			return m, tea.Quit
+		}
+		if m.firstRun {
+			// The welcome banner says "press any key to begin"; consume that one
+			// keystroke so a natural 'q' doesn't quit the app just initialized.
+			m.firstRun = false
+			return m, nil
 		}
 		if !m.sections[m.active].capturing() {
 			if next, ok := switchTarget(m.active, len(m.sections), msg); ok {
@@ -498,6 +505,11 @@ func (s hostsSection) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return s, tea.Batch(s.loadDiscoveryCmd(), s.spinner.Tick)
 		case "t":
+			if s.testing {
+				// A probe is already in flight; ignore re-presses so we don't
+				// double-start the spinner tick loop (it would then run at 2x).
+				return s, nil
+			}
 			if len(s.names) == 0 {
 				s.status = "no host selected"
 				return s, nil
@@ -975,8 +987,7 @@ func (s hostsSection) discoveryView() string {
 		b.WriteString(s.styles.dim.Render("Press esc to close, then a on the Hosts tab to add one by hand."))
 		b.WriteString("\n")
 	} else {
-		window := s.visibleDiscoveryCandidates()
-		start := s.discoveryVisibleStart()
+		window, start := s.discoverWindow()
 		rows := make([][]string, 0, len(window))
 		for i, candidate := range window {
 			rows = append(rows, discoverRow(candidate, s.discover.selected[start+i]))
@@ -1000,37 +1011,15 @@ func (s hostsSection) discoveryView() string {
 	return b.String()
 }
 
-func (s hostsSection) discoveryVisibleStart() int {
-	if s.h <= 0 || len(s.discover.candidates) == 0 {
-		return 0
-	}
+func (s hostsSection) discoverWindow() (candidates []discovery.Candidate, start int) {
 	height := s.h - 8
-	if height < 3 {
-		height = 3
-	}
-	if height >= len(s.discover.candidates) || s.discover.cursor < height {
-		return 0
-	}
-	return s.discover.cursor - height + 1
-}
-
-func (s hostsSection) visibleDiscoveryCandidates() []discovery.Candidate {
-	if len(s.discover.candidates) == 0 {
-		return nil
-	}
-	start := s.discoveryVisibleStart()
 	if s.h <= 0 {
-		return s.discover.candidates[start:]
-	}
-	height := s.h - 8
-	if height < 3 {
+		height = len(s.discover.candidates) // size unknown: show all
+	} else if height < 3 {
 		height = 3
 	}
-	end := start + height
-	if end > len(s.discover.candidates) {
-		end = len(s.discover.candidates)
-	}
-	return s.discover.candidates[start:end]
+	start, end := scrollWindow(s.discover.cursor, len(s.discover.candidates), height)
+	return s.discover.candidates[start:end], start
 }
 
 var discoverColumns = []tableColumn{
@@ -1103,23 +1092,13 @@ func discoveryStatusCell(candidate discovery.Candidate) string {
 // hostWindow returns the visible slice of host names and its start offset, so
 // the table cursor can be expressed relative to the window.
 func (s hostsSection) hostWindow() (names []string, start int) {
-	if s.h <= 0 || len(s.names) == 0 {
-		return s.names, 0
-	}
 	height := s.h - 8
-	if height < 3 {
+	if s.h <= 0 {
+		height = len(s.names) // size unknown: show all
+	} else if height < 3 {
 		height = 3
 	}
-	if height >= len(s.names) {
-		return s.names, 0
-	}
-	if s.cursor >= height {
-		start = s.cursor - height + 1
-	}
-	end := start + height
-	if end > len(s.names) {
-		end = len(s.names)
-	}
+	start, end := scrollWindow(s.cursor, len(s.names), height)
 	return s.names[start:end], start
 }
 
@@ -1464,23 +1443,13 @@ func sessionRow(summary session.Summary) []string {
 }
 
 func (s sessionsSection) sessionWindow() (summaries []session.Summary, start int) {
-	if s.h <= 0 || len(s.summaries) == 0 {
-		return s.summaries, 0
-	}
 	height := s.h - 4
-	if height < 3 {
+	if s.h <= 0 {
+		height = len(s.summaries) // size unknown: show all
+	} else if height < 3 {
 		height = 3
 	}
-	if height >= len(s.summaries) {
-		return s.summaries, 0
-	}
-	if s.cursor >= height {
-		start = s.cursor - height + 1
-	}
-	end := start + height
-	if end > len(s.summaries) {
-		end = len(s.summaries)
-	}
+	start, end := scrollWindow(s.cursor, len(s.summaries), height)
 	return s.summaries[start:end], start
 }
 

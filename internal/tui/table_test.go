@@ -22,6 +22,22 @@ func lineWith(out, needle string) string {
 	return ""
 }
 
+func TestScrollWindow(t *testing.T) {
+	cases := []struct{ cursor, n, height, wantStart, wantEnd int }{
+		{0, 0, 5, 0, 0},   // empty list
+		{0, 3, 5, 0, 3},   // height >= n: show all
+		{0, 10, 0, 0, 10}, // height <= 0 (unknown size): show all
+		{0, 10, 4, 0, 4},  // cursor at top
+		{5, 10, 4, 2, 6},  // cursor mid: window follows
+		{9, 10, 4, 6, 10}, // cursor at bottom
+	}
+	for _, c := range cases {
+		if s, e := scrollWindow(c.cursor, c.n, c.height); s != c.wantStart || e != c.wantEnd {
+			t.Errorf("scrollWindow(%d,%d,%d) = (%d,%d), want (%d,%d)", c.cursor, c.n, c.height, s, e, c.wantStart, c.wantEnd)
+		}
+	}
+}
+
 func TestRenderTableMarksCursorAndKeepsHeaders(t *testing.T) {
 	st := newAppStyles(lipgloss.NewRenderer(io.Discard))
 	cols := []tableColumn{{header: "NAME"}, {header: "PORT", right: true}}
