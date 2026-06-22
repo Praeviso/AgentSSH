@@ -261,6 +261,23 @@ func TestPolicySectionEvaluate(t *testing.T) {
 	}
 }
 
+func TestSessionsShowsAnomalyColumns(t *testing.T) {
+	records := []audit.Record{
+		{SessionID: "s_a", ReqID: "r1", Event: audit.EventCompleted, TS: "2026-06-20T10:00:00Z"},
+		{SessionID: "s_a", ReqID: "r2", Event: audit.EventDenied, TS: "2026-06-20T10:01:00Z"},
+		{SessionID: "s_a", ReqID: "r3", Event: audit.EventDenied, TS: "2026-06-20T10:02:00Z"},
+	}
+	s := newSessionsSection(records, testAppStyles(), nil)
+	s.w, s.h = 100, 20
+	v := s.View()
+	if !strings.Contains(v, "DEN") || !strings.Contains(v, "FAIL") {
+		t.Fatalf("sessions should show DEN/FAIL columns:\n%s", v)
+	}
+	if !strings.Contains(v, "2") { // two denials in s_a
+		t.Fatalf("expected the denied count in the row:\n%s", v)
+	}
+}
+
 func TestSessionsEnterProducesAuditFilterMessage(t *testing.T) {
 	st := testAppStyles()
 	records := []audit.Record{{ReqID: "r1", SessionID: "s_a", TS: "2026-06-17T10:00:00Z"}}

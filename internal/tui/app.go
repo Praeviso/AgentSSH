@@ -1937,7 +1937,7 @@ func (s sessionsSection) View() string {
 		window, start := s.sessionWindow()
 		rows := make([][]string, 0, len(window))
 		for _, summary := range window {
-			rows = append(rows, sessionRow(summary))
+			rows = append(rows, sessionRow(s.styles.glyphs, summary))
 		}
 		b.WriteString(renderTable(s.styles, sessionColumns, rows, s.cursor-start))
 		b.WriteString("\n")
@@ -1950,12 +1950,15 @@ var sessionColumns = []tableColumn{
 	{header: "LABEL"},
 	{header: "WINDOW"},
 	{header: "CMDS", right: true},
+	{header: "DEN", right: true},
+	{header: "FAIL", right: true},
 }
 
 // sessionRow projects a session summary into aligned cells. WINDOW uses HH:MM:SS
-// clocks instead of two overflowing RFC3339 stamps. AGENT/DEN/FAIL columns need
-// data plumbing on session.Summary (P2) and are intentionally omitted for now.
-func sessionRow(summary session.Summary) []string {
+// clocks instead of two overflowing RFC3339 stamps. DEN/FAIL show a count, or a
+// dim "absent" glyph when zero so anomalies stand out (per-cell coloring is a
+// lipgloss/table limitation).
+func sessionRow(g theme.Glyphs, summary session.Summary) []string {
 	label := summary.Label
 	if label == "" {
 		label = "-"
@@ -1965,7 +1968,18 @@ func sessionRow(summary session.Summary) []string {
 		truncate(label, 28),
 		clockOf(summary.Start) + "–" + clockOf(summary.End),
 		strconv.Itoa(summary.CommandCount),
+		countCell(g, summary.Denied),
+		countCell(g, summary.Failed),
 	}
+}
+
+// countCell shows n, or a dim absent-glyph when zero, so non-zero anomaly counts
+// stand out in a column of mostly-zeros.
+func countCell(g theme.Glyphs, n int) string {
+	if n == 0 {
+		return g.Absent
+	}
+	return strconv.Itoa(n)
 }
 
 func (s sessionsSection) sessionWindow() (summaries []session.Summary, start int) {
