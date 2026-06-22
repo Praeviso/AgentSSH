@@ -550,16 +550,17 @@ type inventoryChangedMsg struct {
 }
 
 type discoveryOverlay struct {
-	active     bool
-	loading    bool
-	probing    bool
-	runID      int
-	candidates []discovery.Candidate
-	notes      []string
-	selected   map[int]bool
-	cursor     int
-	status     string
-	err        error
+	active      bool
+	loading     bool
+	probing     bool
+	runID       int
+	candidates  []discovery.Candidate
+	notes       []string
+	selected    map[int]bool
+	probingKeys map[string]bool // candidateKey set still in flight (streaming probe)
+	cursor      int
+	status      string
+	err         error
 }
 
 type discoveryLoadedMsg struct {
@@ -691,16 +692,26 @@ func (s hostsSection) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if !s.discover.active || msg.runID != s.discover.runID {
 			return s, nil
 		}
-		s.discover.probing = false
 		if msg.err != nil {
 			s.discover.err = msg.err
 			s.discover.status = ""
+			s.discover.probing = false
+			s.discover.probingKeys = nil
 			return s, nil
 		}
+		// Streaming: fold in this candidate's result and clear its in-flight mark.
 		// Merge by stable candidate identity, not by the (mutable) selection map,
 		// so a selection change while probing can't write results into wrong rows.
 		s.discover.candidates = mergeProbedCandidates(s.discover.candidates, msg.candidates)
-		s.discover.status = "probe complete"
+		for _, c := range msg.candidates {
+			delete(s.discover.probingKeys, candidateKey(c))
+		}
+		if len(s.discover.probingKeys) == 0 {
+			s.discover.probing = false
+			s.discover.status = "probe complete"
+		} else {
+			s.discover.status = fmt.Sprintf("probing %d candidate(s)…", len(s.discover.probingKeys))
+		}
 		return s, nil
 	case hostProbeMsg:
 		s.testing = false
@@ -919,7 +930,9 @@ func (s hostsSection) loadDiscoveryCmd() tea.Cmd {
 	}
 }
 
-func (s hostsSection) probeDiscoveryCmd(candidates []discovery.Candidate) tea.Cmd {
+// probeOneCmd probes a single discovery candidate and returns its result alone,
+// so rows resolve as each completes (streaming) rather than in one batch.
+func (s hostsSection) probeOneCmd(candidate discovery.Candidate) tea.Cmd {
 	runID := s.discover.runID
 	return func() tea.Msg {
 		cfgPath, knownHostsPath, _ := sshClientPaths()
@@ -930,10 +943,10 @@ func (s hostsSection) probeDiscoveryCmd(candidates []discovery.Candidate) tea.Cm
 			HostKeyPolicy:  s.inventory.HostKeyPolicy,
 			PasswordSource: secrets.EnvPasswordSource(s.paths.SecretsFile),
 		})
-		probed := discovery.Probe(context.Background(), candidates, discovery.ProbeOptions{
+		probed := discovery.Probe(context.Background(), []discovery.Candidate{candidate}, discovery.ProbeOptions{
 			Executor:    exec,
 			Timeout:     executor.ProbeTimeout,
-			Concurrency: 4,
+			Concurrency: 1,
 		})
 		return discoveryProbedMsg{runID: runID, candidates: probed}
 	}
@@ -1019,8 +1032,14 @@ func (s hostsSection) updateDiscovery(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		s.discover.probing = true
 		s.discover.err = nil
+		s.discover.probingKeys = make(map[string]bool, len(selected))
+		cmds := []tea.Cmd{s.spinner.Tick}
+		for _, c := range selected {
+			s.discover.probingKeys[candidateKey(c)] = true
+			cmds = append(cmds, s.probeOneCmd(c))
+		}
 		s.discover.status = fmt.Sprintf("probing %d candidate(s)…", len(selected))
-		return s, tea.Batch(s.probeDiscoveryCmd(selected), s.spinner.Tick)
+		return s, tea.Batch(cmds...)
 	case "enter", "i":
 		if s.discover.loading || s.discover.probing {
 			return s, nil
@@ -1411,7 +1430,8 @@ func (s hostsSection) discoveryView() string {
 		window, start := s.discoverWindow()
 		rows := make([][]string, 0, len(window))
 		for i, candidate := range window {
-			rows = append(rows, discoverRow(s.styles.glyphs, candidate, s.discover.selected[start+i]))
+			probing := s.discover.probingKeys[candidateKey(candidate)]
+			rows = append(rows, discoverRow(s.styles.glyphs, candidate, s.discover.selected[start+i], probing))
 		}
 		b.WriteString(renderTable(s.styles, discoverColumns, rows, s.discover.cursor-start))
 		b.WriteString("\n")
@@ -1460,10 +1480,14 @@ var discoverColumns = []tableColumn{
 	{header: "STATUS"},
 }
 
-func discoverRow(g theme.Glyphs, candidate discovery.Candidate, selected bool) []string {
+func discoverRow(g theme.Glyphs, candidate discovery.Candidate, selected, probing bool) []string {
 	sel := "[ ]"
 	if selected {
 		sel = "[x]"
+	}
+	status := discoveryStatusCell(g, candidate)
+	if probing {
+		status = g.Maybe + " probing"
 	}
 	return []string{
 		sel,
@@ -1473,7 +1497,7 @@ func discoverRow(g theme.Glyphs, candidate discovery.Candidate, selected bool) [
 		glyphBool(g, candidate.HasKey),
 		glyphBool(g, candidate.InKnownHosts),
 		glyphBool(g, candidate.InInventory),
-		discoveryStatusCell(g, candidate),
+		status,
 	}
 }
 

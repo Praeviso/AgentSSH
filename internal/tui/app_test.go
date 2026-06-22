@@ -838,6 +838,39 @@ func TestMergeProbedCandidatesMatchesByIdentityNotPosition(t *testing.T) {
 	}
 }
 
+func TestDiscoverProbeStreamsPerCandidate(t *testing.T) {
+	s := newHostsSection(config.Paths{}, lipgloss.NewRenderer(io.Discard), testAppStyles(), inventory.Inventory{}, nil)
+	s.focus = hostFocusDiscover
+	c1 := discovery.Candidate{Name: "a", Source: discovery.SourceSSHConfig}
+	c2 := discovery.Candidate{Name: "b", Source: discovery.SourceSSHConfig}
+	s.discover = discoveryOverlay{active: true, runID: 1, candidates: []discovery.Candidate{c1, c2}, selected: map[int]bool{0: true, 1: true}}
+
+	updated, cmd := s.Update(keyMsg("p"))
+	s = updated.(hostsSection)
+	if !s.discover.probing || len(s.discover.probingKeys) != 2 || cmd == nil {
+		t.Fatalf("p should mark both candidates in-flight: probing=%t keys=%d cmdNil=%t", s.discover.probing, len(s.discover.probingKeys), cmd == nil)
+	}
+
+	// First candidate resolves; the second stays in flight (streaming).
+	r1 := discovery.Candidate{Name: "a", Source: discovery.SourceSSHConfig, ProbeStatus: executor.ProbeConnectable}
+	updated, _ = s.Update(discoveryProbedMsg{runID: 1, candidates: []discovery.Candidate{r1}})
+	s = updated.(hostsSection)
+	if !s.discover.probing || len(s.discover.probingKeys) != 1 {
+		t.Fatalf("one result should leave one in-flight: probing=%t keys=%d", s.discover.probing, len(s.discover.probingKeys))
+	}
+	if s.discover.candidates[0].ProbeStatus != executor.ProbeConnectable {
+		t.Fatal("the resolved candidate should be merged in")
+	}
+
+	// Second resolves; probing stops.
+	r2 := discovery.Candidate{Name: "b", Source: discovery.SourceSSHConfig, ProbeStatus: executor.ProbeUnreachable}
+	updated, _ = s.Update(discoveryProbedMsg{runID: 1, candidates: []discovery.Candidate{r2}})
+	s = updated.(hostsSection)
+	if s.discover.probing || len(s.discover.probingKeys) != 0 {
+		t.Fatalf("all results in should stop probing: probing=%t keys=%d", s.discover.probing, len(s.discover.probingKeys))
+	}
+}
+
 func TestDiscoveryProbedMsgIgnoredWhenStaleOrInactive(t *testing.T) {
 	st := testAppStyles()
 	s := newHostsSection(config.Paths{}, lipgloss.NewRenderer(io.Discard), st, inventory.Inventory{}, nil)
