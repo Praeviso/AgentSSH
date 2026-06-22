@@ -19,6 +19,7 @@ import (
 	"github.com/Praeviso/AgentSSH/internal/policy"
 	"github.com/Praeviso/AgentSSH/internal/secrets"
 	"github.com/Praeviso/AgentSSH/internal/session"
+	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -46,6 +47,7 @@ type appModel struct {
 	active   int
 	w, h     int
 	ready    bool
+	firstRun bool // show the one-time welcome banner until the first keypress
 }
 
 type appStyles struct {
@@ -60,6 +62,10 @@ type appStyles struct {
 	panel      lipgloss.Style
 	confirm    lipgloss.Style
 	background lipgloss.Style
+	// table cell styles, shared by the aligned list renderer (see table.go).
+	tableHeader lipgloss.Style
+	tableSel    lipgloss.Style
+	tableCell   lipgloss.Style
 }
 
 func newAppStyles(r *lipgloss.Renderer) appStyles {
@@ -75,7 +81,17 @@ func newAppStyles(r *lipgloss.Renderer) appStyles {
 		panel:      r.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1),
 		confirm:    r.NewStyle().Foreground(lipgloss.Color("220")).Bold(true),
 		background: r.NewStyle(),
+
+		tableHeader: r.NewStyle().Padding(0, 1).Bold(true).Foreground(lipgloss.Color("241")),
+		tableSel:    r.NewStyle().Padding(0, 1).Background(lipgloss.Color("237")),
+		tableCell:   r.NewStyle().Padding(0, 1),
 	}
+}
+
+// keyHint renders an actionable "[key] description" chip for empty states and
+// inline hints, with the key emphasized so the next action is obvious.
+func keyHint(st appStyles, key, desc string) string {
+	return st.cursor.Render("["+key+"]") + " " + st.dim.Render(desc)
 }
 
 func newAppModel(paths config.Paths, renderer *lipgloss.Renderer) appModel {
@@ -168,7 +184,18 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case inventoryChangedMsg:
 		m.applyInventoryChange(msg.inventory)
 		return m, nil
+	case verifyMsg:
+		// Deliver to Audit even when it isn't the active tab — the launch-time
+		// auto-verify (model.Init) lands while Hosts is active, and a manual
+		// re-verify result can arrive after the operator has switched away.
+		return m.updateSection(sectionAudit, msg)
+	case hostProbeMsg, discoveryLoadedMsg, discoveryProbedMsg:
+		// Async Hosts results must reach the Hosts section regardless of the
+		// active tab; a probe blocks up to ProbeTimeout, during which the
+		// operator can switch tabs. runID guards make stale delivery safe.
+		return m.updateSection(sectionHosts, msg)
 	case tea.KeyMsg:
+		m.firstRun = false // any keypress dismisses the welcome banner
 		if msg.Type == tea.KeyCtrlC {
 			return m, tea.Quit
 		}
@@ -186,9 +213,15 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m appModel) updateActive(msg tea.Msg) (tea.Model, tea.Cmd) {
-	updated, cmd := m.sections[m.active].Update(msg)
+	return m.updateSection(m.active, msg)
+}
+
+// updateSection delivers a message to a specific section by index, regardless of
+// which tab is active — used to route async results back to their owning section.
+func (m appModel) updateSection(i int, msg tea.Msg) (tea.Model, tea.Cmd) {
+	updated, cmd := m.sections[i].Update(msg)
 	if next, ok := updated.(section); ok {
-		m.sections[m.active] = next
+		m.sections[i] = next
 	}
 	return m, cmd
 }
@@ -219,6 +252,10 @@ func (m appModel) View() string {
 	body := m.sections[m.active].View()
 	if !m.ready {
 		body = "loading..."
+	}
+	if m.firstRun {
+		welcome := m.styles.ok.Render("✓ Welcome to AgentSSH — created a starter inventory.yaml + policy.yaml. Press any key to begin.")
+		return lipgloss.JoinVertical(lipgloss.Left, welcome, tabs, body)
 	}
 	return lipgloss.JoinVertical(lipgloss.Left, tabs, body)
 }
@@ -265,9 +302,17 @@ type hostsSection struct {
 	form        hostform.Model
 	adding      bool
 	confirm     bool
+	testing     bool // a host connectivity probe is in flight
 	discover    discoveryOverlay
 	discoverSeq int
+	spinner     spinner.Model
 	w, h        int
+}
+
+// busy reports whether any async Hosts operation is in flight, driving the
+// spinner's tick loop and its visibility.
+func (s hostsSection) busy() bool {
+	return s.testing || s.discover.loading || s.discover.probing
 }
 
 type inventoryChangedMsg struct {
@@ -308,6 +353,11 @@ type hostProbeMsg struct {
 
 func newHostsSection(paths config.Paths, renderer *lipgloss.Renderer, st appStyles, inv inventory.Inventory, loadErr error) hostsSection {
 	s := hostsSection{paths: paths, renderer: renderer, styles: st, inventory: inv, err: loadErr}
+	sp := spinner.New(spinner.WithSpinner(spinner.Line)) // ASCII frames degrade cleanly under NO_COLOR
+	if renderer != nil {
+		sp.Style = renderer.NewStyle().Foreground(lipgloss.Color("212"))
+	}
+	s.spinner = sp
 	s.rebuildNames()
 	return s
 }
@@ -350,6 +400,15 @@ func (s hostsSection) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return s, cmd
 	}
 	switch msg := msg.(type) {
+	case spinner.TickMsg:
+		// Keep ticking only while an async op is in flight; once it lands, the
+		// dropped tick lets the spinner chain stop on its own.
+		if s.busy() {
+			var cmd tea.Cmd
+			s.spinner, cmd = s.spinner.Update(msg)
+			return s, cmd
+		}
+		return s, nil
 	case discoveryLoadedMsg:
 		// Ignore results from a closed or superseded overlay (the user may have
 		// closed and reopened discovery before this async load returned).
@@ -383,6 +442,7 @@ func (s hostsSection) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		s.discover.status = "probe complete"
 		return s, nil
 	case hostProbeMsg:
+		s.testing = false
 		if msg.ok {
 			s.err = nil
 			s.status = "OK " + msg.name
@@ -434,18 +494,19 @@ func (s hostsSection) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				loading:  true,
 				runID:    s.discoverSeq,
 				selected: map[int]bool{},
-				status:   "discovering from ssh config and known_hosts...",
+				status:   "discovering from ssh config and known_hosts…",
 			}
-			return s, s.loadDiscoveryCmd()
+			return s, tea.Batch(s.loadDiscoveryCmd(), s.spinner.Tick)
 		case "t":
 			if len(s.names) == 0 {
 				s.status = "no host selected"
 				return s, nil
 			}
 			name := s.names[s.cursor]
-			s.status = "testing " + name + "..."
+			s.status = "testing " + name + "…"
 			s.err = nil
-			return s, s.probeHostCmd(name)
+			s.testing = true
+			return s, tea.Batch(s.probeHostCmd(name), s.spinner.Tick)
 		case "r", "x":
 			if s.err != nil {
 				s.status = "fix inventory.yaml before editing hosts"
@@ -589,8 +650,8 @@ func (s hostsSection) updateDiscovery(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		s.discover.probing = true
 		s.discover.err = nil
-		s.discover.status = fmt.Sprintf("probing %d candidate(s)...", len(selected))
-		return s, s.probeDiscoveryCmd(selected)
+		s.discover.status = fmt.Sprintf("probing %d candidate(s)…", len(selected))
+		return s, tea.Batch(s.probeDiscoveryCmd(selected), s.spinner.Tick)
 	case "enter", "i":
 		if s.discover.loading || s.discover.probing {
 			return s, nil
@@ -847,22 +908,28 @@ func (s hostsSection) View() string {
 		if s.confirm {
 			style = s.styles.confirm
 		}
+		if s.testing {
+			b.WriteString(s.spinner.View())
+			b.WriteString(" ")
+		}
 		b.WriteString(style.Render(s.status))
 		b.WriteString("\n")
 	}
 	if len(s.names) == 0 {
-		b.WriteString(s.styles.dim.Render("(no hosts)"))
+		b.WriteString(s.styles.dim.Render("No hosts yet."))
+		b.WriteString("\n")
+		b.WriteString(keyHint(s.styles, "a", "add a host"))
+		b.WriteString("    ")
+		b.WriteString(keyHint(s.styles, "d", "discover hosts you can already reach"))
 		b.WriteString("\n")
 	} else {
-		for _, name := range s.visibleNames() {
-			cursor := "  "
-			if name == s.names[s.cursor] {
-				cursor = s.styles.cursor.Render("> ")
-			}
-			b.WriteString(cursor)
-			b.WriteString(renderHostLine(name, s.inventory.Hosts[name]))
-			b.WriteString("\n")
+		window, start := s.hostWindow()
+		rows := make([][]string, 0, len(window))
+		for _, name := range window {
+			rows = append(rows, hostRow(name, s.inventory.Hosts[name]))
 		}
+		b.WriteString(renderTable(s.styles, hostColumns, rows, s.cursor-start))
+		b.WriteString("\n")
 	}
 	if len(s.inventory.Groups) > 0 {
 		b.WriteString("\n")
@@ -892,48 +959,34 @@ func (s hostsSection) discoveryView() string {
 		b.WriteString("\n")
 	}
 	if s.discover.status != "" {
+		if s.discover.loading || s.discover.probing {
+			b.WriteString(s.spinner.View())
+			b.WriteString(" ")
+		}
 		b.WriteString(s.styles.ok.Render(s.discover.status))
 		b.WriteString("\n")
 	}
 	if s.discover.loading {
-		b.WriteString(s.styles.dim.Render("loading candidates..."))
+		b.WriteString(s.styles.dim.Render("scanning ssh config and known_hosts…"))
 		b.WriteString("\n")
 	} else if len(s.discover.candidates) == 0 {
-		b.WriteString(s.styles.dim.Render("(no candidates)"))
+		b.WriteString(s.styles.dim.Render("No hosts found in ~/.ssh/config or known_hosts."))
+		b.WriteString("\n")
+		b.WriteString(s.styles.dim.Render("Press esc to close, then a on the Hosts tab to add one by hand."))
 		b.WriteString("\n")
 	} else {
-		b.WriteString(s.styles.dim.Render("SEL NAME SOURCE ADDR KEY KNOWN_HOSTS INVENTORY STATUS"))
+		window := s.visibleDiscoveryCandidates()
+		start := s.discoveryVisibleStart()
+		rows := make([][]string, 0, len(window))
+		for i, candidate := range window {
+			rows = append(rows, discoverRow(candidate, s.discover.selected[start+i]))
+		}
+		b.WriteString(renderTable(s.styles, discoverColumns, rows, s.discover.cursor-start))
 		b.WriteString("\n")
-		for i, candidate := range s.visibleDiscoveryCandidates() {
-			index := s.discoveryVisibleStart() + i
-			cursor := "  "
-			if index == s.discover.cursor {
-				cursor = s.styles.cursor.Render("> ")
-			}
-			selected := "[ ]"
-			if s.discover.selected[index] {
-				selected = "[x]"
-			}
-			b.WriteString(cursor)
-			b.WriteString(selected)
-			b.WriteString(" ")
-			b.WriteString(candidate.Name)
-			b.WriteString(" ")
-			b.WriteString(candidate.Source)
-			b.WriteString(" ")
-			b.WriteString(formatDiscoveryAddr(candidate))
-			b.WriteString(" ")
-			b.WriteString(yesNo(candidate.HasKey))
-			b.WriteString(" ")
-			b.WriteString(yesNo(candidate.InKnownHosts))
-			b.WriteString(" ")
-			b.WriteString(yesNo(candidate.InInventory))
-			b.WriteString(" ")
-			b.WriteString(discoveryStatus(candidate))
-			b.WriteString("\n")
-			if candidate.Hint != "" {
-				b.WriteString("    ")
-				b.WriteString(s.styles.dim.Render(candidate.Hint))
+		// The per-row hint can't live inside the table; show the current row's.
+		if cur := s.discover.cursor; cur >= 0 && cur < len(s.discover.candidates) {
+			if h := s.discover.candidates[cur].Hint; h != "" {
+				b.WriteString(s.styles.dim.Render("  " + h))
 				b.WriteString("\n")
 			}
 		}
@@ -980,6 +1033,34 @@ func (s hostsSection) visibleDiscoveryCandidates() []discovery.Candidate {
 	return s.discover.candidates[start:end]
 }
 
+var discoverColumns = []tableColumn{
+	{header: "SEL"},
+	{header: "NAME"},
+	{header: "SOURCE"},
+	{header: "ADDR"},
+	{header: "KEY"},
+	{header: "KNW"},
+	{header: "INV"},
+	{header: "STATUS"},
+}
+
+func discoverRow(candidate discovery.Candidate, selected bool) []string {
+	sel := "[ ]"
+	if selected {
+		sel = "[x]"
+	}
+	return []string{
+		sel,
+		truncate(candidate.Name, 22),
+		candidate.Source,
+		truncate(formatDiscoveryAddr(candidate), 22),
+		glyphBool(candidate.HasKey),
+		glyphBool(candidate.InKnownHosts),
+		glyphBool(candidate.InInventory),
+		discoveryStatusCell(candidate),
+	}
+}
+
 func formatDiscoveryAddr(candidate discovery.Candidate) string {
 	if candidate.Port == 0 || candidate.Port == 22 {
 		return candidate.Addr
@@ -987,38 +1068,51 @@ func formatDiscoveryAddr(candidate discovery.Candidate) string {
 	return fmt.Sprintf("%s:%d", candidate.Addr, candidate.Port)
 }
 
-func yesNo(ok bool) string {
+// glyphBool renders a present/absent column as a glyph (color comes in P1; the
+// glyph alone carries meaning, and survives NO_COLOR as plain text).
+func glyphBool(ok bool) string {
 	if ok {
-		return "yes"
+		return "●"
 	}
-	return "no"
+	return "·"
 }
 
-func discoveryStatus(candidate discovery.Candidate) string {
-	if candidate.ProbeStatus != "" {
-		return string(candidate.ProbeStatus)
+// discoveryStatusCell renders the probe/known state as a glyph + word so the
+// STATUS column is scannable. Coloring per status lands with the P1 StatusCell.
+func discoveryStatusCell(candidate discovery.Candidate) string {
+	switch candidate.ProbeStatus {
+	case executor.ProbeConnectable:
+		return "● reachable"
+	case executor.ProbeAuthFailed:
+		return "▲ auth-failed"
+	case executor.ProbeHostKeyIssue:
+		return "▲ host-key"
+	case executor.ProbeUnreachable:
+		return "✖ unreachable"
 	}
-	if candidate.InInventory {
-		return "imported"
+	switch {
+	case candidate.InInventory:
+		return "· in inventory"
+	case candidate.HasKey:
+		return "○ looks-connectable"
+	default:
+		return "· needs-auth"
 	}
-	if candidate.HasKey {
-		return "looks-connectable"
-	}
-	return "needs-auth"
 }
 
-func (s hostsSection) visibleNames() []string {
+// hostWindow returns the visible slice of host names and its start offset, so
+// the table cursor can be expressed relative to the window.
+func (s hostsSection) hostWindow() (names []string, start int) {
 	if s.h <= 0 || len(s.names) == 0 {
-		return s.names
+		return s.names, 0
 	}
 	height := s.h - 8
 	if height < 3 {
 		height = 3
 	}
 	if height >= len(s.names) {
-		return s.names
+		return s.names, 0
 	}
-	start := 0
 	if s.cursor >= height {
 		start = s.cursor - height + 1
 	}
@@ -1026,30 +1120,54 @@ func (s hostsSection) visibleNames() []string {
 	if end > len(s.names) {
 		end = len(s.names)
 	}
-	return s.names[start:end]
+	return s.names[start:end], start
 }
 
-func renderHostLine(name string, host inventory.Host) string {
-	parts := []string{name}
-	if host.Addr != "" {
-		parts = append(parts, "addr="+host.Addr)
+var hostColumns = []tableColumn{
+	{header: "NAME"},
+	{header: "ADDR"},
+	{header: "PORT", right: true},
+	{header: "USER"},
+	{header: "AUTH"},
+	{header: "TAGS"},
+}
+
+// hostRow projects an inventory host into aligned table cells. AUTH names the
+// method (key/alias) without ever exposing the key path's secrecy — identity_file
+// is a path, surfaced in full only by the P1 detail panel.
+func hostRow(name string, host inventory.Host) []string {
+	display := name
+	if hostHasTag(host, "prod") {
+		display += " [prod]"
 	}
-	if host.User != "" {
-		parts = append(parts, "user="+host.User)
-	}
+	port := "22"
 	if host.Port != 0 {
-		parts = append(parts, "port="+strconv.Itoa(host.Port))
+		port = strconv.Itoa(host.Port)
 	}
-	if host.SSHConfigAlias != "" {
-		parts = append(parts, "alias="+host.SSHConfigAlias)
+	auth := "-"
+	switch {
+	case host.IdentityFile != "":
+		auth = "key"
+	case host.SSHConfigAlias != "":
+		auth = "alias:" + host.SSHConfigAlias
 	}
-	if host.IdentityFile != "" {
-		parts = append(parts, "identity_file="+host.IdentityFile)
+	return []string{
+		truncate(display, 28),
+		truncate(orDash(host.Addr), 24),
+		port,
+		orDash(host.User),
+		truncate(auth, 18),
+		truncate(strings.Join(host.Tags, ","), 20),
 	}
-	if len(host.Tags) > 0 {
-		parts = append(parts, "tags="+strings.Join(host.Tags, ","))
+}
+
+func hostHasTag(host inventory.Host, tag string) bool {
+	for _, t := range host.Tags {
+		if t == tag {
+			return true
+		}
 	}
-	return strings.Join(parts, " ")
+	return false
 }
 
 type policySection struct {
@@ -1155,7 +1273,7 @@ func (s policySection) View() string {
 	var b strings.Builder
 	b.WriteString(s.styles.header.Render("Policy"))
 	b.WriteString("\n")
-	b.WriteString(renderPolicyConfig(s.config))
+	b.WriteString(renderPolicyConfig(s.styles, s.config))
 	b.WriteString("\n")
 	if s.err != nil {
 		b.WriteString(s.styles.err.Render(s.err.Error()))
@@ -1183,36 +1301,60 @@ func (s policySection) View() string {
 	return b.String()
 }
 
-func renderPolicyConfig(cfg policy.Config) string {
+var policyRuleColumns = []tableColumn{
+	{header: "NAME"},
+	{header: "ACTION"},
+	{header: "CMD REGEX"},
+}
+
+// policyActionCell renders a policy action as a glyph + word so deny reads as a
+// distinct verdict (coloring lands with the P1 StatusCell/theme).
+func policyActionCell(action policy.Action) string {
+	if action == policy.ActionDeny {
+		return "⊘ DENY"
+	}
+	return "● ALLOW"
+}
+
+func renderPolicyConfig(st appStyles, cfg policy.Config) string {
 	var b strings.Builder
 	defaultPolicy := cfg.Defaults.Policy
 	if defaultPolicy == "" {
 		defaultPolicy = policy.ActionAllow
 	}
-	fmt.Fprintf(&b, "defaults.policy=%s\n", defaultPolicy)
+	fmt.Fprintf(&b, "default posture: %s\n\n", policyActionCell(defaultPolicy))
+
 	if len(cfg.Rules) == 0 {
-		b.WriteString("rules: (none)\n")
+		b.WriteString(st.dim.Render("rules: (none)"))
+		b.WriteString("\n")
 	} else {
-		b.WriteString("rules:\n")
+		rows := make([][]string, 0, len(cfg.Rules))
 		for i, rule := range cfg.Rules {
 			name := rule.Name
 			if name == "" {
 				name = fmt.Sprintf("[%d]", i)
 			}
-			fmt.Fprintf(&b, "  - %s action=%s cmd_regex=%q\n", name, rule.Action, rule.Match.CmdRegex)
+			rows = append(rows, []string{
+				truncate(name, 22),
+				policyActionCell(rule.Action),
+				truncate(rule.Match.CmdRegex, 44),
+			})
 		}
+		b.WriteString(renderTable(st, policyRuleColumns, rows, -1))
+		b.WriteString("\n")
 	}
-	if len(cfg.HostOverrides) == 0 {
-		b.WriteString("host_overrides: (none)\n")
-	} else {
-		b.WriteString("host_overrides:\n")
-		names := sortedOverrideNames(cfg.HostOverrides)
-		for _, name := range names {
+
+	if len(cfg.HostOverrides) > 0 {
+		b.WriteString("\n")
+		b.WriteString(st.dim.Render("host overrides:"))
+		b.WriteString("\n")
+		for _, name := range sortedOverrideNames(cfg.HostOverrides) {
 			override := cfg.HostOverrides[name]
-			fmt.Fprintf(&b, "  - %s policy=%s allow_rules=%d\n", name, override.Policy, len(override.AllowRules))
+			fmt.Fprintf(&b, "  %s → %s (%d allow rules)\n",
+				name, policyActionCell(override.Policy), len(override.AllowRules))
 		}
 	}
-	fmt.Fprintf(&b, "output.max_bytes=%d redactions=%d\n", cfg.Output.MaxBytes, len(cfg.Output.Redact))
+	fmt.Fprintf(&b, "\noutput: max_bytes=%d · redactions=%d\n", cfg.Output.MaxBytes, len(cfg.Output.Redact))
 	return b.String()
 }
 
@@ -1280,39 +1422,58 @@ func (s sessionsSection) View() string {
 		b.WriteString("\n")
 	}
 	if len(s.summaries) == 0 {
-		b.WriteString(s.styles.dim.Render("(no sessions)"))
+		b.WriteString(s.styles.dim.Render("No sessions recorded yet."))
+		b.WriteString("\n")
+		b.WriteString(s.styles.dim.Render("Sessions appear here after the agent runs: agentssh run <host> -- <cmd>"))
 		b.WriteString("\n")
 	} else {
-		for _, summary := range s.visibleSummaries() {
-			cursor := "  "
-			if summary.ID == s.summaries[s.cursor].ID {
-				cursor = s.styles.cursor.Render("> ")
-			}
-			label := summary.Label
-			if label == "" {
-				label = "(none)"
-			}
-			fmt.Fprintf(&b, "%s%s label=%q start=%s end=%s commands=%d\n",
-				cursor, summary.ID, label, summary.Start, summary.End, summary.CommandCount)
+		window, start := s.sessionWindow()
+		rows := make([][]string, 0, len(window))
+		for _, summary := range window {
+			rows = append(rows, sessionRow(summary))
 		}
+		b.WriteString(renderTable(s.styles, sessionColumns, rows, s.cursor-start))
+		b.WriteString("\n")
 	}
 	b.WriteString("\n")
 	b.WriteString(s.styles.dim.Render("j/k move · enter open in Audit"))
 	return b.String()
 }
 
-func (s sessionsSection) visibleSummaries() []session.Summary {
+var sessionColumns = []tableColumn{
+	{header: "ID"},
+	{header: "LABEL"},
+	{header: "WINDOW"},
+	{header: "CMDS", right: true},
+}
+
+// sessionRow projects a session summary into aligned cells. WINDOW uses HH:MM:SS
+// clocks instead of two overflowing RFC3339 stamps. AGENT/DEN/FAIL columns need
+// data plumbing on session.Summary (P2) and are intentionally omitted for now.
+func sessionRow(summary session.Summary) []string {
+	label := summary.Label
+	if label == "" {
+		label = "-"
+	}
+	return []string{
+		truncate(summary.ID, 16),
+		truncate(label, 28),
+		clockOf(summary.Start) + "–" + clockOf(summary.End),
+		strconv.Itoa(summary.CommandCount),
+	}
+}
+
+func (s sessionsSection) sessionWindow() (summaries []session.Summary, start int) {
 	if s.h <= 0 || len(s.summaries) == 0 {
-		return s.summaries
+		return s.summaries, 0
 	}
 	height := s.h - 4
 	if height < 3 {
 		height = 3
 	}
 	if height >= len(s.summaries) {
-		return s.summaries
+		return s.summaries, 0
 	}
-	start := 0
 	if s.cursor >= height {
 		start = s.cursor - height + 1
 	}
@@ -1320,7 +1481,7 @@ func (s sessionsSection) visibleSummaries() []session.Summary {
 	if end > len(s.summaries) {
 		end = len(s.summaries)
 	}
-	return s.summaries[start:end]
+	return s.summaries[start:end], start
 }
 
 func sortedHostNames(hosts map[string]inventory.Host) []string {

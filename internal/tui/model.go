@@ -128,6 +128,7 @@ type model struct {
 	detail          viewport.Model
 	keys            keyMap
 	styles          styles
+	verifying       bool
 	verifyDone      bool
 	verifyResult    audit.VerifyResult
 	verifyErr       error
@@ -150,6 +151,7 @@ func newModel(records []audit.Record, hosts map[string]HostMeta, st styles, veri
 		keys:         defaultKeys(),
 		styles:       st,
 		verifyFn:     verify,
+		verifying:    verify != nil,
 		expandedByID: map[string]bool{},
 	}
 	// Build groups once; expand the most recent session by default for context.
@@ -199,7 +201,10 @@ func (m model) verifyCommand() tea.Cmd {
 	return verifyCmd(m.verifyFn)
 }
 
-func (m model) Init() tea.Cmd { return nil }
+// Init kicks off an automatic chain verification so the integrity badge resolves
+// to ✓/✗ on launch — a tamper-evidence tool must not show "unknown" by default.
+// Returns nil when no verify function is wired (e.g. in tests).
+func (m model) Init() tea.Cmd { return m.verifyCommand() }
 
 func (m model) title() string { return "Audit" }
 
@@ -305,6 +310,9 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 	case key.Matches(msg, m.keys.Verify):
+		if m.verifyFn != nil {
+			m.verifying = true
+		}
 		return m, m.verifyCommand()
 	case key.Matches(msg, m.keys.Filter):
 		m.focus = focusFilter
@@ -340,6 +348,9 @@ func (m model) updateDetail(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.focus = focusList
 		return m, nil
 	case key.Matches(msg, m.keys.Verify):
+		if m.verifyFn != nil {
+			m.verifying = true
+		}
 		return m, m.verifyCommand()
 	}
 	var cmd tea.Cmd
@@ -376,6 +387,7 @@ func (m model) updateFilter(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) applyVerify(msg verifyMsg) {
+	m.verifying = false
 	m.verifyDone = true
 	m.verifyResult = msg.result
 	m.verifyErr = msg.err
@@ -429,6 +441,9 @@ func (m model) statusBar() string {
 
 func (m model) chainStatus() string {
 	if !m.verifyDone {
+		if m.verifying {
+			return m.styles.dim.Render("链 … 校验中")
+		}
 		return m.styles.dim.Render("链 ? (press v)")
 	}
 	if m.verifyErr != nil {
@@ -478,7 +493,7 @@ func (m model) listHeight() int {
 
 func (m model) renderList() string {
 	if len(m.rows) == 0 {
-		return m.styles.dim.Render("(no records)")
+		return m.styles.dim.Render("No audit records yet.\nThey appear after the agent runs: agentssh run <host> -- <cmd>")
 	}
 	height := m.listHeight()
 	start := 0

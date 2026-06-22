@@ -224,7 +224,8 @@ func runTUI(cmd *cobra.Command) error {
 		return classifyConfigError(err)
 	}
 	opts := tui.Options{
-		Paths: cfg.Paths,
+		Paths:    cfg.Paths,
+		FirstRun: created,
 	}
 	err = tui.NewRunner().Run(opts)
 	if tui.IsNotInteractive(err) {

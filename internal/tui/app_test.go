@@ -16,6 +16,7 @@ import (
 	"github.com/Praeviso/AgentSSH/internal/inventory"
 	"github.com/Praeviso/AgentSSH/internal/policy"
 	"github.com/Praeviso/AgentSSH/internal/secrets"
+	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -297,6 +298,94 @@ func TestInventoryChangedUpdatesAuditAndPolicySections(t *testing.T) {
 	policyModel, ok := app.sections[sectionPolicy].(policySection)
 	if !ok || policyModel.inventory.Hosts["web-1"].Addr != "10.0.0.11" {
 		t.Fatalf("policy inventory not updated: %T %#v", app.sections[sectionPolicy], ok)
+	}
+}
+
+func TestFirstRunWelcomeShownThenDismissed(t *testing.T) {
+	app := newAppModel(testPaths(t), lipgloss.NewRenderer(io.Discard))
+	app.firstRun = true
+	updated, _ := app.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	app = updated.(appModel)
+	if !strings.Contains(app.View(), "Welcome to AgentSSH") {
+		t.Fatalf("first run should show the welcome banner:\n%s", app.View())
+	}
+	updated, _ = app.Update(keyMsg("j"))
+	app = updated.(appModel)
+	if app.firstRun || strings.Contains(app.View(), "Welcome to AgentSSH") {
+		t.Fatal("any key should dismiss the welcome banner")
+	}
+}
+
+func TestEmptyStatesTeachNextAction(t *testing.T) {
+	st := testAppStyles()
+	hosts := newHostsSection(testPaths(t), lipgloss.NewRenderer(io.Discard), st, inventory.Inventory{}, nil)
+	if v := hosts.View(); !strings.Contains(v, "No hosts yet") || !strings.Contains(v, "[a]") || !strings.Contains(v, "[d]") {
+		t.Fatalf("empty Hosts should teach a/d:\n%s", v)
+	}
+	sessions := newSessionsSection(nil, st, nil)
+	if v := sessions.View(); !strings.Contains(v, "No sessions recorded") || !strings.Contains(v, "agentssh run") {
+		t.Fatalf("empty Sessions should teach the run command:\n%s", v)
+	}
+}
+
+func TestProbeShowsSpinnerUntilResult(t *testing.T) {
+	section := newHostsSection(testPaths(t), lipgloss.NewRenderer(io.Discard), testAppStyles(), inventory.Inventory{
+		Hosts: map[string]inventory.Host{"web-1": {Addr: "127.0.0.1", Port: 1}},
+	}, nil)
+
+	updated, cmd := section.Update(keyMsg("t"))
+	hs := updated.(hostsSection)
+	if !hs.testing || !hs.busy() || cmd == nil {
+		t.Fatalf("probe should mark testing/busy and emit a cmd: testing=%t busy=%t cmdNil=%t", hs.testing, hs.busy(), cmd == nil)
+	}
+
+	// A tick while busy advances the spinner and reschedules the next frame.
+	updated, tickCmd := hs.Update(spinner.TickMsg{})
+	hs = updated.(hostsSection)
+	if tickCmd == nil {
+		t.Fatal("a tick while busy should reschedule the spinner")
+	}
+
+	// The probe result clears the busy flag.
+	updated, _ = hs.Update(hostProbeMsg{name: "web-1", ok: true})
+	hs = updated.(hostsSection)
+	if hs.testing || hs.busy() {
+		t.Fatalf("result should clear testing/busy: testing=%t busy=%t", hs.testing, hs.busy())
+	}
+
+	// A tick after the result is dropped, so the spinner chain stops.
+	if _, after := hs.Update(spinner.TickMsg{}); after != nil {
+		t.Fatal("a tick after the result must not reschedule")
+	}
+}
+
+func TestVerifyMsgRoutedToAuditWhileAnotherTabActive(t *testing.T) {
+	app := newAppModel(config.Paths{}, lipgloss.NewRenderer(io.Discard))
+	app.active = sectionHosts // launch lands here; auto-verify targets Audit
+
+	updated, _ := app.Update(verifyMsg{result: audit.VerifyResult{OK: true, Count: 3}})
+	next := updated.(appModel)
+	if next.active != sectionHosts {
+		t.Fatalf("routing a verifyMsg must not change the active tab, got %d", next.active)
+	}
+	auditModel, ok := next.sections[sectionAudit].(model)
+	if !ok || !auditModel.verifyDone || !auditModel.verifyResult.OK {
+		t.Fatalf("verifyMsg did not reach the inactive Audit section: %T done=%t", next.sections[sectionAudit], ok && auditModel.verifyDone)
+	}
+}
+
+func TestHostProbeMsgRoutedToHostsWhileAnotherTabActive(t *testing.T) {
+	app := newAppModel(testPaths(t), lipgloss.NewRenderer(io.Discard))
+	app.active = sectionAudit // operator switched away while a probe was in flight
+
+	updated, _ := app.Update(hostProbeMsg{name: "web-1", ok: true})
+	next := updated.(appModel)
+	if next.active != sectionAudit {
+		t.Fatalf("routing a hostProbeMsg must not change the active tab, got %d", next.active)
+	}
+	hosts, ok := next.sections[sectionHosts].(hostsSection)
+	if !ok || !strings.Contains(hosts.status, "OK web-1") {
+		t.Fatalf("hostProbeMsg did not reach the inactive Hosts section: %T status=%q", next.sections[sectionHosts], hosts.status)
 	}
 }
 
