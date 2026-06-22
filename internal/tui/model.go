@@ -9,6 +9,7 @@ import (
 	"github.com/Praeviso/AgentSSH/internal/audit"
 	"github.com/Praeviso/AgentSSH/internal/session"
 	"github.com/Praeviso/AgentSSH/internal/theme"
+	"github.com/charmbracelet/bubbles/help"
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
@@ -418,14 +419,10 @@ func (m model) View() string {
 	left := m.styles.normal.Width(m.leftWidth()).Render(m.renderList())
 	body := lipgloss.JoinHorizontal(lipgloss.Top, left, right)
 
-	var bottom string
 	if m.focus == focusFilter {
-		bottom = m.filter.View()
-	} else {
-		bottom = m.styles.dim.Render(m.helpLine())
+		return lipgloss.JoinVertical(lipgloss.Left, bar, body, m.filter.View())
 	}
-
-	return lipgloss.JoinVertical(lipgloss.Left, bar, body, bottom)
+	return lipgloss.JoinVertical(lipgloss.Left, bar, body)
 }
 
 func (m model) statusBar() string {
@@ -463,11 +460,17 @@ func (m model) chainStatus() string {
 	return m.styles.bad.Render(fmt.Sprintf("链 %s 断于 seq=%d · %s", m.styles.glyphs.Cross, m.verifyResult.BrokenSeq, reasonText(m.verifyResult.Reason)))
 }
 
-func (m model) helpLine() string {
-	if m.sessionFocus != "" {
-		return "↑/↓ move · enter/d detail · v verify · esc exit focus"
+func (m model) helpKeyMap() help.KeyMap {
+	switch {
+	case m.focus == focusFilter:
+		return helpMap{short: []key.Binding{hk("enter", "apply"), hk("esc", "cancel")}}
+	case m.focus == focusDetail:
+		return helpMap{short: []key.Binding{hk("esc", "back"), hk("v", "verify")}}
+	case m.sessionFocus != "":
+		return helpMap{short: []key.Binding{hk("j/k", "move"), hk("enter", "detail"), hk("v", "verify"), hk("esc", "exit focus")}}
+	default:
+		return helpMap{short: []key.Binding{hk("j/k", "move"), hk("enter", "expand"), hk("d", "detail"), hk("l", "focus session"), hk("v", "verify"), hk("/", "filter")}}
 	}
-	return "↑/↓ move · enter expand · d detail · l focus session · v verify · / filter"
 }
 
 func (m model) detailHint() string {

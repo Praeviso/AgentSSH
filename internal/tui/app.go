@@ -20,6 +20,8 @@ import (
 	"github.com/Praeviso/AgentSSH/internal/secrets"
 	"github.com/Praeviso/AgentSSH/internal/session"
 	"github.com/Praeviso/AgentSSH/internal/theme"
+	"github.com/charmbracelet/bubbles/help"
+	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -31,6 +33,49 @@ type section interface {
 	tea.Model
 	title() string
 	capturing() bool
+	// helpKeyMap returns the key bindings to show in the footer for this section,
+	// in its current mode (a section may vary them by focus/overlay).
+	helpKeyMap() help.KeyMap
+}
+
+// helpMap adapts explicit short/full binding sets to bubbles/help.KeyMap.
+type helpMap struct {
+	short []key.Binding
+	full  [][]key.Binding
+}
+
+func (h helpMap) ShortHelp() []key.Binding { return h.short }
+
+func (h helpMap) FullHelp() [][]key.Binding {
+	if h.full != nil {
+		return h.full
+	}
+	return [][]key.Binding{h.short}
+}
+
+// hk is a terse constructor for a help-only key binding (the keys it lists are
+// for display; actual handling lives in each section's Update).
+func hk(keys, desc string) key.Binding {
+	return key.NewBinding(key.WithKeys(keys), key.WithHelp(keys, desc))
+}
+
+// globalHelpKeys are the cross-section bindings shown on the right of the footer.
+func globalHelpKeys() []key.Binding {
+	return []key.Binding{hk("tab/1-4", "switch"), hk("?", "help"), hk("q", "quit")}
+}
+
+// combinedHelp merges a section's bindings with the global ones for the footer.
+type combinedHelp struct {
+	section help.KeyMap
+	global  []key.Binding
+}
+
+func (c combinedHelp) ShortHelp() []key.Binding {
+	return append(c.section.ShortHelp(), c.global...)
+}
+
+func (c combinedHelp) FullHelp() [][]key.Binding {
+	return append(c.section.FullHelp(), c.global)
 }
 
 const (
@@ -46,6 +91,7 @@ type appModel struct {
 	styles   appStyles
 	sections []section
 	active   int
+	help     help.Model
 	w, h     int
 	ready    bool
 	firstRun bool // show the one-time welcome banner until the first keypress
@@ -64,6 +110,7 @@ type appStyles struct {
 	confirm    lipgloss.Style
 	deny       lipgloss.Style
 	prod       lipgloss.Style
+	statusBar  lipgloss.Style
 	background lipgloss.Style
 	// table cell styles, shared by the aligned list renderer (see table.go).
 	tableHeader lipgloss.Style
@@ -87,6 +134,7 @@ func newAppStyles(r *lipgloss.Renderer) appStyles {
 		confirm:    r.NewStyle().Foreground(theme.Warn).Bold(true),
 		deny:       r.NewStyle().Foreground(theme.Deny).Bold(true),
 		prod:       r.NewStyle().Foreground(theme.Prod).Bold(true),
+		statusBar:  r.NewStyle().Border(lipgloss.NormalBorder(), false, false, true, false).BorderForeground(theme.Border),
 		background: r.NewStyle(),
 
 		tableHeader: r.NewStyle().Padding(0, 1).Bold(true).Foreground(theme.Dim),
@@ -115,6 +163,7 @@ func newAppModel(paths config.Paths, renderer *lipgloss.Renderer) appModel {
 		paths:    paths,
 		renderer: renderer,
 		styles:   st,
+		help:     help.New(),
 		sections: []section{
 			newHostsSection(paths, renderer, st, inv, invErr),
 			newModel(records, hosts, newStyles(renderer), func() (audit.VerifyResult, error) {
@@ -173,8 +222,9 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.w, m.h, m.ready = msg.Width, msg.Height, true
+		m.help.Width = msg.Width
 		inner := msg
-		inner.Height -= lipgloss.Height(m.renderTabs())
+		inner.Height -= lipgloss.Height(m.renderStatusBar()) + 1 // status bar + footer line
 		if inner.Height < 1 {
 			inner.Height = 1
 		}
@@ -216,6 +266,10 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if !m.sections[m.active].capturing() {
+			if msg.String() == "?" {
+				m.help.ShowAll = !m.help.ShowAll
+				return m, nil
+			}
 			if next, ok := switchTarget(m.active, len(m.sections), msg); ok {
 				m.active = next
 				return m, nil
@@ -264,19 +318,42 @@ func (m appModel) View() string {
 	if len(m.sections) == 0 {
 		return "loading..."
 	}
-	tabs := m.renderTabs()
+	statusBar := m.renderStatusBar()
+	footer := m.renderFooter()
 	body := m.sections[m.active].View()
 	if !m.ready {
 		body = "loading..."
 	}
+
+	var welcome string
 	if m.firstRun {
-		welcome := m.styles.ok.Render("✓ Welcome to AgentSSH — created a starter inventory.yaml + policy.yaml. Press any key to begin.")
-		return lipgloss.JoinVertical(lipgloss.Left, welcome, tabs, body)
+		welcome = m.styles.ok.Render(m.styles.glyphs.Check + " Welcome to AgentSSH — created a starter inventory.yaml + policy.yaml. Press any key to begin.")
 	}
-	return lipgloss.JoinVertical(lipgloss.Left, tabs, body)
+
+	// Pin the footer to the bottom by filling the space between the status bar
+	// and the footer (also clamps an over-tall body so it can't push the footer
+	// off-screen). Full measured layout per section is P1#9.
+	if m.h > 0 {
+		used := lipgloss.Height(statusBar) + lipgloss.Height(footer)
+		if welcome != "" {
+			used += lipgloss.Height(welcome)
+		}
+		if bodyH := m.h - used; bodyH > 0 {
+			body = lipgloss.NewStyle().Height(bodyH).MaxHeight(bodyH).Render(body)
+		}
+	}
+
+	parts := make([]string, 0, 4)
+	if welcome != "" {
+		parts = append(parts, welcome)
+	}
+	parts = append(parts, statusBar, body, footer)
+	return lipgloss.JoinVertical(lipgloss.Left, parts...)
 }
 
-func (m appModel) renderTabs() string {
+// renderStatusBar is the persistent full-width top rail: tab pips with the
+// active one inverted, underlined by a bottom border.
+func (m appModel) renderStatusBar() string {
 	labels := make([]string, 0, len(m.sections))
 	for i, section := range m.sections {
 		label := fmt.Sprintf("%d %s", i+1, section.title())
@@ -286,8 +363,19 @@ func (m appModel) renderTabs() string {
 			labels = append(labels, m.styles.inactive.Render(label))
 		}
 	}
-	help := m.styles.dim.Render("tab/shift+tab or 1-4 switch · q quit")
-	return lipgloss.JoinHorizontal(lipgloss.Top, append(labels, help)...)
+	bar := lipgloss.JoinHorizontal(lipgloss.Top, labels...)
+	style := m.styles.statusBar
+	if m.w > 0 {
+		style = style.Width(m.w)
+	}
+	return style.Render(bar)
+}
+
+// renderFooter is the persistent bottom rail: the active section's key bindings
+// plus the global ones, via one bubbles/help model (? toggles full help).
+func (m appModel) renderFooter() string {
+	km := combinedHelp{section: m.sections[m.active].helpKeyMap(), global: globalHelpKeys()}
+	return m.help.View(km)
 }
 
 func switchTarget(active, n int, msg tea.KeyMsg) (int, bool) {
@@ -381,6 +469,19 @@ func newHostsSection(paths config.Paths, renderer *lipgloss.Renderer, st appStyl
 func (s hostsSection) title() string { return "Hosts" }
 
 func (s hostsSection) capturing() bool { return s.adding || s.confirm || s.discover.active }
+
+func (s hostsSection) helpKeyMap() help.KeyMap {
+	switch {
+	case s.adding:
+		return helpMap{short: []key.Binding{hk("tab", "next"), hk("shift+tab", "prev"), hk("enter", "save"), hk("esc", "cancel")}}
+	case s.discover.active:
+		return helpMap{short: []key.Binding{hk("j/k", "move"), hk("space", "select"), hk("p", "probe"), hk("enter", "import"), hk("esc", "close")}}
+	case s.confirm:
+		return helpMap{short: []key.Binding{hk("y", "confirm"), hk("n/esc", "cancel")}}
+	default:
+		return helpMap{short: []key.Binding{hk("j/k", "move"), hk("a", "add"), hk("d", "discover"), hk("t", "test"), hk("r/x", "remove")}}
+	}
+}
 
 func (s hostsSection) Init() tea.Cmd { return nil }
 
@@ -966,8 +1067,6 @@ func (s hostsSection) View() string {
 			b.WriteString("\n")
 		}
 	}
-	b.WriteString("\n")
-	b.WriteString(s.styles.dim.Render("j/k move · a add · d discover · t test · r/x remove · tab switch"))
 	return b.String()
 }
 
@@ -1015,8 +1114,6 @@ func (s hostsSection) discoveryView() string {
 		b.WriteString(s.styles.dim.Render("note: " + note))
 		b.WriteString("\n")
 	}
-	b.WriteString("\n")
-	b.WriteString(s.styles.dim.Render("j/k move · space select · p probe · enter/i import connectable · esc/q close"))
 	return b.String()
 }
 
@@ -1181,6 +1278,13 @@ func (s policySection) title() string { return "Policy" }
 
 func (s policySection) capturing() bool { return s.input.Focused() }
 
+func (s policySection) helpKeyMap() help.KeyMap {
+	if s.input.Focused() {
+		return helpMap{short: []key.Binding{hk("enter", "evaluate"), hk("esc", "cancel")}}
+	}
+	return helpMap{short: []key.Binding{hk("t", "test a command")}}
+}
+
 func (s policySection) Init() tea.Cmd { return nil }
 
 func (s policySection) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -1285,8 +1389,6 @@ func (s policySection) View() string {
 		}
 		b.WriteString(s.styles.dim.Render(value))
 	}
-	b.WriteString("\n")
-	b.WriteString(s.styles.dim.Render("t or / test · enter evaluate · esc cancel input"))
 	return b.String()
 }
 
@@ -1376,6 +1478,10 @@ func (s sessionsSection) title() string { return "Sessions" }
 
 func (s sessionsSection) capturing() bool { return false }
 
+func (s sessionsSection) helpKeyMap() help.KeyMap {
+	return helpMap{short: []key.Binding{hk("j/k", "move"), hk("enter", "open in Audit")}}
+}
+
 func (s sessionsSection) Init() tea.Cmd { return nil }
 
 func (s sessionsSection) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -1424,8 +1530,6 @@ func (s sessionsSection) View() string {
 		b.WriteString(renderTable(s.styles, sessionColumns, rows, s.cursor-start))
 		b.WriteString("\n")
 	}
-	b.WriteString("\n")
-	b.WriteString(s.styles.dim.Render("j/k move · enter open in Audit"))
 	return b.String()
 }
 

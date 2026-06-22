@@ -16,6 +16,7 @@ import (
 	"github.com/Praeviso/AgentSSH/internal/inventory"
 	"github.com/Praeviso/AgentSSH/internal/policy"
 	"github.com/Praeviso/AgentSSH/internal/secrets"
+	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -298,6 +299,51 @@ func TestInventoryChangedUpdatesAuditAndPolicySections(t *testing.T) {
 	policyModel, ok := app.sections[sectionPolicy].(policySection)
 	if !ok || policyModel.inventory.Hosts["web-1"].Addr != "10.0.0.11" {
 		t.Fatalf("policy inventory not updated: %T %#v", app.sections[sectionPolicy], ok)
+	}
+}
+
+func TestFooterShowsSectionAndGlobalKeys(t *testing.T) {
+	app := newAppModel(testPaths(t), lipgloss.NewRenderer(io.Discard))
+	app.help.Width = 200 // wide enough that short help shows every binding
+	app.active = sectionHosts
+	footer := app.renderFooter()
+	for _, want := range []string{"add", "discover", "test", "switch", "quit"} {
+		if !strings.Contains(footer, want) {
+			t.Fatalf("footer missing %q:\n%s", want, footer)
+		}
+	}
+}
+
+func TestHostsFooterIsContextual(t *testing.T) {
+	s := newHostsSection(testPaths(t), lipgloss.NewRenderer(io.Discard), testAppStyles(), inventory.Inventory{}, nil)
+	s.discover.active = true
+	hasDesc := func(km interface{ ShortHelp() []key.Binding }, desc string) bool {
+		for _, b := range km.ShortHelp() {
+			if b.Help().Desc == desc {
+				return true
+			}
+		}
+		return false
+	}
+	if !hasDesc(s.helpKeyMap(), "import") {
+		t.Fatalf("discover-active footer should advertise import, got %+v", s.helpKeyMap().ShortHelp())
+	}
+	s.discover.active = false
+	if !hasDesc(s.helpKeyMap(), "add") {
+		t.Fatalf("list footer should advertise add")
+	}
+}
+
+func TestHelpKeyTogglesFullHelp(t *testing.T) {
+	app := newAppModel(testPaths(t), lipgloss.NewRenderer(io.Discard))
+	app.active = sectionHosts
+	if app.help.ShowAll {
+		t.Fatal("help should start collapsed")
+	}
+	updated, _ := app.Update(keyMsg("?"))
+	app = updated.(appModel)
+	if !app.help.ShowAll {
+		t.Fatal("'?' should toggle full help on")
 	}
 }
 
