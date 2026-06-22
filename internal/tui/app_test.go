@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Praeviso/AgentSSH/internal/audit"
 	"github.com/Praeviso/AgentSSH/internal/config"
@@ -522,6 +523,39 @@ func TestFirstRunSwallowsQuitKeyButCtrlCStillQuits(t *testing.T) {
 	}
 	if _, ok := quit().(tea.QuitMsg); !ok {
 		t.Fatalf("ctrl+c should produce tea.QuitMsg, got %T", quit())
+	}
+}
+
+func TestDetailShowsProbeVerdict(t *testing.T) {
+	t.Setenv("AGENTSSH_MASTER_PASSWORD", "") // keep the password indicator "unknown"
+	s := newHostsSection(testPaths(t), lipgloss.NewRenderer(io.Discard), testAppStyles(), inventory.Inventory{
+		Hosts: map[string]inventory.Host{"web-1": {Addr: "10.0.0.11"}},
+	}, nil)
+	s.w, s.h = 100, 20
+	if !strings.Contains(s.View(), "not tested") {
+		t.Fatalf("an untested host should say so in the detail card:\n%s", s.View())
+	}
+	updated, _ := s.Update(hostProbeMsg{name: "web-1", ok: true, dur: 3400 * time.Millisecond})
+	s = updated.(hostsSection)
+	v := s.View()
+	if !strings.Contains(v, "ok") || !strings.Contains(v, "3.4s") {
+		t.Fatalf("detail should show the probe verdict + duration:\n%s", v)
+	}
+}
+
+func TestDetailPasswordIndicator(t *testing.T) {
+	t.Setenv("AGENTSSH_MASTER_PASSWORD", "")
+	s := newHostsSection(testPaths(t), lipgloss.NewRenderer(io.Discard), testAppStyles(), inventory.Inventory{
+		Hosts: map[string]inventory.Host{"web-1": {Addr: "10.0.0.11"}},
+	}, nil)
+	s.w, s.h = 100, 20
+	if !strings.Contains(s.View(), "managed via") {
+		t.Fatalf("without a readable store the indicator should be 'unknown':\n%s", s.View())
+	}
+	s.secretsReadable = true
+	s.secretHosts = map[string]bool{"web-1": true}
+	if !strings.Contains(s.View(), "stored (encrypted)") {
+		t.Fatalf("a host with a stored password should show it:\n%s", s.View())
 	}
 }
 

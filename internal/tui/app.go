@@ -531,7 +531,12 @@ type hostsSection struct {
 	discover    discoveryOverlay
 	discoverSeq int
 	spinner     spinner.Model
-	w, h        int
+	probes      map[string]hostProbe // last probe verdict per host
+	// secretHosts/secretsReadable are populated only when AGENTSSH_MASTER_PASSWORD
+	// lets us read the encrypted store; otherwise the password indicator is "unknown".
+	secretHosts     map[string]bool
+	secretsReadable bool
+	w, h            int
 }
 
 // busy reports whether any async Hosts operation is in flight, driving the
@@ -574,6 +579,15 @@ type hostProbeMsg struct {
 	hint string
 	err  error
 	ok   bool
+	dur  time.Duration
+}
+
+// hostProbe is the remembered verdict of the last connectivity test for a host,
+// shown in the detail card so it persists past the transient status line.
+type hostProbe struct {
+	ok     bool
+	detail string
+	dur    time.Duration
 }
 
 func newHostsSection(paths config.Paths, renderer *lipgloss.Renderer, st appStyles, inv inventory.Inventory, loadErr error) hostsSection {
@@ -583,6 +597,18 @@ func newHostsSection(paths config.Paths, renderer *lipgloss.Renderer, st appStyl
 		sp.Style = renderer.NewStyle().Foreground(lipgloss.Color("212"))
 	}
 	s.spinner = sp
+	s.probes = map[string]hostProbe{}
+	// If the master password is in the environment we can show which hosts have a
+	// stored password; otherwise the indicator stays "unknown" (we never prompt).
+	if master := os.Getenv("AGENTSSH_MASTER_PASSWORD"); master != "" {
+		if store, err := secrets.Open(paths.SecretsFile, master); err == nil {
+			s.secretsReadable = true
+			s.secretHosts = map[string]bool{}
+			for _, n := range store.Names() {
+				s.secretHosts[n] = true
+			}
+		}
+	}
 	s.rebuildNames()
 	return s
 }
@@ -678,15 +704,20 @@ func (s hostsSection) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return s, nil
 	case hostProbeMsg:
 		s.testing = false
-		if msg.ok {
+		switch {
+		case msg.ok:
 			s.err = nil
 			s.status = "OK " + msg.name
-		} else if msg.hint != "" {
+			s.probes[msg.name] = hostProbe{ok: true, detail: "ok", dur: msg.dur}
+		case msg.hint != "":
 			s.err = nil
 			s.status = "FAILED " + msg.name + ": " + msg.hint
-		} else if msg.err != nil {
+			s.probes[msg.name] = hostProbe{ok: false, detail: msg.hint, dur: msg.dur}
+		case msg.err != nil:
 			s.err = nil
-			s.status = "FAILED " + msg.name + ": " + executor.ConnectHint(msg.err)
+			hint := executor.ConnectHint(msg.err)
+			s.status = "FAILED " + msg.name + ": " + hint
+			s.probes[msg.name] = hostProbe{ok: false, detail: hint, dur: msg.dur}
 		}
 		return s, nil
 	}
@@ -923,12 +954,12 @@ func (s hostsSection) probeHostCmd(name string) tea.Cmd {
 		defer cancel()
 		result := exec.Probe(ctx, inventory.Target{Name: name, Host: host})
 		if result.Err == nil && result.ExitCode == 0 {
-			return hostProbeMsg{name: name, ok: true}
+			return hostProbeMsg{name: name, ok: true, dur: result.Duration}
 		}
 		if result.Err != nil {
-			return hostProbeMsg{name: name, err: result.Err, hint: executor.ConnectHint(result.Err)}
+			return hostProbeMsg{name: name, err: result.Err, hint: executor.ConnectHint(result.Err), dur: result.Duration}
 		}
-		return hostProbeMsg{name: name, hint: fmt.Sprintf("probe command exited %d", result.ExitCode)}
+		return hostProbeMsg{name: name, hint: fmt.Sprintf("probe command exited %d", result.ExitCode), dur: result.Duration}
 	}
 }
 
@@ -1134,6 +1165,12 @@ func (s *hostsSection) addHost(result hostform.Result) error {
 			}
 			return fmt.Errorf("failed to store password; rolled back inventory add: %w", err)
 		}
+		// We just proved the master works, so the store is readable; record it.
+		if s.secretHosts == nil {
+			s.secretHosts = map[string]bool{}
+		}
+		s.secretHosts[result.Name] = true
+		s.secretsReadable = true
 		return nil
 	}
 	return s.addInventoryHost(base, result)
@@ -1649,15 +1686,14 @@ func (s hostsSection) hostDetailView(width int, focused bool) string {
 		identity += " " + s.styles.dim.Render("[key]")
 	}
 	field("identity", identity)
+	field("password", s.passwordCell(name))
 	field("tags", orDash(strings.Join(host.Tags, ", ")))
 	if hostHasTag(host, "prod") {
 		b.WriteString(s.styles.prod.Render("[PROD]"))
 		b.WriteString("\n")
 	}
 	b.WriteString("\n")
-	b.WriteString(s.styles.dim.Render("password managed via `agentssh secret`"))
-	b.WriteString("\n")
-	b.WriteString(s.styles.dim.Render("press t to test connectivity"))
+	field("probe", s.probeCell(name))
 
 	panel := s.styles.panel.Width(width)
 	if focused {
@@ -1666,6 +1702,32 @@ func (s hostsSection) hostDetailView(width int, focused bool) string {
 		panel = panel.BorderForeground(theme.Border)
 	}
 	return panel.Render(b.String())
+}
+
+// probeCell renders the remembered probe verdict for the detail card (color is
+// fine here — it's a panel, not a table).
+func (s hostsSection) probeCell(name string) string {
+	p, ok := s.probes[name]
+	if !ok {
+		return s.styles.dim.Render("not tested — press t")
+	}
+	if p.ok {
+		return s.styles.ok.Render(s.styles.glyphs.OK + " ok · " + durStr(p.dur.Milliseconds()))
+	}
+	return s.styles.err.Render(s.styles.glyphs.Fail + " " + truncate(p.detail, 40))
+}
+
+// passwordCell shows whether a password is stored, but only when the master
+// password lets us read the store; otherwise it stays "unknown" rather than
+// implying "none".
+func (s hostsSection) passwordCell(name string) string {
+	if !s.secretsReadable {
+		return s.styles.dim.Render("managed via `agentssh secret`")
+	}
+	if s.secretHosts[name] {
+		return s.styles.ok.Render(s.styles.glyphs.OK + " stored (encrypted)")
+	}
+	return s.styles.dim.Render("— (not stored)")
 }
 
 type policySection struct {
