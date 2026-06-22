@@ -476,7 +476,7 @@ func shortHelpFit(st appStyles, bindings []key.Binding, maxW int) string {
 		if len(parts) > 0 {
 			cost += 3 // " • " separator
 		}
-		if used+cost+2 > maxW { // +2 reserves room for the ellipsis
+		if used+cost+4 > maxW { // reserve the ellipsis: its " • " (3) + "…" (1)
 			parts = append(parts, "…")
 			break
 		}
@@ -1257,6 +1257,7 @@ func (s *hostsSection) removeSelected() bool {
 	}
 	s.inventory = next
 	s.rebuildNames()
+	delete(s.secretHosts, name) // keep the password indicator tied to the host's lifecycle
 	s.err = nil
 	return true
 }
@@ -2059,8 +2060,9 @@ func sessionRow(g theme.Glyphs, summary session.Summary) []string {
 	}
 }
 
-// countCell shows n, or a dim absent-glyph when zero, so non-zero anomaly counts
-// stand out in a column of mostly-zeros.
+// countCell shows n, or the absent glyph ("·") when zero, so non-zero anomaly
+// counts stand out in a column of mostly-zeros. Cells are unstyled (per-cell
+// coloring is a lipgloss/table limitation); the glyph carries the emphasis.
 func countCell(g theme.Glyphs, n int) string {
 	if n == 0 {
 		return g.Absent

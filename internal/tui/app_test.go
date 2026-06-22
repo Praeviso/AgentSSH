@@ -543,6 +543,24 @@ func TestDetailShowsProbeVerdict(t *testing.T) {
 	}
 }
 
+func TestRemoveHostClearsPasswordIndicator(t *testing.T) {
+	t.Setenv("AGENTSSH_MASTER_PASSWORD", "")
+	paths := testPaths(t)
+	inv := inventory.Inventory{Version: 1, Hosts: map[string]inventory.Host{"web-1": {Addr: "10.0.0.11"}}}
+	if err := inventory.Save(paths.InventoryFile, inv); err != nil {
+		t.Fatal(err)
+	}
+	s := newHostsSection(paths, lipgloss.NewRenderer(io.Discard), testAppStyles(), inv, nil)
+	s.secretsReadable = true
+	s.secretHosts = map[string]bool{"web-1": true}
+	if !s.removeSelected() {
+		t.Fatal("remove should succeed")
+	}
+	if s.secretHosts["web-1"] {
+		t.Fatal("removing a host should clear its password indicator entry")
+	}
+}
+
 func TestDetailPasswordIndicator(t *testing.T) {
 	t.Setenv("AGENTSSH_MASTER_PASSWORD", "")
 	s := newHostsSection(testPaths(t), lipgloss.NewRenderer(io.Discard), testAppStyles(), inventory.Inventory{
