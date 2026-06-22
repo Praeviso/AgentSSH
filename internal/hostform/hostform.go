@@ -228,20 +228,33 @@ func defaultKeys() keyMap {
 }
 
 type styles struct {
-	title lipgloss.Style
-	label lipgloss.Style
-	help  lipgloss.Style
-	err   lipgloss.Style
+	title  lipgloss.Style
+	group  lipgloss.Style
+	label  lipgloss.Style
+	help   lipgloss.Style
+	err    lipgloss.Style
+	warn   lipgloss.Style
+	glyphs theme.Glyphs
 }
 
 func newStyles(r *lipgloss.Renderer) styles {
 	return styles{
-		title: r.NewStyle().Bold(true),
-		label: r.NewStyle().Foreground(theme.Accent),
-		help:  r.NewStyle().Foreground(theme.Dim),
-		err:   r.NewStyle().Foreground(theme.Danger),
+		title:  r.NewStyle().Bold(true),
+		group:  r.NewStyle().Foreground(theme.Accent).Bold(true),
+		label:  r.NewStyle().Foreground(theme.Dim),
+		help:   r.NewStyle().Foreground(theme.Dim),
+		err:    r.NewStyle().Foreground(theme.Danger),
+		warn:   r.NewStyle().Foreground(theme.Warn),
+		glyphs: theme.GlyphsFor(r),
 	}
 }
+
+// fieldLabels are the display labels indexed by field.
+var fieldLabels = []string{"name", "addr", "user", "port", "tags", "ssh_config_alias", "identity_file", "password"}
+
+// fieldWidths are the textinput widths indexed by field, sized for the grouped
+// layout (short fields pair on one row).
+var fieldWidths = []int{18, 44, 12, 5, 22, 20, 38, 24}
 
 // Model is the embeddable add-host form model.
 type Model struct {
@@ -271,6 +284,7 @@ func newModel(opts Options, st styles) Model {
 		ti := textinput.New()
 		ti.Placeholder = placeholders[i]
 		ti.SetValue(values[i])
+		ti.Width = fieldWidths[i]
 		if field(i) == fieldPassword {
 			ti.EchoMode = textinput.EchoPassword
 		}
@@ -322,19 +336,65 @@ func (m Model) View() string {
 	var b strings.Builder
 	b.WriteString(m.styles.title.Render("Add inventory host"))
 	b.WriteString("\n\n")
-	labels := []string{"name", "addr", "user", "port", "tags", "ssh_config_alias", "identity_file", "password (optional)"}
-	for i := range m.inputs {
-		b.WriteString(m.styles.label.Render(labels[i]))
+
+	b.WriteString(m.groupHeader("Connection"))
+	b.WriteString("\n")
+	b.WriteString(joinFields(m.field(fieldName), m.field(fieldUser), m.field(fieldPort)))
+	b.WriteString("\n")
+	b.WriteString(m.field(fieldAddr))
+	b.WriteString("\n\n")
+
+	b.WriteString(m.groupHeader("Routing"))
+	b.WriteString("\n")
+	b.WriteString(joinFields(m.field(fieldTags), m.field(fieldAlias)))
+	b.WriteString("\n\n")
+
+	b.WriteString(m.groupHeader("Auth"))
+	b.WriteString("\n")
+	b.WriteString(m.field(fieldIdentity))
+	b.WriteString("\n")
+	b.WriteString(m.field(fieldPassword))
+	b.WriteString("\n")
+	b.WriteString(m.styles.help.Render("identity_file is a path saved in inventory; password is encrypted (age) and never shown."))
+	b.WriteString("\n")
+	if strings.TrimSpace(m.inputs[fieldPassword].Value()) != "" && os.Getenv("AGENTSSH_MASTER_PASSWORD") == "" {
+		b.WriteString(m.styles.warn.Render(m.styles.glyphs.Warn + " AGENTSSH_MASTER_PASSWORD not set — the password won't be saved."))
 		b.WriteString("\n")
-		b.WriteString(m.inputs[i].View())
-		if m.errs[i] != "" {
-			b.WriteString(" ")
-			b.WriteString(m.styles.err.Render(m.errs[i]))
-		}
-		b.WriteString("\n\n")
 	}
-	b.WriteString(m.styles.help.Render("tab/down next · shift+tab/up previous · enter submit · esc cancel"))
+
+	b.WriteString("\n")
+	b.WriteString(m.styles.help.Render("tab/down next · shift+tab/up prev · enter submit · esc cancel"))
 	return b.String()
+}
+
+func (m Model) groupHeader(name string) string {
+	return m.styles.group.Render("── " + name + " " + strings.Repeat("─", 24-len(name)))
+}
+
+// field renders one labelled input plus its inline error, as a block for
+// horizontal joining.
+func (m Model) field(f field) string {
+	var b strings.Builder
+	b.WriteString(m.styles.label.Render(fieldLabels[f]))
+	b.WriteString("\n")
+	b.WriteString(m.inputs[f].View())
+	if m.errs[f] != "" {
+		b.WriteString("\n")
+		b.WriteString(m.styles.err.Render(m.errs[f]))
+	}
+	return b.String()
+}
+
+// joinFields lays out field blocks side by side with a gutter between them.
+func joinFields(blocks ...string) string {
+	parts := make([]string, 0, len(blocks)*2-1)
+	for i, blk := range blocks {
+		if i > 0 {
+			parts = append(parts, "  ")
+		}
+		parts = append(parts, blk)
+	}
+	return lipgloss.JoinHorizontal(lipgloss.Top, parts...)
 }
 
 func (m Model) move(delta int) (tea.Model, tea.Cmd) {

@@ -9,6 +9,27 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
+func TestFormGroupedAndWarnsOnPasswordWithoutMaster(t *testing.T) {
+	t.Setenv("AGENTSSH_MASTER_PASSWORD", "") // ensure unset
+	m := New(Options{}, lipgloss.NewRenderer(io.Discard))
+	for _, g := range []string{"Connection", "Routing", "Auth"} {
+		if !strings.Contains(m.View(), g) {
+			t.Fatalf("grouped form should contain the %q section:\n%s", g, m.View())
+		}
+	}
+	if strings.Contains(m.View(), "won't be saved") {
+		t.Fatal("no warning expected before a password is entered")
+	}
+	m.inputs[fieldPassword].SetValue("ssh-secret")
+	if !strings.Contains(m.View(), "AGENTSSH_MASTER_PASSWORD not set") {
+		t.Fatalf("form should warn when a password is set without the master:\n%s", m.View())
+	}
+	// The password value must never appear in the rendered form (masked).
+	if strings.Contains(m.View(), "ssh-secret") {
+		t.Fatal("password value leaked into the rendered form")
+	}
+}
+
 func TestValidateNormalizesHostFields(t *testing.T) {
 	t.Setenv("USER", "alice")
 	result, errs := Validate(Options{
