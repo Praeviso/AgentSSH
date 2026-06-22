@@ -128,6 +128,8 @@ nginx.service - A high performance web server
 
 ## B. TUI 设计(人类审计查看器)
 
+> 注:本节描述的是 TUI 的**当前/既定**形态(草案 v1,Audit 为中心)。`agentssh tui` 已扩展为四 Tab 操作台(Hosts/Audit/Policy/Sessions),其整体 UX 重构的北极星与分阶段路线图见 [`docs/plans/tui-redesign.md`](plans/tui-redesign.md)。
+
 技术:`bubbletea` + `lipgloss` + `bubbles`。**单一视图:审计流,按会话分组**(无审批界面)。`agentssh tui` 即打开它,等价于交互式的 `agentssh audit`。
 
 ### B.1 全局布局(按会话折叠)
