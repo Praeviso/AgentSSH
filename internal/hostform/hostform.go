@@ -308,7 +308,12 @@ func (m Model) Init() tea.Cmd {
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if keyMsg, ok := msg.(tea.KeyMsg); ok {
 		switch {
-		case key.Matches(keyMsg, m.keys.Cancel), key.Matches(keyMsg, m.keys.ForceQuit):
+		case key.Matches(keyMsg, m.keys.ForceQuit):
+			// Ctrl+C means quit, not just cancel the form: return tea.Quit so it
+			// propagates up and exits the whole program (the standalone runner and
+			// the embedded TUI both honor it).
+			return m, tea.Quit
+		case key.Matches(keyMsg, m.keys.Cancel):
 			m.result = Result{Submitted: false}
 			m.done = true
 			return m, nil

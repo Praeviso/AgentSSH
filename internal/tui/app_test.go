@@ -262,6 +262,26 @@ func TestPolicySectionEvaluate(t *testing.T) {
 	}
 }
 
+func TestPolicyEvaluateRefusesStaleConfigOnParseError(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "policy.yaml")
+	if err := os.WriteFile(path, []byte("defaults: [ broken flow"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The section holds a previously-valid config; a now-malformed file must not
+	// be silently ignored while still producing a verdict.
+	prior := policy.Config{Defaults: policy.Defaults{Policy: policy.ActionAllow}}
+	section := newPolicySection(path, inventory.Inventory{}, prior, testAppStyles(), nil)
+	section.input.SetValue("rm -rf /")
+	section.evaluate()
+	if section.err == nil {
+		t.Fatal("a malformed policy.yaml should set an error")
+	}
+	if section.result != "" {
+		t.Fatalf("must not show a verdict tested against stale config, got %q", section.result)
+	}
+}
+
 func TestSessionsShowsAnomalyColumns(t *testing.T) {
 	records := []audit.Record{
 		{SessionID: "s_a", ReqID: "r1", Event: audit.EventCompleted, TS: "2026-06-20T10:00:00Z"},

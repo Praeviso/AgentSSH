@@ -6,8 +6,27 @@ import (
 	"testing"
 
 	"github.com/charmbracelet/bubbles/textinput"
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
+
+func TestCtrlCQuitsAndEscCancels(t *testing.T) {
+	m := New(Options{}, lipgloss.NewRenderer(io.Discard))
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	if cmd == nil {
+		t.Fatal("ctrl+c should return a command")
+	}
+	if _, ok := cmd().(tea.QuitMsg); !ok {
+		t.Fatalf("ctrl+c should produce tea.QuitMsg (quit the program), got %T", cmd())
+	}
+
+	// Esc still cancels the form (done, not submitted) without quitting.
+	updated, _ := New(Options{}, lipgloss.NewRenderer(io.Discard)).Update(tea.KeyMsg{Type: tea.KeyEsc})
+	fm, ok := updated.(Model)
+	if !ok || !fm.Done() || fm.Result().Submitted {
+		t.Fatalf("esc should cancel: done=%t submitted=%t", ok && fm.Done(), ok && fm.Result().Submitted)
+	}
+}
 
 func TestFormGroupedAndWarnsOnPasswordWithoutMaster(t *testing.T) {
 	t.Setenv("AGENTSSH_MASTER_PASSWORD", "") // ensure unset

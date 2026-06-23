@@ -1820,11 +1820,17 @@ func (s policySection) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (s *policySection) evaluate() {
 	// Reflect current policy.yaml (it may have changed since launch). Skip when
-	// there is no backing file (e.g. an in-memory section in tests).
+	// there is no backing file (e.g. an in-memory section in tests). If the file
+	// no longer parses, surface the error and refuse to evaluate — otherwise the
+	// verdict would be tested against a stale/zero policy, not the file on disk.
 	if s.path != "" {
-		if cfg, err := loadPolicy(s.path); err == nil {
-			s.config = cfg
+		cfg, err := loadPolicy(s.path)
+		if err != nil {
+			s.err = err
+			s.result = ""
+			return
 		}
+		s.config = cfg
 	}
 	engine, err := policy.NewEngine(s.config, s.inventory)
 	if err != nil {
