@@ -8,6 +8,8 @@ import (
 
 	"github.com/Praeviso/AgentSSH/internal/audit"
 	"github.com/Praeviso/AgentSSH/internal/session"
+	"github.com/Praeviso/AgentSSH/internal/theme"
+	"github.com/charmbracelet/bubbles/help"
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
@@ -86,19 +88,23 @@ type styles struct {
 	prod   lipgloss.Style
 	ok     lipgloss.Style
 	bad    lipgloss.Style
+	deny   lipgloss.Style
+	glyphs theme.Glyphs
 }
 
 func newStyles(r *lipgloss.Renderer) styles {
 	return styles{
 		bar:    r.NewStyle().Bold(true),
-		header: r.NewStyle().Bold(true).Foreground(lipgloss.Color("63")),
-		cursor: r.NewStyle().Foreground(lipgloss.Color("212")).Bold(true),
-		dim:    r.NewStyle().Foreground(lipgloss.Color("241")),
+		header: r.NewStyle().Bold(true).Foreground(theme.Accent),
+		cursor: r.NewStyle().Foreground(theme.Cursor).Bold(true),
+		dim:    r.NewStyle().Foreground(theme.Dim),
 		normal: r.NewStyle(),
 		panel:  r.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1),
-		prod:   r.NewStyle().Foreground(lipgloss.Color("203")).Bold(true),
-		ok:     r.NewStyle().Foreground(lipgloss.Color("42")).Bold(true),
-		bad:    r.NewStyle().Foreground(lipgloss.Color("196")).Bold(true),
+		prod:   r.NewStyle().Foreground(theme.Prod).Bold(true),
+		ok:     r.NewStyle().Foreground(theme.Success).Bold(true),
+		bad:    r.NewStyle().Foreground(theme.Danger).Bold(true),
+		deny:   r.NewStyle().Foreground(theme.Deny).Bold(true),
+		glyphs: theme.GlyphsFor(r),
 	}
 }
 
@@ -128,6 +134,7 @@ type model struct {
 	detail          viewport.Model
 	keys            keyMap
 	styles          styles
+	verifying       bool
 	verifyDone      bool
 	verifyResult    audit.VerifyResult
 	verifyErr       error
@@ -150,6 +157,7 @@ func newModel(records []audit.Record, hosts map[string]HostMeta, st styles, veri
 		keys:         defaultKeys(),
 		styles:       st,
 		verifyFn:     verify,
+		verifying:    verify != nil,
 		expandedByID: map[string]bool{},
 	}
 	// Build groups once; expand the most recent session by default for context.
@@ -199,7 +207,10 @@ func (m model) verifyCommand() tea.Cmd {
 	return verifyCmd(m.verifyFn)
 }
 
-func (m model) Init() tea.Cmd { return nil }
+// Init kicks off an automatic chain verification so the integrity badge resolves
+// to ✓/✗ on launch — a tamper-evidence tool must not show "unknown" by default.
+// Returns nil when no verify function is wired (e.g. in tests).
+func (m model) Init() tea.Cmd { return m.verifyCommand() }
 
 func (m model) title() string { return "Audit" }
 
@@ -305,6 +316,9 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 	case key.Matches(msg, m.keys.Verify):
+		if m.verifyFn != nil {
+			m.verifying = true
+		}
 		return m, m.verifyCommand()
 	case key.Matches(msg, m.keys.Filter):
 		m.focus = focusFilter
@@ -340,6 +354,9 @@ func (m model) updateDetail(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.focus = focusList
 		return m, nil
 	case key.Matches(msg, m.keys.Verify):
+		if m.verifyFn != nil {
+			m.verifying = true
+		}
 		return m, m.verifyCommand()
 	}
 	var cmd tea.Cmd
@@ -376,6 +393,7 @@ func (m model) updateFilter(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) applyVerify(msg verifyMsg) {
+	m.verifying = false
 	m.verifyDone = true
 	m.verifyResult = msg.result
 	m.verifyErr = msg.err
@@ -401,14 +419,10 @@ func (m model) View() string {
 	left := m.styles.normal.Width(m.leftWidth()).Render(m.renderList())
 	body := lipgloss.JoinHorizontal(lipgloss.Top, left, right)
 
-	var bottom string
 	if m.focus == focusFilter {
-		bottom = m.filter.View()
-	} else {
-		bottom = m.styles.dim.Render(m.helpLine())
+		return lipgloss.JoinVertical(lipgloss.Left, bar, body, m.filter.View())
 	}
-
-	return lipgloss.JoinVertical(lipgloss.Left, bar, body, bottom)
+	return lipgloss.JoinVertical(lipgloss.Left, bar, body)
 }
 
 func (m model) statusBar() string {
@@ -429,6 +443,9 @@ func (m model) statusBar() string {
 
 func (m model) chainStatus() string {
 	if !m.verifyDone {
+		if m.verifying {
+			return m.styles.dim.Render("链 … 校验中")
+		}
 		return m.styles.dim.Render("链 ? (press v)")
 	}
 	if m.verifyErr != nil {
@@ -436,18 +453,24 @@ func (m model) chainStatus() string {
 	}
 	if m.verifyResult.OK {
 		if m.verifyResult.Count == 0 {
-			return m.styles.ok.Render("链 ✓ 完整 (empty)")
+			return m.styles.ok.Render("链 " + m.styles.glyphs.Check + " 完整 (empty)")
 		}
-		return m.styles.ok.Render(fmt.Sprintf("链 ✓ 完整 (0..%d)", m.verifyResult.Count-1))
+		return m.styles.ok.Render(fmt.Sprintf("链 %s 完整 (0..%d)", m.styles.glyphs.Check, m.verifyResult.Count-1))
 	}
-	return m.styles.bad.Render(fmt.Sprintf("链 ✗ 断于 seq=%d · %s", m.verifyResult.BrokenSeq, reasonText(m.verifyResult.Reason)))
+	return m.styles.bad.Render(fmt.Sprintf("链 %s 断于 seq=%d · %s", m.styles.glyphs.Cross, m.verifyResult.BrokenSeq, reasonText(m.verifyResult.Reason)))
 }
 
-func (m model) helpLine() string {
-	if m.sessionFocus != "" {
-		return "↑/↓ move · enter/d detail · v verify · esc exit focus"
+func (m model) helpKeyMap() help.KeyMap {
+	switch {
+	case m.focus == focusFilter:
+		return helpMap{short: []key.Binding{hk("enter", "apply"), hk("esc", "cancel")}}
+	case m.focus == focusDetail:
+		return helpMap{short: []key.Binding{hk("esc", "back"), hk("v", "verify")}}
+	case m.sessionFocus != "":
+		return helpMap{short: []key.Binding{hk("j/k", "move"), hk("enter", "detail"), hk("v", "verify"), hk("esc", "exit focus")}}
+	default:
+		return helpMap{short: []key.Binding{hk("j/k", "move"), hk("enter", "expand"), hk("d", "detail"), hk("l", "focus session"), hk("v", "verify"), hk("/", "filter")}}
 	}
-	return "↑/↓ move · enter expand · d detail · l focus session · v verify · / filter"
 }
 
 func (m model) detailHint() string {
@@ -469,7 +492,12 @@ func (m model) leftWidth() int {
 }
 
 func (m model) listHeight() int {
-	h := m.h - 4
+	// The audit body is the status bar line plus the list (plus the filter input
+	// when filtering); m.h is the height the shell allocated to this section.
+	h := m.h - 1
+	if m.focus == focusFilter {
+		h--
+	}
 	if h < 1 {
 		h = 1
 	}
@@ -478,7 +506,7 @@ func (m model) listHeight() int {
 
 func (m model) renderList() string {
 	if len(m.rows) == 0 {
-		return m.styles.dim.Render("(no records)")
+		return m.styles.dim.Render("No audit records yet.\nThey appear after the agent runs: agentssh run <host> -- <cmd>")
 	}
 	height := m.listHeight()
 	start := 0
@@ -536,14 +564,17 @@ func (m model) renderRow(i int) string {
 		exit = strconv.Itoa(*rec.ExitCode)
 	}
 	body := fmt.Sprintf("    %s %s  %s  %s  %s  %s/%s · exit %s · %s",
-		iconFor(rec.Event), clockOf(rec.TS), host, skill, truncate(rec.Cmd, 40),
+		iconFor(m.styles.glyphs, rec.Event), clockOf(rec.TS), host, skill, truncate(rec.Cmd, 40),
 		rec.PolicyAction, rec.PolicyRule, exit, durStr(rec.DurationMS))
 
 	style := m.styles.normal
-	if m.brokenSeq != nil && *m.brokenSeq == rec.Seq {
-		body += "  ⚠ TAMPERED"
+	switch {
+	case m.brokenSeq != nil && *m.brokenSeq == rec.Seq:
+		body += "  " + m.styles.glyphs.Warn + " TAMPERED"
 		style = m.styles.bad
-	} else if rec.Event == audit.EventDenied || rec.Event == audit.EventFailed {
+	case rec.Event == audit.EventDenied:
+		style = m.styles.deny
+	case rec.Event == audit.EventFailed:
 		style = m.styles.bad
 	}
 	return cursor + style.Render(body)
@@ -733,18 +764,18 @@ func reasonText(reason string) string {
 	}
 }
 
-func iconFor(event audit.Event) string {
+func iconFor(g theme.Glyphs, event audit.Event) string {
 	switch event {
 	case audit.EventCompleted:
-		return "✓"
+		return g.Check
 	case audit.EventFailed:
-		return "✗"
+		return g.Cross
 	case audit.EventDenied:
-		return "⊘"
+		return g.Deny
 	case audit.EventStarted:
-		return "●"
+		return g.OK
 	default:
-		return "·"
+		return g.Absent
 	}
 }
 

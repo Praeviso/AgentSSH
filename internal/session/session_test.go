@@ -9,6 +9,22 @@ import (
 	"github.com/Praeviso/AgentSSH/internal/audit"
 )
 
+func TestSummariesCountsDeniedAndFailed(t *testing.T) {
+	recs := []audit.Record{
+		{SessionID: "s1", ReqID: "r1", Event: audit.EventCompleted, TS: "2026-06-20T10:00:00Z"},
+		{SessionID: "s1", ReqID: "r2", Event: audit.EventDenied, TS: "2026-06-20T10:01:00Z"},
+		{SessionID: "s1", ReqID: "r3", Event: audit.EventFailed, TS: "2026-06-20T10:02:00Z"},
+		{SessionID: "s1", ReqID: "r4", Event: audit.EventDenied, TS: "2026-06-20T10:03:00Z"},
+	}
+	sums := Summaries(recs)
+	if len(sums) != 1 {
+		t.Fatalf("want 1 summary, got %d", len(sums))
+	}
+	if sums[0].Denied != 2 || sums[0].Failed != 1 {
+		t.Fatalf("denied=%d failed=%d, want 2/1", sums[0].Denied, sums[0].Failed)
+	}
+}
+
 func TestResolveOrder(t *testing.T) {
 	resolver := Resolver{Path: filepath.Join(t.TempDir(), "session"), NewID: fixedID("s_new")}
 	ctx, err := resolver.Resolve("s_explicit", "label")

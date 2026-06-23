@@ -139,6 +139,8 @@ type Summary struct {
 	Start        string
 	End          string
 	CommandCount int
+	Denied       int // count of policy-denied events in the session
+	Failed       int // count of failed events in the session
 }
 
 // Summaries groups audit records by session id.
@@ -166,6 +168,12 @@ func Summaries(records []audit.Record) []Summary {
 		}
 		if record.ReqID != "" {
 			reqsByID[record.SessionID][record.ReqID] = struct{}{}
+		}
+		switch record.Event {
+		case audit.EventDenied:
+			summary.Denied++
+		case audit.EventFailed:
+			summary.Failed++
 		}
 	}
 

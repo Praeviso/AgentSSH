@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/Praeviso/AgentSSH/internal/audit"
+	"github.com/Praeviso/AgentSSH/internal/theme"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/termenv"
 )
@@ -198,14 +199,15 @@ func TestReasonText(t *testing.T) {
 }
 
 func TestIconFor(t *testing.T) {
+	g := theme.GlyphsFor(nil) // Unicode set
 	cases := map[audit.Event]string{
-		audit.EventCompleted: "✓",
-		audit.EventFailed:    "✗",
-		audit.EventDenied:    "⊘",
-		audit.EventStarted:   "●",
+		audit.EventCompleted: g.Check,
+		audit.EventFailed:    g.Cross,
+		audit.EventDenied:    g.Deny,
+		audit.EventStarted:   g.OK,
 	}
 	for event, want := range cases {
-		if got := iconFor(event); got != want {
+		if got := iconFor(g, event); got != want {
 			t.Errorf("iconFor(%q) = %q, want %q", event, got, want)
 		}
 	}
@@ -255,6 +257,55 @@ func TestNoColorStylesEscapeFree(t *testing.T) {
 	rc.SetColorProfile(termenv.TrueColor)
 	if out := newStyles(rc).header.Render("x"); !strings.Contains(out, "\x1b") {
 		t.Errorf("expected ANSI under TrueColor, got %q", out)
+	}
+}
+
+func TestInitAutoVerifiesChain(t *testing.T) {
+	st := newStyles(lipgloss.NewRenderer(io.Discard))
+
+	// With a verify function wired, Init must return a command (the auto-verify)
+	// and the badge must read as in-flight until the result lands.
+	verified := false
+	m := newModel(sampleRecords(), nil, st, func() (audit.VerifyResult, error) {
+		verified = true
+		return audit.VerifyResult{OK: true, Count: 4}, nil
+	})
+	if !m.verifying {
+		t.Fatal("model should be in verifying state before the result arrives")
+	}
+	if !strings.Contains(m.chainStatus(), "校验中") {
+		t.Fatalf("in-flight badge should say 校验中, got %q", m.chainStatus())
+	}
+	cmd := m.Init()
+	if cmd == nil {
+		t.Fatal("Init should return the auto-verify command when a verify fn is set")
+	}
+	if _, ok := cmd().(verifyMsg); !ok || !verified {
+		t.Fatalf("Init command should run verify and yield verifyMsg, got %T verified=%t", cmd(), verified)
+	}
+
+	// Without a verify function (e.g. tests), Init is a no-op and the badge falls
+	// back to the manual prompt rather than getting stuck on "校验中".
+	none := newModel(sampleRecords(), nil, st, nil)
+	if none.verifying || none.Init() != nil {
+		t.Fatalf("nil verify fn: verifying=%t initNil=%t", none.verifying, none.Init() == nil)
+	}
+	if !strings.Contains(none.chainStatus(), "press v") {
+		t.Fatalf("no-verify badge should prompt for v, got %q", none.chainStatus())
+	}
+}
+
+func TestApplyVerifyClearsInFlight(t *testing.T) {
+	st := newStyles(lipgloss.NewRenderer(io.Discard))
+	m := newModel(sampleRecords(), nil, st, func() (audit.VerifyResult, error) {
+		return audit.VerifyResult{OK: true, Count: 4}, nil
+	})
+	m.applyVerify(verifyMsg{result: audit.VerifyResult{OK: true, Count: 4}})
+	if m.verifying || !m.verifyDone {
+		t.Fatalf("after result: verifying=%t done=%t", m.verifying, m.verifyDone)
+	}
+	if !strings.Contains(m.chainStatus(), "完整") {
+		t.Fatalf("resolved badge should report 完整, got %q", m.chainStatus())
 	}
 }
 

@@ -23,6 +23,10 @@ type HostMeta struct {
 type Options struct {
 	// Paths contains the AgentSSH home layout used by the console sections.
 	Paths config.Paths
+	// FirstRun is true when this launch just initialized ~/.agentssh, so the
+	// console shows a one-time welcome banner (the alt-screen erases the
+	// stderr "initialized …" line the CLI prints).
+	FirstRun bool
 }
 
 // Runner starts the terminal console.
@@ -57,6 +61,7 @@ func run(options Options) error {
 	}
 
 	m := newAppModel(options.Paths, renderer)
+	m.firstRun = options.FirstRun
 	_, err := tea.NewProgram(m, tea.WithAltScreen()).Run()
 	return err
 }
