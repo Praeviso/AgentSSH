@@ -1,10 +1,42 @@
 # TUI 优化北极星 (North-star Optimization Plan)
 
-> 状态:提案 v1 · 创建于 2026-06-22 · 范围:`agentssh tui` 操作台(人类界面)的整体 UX 重构。
+> 状态:**已全部实现** v1 · 创建于 2026-06-22 · 实现于 2026-06-23 · 分支 `tui-redesign` · 范围:`agentssh tui` 操作台(人类界面)的整体 UX 重构。
 >
 > 由多智能体设计工作流综合产出:6 个 UX 视角审计(41 条问题,13 个 P0)→ 3 个独立设计方向 → 评审打分(Polished Modern 32 / Guided 31 / Cockpit 29)→ 综合 → 对抗式审查 → 定稿。配套规范见 [`docs/DESIGN.md`](../DESIGN.md);架构见 [`docs/architecture/unified-tui.md`](../architecture/unified-tui.md)。
 
 > 一句话北极星:一个操作台,四个 Tab 终于看起来像同一个产品。Audit 这个 Tab 已经证明团队能做出一屏好界面——本方案把它的骨架(状态条 + 主从面板 + 实测布局)推广到全 app,合并重复的样式系统,并让异步/安全状态默认可见。
+
+---
+
+## 实施进度 (Implementation status)
+
+全部 P0/P1/P2 项已在分支 `tui-redesign` 实现,每个提交均通过 `gofmt`/`go vet`/`go build`/`go test -race ./...`/`golangci-lint`(0 issues),零新增依赖;每个阶段后做了一轮 worktree 隔离的对抗式审查并修复全部发现。下表把路线图条目映射到提交。
+
+| 项 | 内容 | 状态 | 提交 |
+|---|---|---|---|
+| P0#1 | 启动自动校验链 | ✅ | `846e7d7` |
+| P0#2 | 类型化异步路由(切 Tab 不丢) | ✅ | `846e7d7` |
+| P0#3 | 四 Tab `lipgloss/table` 对齐 | ✅ | `846e7d7` |
+| P0#4 | probe/discover spinner | ✅ | `846e7d7` |
+| P0#5 | 教学空状态 + 首跑欢迎 | ✅ | `846e7d7` |
+| — | P0 对抗审查修复(spinner tick 路由 · `t` 重入 · 首跑 `q`)| ✅ | `4066edb` |
+| P1#6 | 合并样式系统 → `internal/theme` | ✅ | `f568ffb` |
+| P1#7 | 字形解析器(NO_COLOR 真降级)| ✅ | `f568ffb` |
+| P1#8 | 持久外壳 + `bubbles/help` 底栏 | ✅ | `1d2152e` |
+| P1#9 | 实测响应式布局(干掉魔法数)| ✅ | `dfc9971` |
+| P1#11 | Hosts 焦点枚举 + 统一键义 | ✅ | `7699607` |
+| P1#10 | Hosts 主从面板 | ✅ | `d0dfd6f` |
+| P1#12 | 状态词汇 / 字形(随 #6/#7)| ✅ | `f568ffb` |
+| P1#13 | 友好错误卡 + 删除确认卡 | ✅ | `9d50a8a` |
+| — | P1 对抗审查修复(宽度溢出 · 焦点卡死 · 残留错误 · 裁剪)| ✅ | `0ace703` |
+| P2#15 | Toast 通道 | ✅ | `d3cd914` |
+| P2#14 | 分组加主机表单 | ✅ | `db47823` |
+| P2#16 | Sessions DEN/FAIL 列 | ✅ | `123f5f9` |
+| P2#17 | 按主机 probe 结果 + 密码指示 | ✅ | `ba8e72a` |
+| P2#18 | Discover 流式 probe + 逐行指示 | ✅ | `72ef5ba` |
+| — | P2 对抗审查修复(footer 省略号预算 · 密码指示生命周期)| ✅ | `682b81d` |
+
+下文为定稿设计(保留为设计依据 / 后续参考)。
 
 ---
 
