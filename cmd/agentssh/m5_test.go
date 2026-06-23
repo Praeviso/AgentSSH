@@ -163,10 +163,10 @@ func TestS1ZeroCredentialFlow(t *testing.T) {
 	}
 
 	// U1: status then restart, in one session.
-	if _, _, err := runCommandForTest(t, "run", "web-1", "--skill", "restart-service", "--", "systemctl", "status", "nginx"); err != nil {
+	if _, _, err := runCommandForTest(t, "run", "web-1", "--", "systemctl", "status", "nginx"); err != nil {
 		t.Fatalf("status step: %v", err)
 	}
-	if _, _, err := runCommandForTest(t, "run", "web-1", "--skill", "restart-service", "--", "sudo", "systemctl", "restart", "nginx"); err != nil {
+	if _, _, err := runCommandForTest(t, "run", "web-1", "--", "sudo", "systemctl", "restart", "nginx"); err != nil {
 		t.Fatalf("restart step: %v", err)
 	}
 	if atomic.LoadInt32(&calls) != 2 {
@@ -189,11 +189,9 @@ func TestS2DenyUnoverridable(t *testing.T) {
 	// (a) every ACCEPTED flag (and combos) still denies and never executes.
 	flagSets := [][]string{
 		nil,
-		{"--skill", "restart-service"},
 		{"--session", "s_x"},
 		{"--session-label", "urgent"},
 		{"--json"},
-		{"--skill", "restart-service", "--json"},
 	}
 	for _, fs := range flagSets {
 		setupHome(t)
@@ -256,14 +254,14 @@ func TestS3AuditVerifyViaCLI(t *testing.T) {
 	}
 }
 
-// S5: a malicious command surfaced via a skill (prompt-injection model) is denied,
-// not executed, and leaves a tamper-evident, queryable audit record with provenance.
-func TestS5InjectionDeniedWithProvenance(t *testing.T) {
+// S5: a malicious command surfaced by the agent is denied, not executed, and
+// leaves a tamper-evident, queryable audit record.
+func TestS5InjectionDeniedRecorded(t *testing.T) {
 	home := setupHome(t)
 	var calls int32
 	withFakeExecutor(t, fakeExecutor{calls: &calls})
 
-	code, _, stderr := runExit(t, "run", "web-1", "--skill", "restart-service", "--", "rm", "-rf", "/")
+	code, _, stderr := runExit(t, "run", "web-1", "--", "rm", "-rf", "/")
 	if code != exitPolicyDenied {
 		t.Fatalf("exit=%d want 6", code)
 	}
@@ -279,8 +277,8 @@ func TestS5InjectionDeniedWithProvenance(t *testing.T) {
 		t.Fatalf("want 1 deny record, got %d", len(records))
 	}
 	rec := records[0]
-	if rec.Event != audit.EventDenied || !strings.Contains(rec.Cmd, "rm -rf /") || rec.Skill != "restart-service" {
-		t.Fatalf("deny provenance wrong: %#v", rec)
+	if rec.Event != audit.EventDenied || !strings.Contains(rec.Cmd, "rm -rf /") {
+		t.Fatalf("deny record wrong: %#v", rec)
 	}
 
 	if out, _, err := runCommandForTest(t, "audit", "verify"); err != nil || !strings.Contains(out, "audit chain ok") {

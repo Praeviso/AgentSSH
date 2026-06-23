@@ -43,9 +43,9 @@ func TestRenderTableMarksCursorAndKeepsHeaders(t *testing.T) {
 	r := lipgloss.NewRenderer(io.Discard)
 	st := newAppStyles(r)
 	marker := theme.GlyphsFor(r).Marker
-	cols := []tableColumn{{header: "NAME"}, {header: "PORT", right: true}}
+	cols := []tableColumn{{header: "NAME", weight: 1}, {header: "PORT", right: true}}
 	rows := [][]string{{"web-1", "22"}, {"db-2", "5432"}}
-	out := renderTable(st, cols, rows, 1)
+	out := renderTable(st, cols, rows, 1, 40)
 
 	if !strings.Contains(out, "NAME") || !strings.Contains(out, "PORT") {
 		t.Fatalf("headers missing:\n%s", out)
@@ -63,7 +63,7 @@ func TestRenderTableNoCursorHasNoMarker(t *testing.T) {
 	r := lipgloss.NewRenderer(io.Discard)
 	st := newAppStyles(r)
 	marker := theme.GlyphsFor(r).Marker
-	out := renderTable(st, policyRuleColumns, [][]string{{"r1", "ALLOW", "^ls"}}, -1)
+	out := renderTable(st, policyRuleColumns, [][]string{{"r1", "ALLOW", "^ls"}}, -1, 80)
 	if strings.Contains(out, marker) {
 		t.Fatalf("cursor=-1 must not mark any row:\n%s", out)
 	}
@@ -73,7 +73,7 @@ func TestRenderTableNoColorEscapeFree(t *testing.T) {
 	r := lipgloss.NewRenderer(io.Discard)
 	r.SetColorProfile(termenv.Ascii) // what tui.run() does under NO_COLOR
 	st := newAppStyles(r)
-	out := renderTable(st, hostColumns, [][]string{hostRow("web-1", inventory.Host{Addr: "10.0.0.11"})}, 0)
+	out := renderTable(st, hostColumns, [][]string{hostRow("web-1", inventory.Host{Addr: "10.0.0.11"})}, 0, 100)
 	if strings.Contains(out, "\x1b") {
 		t.Fatalf("table emitted ANSI escapes under NO_COLOR:\n%q", out)
 	}

@@ -1,0 +1,809 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AgentSSH TUI Audit Session-first Draft</title>
+  <style>
+    :root {
+      --bg: #0d100d;
+      --bg-2: #151912;
+      --ink: #eff2e6;
+      --muted: #9ba38f;
+      --faint: #687160;
+      --line: #303a2d;
+      --line-strong: #6d8057;
+      --paper: rgba(20, 25, 18, 0.92);
+      --paper-2: rgba(28, 34, 24, 0.9);
+      --wash: rgba(255, 255, 255, 0.035);
+      --green: #a5d67d;
+      --red: #e16c61;
+      --orange: #e5a34d;
+      --yellow: #d9c35a;
+      --blue: #8eb6dc;
+      --shadow: rgba(0, 0, 0, 0.48);
+      --mono: "Iosevka", "Berkeley Mono", "Cascadia Mono", "Fira Code", monospace;
+      --display: "Alegreya Sans SC", "Gill Sans", "Optima", sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 14% 16%, rgba(165, 214, 125, 0.18), transparent 34rem),
+        radial-gradient(circle at 86% 12%, rgba(229, 163, 77, 0.13), transparent 31rem),
+        linear-gradient(140deg, #080a08 0%, var(--bg) 44%, #10150f 100%);
+      font-family: var(--mono);
+      overflow-x: hidden;
+    }
+
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      opacity: 0.25;
+      background-image:
+        linear-gradient(rgba(255, 255, 255, 0.035) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255, 255, 255, 0.028) 1px, transparent 1px);
+      background-size: 32px 32px;
+      mask-image: linear-gradient(to bottom, black 0%, transparent 86%);
+    }
+
+    .page {
+      width: min(1500px, calc(100vw - 32px));
+      margin: 0 auto;
+      padding: 48px 0 68px;
+    }
+
+    .hero {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(360px, 0.56fr);
+      gap: 28px;
+      align-items: end;
+      margin-bottom: 26px;
+    }
+
+    .eyebrow {
+      margin: 0 0 12px;
+      color: var(--green);
+      font-size: 12px;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      margin: 0;
+      max-width: 980px;
+      font-family: var(--display);
+      font-size: clamp(42px, 6.5vw, 88px);
+      line-height: 0.93;
+      letter-spacing: -0.065em;
+      font-weight: 700;
+    }
+
+    .brief {
+      margin: 0;
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.72;
+    }
+
+    .principles {
+      display: grid;
+      gap: 10px;
+    }
+
+    .principle {
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: rgba(255, 255, 255, 0.035);
+      padding: 12px 14px;
+      color: var(--muted);
+      line-height: 1.45;
+      font-size: 12px;
+    }
+
+    .principle strong {
+      display: block;
+      color: var(--ink);
+      margin-bottom: 4px;
+      font-size: 13px;
+    }
+
+    .comparison {
+      display: grid;
+      grid-template-columns: 0.95fr 1.05fr;
+      gap: 24px;
+      align-items: start;
+    }
+
+    .panel {
+      position: relative;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 26px;
+      background: linear-gradient(180deg, var(--paper), rgba(10, 13, 10, 0.94));
+      box-shadow: 0 30px 90px var(--shadow);
+      animation: rise 620ms ease both;
+    }
+
+    .panel.primary {
+      border-color: rgba(165, 214, 125, 0.5);
+      animation-delay: 110ms;
+    }
+
+    .panel::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      background: linear-gradient(110deg, rgba(255, 255, 255, 0.08), transparent 28%, transparent 70%, rgba(255, 255, 255, 0.035));
+      opacity: 0.5;
+    }
+
+    .panel-head {
+      position: relative;
+      z-index: 1;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+      padding: 18px 20px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.03);
+    }
+
+    .label {
+      display: block;
+      margin-bottom: 5px;
+      color: var(--faint);
+      font-size: 11px;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+    }
+
+    h2 {
+      margin: 0;
+      font-size: 18px;
+      letter-spacing: -0.02em;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 7px 10px;
+      color: var(--muted);
+      background: rgba(0, 0, 0, 0.16);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+
+    .badge.good {
+      color: var(--green);
+      border-color: rgba(165, 214, 125, 0.32);
+    }
+
+    .terminal {
+      position: relative;
+      z-index: 1;
+      margin: 20px;
+      overflow: hidden;
+      border: 1px solid #273022;
+      border-radius: 20px;
+      background:
+        linear-gradient(rgba(255, 255, 255, 0.025) 50%, rgba(0, 0, 0, 0.03) 50%),
+        #070907;
+      background-size: 100% 8px;
+    }
+
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      min-height: 44px;
+      padding: 10px 13px;
+      border-bottom: 1px solid #252e22;
+      color: var(--muted);
+      background: rgba(255, 255, 255, 0.035);
+      font-size: 12px;
+    }
+
+    .dots {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+    }
+
+    .dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: var(--line);
+    }
+
+    .dot:nth-child(1) { background: var(--red); }
+    .dot:nth-child(2) { background: var(--orange); }
+    .dot:nth-child(3) { background: var(--green); }
+
+    .tui {
+      padding: 15px;
+      font-size: clamp(11px, 0.85vw, 13px);
+      line-height: 1.58;
+    }
+
+    .rail {
+      display: flex;
+      justify-content: space-between;
+      gap: 14px;
+      padding: 8px 10px;
+      border: 1px solid rgba(255, 255, 255, 0.07);
+      border-radius: 13px;
+      background: rgba(255, 255, 255, 0.04);
+      color: var(--muted);
+    }
+
+    .rail strong {
+      color: var(--ink);
+    }
+
+    .summary-strip {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 8px;
+      margin: 12px 0;
+    }
+
+    .metric {
+      min-height: 78px;
+      border: 1px solid rgba(255, 255, 255, 0.07);
+      border-radius: 16px;
+      padding: 11px 12px;
+      background: rgba(255, 255, 255, 0.03);
+    }
+
+    .metric em {
+      display: block;
+      color: var(--faint);
+      font-style: normal;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.11em;
+    }
+
+    .metric strong {
+      display: block;
+      margin-top: 9px;
+      color: var(--ink);
+      font-size: 23px;
+      letter-spacing: -0.05em;
+    }
+
+    .metric.danger strong { color: var(--red); }
+    .metric.deny strong { color: var(--orange); }
+    .metric.good strong { color: var(--green); }
+
+    .section-title {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin: 16px 0 8px;
+      color: var(--muted);
+      font-size: 12px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+
+    .session-list {
+      display: grid;
+      gap: 8px;
+    }
+
+    .session-row {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      gap: 12px;
+      align-items: center;
+      border: 1px solid rgba(255, 255, 255, 0.07);
+      border-radius: 16px;
+      padding: 11px 12px;
+      background: rgba(255, 255, 255, 0.025);
+    }
+
+    .session-row.selected {
+      border-color: rgba(165, 214, 125, 0.48);
+      background: rgba(165, 214, 125, 0.08);
+      box-shadow: inset 3px 0 0 var(--green);
+    }
+
+    .session-row.warn {
+      border-color: rgba(229, 163, 77, 0.3);
+    }
+
+    .session-row.fail {
+      border-color: rgba(225, 108, 97, 0.34);
+    }
+
+    .status {
+      min-width: 74px;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+    }
+
+    .status.ok { color: var(--green); }
+    .status.deny { color: var(--orange); }
+    .status.fail { color: var(--red); }
+    .status.run { color: var(--yellow); }
+
+    .session-main {
+      min-width: 0;
+    }
+
+    .session-title {
+      display: flex;
+      align-items: baseline;
+      gap: 9px;
+      min-width: 0;
+      white-space: nowrap;
+    }
+
+    .session-title strong {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      color: var(--ink);
+    }
+
+    .session-title span {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      color: var(--muted);
+    }
+
+    .session-meta {
+      margin-top: 4px;
+      overflow: hidden;
+      color: var(--faint);
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 12px;
+    }
+
+    .session-count {
+      text-align: right;
+      color: var(--muted);
+      white-space: nowrap;
+      font-size: 12px;
+    }
+
+    .session-count strong {
+      display: block;
+      color: var(--ink);
+      font-size: 15px;
+    }
+
+    .detail {
+      display: grid;
+      grid-template-rows: auto auto minmax(0, 1fr) auto;
+      gap: 12px;
+    }
+
+    .detail-head {
+      border: 1px solid rgba(165, 214, 125, 0.36);
+      border-radius: 18px;
+      padding: 13px 14px;
+      background: linear-gradient(135deg, rgba(165, 214, 125, 0.11), rgba(255, 255, 255, 0.03));
+    }
+
+    .detail-head h3 {
+      margin: 0 0 7px;
+      font-size: 17px;
+      letter-spacing: -0.03em;
+    }
+
+    .detail-head p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.55;
+    }
+
+    .chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 7px;
+    }
+
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 999px;
+      padding: 6px 9px;
+      background: rgba(255, 255, 255, 0.03);
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+
+    .chip.good { color: var(--green); border-color: rgba(165, 214, 125, 0.26); }
+    .chip.deny { color: var(--orange); border-color: rgba(229, 163, 77, 0.3); }
+    .chip.fail { color: var(--red); border-color: rgba(225, 108, 97, 0.3); }
+    .chip.prod { color: #f08f8a; border-color: rgba(240, 143, 138, 0.3); }
+
+    .commands {
+      display: grid;
+      gap: 9px;
+    }
+
+    .command {
+      display: grid;
+      grid-template-columns: 82px minmax(0, 1fr);
+      gap: 12px;
+      border: 1px solid rgba(255, 255, 255, 0.075);
+      border-radius: 17px;
+      padding: 12px;
+      background: rgba(255, 255, 255, 0.025);
+    }
+
+    .command.selected {
+      border-color: rgba(165, 214, 125, 0.42);
+      background: rgba(165, 214, 125, 0.07);
+    }
+
+    .command.deny {
+      border-color: rgba(229, 163, 77, 0.34);
+      background: rgba(229, 163, 77, 0.045);
+    }
+
+    .command.fail {
+      border-color: rgba(225, 108, 97, 0.34);
+      background: rgba(225, 108, 97, 0.045);
+    }
+
+    .command-status {
+      font-weight: 800;
+      letter-spacing: -0.03em;
+    }
+
+    .command-body {
+      min-width: 0;
+    }
+
+    .cmdline {
+      overflow: hidden;
+      color: #f1d189;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .cmdmeta {
+      margin-top: 6px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+
+    .output-note {
+      margin-top: 7px;
+      color: var(--faint);
+      font-size: 12px;
+    }
+
+    .debug-footnote {
+      border-top: 1px dashed rgba(255, 255, 255, 0.12);
+      padding-top: 10px;
+      color: var(--faint);
+      font-size: 12px;
+      line-height: 1.5;
+    }
+
+    .debug-footnote strong {
+      color: var(--muted);
+      font-weight: 700;
+    }
+
+    .anti {
+      opacity: 0.72;
+      filter: saturate(0.62);
+    }
+
+    .anti pre {
+      margin: 0;
+      min-height: 465px;
+      overflow: auto;
+      padding: 16px;
+      color: #c8cebd;
+      font-size: clamp(10px, 0.78vw, 12px);
+      line-height: 1.6;
+      white-space: pre;
+    }
+
+    .dim { color: var(--faint); }
+    .green { color: var(--green); }
+    .orange { color: var(--orange); }
+    .red { color: var(--red); }
+    .blue { color: var(--blue); }
+    .yellow { color: var(--yellow); }
+
+    .callouts {
+      position: relative;
+      z-index: 1;
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 10px;
+      padding: 0 20px 20px;
+    }
+
+    .callout {
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 16px;
+      padding: 12px;
+      background: rgba(0, 0, 0, 0.12);
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.52;
+    }
+
+    .callout strong {
+      display: block;
+      color: var(--ink);
+      margin-bottom: 5px;
+    }
+
+    @keyframes rise {
+      from {
+        opacity: 0;
+        transform: translateY(18px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+
+    @media (max-width: 1100px) {
+      .hero,
+      .comparison {
+        grid-template-columns: 1fr;
+      }
+
+      .principles {
+        grid-template-columns: repeat(2, 1fr);
+      }
+    }
+
+    @media (max-width: 760px) {
+      .page {
+        width: min(100vw - 18px, 1500px);
+        padding-top: 28px;
+      }
+
+      .principles,
+      .summary-strip,
+      .callouts {
+        grid-template-columns: 1fr;
+      }
+
+      .panel-head {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+
+      .rail,
+      .session-row,
+      .command {
+        grid-template-columns: 1fr;
+        display: grid;
+      }
+
+      .rail {
+        gap: 4px;
+      }
+
+      .session-count {
+        text-align: left;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header class="hero">
+      <div>
+        <p class="eyebrow">AgentSSH TUI · Audit redesign draft</p>
+        <h1>Audit 默认看 session，进入后只看命令结果。</h1>
+      </div>
+      <div class="principles" aria-label="design principles">
+        <p class="brief">这个初稿刻意把视觉层级拆开：全局状态是 rail，会话是 review queue，命令是 session 内的主信息，record/hash 只作为底层审计脚注，不再抢占视线。</p>
+        <div class="principle"><strong>不再分栏</strong>主列表和详情分别占满一屏，减少“左边选什么、右边看什么”的认知负担。</div>
+        <div class="principle"><strong>不再展示 record</strong>started/completed/denied 是审计账本事件，不是用户要操作的对象。</div>
+      </div>
+    </header>
+
+    <section class="comparison">
+      <article class="panel anti">
+        <div class="panel-head">
+          <div>
+            <span class="label">Current mental model</span>
+            <h2>实现细节泄漏：record/run 混在同一层</h2>
+          </div>
+          <span class="badge">信息密度高，但主次弱</span>
+        </div>
+        <div class="terminal">
+          <div class="topbar">
+            <span class="dots"><span class="dot"></span><span class="dot"></span><span class="dot"></span></span>
+            <span>record-oriented audit view</span>
+          </div>
+          <pre>AgentSSH · Audit · 5 runs · 2 sessions · 链 ✓ 完整 (0..7)
+
+▾ s_faefaa8c  "nginx 502 recovery"  claude  08:31-08:33  3 runs
+    ✓ 08:31  greencloud-sg-1212 [prod]  systemctl status nginx
+      allow/default · exit 0 · 1.8s
+    ⊘ 08:32  greencloud-sg-1212 [prod]  rm -rf /
+      deny/rules:catastrophic · exit 6 · -
+    ✗ 08:33  greencloud-sg-1212 [prod]  journalctl -u nginx -n 80 --no-pager
+      allow/default · exit 9 · 4.2s
+
+▾ s_7dd0f20e  "routine check"  claude  09:12-09:14  2 runs
+    ✓ 09:12  web-staging-1  whoami
+      allow/default · exit 0 · 0.4s
+    … 09:14  web-staging-1  deploy.sh
+      allow/default · exit - · -
+
+select a run and press enter for details
+
+Run 48f494 · completed
+
+Event chain
+  seq 2 started   prev=...
+  seq 3 completed prev=... hash=...
+
+Problem:
+  start/end/record/hash 被放到用户阅读路径里；
+  用户想知道“这次会话做了什么”，却必须先理解 run 和 record。</pre>
+        </div>
+      </article>
+
+      <article class="panel primary">
+        <div class="panel-head">
+          <div>
+            <span class="label">Proposed mental model</span>
+            <h2>会话优先：session 是列表，命令结果是详情</h2>
+          </div>
+          <span class="badge good">链 ✓ 自动校验</span>
+        </div>
+        <div class="terminal">
+          <div class="topbar">
+            <span class="dots"><span class="dot"></span><span class="dot"></span><span class="dot"></span></span>
+            <span>Audit Sessions</span>
+          </div>
+          <div class="tui">
+            <div class="rail">
+              <span><strong>AgentSSH · Audit</strong> · sessions review queue</span>
+              <span class="green">链 ✓ 完整 (0..7)</span>
+            </div>
+
+            <div class="summary-strip" aria-label="audit summary">
+              <div class="metric"><em>sessions</em><strong>3</strong></div>
+              <div class="metric good"><em>commands</em><strong>8</strong></div>
+              <div class="metric deny"><em>denied</em><strong>1</strong></div>
+              <div class="metric danger"><em>failed</em><strong>1</strong></div>
+            </div>
+
+            <div class="section-title">
+              <span>Sessions</span>
+              <span>按更新时间倒序</span>
+            </div>
+
+            <div class="session-list">
+              <div class="session-row selected warn">
+                <div class="status run">… LIVE</div>
+                <div class="session-main">
+                  <div class="session-title"><strong>s_b947c80d</strong><span>deploy follow-up</span></div>
+                  <div class="session-meta">web-staging-1 · claude · updated 09:14 · started 09:14</div>
+                </div>
+                <div class="session-count"><strong>2 commands</strong><span class="yellow">1 running</span></div>
+              </div>
+
+              <div class="session-row">
+                <div class="status ok">✓ OK</div>
+                <div class="session-main">
+                  <div class="session-title"><strong>s_7dd0f20e</strong><span>routine health check</span></div>
+                  <div class="session-meta">web-staging-1 · claude · updated 09:13 · 09:12-09:13</div>
+                </div>
+                <div class="session-count"><strong>3 commands</strong>all completed</div>
+              </div>
+
+              <div class="session-row fail">
+                <div class="status fail">✗ FAIL</div>
+                <div class="session-main">
+                  <div class="session-title"><strong>s_faefaa8c</strong><span>nginx 502 recovery</span></div>
+                  <div class="session-meta">greencloud-sg-1212 <span class="red">[prod]</span> · claude · updated 08:33 · 08:31-08:33</div>
+                </div>
+                <div class="session-count"><strong>3 commands</strong><span class="orange">1 denied</span> · <span class="red">1 failed</span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="terminal">
+          <div class="topbar">
+            <span class="dots"><span class="dot"></span><span class="dot"></span><span class="dot"></span></span>
+            <span>Session Detail · s_faefaa8c</span>
+          </div>
+          <div class="tui detail">
+            <div class="rail">
+              <span><strong>Session s_faefaa8c</strong> · nginx 502 recovery</span>
+              <span>esc back · j/k move · v verify</span>
+            </div>
+
+            <div class="detail-head">
+              <h3>本次会话执行了 3 条命令，其中 2 条需要关注。</h3>
+              <p>详情页不再跳到 run，也不展示 started/completed record。每条命令直接呈现最终语义：执行成功、执行失败、被策略拒绝，或仍在运行。</p>
+            </div>
+
+            <div class="chips">
+              <span class="chip prod">greencloud-sg-1212 [prod]</span>
+              <span class="chip">claude</span>
+              <span class="chip">08:31-08:33</span>
+              <span class="chip good">链 ✓ verified</span>
+              <span class="chip deny">1 denied</span>
+              <span class="chip fail">1 failed</span>
+            </div>
+
+            <div class="commands">
+              <div class="command deny selected">
+                <div class="command-status orange">⊘ DENIED</div>
+                <div class="command-body">
+                  <div class="cmdline">rm -rf /</div>
+                  <div class="cmdmeta">policy: deny/rules:catastrophic · not executed · exit 6 · 08:32:48</div>
+                  <div class="output-note">没有远端输出；这是本地策略拒绝，不是 SSH 执行失败。</div>
+                </div>
+              </div>
+
+              <div class="command fail">
+                <div class="command-status red">✗ FAILED</div>
+                <div class="command-body">
+                  <div class="cmdline">journalctl -u nginx -n 80 --no-pager</div>
+                  <div class="cmdmeta">policy: allow/default · exit 9 · 4.2s · 08:33:10</div>
+                  <div class="output-note">output truncated · redactions 2</div>
+                </div>
+              </div>
+
+              <div class="command">
+                <div class="command-status green">✓ OK</div>
+                <div class="command-body">
+                  <div class="cmdline">systemctl status nginx</div>
+                  <div class="cmdmeta">policy: allow/default · exit 0 · 1.8s · 08:31:40</div>
+                  <div class="output-note">output captured · no redactions</div>
+                </div>
+              </div>
+            </div>
+
+            <div class="debug-footnote">
+              <strong>底层审计：</strong>每条命令仍由 append-only records 组成，用于哈希链和崩溃恢复；TUI 默认只展示投影后的 command result。需要查 seq/hash 时走 verify/debug，而不是主阅读路径。
+            </div>
+          </div>
+        </div>
+
+        <div class="callouts">
+          <div class="callout"><strong>层级 1 · rail</strong>只放产品位置、总数、链状态、快捷键。它是全局状态，不和业务行混排。</div>
+          <div class="callout"><strong>层级 2 · queue</strong>默认 session 列表按更新时间倒序；异常只做行内状态提示，不改变排序规则。</div>
+          <div class="callout"><strong>层级 3 · commands</strong>session 详情只列命令结果；被拒绝、失败、成功、运行中有不同颜色和文案。</div>
+          <div class="callout"><strong>层级 4 · evidence</strong>record/hash 保留为底层能力，但只在 verify/debug 里出现，避免污染主 UI。</div>
+        </div>
+      </article>
+    </section>
+  </main>
+</body>
+</html>

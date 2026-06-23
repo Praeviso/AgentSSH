@@ -451,6 +451,35 @@ func TestFirstRunWelcomeShownThenDismissed(t *testing.T) {
 	}
 }
 
+func TestAppViewFillsWindow(t *testing.T) {
+	app := newAppModel(testPaths(t), lipgloss.NewRenderer(io.Discard))
+	updated, _ := app.Update(tea.WindowSizeMsg{Width: 96, Height: 28})
+	app = updated.(appModel)
+	view := app.View()
+	lines := strings.Split(view, "\n")
+	if got := len(lines); got != 28 {
+		t.Fatalf("view should fill terminal height: got %d lines want 28\n%s", got, view)
+	}
+	for i, line := range lines {
+		if got := lipgloss.Width(line); got != 96 {
+			t.Fatalf("line %d should fill terminal width: got %d want 96\n%q", i, got, line)
+		}
+	}
+
+	updated, _ = app.Update(tea.WindowSizeMsg{Width: 72, Height: 18})
+	app = updated.(appModel)
+	view = app.View()
+	lines = strings.Split(view, "\n")
+	if got := len(lines); got != 18 {
+		t.Fatalf("resized view should fill new height: got %d lines want 18\n%s", got, view)
+	}
+	for i, line := range lines {
+		if got := lipgloss.Width(line); got != 72 {
+			t.Fatalf("resized line %d should fill new width: got %d want 72\n%q", i, got, line)
+		}
+	}
+}
+
 func TestEmptyStatesTeachNextAction(t *testing.T) {
 	st := testAppStyles()
 	hosts := newHostsSection(testPaths(t), lipgloss.NewRenderer(io.Discard), st, inventory.Inventory{}, nil)
@@ -652,6 +681,29 @@ func TestMasterDetailDoesNotOverflowInNarrowBand(t *testing.T) {
 				t.Fatalf("w=%d: shown card narrower than min (%d)", w, rightW)
 			}
 		}
+	}
+}
+
+func TestHostsMasterListResizesWithWindow(t *testing.T) {
+	s := newHostsSection(testPaths(t), lipgloss.NewRenderer(io.Discard), testAppStyles(), inventory.Inventory{
+		Hosts: map[string]inventory.Host{
+			"web-production-primary-long-name": {Addr: "203.0.113.51", Port: 22},
+			"db-2":                             {Addr: "10.0.0.31", Port: 5432},
+		},
+	}, nil)
+	s.w, s.h = 90, 20
+	leftNarrow, _, ok := s.detailLayout()
+	if !ok {
+		t.Fatal("expected detail layout at width 90")
+	}
+	s.w = 150
+	leftWide, _, ok := s.detailLayout()
+	if !ok {
+		t.Fatal("expected detail layout at width 150")
+	}
+	if lipgloss.Width(leftWide) <= lipgloss.Width(leftNarrow) {
+		t.Fatalf("left host list should grow with window: narrow=%d wide=%d\nnarrow:\n%s\nwide:\n%s",
+			lipgloss.Width(leftNarrow), lipgloss.Width(leftWide), leftNarrow, leftWide)
 	}
 }
 

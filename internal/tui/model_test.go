@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	"github.com/Praeviso/AgentSSH/internal/audit"
-	"github.com/Praeviso/AgentSSH/internal/theme"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/termenv"
 )
@@ -56,10 +55,16 @@ func TestBuildGroupsOrderingAndBuckets(t *testing.T) {
 	if groups[1].commandCount != 1 {
 		t.Fatalf("s_a should count 1 distinct request, got %d", groups[1].commandCount)
 	}
-	// Records within a group display most-recent (highest seq) first.
+	// Records with the same req_id collapse to one operator-facing command.
 	sa := groups[1]
-	if len(sa.records) != 2 || sa.records[0].Seq != 2 || sa.records[1].Seq != 1 {
-		t.Fatalf("s_a records not in seq-descending order: %+v", sa.records)
+	if len(sa.runs) != 1 {
+		t.Fatalf("s_a should display one command, got %+v", sa.runs)
+	}
+	if recs := sa.runs[0].records; len(recs) != 2 || recs[0].Seq != 1 || recs[1].Seq != 2 {
+		t.Fatalf("s_a event chain should stay seq-ascending inside the run: %+v", recs)
+	}
+	if sa.runs[0].latest.Event != audit.EventCompleted {
+		t.Fatalf("s_a latest outcome should be completed, got %s", sa.runs[0].latest.Event)
 	}
 }
 
@@ -87,16 +92,15 @@ func TestBuildGroupsSessionFocus(t *testing.T) {
 	}
 }
 
-func TestRecordMatches(t *testing.T) {
+func TestRunMatches(t *testing.T) {
 	r := rec(1, "2026-06-16T10:00:00Z", "s_a", "fix 502", audit.EventCompleted, "abc")
-	r.Skill = "restart-service"
+	run := buildRuns([]audit.Record{r})[0]
 	cases := []struct {
 		query string
 		want  bool
 	}{
 		{"", true},
 		{"WEB-1", true},      // host, case-insensitive
-		{"restart", true},    // skill
 		{"s_a", true},        // session id
 		{"fix 502", true},    // label
 		{"completed", true},  // status
@@ -104,25 +108,23 @@ func TestRecordMatches(t *testing.T) {
 		{"does-not-exist", false},
 	}
 	for _, c := range cases {
-		if got := recordMatches(r, c.query); got != c.want {
-			t.Errorf("recordMatches(%q) = %v, want %v", c.query, got, c.want)
+		if got := runMatches(run, c.query); got != c.want {
+			t.Errorf("runMatches(%q) = %v, want %v", c.query, got, c.want)
 		}
 	}
 }
 
-func TestRecordMatchesStructured(t *testing.T) {
+func TestRunMatchesStructured(t *testing.T) {
 	r := rec(1, "2026-06-16T10:00:00Z", "s_a", "fix 502", audit.EventDenied, "abc")
 	r.Host = "web-1"
-	r.Skill = "restart-service"
 	r.PolicyAction = "deny"
+	run := buildRuns([]audit.Record{r})[0]
 	cases := []struct {
 		query string
 		want  bool
 	}{
 		{"host:web-1", true},
 		{"host:db", false},
-		{"skill:restart", true},
-		{"skill:deploy", false},
 		{"session:s_a", true},
 		{"session:s_b", false},
 		{"status:deny", true},   // matches policy action
@@ -135,9 +137,21 @@ func TestRecordMatchesStructured(t *testing.T) {
 		{"host:web-1 status:allow", false}, // host ok but status fails
 	}
 	for _, c := range cases {
-		if got := recordMatches(r, c.query); got != c.want {
-			t.Errorf("recordMatches(%q) = %v, want %v", c.query, got, c.want)
+		if got := runMatches(run, c.query); got != c.want {
+			t.Errorf("runMatches(%q) = %v, want %v", c.query, got, c.want)
 		}
+	}
+}
+
+func TestRunMatchesStatusUsesLatestOutcome(t *testing.T) {
+	started := rec(1, "2026-06-16T10:00:00Z", "s_a", "task", audit.EventStarted, "abc")
+	completed := rec(2, "2026-06-16T10:00:01Z", "s_a", "task", audit.EventCompleted, "abc")
+	run := buildRuns([]audit.Record{started, completed})[0]
+	if runMatches(run, "status:started") {
+		t.Fatal("completed run must not match status:started just because it has a started event")
+	}
+	if !runMatches(run, "status:completed") {
+		t.Fatal("completed run should match latest status")
 	}
 }
 
@@ -155,34 +169,162 @@ func TestDurStr(t *testing.T) {
 	}
 }
 
-func TestRenderDetailNilExit(t *testing.T) {
-	r := rec(7, "2026-06-16T10:00:00Z", "s_a", "task", audit.EventDenied, "abc")
-	r.Cmd = "rm -rf /tmp/x"
-	out := renderDetail(r, nil)
-	if !strings.Contains(out, "Exit     -") {
-		t.Errorf("nil ExitCode should render as '-':\n%s", out)
+func TestAuditListRowsAreSessionsOnly(t *testing.T) {
+	m := newModel(sampleRecords(), nil, newStyles(lipgloss.NewRenderer(io.Discard)), nil)
+	m.w, m.h, m.ready = 120, 24, true
+	if got := len(m.rows); got != 3 {
+		t.Fatalf("top-level Audit list should contain sessions only, got %d rows", got)
 	}
-	if !strings.Contains(out, "rm -rf /tmp/x") {
-		t.Errorf("detail should contain the command:\n%s", out)
+	out := m.View()
+	if strings.Contains(out, "systemctl status nginx") {
+		t.Fatalf("session list should not expose command rows:\n%s", out)
 	}
-	if !strings.Contains(out, "seq 7") {
-		t.Errorf("detail should contain the seq:\n%s", out)
+	if strings.Contains(m.statusBar(), "3 sessions") || strings.Contains(m.statusBar(), "3 commands") {
+		t.Fatalf("status bar should not expose aggregate counts: %q", m.statusBar())
+	}
+	if !strings.Contains(m.statusBar(), "Audit") || strings.Contains(m.statusBar(), "链") {
+		t.Fatalf("status bar should stay compact and contextual: %q", m.statusBar())
 	}
 }
 
-func TestRenderDetailWithExitAndHostMeta(t *testing.T) {
-	r := rec(2, "2026-06-16T10:00:00Z", "s_a", "task", audit.EventCompleted, "abc")
+func TestAuditStatusBarOnlyShowsChainWhenActionable(t *testing.T) {
+	m := newModel(sampleRecords(), nil, newStyles(lipgloss.NewRenderer(io.Discard)), nil)
+	if got := m.statusBar(); got != "Audit" {
+		t.Fatalf("default status bar should hide audit-chain implementation detail, got %q", got)
+	}
+	m.verifying = true
+	if got := m.statusBar(); !strings.Contains(got, "审计日志校验中") {
+		t.Fatalf("verifying status should be visible, got %q", got)
+	}
+	m.verifying = false
+	m.verifyDone = true
+	m.verifyResult = audit.VerifyResult{OK: true}
+	if got := m.statusBar(); got != "Audit" {
+		t.Fatalf("successful verification should stay quiet, got %q", got)
+	}
+	m.verifyResult = audit.VerifyResult{OK: false, BrokenSeq: 7}
+	if got := m.statusBar(); !strings.Contains(got, "审计日志异常") || !strings.Contains(got, "seq=7") {
+		t.Fatalf("broken audit log should be visible, got %q", got)
+	}
+}
+
+func TestAuditSessionListColumnsAlign(t *testing.T) {
+	r := lipgloss.NewRenderer(io.Discard)
+	r.SetColorProfile(termenv.Ascii)
+	m := newModel(sampleRecords(), nil, newStyles(r), nil)
+	m.w, m.h, m.ready = 120, 24, true
+	lines := strings.Split(m.renderList(), "\n")
+	if len(lines) < 4 {
+		t.Fatalf("expected header plus rows, got:\n%s", m.renderList())
+	}
+	header := lines[0]
+	rows := lines[1:4]
+	columns := map[string][]string{
+		"STATUS":   {"D DENIED", "+ OK", "+ OK"},
+		"SESSION":  {"s_b", "s_a", "(none)"},
+		"LABEL":    {"task b", "task a", "(no session)"},
+		"UPDATED":  {"updated 11:00:00", "updated 10:00:01", "updated 09:00:00"},
+		"COMMANDS": {"1 command", "1 command", "1 command"},
+	}
+	for heading, values := range columns {
+		want := strings.Index(header, heading)
+		if want < 0 {
+			t.Fatalf("heading %q missing from header %q", heading, header)
+		}
+		for i, value := range values {
+			got := strings.Index(rows[i], value)
+			if got != want {
+				t.Fatalf("%s column not aligned for value %q: got %d want %d\nheader=%q\nrow=%q", heading, value, got, want, header, rows[i])
+			}
+		}
+	}
+}
+
+func TestAuditSessionListColumnsResizeWithWindow(t *testing.T) {
+	groups := buildGroups(sampleRecords(), "", "")
+	glyphs := newStyles(lipgloss.NewRenderer(io.Discard)).glyphs
+	narrow := auditListWidths(glyphs, groups, nil, 80)
+	wide := auditListWidths(glyphs, groups, nil, 160)
+	if wide.label <= narrow.label {
+		t.Fatalf("LABEL column should grow with window width: narrow=%d wide=%d", narrow.label, wide.label)
+	}
+	if wide.hosts <= narrow.hosts {
+		t.Fatalf("HOSTS column should grow with window width: narrow=%d wide=%d", narrow.hosts, wide.hosts)
+	}
+}
+
+func TestAuditEnterOpensSessionCommandResults(t *testing.T) {
+	r := rec(7, "2026-06-16T10:00:00Z", "s_a", "task", audit.EventDenied, "abc")
+	r.Cmd = "rm -rf /tmp/x"
+	m := newModel([]audit.Record{r}, nil, newStyles(lipgloss.NewRenderer(io.Discard)), nil)
+	m.w, m.h, m.ready = 120, 24, true
+	updated, _ := m.Update(keyMsg("enter"))
+	next := updated.(model)
+	if next.focus != focusDetail {
+		t.Fatalf("enter should open session detail, focus=%v", next.focus)
+	}
+	out := next.View()
+	if !strings.Contains(out, "Session s_a") || !strings.Contains(out, "rm -rf /tmp/x") {
+		t.Fatalf("session detail should contain selected session command results:\n%s", out)
+	}
+	if !strings.Contains(out, "DENIED") || !strings.Contains(out, "exit 6") || !strings.Contains(out, "not executed") {
+		t.Fatalf("denied command result should render CLI semantics:\n%s", out)
+	}
+	if strings.Contains(out, "Event chain") || strings.Contains(out, "seq 7") {
+		t.Fatalf("session detail should not expose raw record evidence by default:\n%s", out)
+	}
+}
+
+func TestRenderSessionDetailWithExitAndHostMeta(t *testing.T) {
+	started := rec(1, "2026-06-16T10:00:00Z", "s_a", "task", audit.EventStarted, "abc")
+	r := rec(2, "2026-06-16T10:00:01Z", "s_a", "task", audit.EventCompleted, "abc")
 	r.ExitCode = intp(0)
 	hosts := map[string]HostMeta{"web-1": {User: "deploy", Addr: "10.0.0.11", Tags: []string{"web", "prod"}}}
-	out := renderDetail(r, hosts)
-	if !strings.Contains(out, "Exit     0") {
+	m := newModel([]audit.Record{started, r}, hosts, newStyles(lipgloss.NewRenderer(io.Discard)), nil)
+	m.w, m.h, m.ready = 120, 24, true
+	m.openSessionDetail(0)
+	out := m.renderSessionDetail()
+	if !strings.Contains(out, "exit 0") {
 		t.Errorf("exit 0 should render:\n%s", out)
 	}
 	if !strings.Contains(out, "deploy@10.0.0.11") {
 		t.Errorf("host detail should include user@addr:\n%s", out)
 	}
-	if !strings.Contains(out, "Tags     web, prod") {
-		t.Errorf("host tags should render:\n%s", out)
+	if !strings.Contains(out, "[prod]") {
+		t.Errorf("prod host marker should render:\n%s", out)
+	}
+	if strings.Contains(out, "Event chain") || strings.Contains(out, "seq 1") || strings.Contains(out, "seq 2") {
+		t.Errorf("session detail should hide started/completed records:\n%s", out)
+	}
+}
+
+func TestRenderCommandResultNilExit(t *testing.T) {
+	r := rec(7, "2026-06-16T10:00:00Z", "s_a", "task", audit.EventDenied, "abc")
+	r.Cmd = "rm -rf /tmp/x"
+	m := newModel([]audit.Record{r}, nil, newStyles(lipgloss.NewRenderer(io.Discard)), nil)
+	out := m.renderCommandResult(buildRuns([]audit.Record{r})[0], true)
+	if !strings.Contains(out, "exit 6") {
+		t.Errorf("denied run should render CLI exit 6:\n%s", out)
+	}
+	if !strings.Contains(out, "rm -rf /tmp/x") {
+		t.Errorf("detail should contain the command:\n%s", out)
+	}
+	if !strings.Contains(out, "not executed") {
+		t.Errorf("denied command should explain it was not executed:\n%s", out)
+	}
+}
+
+func TestSessionHostsShowsAdditionalHostCount(t *testing.T) {
+	r1 := rec(1, "2026-06-16T10:00:00Z", "s_a", "task", audit.EventCompleted, "a")
+	r1.Host = "web-1"
+	r2 := rec(2, "2026-06-16T10:01:00Z", "s_a", "task", audit.EventCompleted, "b")
+	r2.Host = "web-2"
+	r3 := rec(3, "2026-06-16T10:02:00Z", "s_a", "task", audit.EventCompleted, "c")
+	r3.Host = "web-3"
+	g := buildGroups([]audit.Record{r1, r2, r3}, "", "")[0]
+	out := sessionHosts(g, map[string]HostMeta{"web-3": {Tags: []string{"prod"}}})
+	if !strings.Contains(out, "web-3 [prod]") || !strings.Contains(out, "+1") {
+		t.Fatalf("session hosts should show first two hosts and overflow count, got %q", out)
 	}
 }
 
@@ -195,21 +337,6 @@ func TestReasonText(t *testing.T) {
 	}
 	if got := reasonText("custom"); got != "custom" {
 		t.Errorf("unknown reason should pass through, got %q", got)
-	}
-}
-
-func TestIconFor(t *testing.T) {
-	g := theme.GlyphsFor(nil) // Unicode set
-	cases := map[audit.Event]string{
-		audit.EventCompleted: g.Check,
-		audit.EventFailed:    g.Cross,
-		audit.EventDenied:    g.Deny,
-		audit.EventStarted:   g.OK,
-	}
-	for event, want := range cases {
-		if got := iconFor(g, event); got != want {
-			t.Errorf("iconFor(%q) = %q, want %q", event, got, want)
-		}
 	}
 }
 
@@ -245,7 +372,7 @@ func TestNoColorStylesEscapeFree(t *testing.T) {
 	s := newStyles(r)
 	for name, st := range map[string]lipgloss.Style{
 		"header": s.header, "cursor": s.cursor, "dim": s.dim,
-		"prod": s.prod, "ok": s.ok, "bad": s.bad,
+		"ok": s.ok, "bad": s.bad,
 	} {
 		if out := st.Render("x"); strings.Contains(out, "\x1b") {
 			t.Errorf("style %q emitted ANSI escapes under NO_COLOR: %q", name, out)
@@ -306,14 +433,5 @@ func TestApplyVerifyClearsInFlight(t *testing.T) {
 	}
 	if !strings.Contains(m.chainStatus(), "完整") {
 		t.Fatalf("resolved badge should report 完整, got %q", m.chainStatus())
-	}
-}
-
-func TestCountReqIDs(t *testing.T) {
-	records := []audit.Record{
-		{ReqID: "a"}, {ReqID: "a"}, {ReqID: "b"}, {ReqID: ""},
-	}
-	if got := countReqIDs(records); got != 2 {
-		t.Errorf("countReqIDs = %d, want 2", got)
 	}
 }

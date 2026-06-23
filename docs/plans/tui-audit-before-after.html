@@ -1,0 +1,512 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AgentSSH TUI Audit Before / After</title>
+  <style>
+    :root {
+      --ink: #e8eadf;
+      --muted: #9ca18e;
+      --paper: #10130f;
+      --panel: rgba(22, 27, 21, 0.88);
+      --panel-2: rgba(30, 36, 29, 0.92);
+      --line: #384033;
+      --line-hot: #a4b46a;
+      --amber: #d8a546;
+      --green: #8fcf7b;
+      --red: #e06f64;
+      --orange: #df8742;
+      --blue: #82a6d7;
+      --shadow: rgba(0, 0, 0, 0.42);
+      --mono: "Berkeley Mono", "Iosevka", "Cascadia Mono", "Fira Code", monospace;
+      --serif: "Iowan Old Style", "Baskerville", "Palatino Linotype", serif;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 12% 8%, rgba(164, 180, 106, 0.22), transparent 28rem),
+        radial-gradient(circle at 84% 22%, rgba(216, 165, 70, 0.12), transparent 32rem),
+        linear-gradient(135deg, #090b08 0%, #141711 48%, #0a0e0b 100%);
+      font-family: var(--mono);
+      overflow-x: hidden;
+    }
+
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      opacity: 0.28;
+      background-image:
+        linear-gradient(rgba(255,255,255,0.035) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,0.025) 1px, transparent 1px);
+      background-size: 28px 28px;
+      mask-image: linear-gradient(to bottom, black, transparent 84%);
+    }
+
+    .page {
+      width: min(1460px, calc(100vw - 32px));
+      margin: 0 auto;
+      padding: 56px 0 72px;
+    }
+
+    header {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 28px;
+      align-items: end;
+      margin-bottom: 34px;
+    }
+
+    .eyebrow {
+      margin: 0 0 12px;
+      color: var(--line-hot);
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      font-size: 12px;
+    }
+
+    h1 {
+      margin: 0;
+      max-width: 880px;
+      font-family: var(--serif);
+      font-size: clamp(42px, 7vw, 92px);
+      line-height: 0.91;
+      letter-spacing: -0.055em;
+    }
+
+    .subtitle {
+      max-width: 520px;
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.6;
+      font-size: 15px;
+    }
+
+    .legend {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
+    .chip {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 7px 10px;
+      color: var(--muted);
+      background: rgba(255,255,255,0.03);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 22px;
+      align-items: start;
+    }
+
+    .card {
+      position: relative;
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      background: linear-gradient(180deg, var(--panel), rgba(13, 16, 13, 0.94));
+      box-shadow: 0 24px 70px var(--shadow);
+      overflow: hidden;
+      animation: rise 680ms ease both;
+    }
+
+    .card.after {
+      border-color: rgba(164, 180, 106, 0.55);
+      animation-delay: 120ms;
+    }
+
+    .card::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      background: linear-gradient(120deg, rgba(255,255,255,0.08), transparent 34%, transparent 70%, rgba(255,255,255,0.04));
+      opacity: 0.62;
+    }
+
+    .card-head {
+      position: relative;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+      padding: 18px 20px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(255,255,255,0.025);
+    }
+
+    .card-title {
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+    }
+
+    .label {
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.16em;
+    }
+
+    h2 {
+      margin: 0;
+      font-size: 18px;
+      letter-spacing: -0.02em;
+    }
+
+    .score {
+      min-width: 76px;
+      border-radius: 16px;
+      padding: 10px 12px;
+      text-align: center;
+      border: 1px solid var(--line);
+      background: rgba(0,0,0,0.18);
+    }
+
+    .score strong {
+      display: block;
+      font-size: 24px;
+      line-height: 1;
+    }
+
+    .score span {
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .terminal {
+      position: relative;
+      margin: 20px;
+      border: 1px solid #2c352b;
+      border-radius: 18px;
+      background:
+        linear-gradient(rgba(255,255,255,0.028) 50%, rgba(0,0,0,0.04) 50%),
+        #070907;
+      background-size: 100% 8px;
+      overflow: hidden;
+    }
+
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 14px;
+      border-bottom: 1px solid #263024;
+      background: rgba(255,255,255,0.03);
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .dots {
+      display: flex;
+      gap: 6px;
+    }
+
+    .dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: var(--line);
+    }
+
+    .dot:nth-child(1) { background: var(--red); }
+    .dot:nth-child(2) { background: var(--amber); }
+    .dot:nth-child(3) { background: var(--green); }
+
+    pre {
+      margin: 0;
+      padding: 18px;
+      min-height: 332px;
+      overflow-x: auto;
+      white-space: pre;
+      font-size: clamp(11px, 0.9vw, 13px);
+      line-height: 1.68;
+      color: #d5dacb;
+    }
+
+    .dim { color: #767d6d; }
+    .ok { color: var(--green); }
+    .deny { color: var(--orange); }
+    .fail { color: var(--red); }
+    .cmd { color: #f1d28a; }
+    .host { color: var(--blue); }
+    .policy { color: #aabf77; }
+    .meta { color: #9fae94; }
+
+    .notes {
+      position: relative;
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+      padding: 0 20px 20px;
+    }
+
+    .note {
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 16px;
+      padding: 13px 14px;
+      background: rgba(255,255,255,0.035);
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.45;
+    }
+
+    .note strong {
+      display: block;
+      color: var(--ink);
+      margin-bottom: 5px;
+      font-size: 13px;
+    }
+
+    .detail-section {
+      margin-top: 24px;
+      display: grid;
+      grid-template-columns: 0.92fr 1.08fr;
+      gap: 22px;
+    }
+
+    .detail-copy {
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      padding: 26px;
+      background: rgba(255,255,255,0.035);
+      box-shadow: 0 18px 50px rgba(0,0,0,0.24);
+    }
+
+    .detail-copy h3 {
+      margin: 0 0 12px;
+      font-family: var(--serif);
+      font-size: 31px;
+      line-height: 1;
+      letter-spacing: -0.04em;
+    }
+
+    .detail-copy p {
+      margin: 0 0 16px;
+      color: var(--muted);
+      line-height: 1.65;
+    }
+
+    .bullets {
+      display: grid;
+      gap: 10px;
+      margin-top: 18px;
+    }
+
+    .bullet {
+      display: grid;
+      grid-template-columns: 26px 1fr;
+      gap: 10px;
+      align-items: start;
+      color: var(--muted);
+      line-height: 1.5;
+      font-size: 14px;
+    }
+
+    .bullet b {
+      color: var(--ink);
+      font-weight: 700;
+    }
+
+    .num {
+      display: inline-grid;
+      place-items: center;
+      width: 24px;
+      height: 24px;
+      border-radius: 50%;
+      color: #0c0f0b;
+      background: var(--line-hot);
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    @keyframes rise {
+      from {
+        transform: translateY(16px);
+        opacity: 0;
+      }
+      to {
+        transform: translateY(0);
+        opacity: 1;
+      }
+    }
+
+    @media (max-width: 1050px) {
+      header,
+      .grid,
+      .detail-section {
+        grid-template-columns: 1fr;
+      }
+
+      .legend {
+        justify-content: flex-start;
+      }
+
+      pre {
+        min-height: auto;
+      }
+    }
+
+    @media (max-width: 680px) {
+      .page {
+        width: min(100vw - 18px, 1460px);
+        padding-top: 28px;
+      }
+
+      .notes {
+        grid-template-columns: 1fr;
+      }
+
+      .terminal {
+        margin: 12px;
+      }
+
+      pre {
+        padding: 14px;
+        font-size: 11px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header>
+      <div>
+        <p class="eyebrow">AgentSSH TUI Audit UX Draft</p>
+        <h1>Record noise → run clarity.</h1>
+      </div>
+      <div>
+        <p class="subtitle">这不是 Web UI 改版稿，而是用 HTML 把 TUI 修改前后“应该看起来像什么”可视化出来。目标是让 Audit 第一屏按一次 run 读，而不是按底层 append-only record 猜。</p>
+        <div class="legend" aria-label="Legend">
+          <span class="chip">No new TUI dependency</span>
+          <span class="chip">One row per req_id</span>
+          <span class="chip">Hash chain preserved in detail</span>
+        </div>
+      </div>
+    </header>
+
+    <section class="grid" aria-label="Before and after comparison">
+      <article class="card before">
+        <div class="card-head">
+          <div class="card-title">
+            <span class="label">Before</span>
+            <h2>底层 record 直接暴露</h2>
+          </div>
+          <div class="score"><strong>2×</strong><span>成功 run 行数</span></div>
+        </div>
+        <div class="terminal">
+          <div class="topbar">
+            <div class="dots"><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>
+            <span>Audit · raw records</span>
+          </div>
+          <pre><span class="dim">AgentSSH [1 Hosts][2 Audit][3 Policy][4 Sessions]</span>
+
+<span class="dim">▾ s_7dd0f20e  "-"  -  09:31–09:31  1 cmd</span>
+  ● 09:31  <span class="host">greencloud-sg-1212</span>  <span class="cmd">-</span>  <span class="policy">allow/default</span> · exit - · -
+  ✓ 09:31  <span class="host">greencloud-sg-1212</span>  <span class="cmd">-</span>  <span class="policy">allow/default</span> · exit 0 · -
+
+<span class="dim">▾ s_faefaa8c  "-"  -  06:22–06:22  2 cmd</span>
+  ● 06:22  <span class="host">greencloud-sg-1212</span>  <span class="cmd">-</span>  <span class="policy">allow/default</span> · exit - · -
+  ✓ 06:22  <span class="host">greencloud-sg-1212</span>  <span class="cmd">-</span>  <span class="policy">allow/default</span> · exit 0 · -
+  <span class="deny">⊘</span> 06:22  <span class="host">greencloud-sg-1212</span>  <span class="cmd">rm -rf /</span>  <span class="policy">deny/rules:catastrophic</span> · exit - · -
+
+<span class="dim">j/k move · enter expand · d detail · l focus session · v verify · / filter</span></pre>
+        </div>
+        <div class="notes">
+          <div class="note"><strong>问题 1</strong>成功执行拆成 started/completed 两行，列表像日志尾巴，不像 run 列表。</div>
+          <div class="note"><strong>问题 2</strong>denied 的 `exit=-` 对 operator 来说低信息，实际 agent 收到的是 exit 6。</div>
+          <div class="note"><strong>问题 3</strong>命令不够突出，最关键的“做了什么”被 policy/seq/session 噪声淹没。</div>
+          <div class="note"><strong>问题 4</strong>详情是单 record 详情，hash 证据存在，但 run 级上下文弱。</div>
+        </div>
+      </article>
+
+      <article class="card after">
+        <div class="card-head">
+          <div class="card-title">
+            <span class="label">After</span>
+            <h2>按一次 run 展示摘要</h2>
+          </div>
+          <div class="score"><strong>1×</strong><span>每次 run 一行</span></div>
+        </div>
+        <div class="terminal">
+          <div class="topbar">
+            <div class="dots"><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>
+            <span>Audit · run summaries</span>
+          </div>
+          <pre><span class="dim">AgentSSH [1 Hosts][2 Audit][3 Policy][4 Sessions]</span>
+
+<span class="dim">▾ s_7dd0f20e  "-"  09:31–09:31  1 run</span>
+  ✓ 09:31  <span class="host">greencloud-sg-1212</span>  <span class="cmd">systemctl status nginx</span>
+    <span class="meta">req=18906f · seq=0..1 · policy=allow/default · exit=0 · dur=8.0s</span>
+
+<span class="dim">▾ s_faefaa8c  "-"  06:22–06:22  2 runs</span>
+  ✓ 06:22  <span class="host">greencloud-sg-1212</span>  <span class="cmd">uptime</span>
+    <span class="meta">req=48f494 · seq=2..3 · policy=allow/default · exit=0 · dur=4.0s</span>
+  <span class="deny">⊘</span> 06:22  <span class="host">greencloud-sg-1212</span>  <span class="cmd">rm -rf /</span>
+    <span class="meta">req=144701 · seq=4 · policy=deny/rules:catastrophic · exit=6 · not executed</span>
+
+<span class="dim">j/k move · enter detail · l focus session · v verify · / filter</span></pre>
+        </div>
+        <div class="notes">
+          <div class="note"><strong>收益 1</strong>列表按 operator 心智建模：一条命令一次 run，一行摘要。</div>
+          <div class="note"><strong>收益 2</strong>`seq=0..1` 保留 hash-chain 证据入口，详情里继续展开 event chain。</div>
+          <div class="note"><strong>收益 3</strong>denied 明确 `exit=6 · not executed`，不用猜 `exit=-` 是什么意思。</div>
+          <div class="note"><strong>收益 4</strong>命令成为主信息；policy、duration、输出处理信号退到 metadata。</div>
+        </div>
+      </article>
+    </section>
+
+    <section class="detail-section" aria-label="Detail redesign">
+      <div class="detail-copy">
+        <p class="eyebrow">Detail Panel</p>
+        <h3>详情页不删证据，只换阅读顺序。</h3>
+        <p>列表按 run 汇总后，详情面板必须保留底层 append-only records。这样第一眼是人能读懂的 run 结果，往下才是审计证明。</p>
+        <div class="bullets">
+          <div class="bullet"><span class="num">1</span><span><b>Summary first:</b> host、command、policy、exit、duration、output flags。</span></div>
+          <div class="bullet"><span class="num">2</span><span><b>Event chain second:</b> started/completed/denied 的 seq、time、prev_hash/hash。</span></div>
+          <div class="bullet"><span class="num">3</span><span><b>Raw audit still available:</b> `agentssh audit show &lt;req&gt;` 继续返回完整 JSON。</span></div>
+        </div>
+      </div>
+
+      <article class="card after">
+        <div class="terminal" style="margin: 0;">
+          <div class="topbar">
+            <div class="dots"><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>
+            <span>After · detail panel</span>
+          </div>
+          <pre>Run req 18906f · completed
+
+Host     <span class="host">greencloud-sg-1212</span>
+Command  <span class="cmd">systemctl status nginx</span>
+Policy   <span class="policy">allow ← default</span>
+Exit     0 · 8.0s · truncated false · redactions 0
+Output   sha256 9f2b…
+
+Event chain
+  seq 0  started    2026-06-18T09:31:32Z
+         prev 0000…  hash 3ab1…
+  seq 1  completed  2026-06-18T09:31:40Z
+         prev 3ab1…  hash 7d41…
+
+esc back · v verify chain</pre>
+        </div>
+      </article>
+    </section>
+  </main>
+</body>
+</html>

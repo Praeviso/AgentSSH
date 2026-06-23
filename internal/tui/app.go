@@ -399,7 +399,7 @@ func (m appModel) View() string {
 	// overflow horizontally.
 	if m.w > 0 && m.h > 0 {
 		bodyH := m.bodyHeight()
-		body = lipgloss.NewStyle().Height(bodyH).MaxHeight(bodyH).MaxWidth(m.w).Render(body)
+		body = lipgloss.NewStyle().Width(m.w).MaxWidth(m.w).Height(bodyH).MaxHeight(bodyH).Render(body)
 	}
 
 	parts := make([]string, 0, 4)
@@ -443,13 +443,13 @@ func (m appModel) renderStatusBar() string {
 func (m appModel) renderFooter() string {
 	km := combinedHelp{section: m.sections[m.active].helpKeyMap(), global: globalHelpKeys()}
 	if m.toast == "" || m.w <= 0 {
-		return m.help.View(km)
+		return m.fullWidthLine(m.help.View(km))
 	}
 	toast := m.styles.ok.Render(m.styles.glyphs.Check + " " + m.toast)
 	toastW := lipgloss.Width(toast)
 	helpW := m.w - toastW - 2 // 1 gutter + 1 col of slack so the toast never clips
 	if helpW < 1 {
-		return m.help.View(km) // no room; the toast is non-essential
+		return m.fullWidthLine(m.help.View(km)) // no room; the toast is non-essential
 	}
 	// bubbles/help doesn't truncate to its Width, so render a width-bounded short
 	// help ourselves to leave room for the right-aligned toast.
@@ -458,7 +458,14 @@ func (m appModel) renderFooter() string {
 	if pad < 1 {
 		pad = 1
 	}
-	return helpView + strings.Repeat(" ", pad) + toast
+	return m.fullWidthLine(helpView + strings.Repeat(" ", pad) + toast)
+}
+
+func (m appModel) fullWidthLine(value string) string {
+	if m.w <= 0 {
+		return value
+	}
+	return lipgloss.NewStyle().Width(m.w).MaxWidth(m.w).Render(value)
 }
 
 // shortHelpFit renders "key desc • key desc …" bounded to maxW columns, appending
@@ -1335,7 +1342,7 @@ func (s hostsSection) View() string {
 		for _, name := range window {
 			rows = append(rows, hostRow(name, s.inventory.Hosts[name]))
 		}
-		b.WriteString(renderTable(s.styles, hostColumns, rows, s.cursor-start))
+		b.WriteString(renderTable(s.styles, hostColumns, rows, s.cursor-start, s.w))
 		b.WriteString("\n")
 	}
 	if len(s.inventory.Groups) > 0 {
@@ -1434,7 +1441,7 @@ func (s hostsSection) discoveryView() string {
 			probing := s.discover.probingKeys[candidateKey(candidate)]
 			rows = append(rows, discoverRow(s.styles.glyphs, candidate, s.discover.selected[start+i], probing))
 		}
-		b.WriteString(renderTable(s.styles, discoverColumns, rows, s.discover.cursor-start))
+		b.WriteString(renderTable(s.styles, discoverColumns, rows, s.discover.cursor-start, s.w))
 		b.WriteString("\n")
 		// The per-row hint can't live inside the table; show the current row's.
 		if cur := s.discover.cursor; cur >= 0 && cur < len(s.discover.candidates) {
@@ -1471,14 +1478,14 @@ func (s hostsSection) discoverWindow() (candidates []discovery.Candidate, start 
 }
 
 var discoverColumns = []tableColumn{
-	{header: "SEL"},
-	{header: "NAME"},
-	{header: "SOURCE"},
-	{header: "ADDR"},
-	{header: "KEY"},
-	{header: "KNW"},
-	{header: "INV"},
-	{header: "STATUS"},
+	{header: "SEL", min: 3},
+	{header: "NAME", min: 6, max: 30, weight: 2},
+	{header: "SOURCE", min: 6, max: 12, weight: 1},
+	{header: "ADDR", min: 8, max: 30, weight: 2},
+	{header: "KEY", min: 3},
+	{header: "KNW", min: 3},
+	{header: "INV", min: 3},
+	{header: "STATUS", min: 8, max: 20, weight: 1},
 }
 
 func discoverRow(g theme.Glyphs, candidate discovery.Candidate, selected, probing bool) []string {
@@ -1492,9 +1499,9 @@ func discoverRow(g theme.Glyphs, candidate discovery.Candidate, selected, probin
 	}
 	return []string{
 		sel,
-		truncate(candidate.Name, 22),
+		candidate.Name,
 		candidate.Source,
-		truncate(formatDiscoveryAddr(candidate), 22),
+		formatDiscoveryAddr(candidate),
 		glyphBool(g, candidate.HasKey),
 		glyphBool(g, candidate.InKnownHosts),
 		glyphBool(g, candidate.InInventory),
@@ -1576,17 +1583,18 @@ func (s hostsSection) listChromeHeight() int {
 }
 
 var hostColumns = []tableColumn{
-	{header: "NAME"},
-	{header: "ADDR"},
-	{header: "PORT", right: true},
-	{header: "USER"},
-	{header: "AUTH"},
-	{header: "TAGS"},
+	{header: "NAME", min: 6, max: 40, weight: 3},
+	{header: "ADDR", min: 8, max: 40, weight: 2},
+	{header: "PORT", right: true, min: 4},
+	{header: "USER", min: 4, max: 18, weight: 1},
+	{header: "AUTH", min: 4, max: 26, weight: 1},
+	{header: "TAGS", min: 4, max: 30, weight: 2},
 }
 
-// hostRow projects an inventory host into aligned table cells. AUTH names the
-// method (key/alias) without ever exposing the key path's secrecy — identity_file
-// is a path, surfaced in full only by the P1 detail panel.
+// hostRow projects an inventory host into table cells (full, untruncated — the
+// renderer fits them to the window). AUTH names the method (key/alias) without
+// ever exposing the key path's secrecy — identity_file is a path, surfaced in
+// full only by the P1 detail panel.
 func hostRow(name string, host inventory.Host) []string {
 	display := name
 	if hostHasTag(host, "prod") {
@@ -1604,12 +1612,12 @@ func hostRow(name string, host inventory.Host) []string {
 		auth = "alias:" + host.SSHConfigAlias
 	}
 	return []string{
-		truncate(display, 28),
-		truncate(orDash(host.Addr), 24),
+		display,
+		orDash(host.Addr),
 		port,
 		orDash(host.User),
-		truncate(auth, 18),
-		truncate(strings.Join(host.Tags, ","), 20),
+		auth,
+		strings.Join(host.Tags, ","),
 	}
 }
 
@@ -1625,9 +1633,9 @@ func hostHasTag(host inventory.Host, tag string) bool {
 // Compact columns for master-detail mode, where the right panel carries the full
 // per-host detail so the left table only needs to identify the row.
 var hostColumnsCompact = []tableColumn{
-	{header: "NAME"},
-	{header: "ADDR"},
-	{header: "PORT", right: true},
+	{header: "NAME", min: 6, max: 48, weight: 3},
+	{header: "ADDR", min: 8, max: 40, weight: 2},
+	{header: "PORT", right: true, min: 4},
 }
 
 func hostRowCompact(name string, host inventory.Host) []string {
@@ -1640,8 +1648,8 @@ func hostRowCompact(name string, host inventory.Host) []string {
 		port = strconv.Itoa(host.Port)
 	}
 	return []string{
-		truncate(display, 26),
-		truncate(orDash(host.Addr), 22),
+		display,
+		orDash(host.Addr),
 		port,
 	}
 }
@@ -1658,12 +1666,20 @@ func (s hostsSection) detailLayout() (left string, rightW int, ok bool) {
 	if s.w < 72 || len(s.names) == 0 {
 		return "", 0, false
 	}
+	leftTarget := (s.w * 46) / 100
+	if leftTarget < 44 {
+		leftTarget = 44
+	}
+	maxLeft := s.w - minDetailWidth - 3 // gutter + card border columns
+	if leftTarget > maxLeft {
+		leftTarget = maxLeft
+	}
 	window, start := s.hostWindow()
 	rows := make([][]string, 0, len(window))
 	for _, name := range window {
 		rows = append(rows, hostRowCompact(name, s.inventory.Hosts[name]))
 	}
-	left = renderTable(s.styles, hostColumnsCompact, rows, s.cursor-start)
+	left = renderTable(s.styles, hostColumnsCompact, rows, s.cursor-start, leftTarget)
 	rightW = s.w - lipgloss.Width(left) - 3 // 1 gutter + 2 card border columns
 	if rightW < minDetailWidth {
 		return "", 0, false
@@ -1871,7 +1887,7 @@ func (s policySection) View() string {
 	var b strings.Builder
 	b.WriteString(s.styles.header.Render("Policy"))
 	b.WriteString("\n")
-	b.WriteString(renderPolicyConfig(s.styles, s.config))
+	b.WriteString(renderPolicyConfig(s.styles, s.config, s.w))
 	b.WriteString("\n")
 	if s.err != nil {
 		b.WriteString(s.styles.err.Render(s.err.Error()))
@@ -1898,9 +1914,9 @@ func (s policySection) View() string {
 }
 
 var policyRuleColumns = []tableColumn{
-	{header: "NAME"},
-	{header: "ACTION"},
-	{header: "CMD REGEX"},
+	{header: "NAME", min: 6, max: 24, weight: 1},
+	{header: "ACTION", min: 7},
+	{header: "CMD REGEX", min: 10, max: 80, weight: 3},
 }
 
 // policyActionCell renders a policy action as a glyph + word so deny reads as a
@@ -1912,7 +1928,7 @@ func policyActionCell(g theme.Glyphs, action policy.Action) string {
 	return g.OK + " ALLOW"
 }
 
-func renderPolicyConfig(st appStyles, cfg policy.Config) string {
+func renderPolicyConfig(st appStyles, cfg policy.Config, avail int) string {
 	var b strings.Builder
 	defaultPolicy := cfg.Defaults.Policy
 	if defaultPolicy == "" {
@@ -1931,12 +1947,12 @@ func renderPolicyConfig(st appStyles, cfg policy.Config) string {
 				name = fmt.Sprintf("[%d]", i)
 			}
 			rows = append(rows, []string{
-				truncate(name, 22),
+				name,
 				policyActionCell(st.glyphs, rule.Action),
-				truncate(rule.Match.CmdRegex, 44),
+				rule.Match.CmdRegex,
 			})
 		}
-		b.WriteString(renderTable(st, policyRuleColumns, rows, -1))
+		b.WriteString(renderTable(st, policyRuleColumns, rows, -1, avail))
 		b.WriteString("\n")
 	}
 
@@ -1946,8 +1962,13 @@ func renderPolicyConfig(st appStyles, cfg policy.Config) string {
 		b.WriteString("\n")
 		for _, name := range sortedOverrideNames(cfg.HostOverrides) {
 			override := cfg.HostOverrides[name]
-			fmt.Fprintf(&b, "  %s → %s (%d allow rules)\n",
+			line := fmt.Sprintf("  %s → %s (%d allow rules)",
 				name, policyActionCell(st.glyphs, override.Policy), len(override.AllowRules))
+			if avail > 0 {
+				line = truncate(line, avail)
+			}
+			b.WriteString(line)
+			b.WriteString("\n")
 		}
 	}
 	fmt.Fprintf(&b, "\noutput: max_bytes=%d · redactions=%d\n", cfg.Output.MaxBytes, len(cfg.Output.Redact))
@@ -2032,19 +2053,19 @@ func (s sessionsSection) View() string {
 		for _, summary := range window {
 			rows = append(rows, sessionRow(s.styles.glyphs, summary))
 		}
-		b.WriteString(renderTable(s.styles, sessionColumns, rows, s.cursor-start))
+		b.WriteString(renderTable(s.styles, sessionColumns, rows, s.cursor-start, s.w))
 		b.WriteString("\n")
 	}
 	return b.String()
 }
 
 var sessionColumns = []tableColumn{
-	{header: "ID"},
-	{header: "LABEL"},
-	{header: "WINDOW"},
-	{header: "CMDS", right: true},
-	{header: "DEN", right: true},
-	{header: "FAIL", right: true},
+	{header: "ID", min: 6, max: 18, weight: 1},
+	{header: "LABEL", min: 6, max: 44, weight: 3},
+	{header: "WINDOW", min: 17},
+	{header: "CMDS", right: true, min: 4},
+	{header: "DEN", right: true, min: 3},
+	{header: "FAIL", right: true, min: 4},
 }
 
 // sessionRow projects a session summary into aligned cells. WINDOW uses HH:MM:SS
@@ -2057,8 +2078,8 @@ func sessionRow(g theme.Glyphs, summary session.Summary) []string {
 		label = "-"
 	}
 	return []string{
-		truncate(summary.ID, 16),
-		truncate(label, 28),
+		summary.ID,
+		label,
 		clockOf(summary.Start) + "–" + clockOf(summary.End),
 		strconv.Itoa(summary.CommandCount),
 		countCell(g, summary.Denied),

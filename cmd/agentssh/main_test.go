@@ -554,6 +554,48 @@ func TestRunAppliesOutputFilterToReturnAndAudit(t *testing.T) {
 	}
 }
 
+func TestAuditLSIncludesCommandAndOutcomeContext(t *testing.T) {
+	home := t.TempDir()
+	writeTestInventory(t, home)
+	writeTestPolicy(t, home)
+	t.Setenv("AGENTSSH_HOME", home)
+	t.Setenv("AGENTSSH_SESSION", "s_test")
+
+	restoreExecutor := newExecutor
+	newExecutor = func(_ *config.Config) executor.Executor {
+		return fakeExecutor{stdout: "password=secret123 abcdefghijklmnopqrstuvwxyz\n"}
+	}
+	defer func() {
+		newExecutor = restoreExecutor
+	}()
+
+	if _, _, err := runCommandForTest(t, "run", "web-1", "--json", "--", "echo", "secret"); err != nil {
+		t.Fatalf("allow run: %v", err)
+	}
+	if _, _, err := runCommandForTest(t, "run", "web-1", "--", "rm", "-rf", "/"); err == nil {
+		t.Fatal("deny run error = nil")
+	}
+
+	stdout, stderr, err := runCommandForTest(t, "audit", "ls")
+	if err != nil {
+		t.Fatalf("audit ls err = %v stderr=%s", err, stderr)
+	}
+	assertContainsAll(t, stdout,
+		"started",
+		"completed",
+		"denied",
+		"host=web-1",
+		"session=s_test",
+		"policy=allow/default",
+		"policy=deny/rules:catastrophic",
+		"exit=0",
+		"exit=6",
+		"out=truncated,redacted:1",
+		`cmd="echo secret"`,
+		`cmd="rm -rf /"`,
+	)
+}
+
 func TestRunStreamingFiltersOutputAndAuditMatchesBuffered(t *testing.T) {
 	home := t.TempDir()
 	writeTestInventory(t, home)
@@ -1012,6 +1054,15 @@ func formatExit(exitCode *int) string {
 		return "-"
 	}
 	return fmt.Sprintf("%d", *exitCode)
+}
+
+func assertContainsAll(t *testing.T, value string, needles ...string) {
+	t.Helper()
+	for _, needle := range needles {
+		if !strings.Contains(value, needle) {
+			t.Fatalf("expected %q to contain %q", value, needle)
+		}
+	}
 }
 
 type fakeExecutor struct {

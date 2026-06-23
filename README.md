@@ -169,12 +169,12 @@ These are the only commands an agent needs. They go through inventory resolution
 ```bash
 agentssh hosts                                   # list targets (name + tags only; no credentials)
 agentssh hosts --json
-agentssh run web-1 --skill restart-service -- systemctl status nginx
+agentssh run web-1 -- systemctl status nginx
 agentssh run web-1 --json -- uptime
 agentssh status <req_id>
 ```
 
-`--skill <name>` links the run to a playbook in audit records and the TUI. On a connection failure, `run` prints a credential-free hint and exits 9.
+On a connection failure, `run` prints a credential-free hint and exits 9.
 
 ## CLI for humans
 
@@ -217,7 +217,7 @@ Example Anthropic Agent Skill-style playbooks live under `skills/`:
 - `skills/restart-service/SKILL.md` — safe systemd service diagnosis and restart.
 - `skills/investigate-cpu/SKILL.md` — mostly read-only high-CPU investigation.
 
-These are procedural knowledge for agents, not RPC tools: they instruct the agent to call `agentssh run --skill <name> ...` while the CLI enforces policy and audit.
+These are procedural knowledge for agents, not RPC tools: they instruct the agent how to call `agentssh run ...` while the CLI enforces policy and audit. AgentSSH does not record or trust playbook names.
 
 See the project documents for the product and implementation contract:
 
