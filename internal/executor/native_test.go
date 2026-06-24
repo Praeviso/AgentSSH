@@ -42,6 +42,9 @@ func TestNativeExecutorExecSuccessAndRemoteNonZero(t *testing.T) {
 	if result.Err != nil || result.ExitCode != 0 || result.Stdout != "ok\n" {
 		t.Fatalf("success result = %#v err=%v", result, result.Err)
 	}
+	if result.OS != "linux" {
+		t.Fatalf("success OS = %q, want linux", result.OS)
+	}
 	if len(result.Argv) == 0 || result.Argv[0] != nativeArgv0 {
 		t.Fatalf("native argv = %#v", result.Argv)
 	}
@@ -535,7 +538,9 @@ func handleSession(channel ssh.Channel, requests <-chan *ssh.Request) {
 		_ = ssh.Unmarshal(req.Payload, &payload)
 		_ = req.Reply(true, nil)
 		code := uint32(0)
-		if strings.Contains(payload.Command, "stream-secret") {
+		if payload.Command == OSProbeCommand {
+			_, _ = channel.Write([]byte("Linux\n"))
+		} else if strings.Contains(payload.Command, "stream-secret") {
 			_, _ = channel.Write([]byte("line1\n"))
 			_, _ = channel.Write([]byte("password="))
 			_, _ = channel.Write([]byte("secret123\nline3\n"))

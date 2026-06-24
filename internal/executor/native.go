@@ -111,7 +111,44 @@ func (e NativeExecutor) runSession(ctx context.Context, request Request, stdout 
 	if err != nil {
 		return Result{ExitCode: -1, Duration: time.Since(start), Err: err, Argv: argv}
 	}
-	return Result{ExitCode: exitCode, Duration: time.Since(start), Argv: argv}
+	osName := ""
+	if request.Command == OSProbeCommand {
+		if buffer, ok := stdout.(*bytes.Buffer); ok {
+			osName = NormalizeOS(buffer.String())
+		}
+	}
+	if osName == "" {
+		osName = e.detectOS(ctx, client)
+	}
+	return Result{ExitCode: exitCode, Duration: time.Since(start), Argv: argv, OS: osName}
+}
+
+func (e NativeExecutor) detectOS(ctx context.Context, client *nativeClient) string {
+	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	session, err := client.NewSession()
+	if err != nil {
+		return ""
+	}
+	defer func() {
+		_ = session.Close()
+	}()
+	var stdout bytes.Buffer
+	session.Stdout = &stdout
+	done := make(chan error, 1)
+	go func() {
+		done <- session.Run(OSProbeCommand)
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			return ""
+		}
+	case <-probeCtx.Done():
+		_ = session.Close()
+		return ""
+	}
+	return NormalizeOS(stdout.String())
 }
 
 type nativeTarget struct {
@@ -373,7 +410,7 @@ func (e NativeExecutor) clientConfig(target nativeTarget) (*ssh.ClientConfig, io
 // Probe opens a native SSH session and runs a no-op command. It is intended for
 // explicit operator diagnostics; callers must gate it behind a user action.
 func (e NativeExecutor) Probe(ctx context.Context, target inventory.Target) Result {
-	return e.Run(ctx, Request{Target: target, Command: "true"})
+	return e.Run(ctx, Request{Target: target, Command: OSProbeCommand})
 }
 
 // ProbeStatusForError maps a transport error into the probe status vocabulary.

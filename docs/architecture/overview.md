@@ -9,7 +9,7 @@
 ```
 ┌──────────────────────────────────────────────────────────────────┐
 │  AI Agent (Claude Code 等)                                         │
-│    读 Skill(操作手册) → 调用 agentssh CLI                          │
+│    读外部操作手册 → 调用 agentssh CLI                                │
 │    [灰区命令的交互式 allow/deny 由 harness 在此层处理]              │
 └───────────────────────────────┬──────────────────────────────────┘
                                  │  进程边界(argv + stdout/stderr + exit code)
@@ -122,7 +122,7 @@ output:
 ## 4. 命令生命周期(`run`)
 
 ```
-run web-1 --skill restart-service -- sudo systemctl restart nginx
+run web-1 -- sudo systemctl restart nginx
   │
   1. 解析 host → inventory(web-1: deploy@10.0.0.11, 组=[web,prod])
   2. Policy 判定命令 → allow / deny
@@ -157,8 +157,6 @@ run web-1 --skill restart-service -- sudo systemctl restart nginx
   "session_id": "s_91be0c",
   "session_label": "fix 502 on web-1",
   "event": "completed",
-  "agent": "claude-code",
-  "skill": "restart-service",
   "host": "web-1",
   "cmd": "sudo systemctl restart nginx",
   "policy_action": "allow",
@@ -231,7 +229,7 @@ agentssh/
     output/                # 脱敏 + 截断
     tui/                   # bubbletea:审计查看器
     approval/              # (预留,MVP 空)未来 out-of-band 同步审批
-  skills/                  # 示例操作手册(SKILL.md),供 Agent 发现
+  skills/                  # 示例外部操作手册(SKILL.md),供 Agent 参考
   docs/
 ```
 

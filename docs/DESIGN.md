@@ -18,7 +18,6 @@
 - **机器友好**:所有读类命令支持 `--json`;默认输出对人也可读。
 - **退出码即信号**:Agent 靠 exit code 判断结果,无需解析自然语言。
 - **可预测、低惊喜**:同样输入同样输出;错误信息含「下一步怎么办」。
-- **意图可标注**:`--skill` 让 Agent 把本次执行关联回手册,供审计还原意图。
 - **不阻塞**:`run` 要么立即执行返回,要么立即被 `deny` 拒绝。没有「等待人工审批」的挂起态。
 
 ### A.2 命令参考
@@ -29,7 +28,7 @@
 agentssh hosts [--json]
     列出可达主机与分组(仅名字/tag,无凭据)。
 
-agentssh run <host|group> [--skill <name>] [--session <id>] [--session-label <text>] [--json] -- <cmd…>
+agentssh run <host|group> [--session <id>] [--session-label <text>] [--json] -- <cmd…>
     在目标上执行命令。经 policy 判定:
       allow → 立即执行,返回输出与退出码
       deny  → 立即以 exit 6 返回,说明命中的规则
@@ -55,7 +54,7 @@ agentssh session ls          列出近期会话(id/label/起止/命令数)
 **人类可读(默认)** —— `run` 成功:
 
 ```
-✓ web-1 · exit 0 · 0.4s · skill=restart-service
+✓ web-1 · exit 0 · 0.4s
 nginx.service - A high performance web server
    Active: active (running) since Mon 2026-06-16 08:32:11 UTC
 ```
@@ -73,8 +72,7 @@ nginx.service - A high performance web server
   "stdout": "nginx.service - A high performance web server\n…",
   "stderr": "",
   "output_truncated": false,
-  "redactions": 0,
-  "skill": "restart-service"
+  "redactions": 0
 }
 ```
 
@@ -150,7 +148,7 @@ nginx.service - A high performance web server
   enter 展开/折叠会话 · l 会话详情 · v 校验链 · / 过滤 · j/k 移动 · q 退出
 ```
 
-- 顶层按**会话**倒序;会话头显示 `id · label · agent · 起止 · 命令数`,折叠态附一行异常摘要(有 deny/失败时)。
+- 顶层按**会话**倒序;会话头单行显示 `id · label · host(user@ip)`,有篡改时附一段异常提示。
 - 展开后是该会话内的 run,时间倒序;状态图标:`✓` 成功 · `✗` 失败 · `⊘` 拒绝(policy deny)· `●` 执行中。
 - 每行一眼看全:**时间 · 状态 · 主机(prod 加红角标) · 手册 · 真实命令 · policy 判定 · exit/耗时**。
 - 危险/拒绝用红、prod 主机加红色 `prod` 角标、含异常的会话头标红;颜色仅作强调,信息不只靠颜色(同时有文字)。
@@ -161,8 +159,8 @@ nginx.service - A high performance web server
 
 ```
 ┌ Record seq 42 · req a3f2c1 ──────────────────────────────────────┐
-│ Agent    claude-code           时间   2026-06-16 08:32:11Z        │
-│ Skill    restart-service       Host   web-1 (deploy@10.0.0.11)    │
+│ 时间     2026-06-16 08:32:11Z                                     │
+│ Session  s_91be0c "fix 502"    Host   web-1 (deploy@10.0.0.11)    │
 │ Tags     web, prod                                                │
 │ Command  sudo systemctl restart nginx                             │
 │ Policy   allow ← prod/allow_rules[1]                              │
@@ -181,10 +179,10 @@ nginx.service - A high performance web server
 
 - `v` 触发 `audit verify`:**顶部状态条**显示 `链 ✓ 完整 (0..N-1)`(seq 0 基)或 `链 ✗ 断于 seq=K · <原因>`。验证在任意焦点(列表/详情)下都可触发。
 - `/` 进入过滤(顶部状态条显示当前 filter)。语法 = 自由文本 + 可选维度前缀,空格分隔、多条件 AND:
-  - `host:<substr>`、`skill:<substr>`、`session:<substr>`(匹配 id 或 label)
+  - `host:<substr>`、`session:<substr>`(匹配 id 或 label)
   - `status:<allow|deny>`(匹配 policy_action)或 `status:<started|completed|failed|denied>`(匹配事件)
   - `date:<YYYY-MM-DD>`(按 ts 前缀做时间筛选)
-  - 其余裸词为自由文本,在 host/skill/session/cmd/状态/ts/policy/req 各字段做子串匹配
+  - 其余裸词为自由文本,在 host/session/cmd/状态/ts/policy/req 各字段做子串匹配
   - 实时生效;`enter` 提交并回列表(保留过滤),`esc` 取消并还原进入过滤前的查询。
 - `l` 进/出会话焦点:只看选中会话的全部 run + 会话元数据(`(no session)` 合成组不可焦点)。
 

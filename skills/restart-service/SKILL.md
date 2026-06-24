@@ -11,7 +11,6 @@ Use this skill when a service appears unhealthy and the operator wants a careful
 
 - Start with read-only diagnosis. Do not restart first.
 - Use `agentssh hosts` to confirm the target host or group name before running commands.
-- Always pass this skill name with `--skill restart-service` so the audit log links the action to this playbook.
 - Treat policy `deny` as final. Do not retry the same denied command or try to bypass policy.
 - Before a state-changing command such as `restart` or `reload`, summarize the diagnosis and rely on the agent harness/operator confirmation flow.
 
@@ -21,31 +20,31 @@ Use this skill when a service appears unhealthy and the operator wants a careful
 2. Check service state:
 
 ```bash
-agentssh run <host> --skill restart-service -- systemctl status <service>
+agentssh run <host> -- systemctl status <service>
 ```
 
 3. Check recent logs, keeping output small:
 
 ```bash
-agentssh run <host> --skill restart-service -- journalctl -u <service> -n 80 --no-pager
+agentssh run <host> -- journalctl -u <service> -n 80 --no-pager
 ```
 
 4. If the service is clearly failed or wedged, explain what you found and restart:
 
 ```bash
-agentssh run <host> --skill restart-service -- sudo systemctl restart <service>
+agentssh run <host> -- sudo systemctl restart <service>
 ```
 
 5. Verify recovery:
 
 ```bash
-agentssh run <host> --skill restart-service -- systemctl status <service>
+agentssh run <host> -- systemctl status <service>
 ```
 
 6. If restart fails, collect focused follow-up evidence:
 
 ```bash
-agentssh run <host> --skill restart-service -- journalctl -u <service> -n 120 --no-pager
+agentssh run <host> -- journalctl -u <service> -n 120 --no-pager
 ```
 
 ## Notes

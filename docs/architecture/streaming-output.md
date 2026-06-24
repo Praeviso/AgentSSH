@@ -63,7 +63,7 @@ swOut.Flush(); swErr.Flush()           // Wait 已在 RunStreaming 内返回
 outputHash := audit.ComputeOutputSHA256(string(swOut.Emitted()), string(swErr.Emitted()))
 redactions := swOut.Redactions()+swErr.Redactions(); truncated := swOut.Truncated()||swErr.Truncated()
 store.Append(completed/failed 记录: exit, outputHash, durationMS, {truncated, redactions})
-printRunStreamFooter(cmd, host, result, skill)   // 输出已实时打过 → 末尾补 "✓ host · exit N · dur · skill="
+printRunStreamFooter(cmd, host, result)          // 输出已实时打过 → 末尾补 "✓ host · exit N · dur"
 mergeExitCode(...)
 ```
 非流式分支:与今天**完全一致**(`outputFilter.Apply` + printRunHuman / json append)。`NewFilter` 既返回 buffered `Filter` 也提供编译好的 `redact`/`maxBytes` 供 StreamWriter 复用(共享同一套编译正则)。

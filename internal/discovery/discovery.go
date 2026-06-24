@@ -38,6 +38,7 @@ type Candidate struct {
 	InInventory  bool                 `json:"in_inventory"`
 	ProbeStatus  executor.ProbeStatus `json:"probe_status,omitempty"`
 	Hint         string               `json:"hint,omitempty"`
+	OS           string               `json:"os,omitempty"`
 }
 
 // ImportHost builds the inventory entry to persist for a discovered candidate.
@@ -46,9 +47,9 @@ type Candidate struct {
 // flattened addr/user/port that would drop those directives.
 func ImportHost(c Candidate) inventory.Host {
 	if c.Source == SourceSSHConfig {
-		return inventory.Host{SSHConfigAlias: c.Name}
+		return inventory.Host{SSHConfigAlias: c.Name, OS: c.OS}
 	}
-	return inventory.Host{Addr: c.Addr, User: c.User, Port: c.Port, IdentityFile: c.IdentityFile}
+	return inventory.Host{Addr: c.Addr, User: c.User, Port: c.Port, IdentityFile: c.IdentityFile, OS: c.OS}
 }
 
 // EndpointKey normalizes addr+port into a comparison key. It returns "" for
@@ -133,7 +134,7 @@ func Static(opts Options) (Result, error) {
 	return result, nil
 }
 
-// Probe dials each candidate and runs a no-op command.
+// Probe dials each candidate and runs AgentSSH's host metadata probe.
 func Probe(ctx context.Context, candidates []Candidate, opts ProbeOptions) []Candidate {
 	timeout := opts.Timeout
 	if timeout == 0 {
@@ -164,7 +165,9 @@ func Probe(ctx context.Context, candidates []Candidate, opts ProbeOptions) []Can
 				candidate.Hint = executor.ConnectHint(result.Err)
 			} else if result.ExitCode != 0 {
 				candidate.ProbeStatus = executor.ProbeUnreachable
-				candidate.Hint = fmt.Sprintf("hint: probe command exited %d; verify the remote shell can run true.", result.ExitCode)
+				candidate.Hint = fmt.Sprintf("hint: probe command exited %d; verify the remote shell can run %s.", result.ExitCode, executor.OSProbeCommand)
+			} else {
+				candidate.OS = result.OS
 			}
 			out[i] = candidate
 		}()

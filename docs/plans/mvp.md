@@ -21,7 +21,7 @@
 - **M1 直通执行(无 policy)**:`inventory` + `run`(全部直接执行)+ `hosts`。能在真实主机上跑命令。
 - **M2 Policy + 审计**:allow/deny 判定(含 prod allowlist override)、hash 链审计 + `audit verify`。
 - **M3 TUI 审计查看器**:`tui` 单视图(审计流 + 详情 + 过滤 + 校验链)。
-- **M4 输出控制 + 手册**:Output Filter(脱敏/截断)、`--skill` 关联、1~2 个示例 SKILL.md、文档收尾。
+- **M4 输出控制 + 手册**:Output Filter(脱敏/截断)、1~2 个示例 SKILL.md、文档收尾。
 - **M5 加固/打磨**:退出码全覆盖、错误信息、`policy test`、`NO_COLOR`、非 TTY 降级、E2E 验收。
 
 ## 2. 阶段任务
@@ -54,7 +54,6 @@
 
 ### M4 输出控制 + 手册
 - [ ] `internal/output`:按 policy 脱敏 + 截断;审计记 redactions/truncated。
-- [ ] `run --skill <name>` 关联手册,贯穿审计与 TUI 展示。
 - [ ] `skills/restart-service/SKILL.md`、`skills/investigate-cpu/SKILL.md` 示例。
 - [ ] README + 文档串联。
 

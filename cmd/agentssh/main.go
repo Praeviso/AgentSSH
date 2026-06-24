@@ -158,7 +158,7 @@ func newHostsCommand() *cobra.Command {
 func newRunCommand() *cobra.Command {
 	var flags runFlags
 	cmd := &cobra.Command{
-		Use:   "run <host|group> [--skill <name>] [--session <id>] [--session-label <text>] [--json] -- <cmd...>",
+		Use:   "run <host|group> [--session <id>] [--session-label <text>] [--json] -- <cmd...>",
 		Short: "Run a policy-checked command on a configured host or group.",
 		Args: func(cmd *cobra.Command, args []string) error {
 			if cmd.ArgsLenAtDash() != 1 {
@@ -175,7 +175,6 @@ func newRunCommand() *cobra.Command {
 			return runDirect(cmd, target, remoteCommand, flags)
 		},
 	}
-	cmd.Flags().StringVar(&flags.skill, "skill", "", "associate the run with an agent skill name")
 	cmd.Flags().StringVar(&flags.session, "session", "", "associate the run with a session id")
 	cmd.Flags().StringVar(&flags.sessionLabel, "session-label", "", "attach a human-readable label to the session")
 	cmd.Flags().BoolVar(&flags.jsonOutput, "json", false, "emit machine-readable JSON")
@@ -479,7 +478,6 @@ func minArgs(count int) cobra.PositionalArgs {
 }
 
 type runFlags struct {
-	skill        string
 	session      string
 	sessionLabel string
 	jsonOutput   bool
@@ -496,7 +494,6 @@ type runResponse struct {
 	Stderr          string `json:"stderr"`
 	OutputTruncated bool   `json:"output_truncated"`
 	Redactions      int    `json:"redactions"`
-	Skill           string `json:"skill,omitempty"`
 	PolicyAction    string `json:"policy_action,omitempty"`
 	PolicyRule      string `json:"policy_rule,omitempty"`
 }
@@ -712,6 +709,29 @@ func writeInventoryAtomic(home string, path string, inv inventory.Inventory) err
 	return inventory.Save(path, inv)
 }
 
+func refreshInventoryHostOS(paths config.Paths, hostName string, osName string) {
+	_ = updateInventoryHostOS(paths, hostName, osName)
+}
+
+func updateInventoryHostOS(paths config.Paths, hostName string, osName string) error {
+	osName = strings.TrimSpace(osName)
+	if hostName == "" || osName == "" || paths.InventoryFile == "" {
+		return nil
+	}
+	inv, err := inventory.Load(paths.InventoryFile)
+	if err != nil {
+		return err
+	}
+	if host, ok := inv.Hosts[hostName]; !ok || host.OS == osName {
+		return nil
+	}
+	next, err := inventory.SetHostOS(inv, hostName, osName)
+	if err != nil {
+		return err
+	}
+	return inventory.Save(paths.InventoryFile, next)
+}
+
 func runSecretSet(cmd *cobra.Command, host string) error {
 	paths, err := resolvePathsForWrite()
 	if err != nil {
@@ -904,6 +924,9 @@ func hostParts(host inventory.Host) []string {
 	if host.SSHConfigAlias != "" {
 		parts = append(parts, "alias="+host.SSHConfigAlias)
 	}
+	if host.OS != "" {
+		parts = append(parts, "os="+host.OS)
+	}
 	if host.IdentityFile != "" {
 		parts = append(parts, "identity_file="+host.IdentityFile)
 	}
@@ -1057,6 +1080,7 @@ func runInventoryTest(cmd *cobra.Command, name string) error {
 	})
 	result := exec.Probe(context.Background(), resolved.Targets[0])
 	if result.Err == nil && result.ExitCode == 0 {
+		refreshInventoryHostOS(cfg.Paths, name, result.OS)
 		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "OK %s\n", name)
 		return nil
 	}
@@ -1142,10 +1166,7 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 	if err != nil {
 		return newUsageError("invalid output filter in policy.yaml: %v\n  fix the regex under output.redact in ~/.agentssh/policy.yaml", err)
 	}
-	sessionCtx, err := session.Resolver{Path: cfg.Paths.SessionFile}.Resolve(flags.session, flags.sessionLabel)
-	if err != nil {
-		return fmt.Errorf("resolve session: %w", err)
-	}
+	sessionResolver := session.Resolver{Path: cfg.Paths.SessionFile}
 	store := audit.NewStore(cfg.Paths.AuditFile)
 	ssh := newExecutor(cfg)
 	exitCode := exitOK
@@ -1155,12 +1176,24 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 		if err != nil {
 			return err
 		}
+		// Bind the session to this target host. A group run therefore records one
+		// session per host, never a single session spanning several hosts.
+		sessionCtx, err := sessionResolver.Resolve(target.Name, flags.session, flags.sessionLabel)
+		if err != nil {
+			return fmt.Errorf("resolve session: %w", err)
+		}
+		if err := sessionResolver.Update(target.Name, sessionCtx.ID, time.Now().UTC()); err != nil {
+			return err
+		}
 		decision, err := engine.Evaluate(target.Name, remoteCommand)
 		if err != nil {
 			return fmt.Errorf("evaluate policy for %s: %w", target.Name, err)
 		}
 		if decision.Action == policy.ActionDeny {
-			if _, err := store.Append(baseAuditRecord(reqID, sessionCtx, audit.EventDenied, target.Name, remoteCommand, flags.skill, decision, nil, "", 0)); err != nil {
+			if _, err := store.Append(baseAuditRecord(reqID, sessionCtx, audit.EventDenied, target.Name, remoteCommand, decision, nil, "", 0)); err != nil {
+				return err
+			}
+			if err := sessionResolver.Update(target.Name, sessionCtx.ID, time.Now().UTC()); err != nil {
 				return err
 			}
 			response := runResponse{
@@ -1171,7 +1204,6 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 				ExitCode:     exitPolicyDenied,
 				PolicyAction: string(decision.Action),
 				PolicyRule:   decision.Rule,
-				Skill:        flags.skill,
 			}
 			if flags.jsonOutput {
 				responses = append(responses, response)
@@ -1182,7 +1214,7 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 			continue
 		}
 
-		if _, err := store.Append(baseAuditRecord(reqID, sessionCtx, audit.EventStarted, target.Name, remoteCommand, flags.skill, decision, nil, "", 0)); err != nil {
+		if _, err := store.Append(baseAuditRecord(reqID, sessionCtx, audit.EventStarted, target.Name, remoteCommand, decision, nil, "", 0)); err != nil {
 			return err
 		}
 		streamExec, canStream := ssh.(executor.StreamingExecutor)
@@ -1200,10 +1232,16 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 				OutputTruncated: streamed.OutputTruncated,
 				Redactions:      streamed.Redactions,
 			}
-			if _, err := store.Append(baseAuditRecord(reqID, sessionCtx, event, target.Name, remoteCommand, flags.skill, decision, &result.ExitCode, outputHash, result.Duration.Milliseconds(), filtered)); err != nil {
+			if _, err := store.Append(baseAuditRecord(reqID, sessionCtx, event, target.Name, remoteCommand, decision, &result.ExitCode, outputHash, result.Duration.Milliseconds(), filtered)); err != nil {
 				return err
 			}
-			printRunStreamFooter(cmd, target.Name, result, streamed.Stdout, flags.skill)
+			if err := sessionResolver.Update(target.Name, sessionCtx.ID, time.Now().UTC()); err != nil {
+				return err
+			}
+			if !isSSHErrorResult(result) {
+				refreshInventoryHostOS(cfg.Paths, target.Name, result.OS)
+			}
+			printRunStreamFooter(cmd, target.Name, result, streamed.Stdout)
 			exitCode = mergeExitCode(exitCode, exitCodeForResult(result))
 			continue
 		}
@@ -1220,8 +1258,14 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 		// The audit hash records the bytes that crossed the trust boundary and
 		// were returned to the agent after output filtering.
 		outputHash := audit.ComputeOutputSHA256(filtered.Stdout, filtered.Stderr)
-		if _, err := store.Append(baseAuditRecord(reqID, sessionCtx, event, target.Name, remoteCommand, flags.skill, decision, &result.ExitCode, outputHash, result.Duration.Milliseconds(), filtered)); err != nil {
+		if _, err := store.Append(baseAuditRecord(reqID, sessionCtx, event, target.Name, remoteCommand, decision, &result.ExitCode, outputHash, result.Duration.Milliseconds(), filtered)); err != nil {
 			return err
+		}
+		if err := sessionResolver.Update(target.Name, sessionCtx.ID, time.Now().UTC()); err != nil {
+			return err
+		}
+		if !isSSHErrorResult(result) {
+			refreshInventoryHostOS(cfg.Paths, target.Name, result.OS)
 		}
 		if flags.jsonOutput {
 			responses = append(responses, runResponse{
@@ -1235,7 +1279,6 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 				Stderr:          filtered.Stderr,
 				OutputTruncated: filtered.OutputTruncated,
 				Redactions:      filtered.Redactions,
-				Skill:           flags.skill,
 				PolicyAction:    string(decision.Action),
 				PolicyRule:      decision.Rule,
 			})
@@ -1243,7 +1286,7 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 				printSSHErrorHint(cmd, result)
 			}
 		} else {
-			printRunHuman(cmd, target.Name, result, filtered, flags.skill)
+			printRunHuman(cmd, target.Name, result, filtered)
 		}
 
 		exitCode = mergeExitCode(exitCode, exitCodeForResult(result))
@@ -1259,16 +1302,13 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 		}
 	}
 
-	if err := (session.Resolver{Path: cfg.Paths.SessionFile}).Update(sessionCtx.ID, time.Now().UTC()); err != nil {
-		return err
-	}
 	if exitCode != exitOK {
 		return commandExitError{Code: exitCode}
 	}
 	return nil
 }
 
-func printRunHuman(cmd *cobra.Command, host string, result executor.Result, filtered output.FilterResult, skill string) {
+func printRunHuman(cmd *cobra.Command, host string, result executor.Result, filtered output.FilterResult) {
 	out := cmd.OutOrStdout()
 	marker := "✓"
 	if isSSHErrorResult(result) {
@@ -1278,9 +1318,6 @@ func printRunHuman(cmd *cobra.Command, host string, result executor.Result, filt
 	}
 
 	_, _ = fmt.Fprintf(out, "%s %s · exit %d · %s", marker, host, result.ExitCode, formatDuration(result.Duration))
-	if skill != "" {
-		_, _ = fmt.Fprintf(out, " · skill=%s", skill)
-	}
 	_, _ = fmt.Fprintln(out)
 	if filtered.Stdout != "" {
 		_, _ = fmt.Fprint(out, filtered.Stdout)
@@ -1329,7 +1366,7 @@ func runStreaming(cmd *cobra.Command, streamExec executor.StreamingExecutor, tar
 	}
 }
 
-func printRunStreamFooter(cmd *cobra.Command, host string, result executor.Result, stdout []byte, skill string) {
+func printRunStreamFooter(cmd *cobra.Command, host string, result executor.Result, stdout []byte) {
 	out := cmd.OutOrStdout()
 	marker := "✓"
 	if isSSHErrorResult(result) {
@@ -1342,9 +1379,6 @@ func printRunStreamFooter(cmd *cobra.Command, host string, result executor.Resul
 		_, _ = fmt.Fprintln(out)
 	}
 	_, _ = fmt.Fprintf(out, "%s %s · exit %d · %s", marker, host, result.ExitCode, formatDuration(result.Duration))
-	if skill != "" {
-		_, _ = fmt.Fprintf(out, " · skill=%s", skill)
-	}
 	_, _ = fmt.Fprintln(out)
 	if isSSHErrorResult(result) {
 		printSSHErrorHint(cmd, result)
@@ -1469,13 +1503,77 @@ func runAuditLS(cmd *cobra.Command, filters audit.Filters) error {
 	}
 	records = audit.FilterRecords(records, filters)
 	for _, record := range records {
-		exit := "-"
-		if record.ExitCode != nil {
-			exit = fmt.Sprintf("%d", *record.ExitCode)
-		}
-		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%d %s %s %s host=%s session=%s policy=%s/%s exit=%s\n", record.Seq, record.TS, record.ReqID, record.Event, record.Host, record.SessionID, record.PolicyAction, record.PolicyRule, exit)
+		_, _ = fmt.Fprintln(cmd.OutOrStdout(), formatAuditListRecord(record))
 	}
 	return nil
+}
+
+func formatAuditListRecord(record audit.Record) string {
+	parts := []string{
+		fmt.Sprintf("%d", record.Seq),
+		record.TS,
+		record.ReqID,
+		string(record.Event),
+		"host=" + dashIfEmpty(record.Host),
+		"session=" + dashIfEmpty(record.SessionID),
+		"policy=" + formatPolicy(record),
+		"exit=" + auditListExit(record),
+	}
+	if record.DurationMS > 0 {
+		parts = append(parts, "dur="+formatDuration(time.Duration(record.DurationMS)*time.Millisecond))
+	}
+	if output := auditListOutput(record); output != "" {
+		parts = append(parts, "out="+output)
+	}
+	if record.Cmd != "" {
+		parts = append(parts, "cmd="+strconv.Quote(truncateRunes(record.Cmd, 96)))
+	}
+	return strings.Join(parts, " ")
+}
+
+func formatPolicy(record audit.Record) string {
+	action := dashIfEmpty(record.PolicyAction)
+	rule := dashIfEmpty(record.PolicyRule)
+	return action + "/" + rule
+}
+
+func auditListExit(record audit.Record) string {
+	if record.ExitCode != nil {
+		return fmt.Sprintf("%d", *record.ExitCode)
+	}
+	if record.Event == audit.EventDenied {
+		return fmt.Sprintf("%d", exitPolicyDenied)
+	}
+	return "-"
+}
+
+func auditListOutput(record audit.Record) string {
+	var parts []string
+	if record.OutputTruncated {
+		parts = append(parts, "truncated")
+	}
+	if record.Redactions > 0 {
+		parts = append(parts, fmt.Sprintf("redacted:%d", record.Redactions))
+	}
+	return strings.Join(parts, ",")
+}
+
+func dashIfEmpty(value string) string {
+	if value == "" {
+		return "-"
+	}
+	return value
+}
+
+func truncateRunes(value string, limit int) string {
+	runes := []rune(value)
+	if len(runes) <= limit {
+		return value
+	}
+	if limit <= 1 {
+		return "…"
+	}
+	return string(runes[:limit-1]) + "…"
 }
 
 func runAuditShow(cmd *cobra.Command, reqID string) error {
@@ -1533,7 +1631,6 @@ func runStatus(cmd *cobra.Command, reqID string, jsonOutput bool) error {
 		DurationMS:      latest.DurationMS,
 		OutputTruncated: latest.OutputTruncated,
 		Redactions:      latest.Redactions,
-		Skill:           latest.Skill,
 		PolicyAction:    latest.PolicyAction,
 		PolicyRule:      latest.PolicyRule,
 	}
@@ -1580,7 +1677,7 @@ func runSessionLS(cmd *cobra.Command) error {
 	return nil
 }
 
-func baseAuditRecord(reqID string, sessionCtx session.Context, event audit.Event, host string, command string, skill string, decision policy.Decision, exitCode *int, outputHash string, durationMS int64, filtered ...output.FilterResult) audit.Record {
+func baseAuditRecord(reqID string, sessionCtx session.Context, event audit.Event, host string, command string, decision policy.Decision, exitCode *int, outputHash string, durationMS int64, filtered ...output.FilterResult) audit.Record {
 	filterResult := output.FilterResult{}
 	if len(filtered) > 0 {
 		filterResult = filtered[0]
@@ -1590,8 +1687,6 @@ func baseAuditRecord(reqID string, sessionCtx session.Context, event audit.Event
 		SessionID:       sessionCtx.ID,
 		SessionLabel:    sessionCtx.Label,
 		Event:           event,
-		Agent:           os.Getenv("AGENTSSH_AGENT"),
-		Skill:           skill,
 		Host:            host,
 		Cmd:             command,
 		PolicyAction:    string(decision.Action),

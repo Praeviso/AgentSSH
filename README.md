@@ -61,7 +61,7 @@ That is the whole loop: you own hosts, policy, and the audit trail through `agen
 
 - **`d` Discover** — opens an overlay of hosts you can likely already reach, gathered from `~/.ssh/config` and `~/.ssh/known_hosts`, annotated with key/known-hosts/in-inventory status. `space` selects, `p` probes (a real connection test), `enter`/`i` imports the connectable, not-yet-known ones into your inventory. `esc`/`q` closes.
 - **`a` Add** — a form with `name / addr / user / port / tags / ssh_config_alias / identity_file / password`. `identity_file` points at a private key for that host. `password` is optional and **masked**; it is stored encrypted, never in `inventory.yaml`. Setting a password in the TUI requires `AGENTSSH_MASTER_PASSWORD` to be set (bubbletea owns the terminal, so there is no separate master prompt) — otherwise use `agentssh secret set`.
-- **`t` Test** — runs a real connectivity check against the selected host and shows `OK` or an actionable hint (missing credentials, unknown host key, unreachable, …).
+- **`t` Test** — runs a real connectivity check against the selected host, updates its detected OS metadata, and shows `OK` or an actionable hint (missing credentials, unknown host key, unreachable, …).
 
 The remote side is always your responsibility — AgentSSH never touches a server's `authorized_keys`; it only connects with the credentials you give it and tells you what to fix when a connection fails.
 
@@ -169,12 +169,12 @@ These are the only commands an agent needs. They go through inventory resolution
 ```bash
 agentssh hosts                                   # list targets (name + tags only; no credentials)
 agentssh hosts --json
-agentssh run web-1 --skill restart-service -- systemctl status nginx
+agentssh run web-1 -- systemctl status nginx
 agentssh run web-1 --json -- uptime
 agentssh status <req_id>
 ```
 
-`--skill <name>` links the run to a playbook in audit records and the TUI. On a connection failure, `run` prints a credential-free hint and exits 9.
+On a connection failure, `run` prints a credential-free hint and exits 9.
 
 ## CLI for humans
 
@@ -217,7 +217,7 @@ Example Anthropic Agent Skill-style playbooks live under `skills/`:
 - `skills/restart-service/SKILL.md` — safe systemd service diagnosis and restart.
 - `skills/investigate-cpu/SKILL.md` — mostly read-only high-CPU investigation.
 
-These are procedural knowledge for agents, not RPC tools: they instruct the agent to call `agentssh run --skill <name> ...` while the CLI enforces policy and audit.
+These are procedural knowledge for agents, not RPC tools: they instruct the agent how to call `agentssh run ...` while the CLI enforces policy and audit. AgentSSH does not record or trust playbook names.
 
 See the project documents for the product and implementation contract:
 

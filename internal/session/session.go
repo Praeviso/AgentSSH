@@ -36,56 +36,103 @@ type Resolver struct {
 	NewID func() (string, error)
 }
 
-// Context is the resolved session information for a run.
+// Context is the resolved session information for a run. A session is bound to
+// exactly one host: Host records which host this session id belongs to, so a
+// session never spans more than one target.
 type Context struct {
 	ID    string
+	Host  string
 	Label string
 }
 
-// Resolve follows --session, AGENTSSH_SESSION, then current-session pointer.
-func (r Resolver) Resolve(explicitID string, label string) (Context, error) {
+// Resolve binds a session id to host, following --session, AGENTSSH_SESSION, then
+// the per-host current-session pointer. The pointer is keyed by host so resuming
+// within the idle window never crosses hosts — a run against a different host
+// always gets that host's own session, enforcing one-session-per-host.
+func (r Resolver) Resolve(host string, explicitID string, label string) (Context, error) {
 	if explicitID != "" {
-		return Context{ID: explicitID, Label: label}, nil
+		return Context{ID: explicitID, Host: host, Label: label}, nil
 	}
 	if envID := os.Getenv(EnvSession); envID != "" {
-		return Context{ID: envID, Label: label}, nil
+		return Context{ID: envID, Host: host, Label: label}, nil
 	}
 
 	clock := r.clock()
 	now := clock.Now().UTC()
-	pointer, err := readPointer(r.Path)
+	pointers, err := readPointers(r.Path)
 	if err != nil {
 		return Context{}, err
 	}
-	if pointer.ID != "" && now.Sub(pointer.LastActivity) <= idleWindow {
-		return Context{ID: pointer.ID, Label: label}, nil
+	if current, ok := pointers.Hosts[host]; ok && current.ID != "" && now.Sub(current.LastActivity) <= idleWindow {
+		return Context{ID: current.ID, Host: host, Label: label}, nil
 	}
 
 	newID, err := r.newID()
 	if err != nil {
 		return Context{}, err
 	}
-	if err := r.Update(newID, now); err != nil {
+	if err := r.Update(host, newID, now); err != nil {
 		return Context{}, err
 	}
-	return Context{ID: newID, Label: label}, nil
+	return Context{ID: newID, Host: host, Label: label}, nil
 }
 
-// Update writes the current-session pointer activity time.
-func (r Resolver) Update(id string, when time.Time) error {
-	if id == "" || r.Path == "" {
+// Update writes the current-session pointer activity time for host.
+func (r Resolver) Update(host string, id string, when time.Time) error {
+	if id == "" || host == "" || r.Path == "" {
 		return nil
 	}
 	if err := os.MkdirAll(filepath.Dir(r.Path), 0o700); err != nil {
 		return fmt.Errorf("create session directory: %w", err)
 	}
-	data, err := json.Marshal(pointer{ID: id, LastActivity: when.UTC()})
+	current, err := readPointers(r.Path)
+	if err != nil {
+		return err
+	}
+	if current.Hosts == nil {
+		current.Hosts = map[string]pointer{}
+	}
+	current.Hosts[host] = pointer{ID: id, LastActivity: when.UTC()}
+	data, err := json.Marshal(current)
 	if err != nil {
 		return fmt.Errorf("marshal session pointer: %w", err)
 	}
-	if err := os.WriteFile(r.Path, append(data, '\n'), 0o600); err != nil {
+	// Write atomically (temp + rename) so a concurrent or interrupted write can't
+	// leave a torn file that readPointers would treat as empty — that would reset
+	// every host's pointer at once. The residual read-modify-write race between
+	// two processes can still lose an update, but the cost is only a fresh session
+	// for one host (pointers are ephemeral), never a corrupt file.
+	return writeFileAtomic(r.Path, append(data, '\n'))
+}
+
+func writeFileAtomic(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	file, err := os.CreateTemp(dir, "session-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temporary session file: %w", err)
+	}
+	tempName := file.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tempName)
+		}
+	}()
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("chmod temporary session file: %w", err)
+	}
+	if _, err := file.Write(data); err != nil {
+		_ = file.Close()
 		return fmt.Errorf("write session pointer: %w", err)
 	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close temporary session file: %w", err)
+	}
+	if err := os.Rename(tempName, path); err != nil {
+		return fmt.Errorf("replace session pointer: %w", err)
+	}
+	cleanup = false
 	return nil
 }
 
@@ -117,25 +164,42 @@ type pointer struct {
 	LastActivity time.Time `json:"last_activity"`
 }
 
-func readPointer(path string) (pointer, error) {
+// pointers is the on-disk current-session file: a per-host map so each host
+// tracks its own active session id independently.
+type pointers struct {
+	Hosts map[string]pointer `json:"hosts"`
+}
+
+// readPointers loads the per-host pointer file. A missing file is an empty set.
+// A file in the legacy single-pointer format (no "hosts" key) is treated as
+// empty: sessions are ephemeral (30-min idle window), so starting fresh is
+// harmless and avoids binding a pre-existing global session to a host.
+func readPointers(path string) (pointers, error) {
+	if path == "" {
+		return pointers{}, nil
+	}
 	data, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) || path == "" {
-		return pointer{}, nil
+	if errors.Is(err, os.ErrNotExist) {
+		return pointers{}, nil
 	}
 	if err != nil {
-		return pointer{}, fmt.Errorf("read session pointer: %w", err)
+		return pointers{}, fmt.Errorf("read session pointer: %w", err)
 	}
-	var current pointer
+	var current pointers
 	if err := json.Unmarshal(data, &current); err != nil {
-		return pointer{}, fmt.Errorf("parse session pointer: %w", err)
+		// Unparseable (or legacy single-pointer) file: start fresh rather than fail.
+		return pointers{}, nil
 	}
 	return current, nil
 }
 
-// Summary is one aggregated session row from audit.log.
+// Summary is one aggregated session row from audit.log. A session is bound to a
+// single host (see Context.Host), so Host is scalar; legacy multi-host audit
+// data resolves to the first host seen for that session id.
 type Summary struct {
 	ID           string
 	Label        string
+	Host         string // the host this session is bound to (first non-empty seen)
 	Start        string
 	End          string
 	CommandCount int
@@ -159,6 +223,9 @@ func Summaries(records []audit.Record) []Summary {
 		}
 		if record.SessionLabel != "" {
 			summary.Label = record.SessionLabel
+		}
+		if record.Host != "" && summary.Host == "" {
+			summary.Host = record.Host
 		}
 		if summary.Start == "" || record.TS < summary.Start {
 			summary.Start = record.TS
