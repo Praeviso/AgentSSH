@@ -40,8 +40,6 @@ func newPolicySection(path string, inv inventory.Inventory, cfg policy.Config, s
 	return policySection{path: path, inventory: inv, config: cfg, styles: st, input: ti, err: err}
 }
 
-func (s policySection) title() string { return "Policy" }
-
 func (s policySection) capturing() bool { return s.input.Focused() }
 
 // atRoot reports whether the pane is at its base state (no test input open), so

@@ -208,21 +208,7 @@ func (m model) verifyCommand() tea.Cmd {
 // Returns nil when no verify function is wired (e.g. in tests).
 func (m model) Init() tea.Cmd { return m.verifyCommand() }
 
-func (m model) title() string { return "Sessions" }
-
 func (m model) capturing() bool { return m.focus == focusFilter }
-
-func (m model) withSessionFilter(id string) model {
-	m.sessionFocus = id
-	m.filterQuery = ""
-	m.prevFilterQuery = ""
-	m.filter.SetValue("")
-	m.filter.Blur()
-	m.focus = focusList
-	m.cursor = 0
-	m.rebuildGroups()
-	return m
-}
 
 // withHostFilter scopes the viewer to the sessions bound to host, resetting any
 // active text filter, session focus, and cursor. Used by the host detail screen.

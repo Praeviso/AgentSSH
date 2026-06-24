@@ -134,8 +134,6 @@ func newHostsSection(paths config.Paths, renderer *lipgloss.Renderer, st appStyl
 	return s
 }
 
-func (s hostsSection) title() string { return "Hosts" }
-
 // selectedHost returns the host name under the grid cursor, or "".
 func (s hostsSection) selectedHost() string {
 	if s.cursor < 0 || s.cursor >= len(s.names) {
@@ -1287,15 +1285,6 @@ func discoveryStatusCell(g theme.Glyphs, candidate discovery.Candidate) string {
 func sortedHostNames(hosts map[string]inventory.Host) []string {
 	names := make([]string, 0, len(hosts))
 	for name := range hosts {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	return names
-}
-
-func sortedGroupNames(groups map[string]inventory.Group) []string {
-	names := make([]string, 0, len(groups))
-	for name := range groups {
 		names = append(names, name)
 	}
 	sort.Strings(names)
