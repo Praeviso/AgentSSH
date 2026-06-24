@@ -100,7 +100,6 @@ def canonical(record):
     fields["session_id"] = record["session_id"]
     fields["session_label"] = record["session_label"]
     fields["event"] = record["event"]
-    fields["agent"] = record["agent"]
     fields["host"] = record["host"]
     fields["cmd"] = record["cmd"]
     fields["policy_action"] = record["policy_action"]
@@ -124,7 +123,6 @@ def make_record(seq, ts, req, session, label, event, host, cmd, action, rule, *,
     record["session_id"] = session
     record["session_label"] = label
     record["event"] = event
-    record["agent"] = "codex-e2e"
     record["host"] = host
     record["cmd"] = cmd
     record["policy_action"] = action

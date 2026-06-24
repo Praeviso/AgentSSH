@@ -33,7 +33,6 @@ type Record struct {
 	SessionID       string `json:"session_id"`
 	SessionLabel    string `json:"session_label"`
 	Event           Event  `json:"event"`
-	Agent           string `json:"agent"`
 	Host            string `json:"host"`
 	Cmd             string `json:"cmd"`
 	PolicyAction    string `json:"policy_action"`
@@ -220,7 +219,6 @@ type canonicalRecord struct {
 	SessionID       string `json:"session_id"`
 	SessionLabel    string `json:"session_label"`
 	Event           Event  `json:"event"`
-	Agent           string `json:"agent"`
 	Host            string `json:"host"`
 	Cmd             string `json:"cmd"`
 	PolicyAction    string `json:"policy_action"`
@@ -241,7 +239,6 @@ func canonicalJSON(record Record) ([]byte, error) {
 		SessionID:       record.SessionID,
 		SessionLabel:    record.SessionLabel,
 		Event:           record.Event,
-		Agent:           record.Agent,
 		Host:            record.Host,
 		Cmd:             record.Cmd,
 		PolicyAction:    record.PolicyAction,

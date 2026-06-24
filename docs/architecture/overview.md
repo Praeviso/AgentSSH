@@ -157,7 +157,6 @@ run web-1 -- sudo systemctl restart nginx
   "session_id": "s_91be0c",
   "session_label": "fix 502 on web-1",
   "event": "completed",
-  "agent": "claude-code",
   "host": "web-1",
   "cmd": "sudo systemctl restart nginx",
   "policy_action": "allow",

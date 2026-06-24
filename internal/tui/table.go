@@ -231,8 +231,11 @@ func fitCell(value string, width int, right bool) string {
 // Callers pass an already-windowed slice of full (untruncated) rows; this helper
 // fits, truncates, and aligns them. It replaces the flat strings.Join rendering
 // across the Hosts, Discover, Policy, and Sessions tabs.
-func renderTable(st appStyles, cols []tableColumn, rows [][]string, cursor, avail int) string {
-	widths := tableWidths(cols, rows, avail)
+func renderTable(st appStyles, cols []tableColumn, rows [][]string, cursor, avail int, fill bool) string {
+	// fill grows columns to span avail — used for navigable selection bands and for
+	// panel-framed tables that should fill their box. Otherwise the table keeps its
+	// natural width so it doesn't trail a sea of padding across a wide frame.
+	widths := tableWidths(cols, rows, avail, fill)
 
 	headers := make([]string, 0, len(cols)+1)
 	headers = append(headers, "") // selection marker column
@@ -286,10 +289,13 @@ func renderTable(st appStyles, cols []tableColumn, rows [][]string, cursor, avai
 
 // tableWidths computes the per-column content widths for renderTable: the natural
 // width of each column (header vs widest cell), fitted into the content budget
-// that avail leaves after the marker column and the two-space cell padding.
-func tableWidths(cols []tableColumn, rows [][]string, avail int) []int {
+// that avail leaves after the marker column and the two-space cell padding. When
+// fill is false the budget is capped at the natural (clamped) sum, so columns
+// shrink to fit a narrow frame but never grow to pad out a wide one.
+func tableWidths(cols []tableColumn, rows [][]string, avail int, fill bool) []int {
 	natural := make([]int, len(cols))
 	fits := make([]colFit, len(cols))
+	clampedSum := 0
 	for i, c := range cols {
 		floor := c.min
 		if floor <= 0 {
@@ -305,10 +311,14 @@ func tableWidths(cols []tableColumn, rows [][]string, avail int) []int {
 		}
 		natural[i] = nat
 		fits[i] = colFit{min: floor, max: c.max, weight: c.weight}
+		clampedSum += clampCol(nat, floor, c.max)
 	}
 	// Budget = avail minus the marker column (1 content + 1 right pad) and the
 	// left+right padding (2) every data column carries. Mirrors the measured
 	// lipgloss/table overhead: total = 2 + Σ(width + 2).
 	budget := avail - 2 - 2*len(cols)
+	if !fill && clampedSum < budget {
+		budget = clampedSum
+	}
 	return fitColumns(fits, natural, budget)
 }

@@ -22,7 +22,6 @@ import (
 type sessionGroup struct {
 	id           string
 	label        string
-	agent        string
 	start        string
 	end          string
 	commandCount int
@@ -62,7 +61,6 @@ type keyMap struct {
 	Toggle  key.Binding
 	Detail  key.Binding
 	Session key.Binding
-	Verify  key.Binding
 	Filter  key.Binding
 	Back    key.Binding
 }
@@ -74,7 +72,6 @@ func defaultKeys() keyMap {
 		Toggle:  key.NewBinding(key.WithKeys("enter", " ")),
 		Detail:  key.NewBinding(key.WithKeys("d")),
 		Session: key.NewBinding(key.WithKeys("l")),
-		Verify:  key.NewBinding(key.WithKeys("v")),
 		Filter:  key.NewBinding(key.WithKeys("/")),
 		Back:    key.NewBinding(key.WithKeys("esc")),
 	}
@@ -129,11 +126,11 @@ type model struct {
 	filterQuery     string
 	prevFilterQuery string
 	sessionFocus    string
+	hostFilter      string // when set, only sessions bound to this host are shown
 	detailGroup     int
 	runCursor       int
 	keys            keyMap
 	styles          styles
-	verifying       bool
 	verifyDone      bool
 	verifyResult    audit.VerifyResult
 	verifyErr       error
@@ -155,7 +152,6 @@ func newModel(records []audit.Record, hosts map[string]HostMeta, st styles, veri
 		keys:        defaultKeys(),
 		styles:      st,
 		verifyFn:    verify,
-		verifying:   verify != nil,
 		detailGroup: -1,
 	}
 	m.groups = buildGroups(records, "", "")
@@ -164,8 +160,24 @@ func newModel(records []audit.Record, hosts map[string]HostMeta, st styles, veri
 }
 
 func (m *model) rebuildGroups() {
-	m.groups = buildGroups(m.allRecords, m.filterQuery, m.sessionFocus)
+	records := m.allRecords
+	if m.hostFilter != "" {
+		records = recordsForHost(records, m.hostFilter)
+	}
+	m.groups = buildGroups(records, m.filterQuery, m.sessionFocus)
 	m.rebuildRows()
+}
+
+// recordsForHost keeps only the audit records bound to host (exact match), so the
+// session viewer in a host's detail shows that host's sessions and no others.
+func recordsForHost(records []audit.Record, host string) []audit.Record {
+	out := make([]audit.Record, 0, len(records))
+	for _, r := range records {
+		if r.Host == host {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 func (m *model) rebuildRows() {
@@ -196,7 +208,7 @@ func (m model) verifyCommand() tea.Cmd {
 // Returns nil when no verify function is wired (e.g. in tests).
 func (m model) Init() tea.Cmd { return m.verifyCommand() }
 
-func (m model) title() string { return "Audit" }
+func (m model) title() string { return "Sessions" }
 
 func (m model) capturing() bool { return m.focus == focusFilter }
 
@@ -210,6 +222,28 @@ func (m model) withSessionFilter(id string) model {
 	m.cursor = 0
 	m.rebuildGroups()
 	return m
+}
+
+// withHostFilter scopes the viewer to the sessions bound to host, resetting any
+// active text filter, session focus, and cursor. Used by the host detail screen.
+func (m model) withHostFilter(host string) model {
+	m.hostFilter = host
+	m.sessionFocus = ""
+	m.filterQuery = ""
+	m.prevFilterQuery = ""
+	m.filter.SetValue("")
+	m.filter.Blur()
+	m.focus = focusList
+	m.cursor = 0
+	m.detailGroup = -1
+	m.rebuildGroups()
+	return m
+}
+
+// atRoot reports whether the viewer is at its base list (no command detail, text
+// filter, or session focus open), so the shell's esc exits the detail screen.
+func (m model) atRoot() bool {
+	return m.focus == focusList && m.sessionFocus == "" && m.filterQuery == ""
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -276,11 +310,6 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.rebuildGroups()
 			}
 		}
-	case key.Matches(msg, m.keys.Verify):
-		if m.verifyFn != nil {
-			m.verifying = true
-		}
-		return m, m.verifyCommand()
 	case key.Matches(msg, m.keys.Filter):
 		m.focus = focusFilter
 		m.prevFilterQuery = m.filterQuery
@@ -325,11 +354,6 @@ func (m model) updateDetail(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if g, ok := m.detailSession(); ok && m.runCursor < len(g.runs)-1 {
 			m.runCursor++
 		}
-	case key.Matches(msg, m.keys.Verify):
-		if m.verifyFn != nil {
-			m.verifying = true
-		}
-		return m, m.verifyCommand()
 	}
 	return m, nil
 }
@@ -363,7 +387,6 @@ func (m model) updateFilter(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) applyVerify(msg verifyMsg) {
-	m.verifying = false
 	m.verifyDone = true
 	m.verifyResult = msg.result
 	m.verifyErr = msg.err
@@ -378,23 +401,32 @@ func (m model) View() string {
 	if !m.ready {
 		return "loading…"
 	}
-	bar := m.styles.bar.Render(m.statusBar())
+	// The bare "Sessions" label is redundant with the breadcrumb above, so the
+	// status bar appears only when it carries state (active filter, session focus,
+	// or an audit-integrity warning).
+	var parts []string
+	if bar := m.statusBar(); bar != "" {
+		parts = append(parts, m.styles.bar.Render(bar))
+	}
 	if m.focus == focusDetail {
-		return lipgloss.JoinVertical(lipgloss.Left, bar, m.renderSessionDetail())
+		parts = append(parts, m.renderSessionDetail())
+		return lipgloss.JoinVertical(lipgloss.Left, parts...)
 	}
 	// MaxWidth (not Width) truncates an over-wide line instead of wrapping it, so a
 	// row that can't fit even at all-min columns (a sub-resize terminal) clips at
 	// the frame edge rather than spilling onto a second line.
-	body := m.styles.normal.MaxWidth(m.contentWidth()).Render(m.renderList())
-
+	parts = append(parts, m.styles.normal.MaxWidth(m.contentWidth()).Render(m.renderList()))
 	if m.focus == focusFilter {
-		return lipgloss.JoinVertical(lipgloss.Left, bar, body, m.filter.View())
+		parts = append(parts, m.filter.View())
 	}
-	return lipgloss.JoinVertical(lipgloss.Left, bar, body)
+	return lipgloss.JoinVertical(lipgloss.Left, parts...)
 }
 
+// statusBar is the contextual rail above the list/detail: it shows an active
+// filter, session focus, or an audit-integrity warning, and is empty otherwise
+// (the pane identity already lives in the shell breadcrumb).
 func (m model) statusBar() string {
-	parts := []string{"Audit"}
+	var parts []string
 	if m.filterQuery != "" {
 		parts = append(parts, fmt.Sprintf("filter=%q", m.filterQuery))
 	}
@@ -407,11 +439,20 @@ func (m model) statusBar() string {
 	return strings.Join(parts, " · ")
 }
 
+// barLines is the number of lines the status bar occupies (0 when it is empty).
+func (m model) barLines() int {
+	if m.statusBar() == "" {
+		return 0
+	}
+	return 1
+}
+
+// chainBadge is the audit integrity signal. Verification runs automatically on
+// launch and is transparent to the operator: while it is in flight, or once it
+// confirms the chain is intact, this shows nothing. It surfaces only when there is
+// a problem to report — a verification error, or a detected tamper break.
 func (m model) chainBadge() string {
 	if !m.verifyDone {
-		if m.verifying {
-			return m.styles.dim.Render("审计日志校验中")
-		}
 		return ""
 	}
 	if m.verifyErr != nil {
@@ -423,35 +464,16 @@ func (m model) chainBadge() string {
 	return m.styles.bad.Render(fmt.Sprintf("审计日志异常 seq=%d", m.verifyResult.BrokenSeq))
 }
 
-func (m model) chainStatus() string {
-	if !m.verifyDone {
-		if m.verifying {
-			return m.styles.dim.Render("链 … 校验中")
-		}
-		return m.styles.dim.Render("链 ? (press v)")
-	}
-	if m.verifyErr != nil {
-		return m.styles.bad.Render("链 verify error")
-	}
-	if m.verifyResult.OK {
-		if m.verifyResult.Count == 0 {
-			return m.styles.ok.Render("链 " + m.styles.glyphs.Check + " 完整 (empty)")
-		}
-		return m.styles.ok.Render(fmt.Sprintf("链 %s 完整 (0..%d)", m.styles.glyphs.Check, m.verifyResult.Count-1))
-	}
-	return m.styles.bad.Render(fmt.Sprintf("链 %s 断于 seq=%d · %s", m.styles.glyphs.Cross, m.verifyResult.BrokenSeq, reasonText(m.verifyResult.Reason)))
-}
-
 func (m model) helpKeyMap() help.KeyMap {
 	switch {
 	case m.focus == focusFilter:
 		return helpMap{short: []key.Binding{hk("enter", "apply"), hk("esc", "cancel")}}
 	case m.focus == focusDetail:
-		return helpMap{short: []key.Binding{hk("j/k", "commands"), hk("esc", "sessions"), hk("v", "verify")}}
+		return helpMap{short: []key.Binding{hk("j/k", "commands"), hk("esc", "sessions")}}
 	case m.sessionFocus != "":
-		return helpMap{short: []key.Binding{hk("j/k", "move"), hk("enter", "open"), hk("v", "verify"), hk("esc", "exit focus")}}
+		return helpMap{short: []key.Binding{hk("j/k", "move"), hk("enter", "open"), hk("esc", "exit focus")}}
 	default:
-		return helpMap{short: []key.Binding{hk("j/k", "move"), hk("enter", "open"), hk("d", "open"), hk("l", "focus session"), hk("v", "verify"), hk("/", "filter")}}
+		return helpMap{short: []key.Binding{hk("j/k", "move"), hk("enter", "open"), hk("d", "open"), hk("l", "focus session"), hk("/", "filter")}}
 	}
 }
 
@@ -477,13 +499,10 @@ func (m model) detailWidth() int {
 }
 
 func (m model) detailCommandHeight() int {
-	// Reserve space for the status bar, session title, summary, divider, and
-	// footer. Each command result currently renders as two lines plus spacing.
-	h := m.h - 7
-	if h < 2 {
-		return 1
-	}
-	rows := h / 3
+	// Chrome above the command rows: the one-line session header, the divider and
+	// its blank line, and the table header (four lines), plus the optional status
+	// bar. Each command renders as a single table row.
+	rows := m.h - 4 - m.barLines()
 	if rows < 1 {
 		return 1
 	}
@@ -491,9 +510,9 @@ func (m model) detailCommandHeight() int {
 }
 
 func (m model) listHeight() int {
-	// The audit body is the status bar line plus the list (plus the filter input
-	// when filtering); m.h is the height the shell allocated to this section.
-	h := m.h - 1
+	// The audit body is the (optional) status bar plus the list (plus the filter
+	// input when filtering); m.h is the height the shell allocated to this section.
+	h := m.h - m.barLines()
 	if m.focus == focusFilter {
 		h--
 	}
@@ -505,7 +524,10 @@ func (m model) listHeight() int {
 
 func (m model) renderList() string {
 	if len(m.rows) == 0 {
-		return m.styles.dim.Render("No audited sessions yet.\nThey appear after the agent runs: agentssh run <host> -- <cmd>")
+		if m.hostFilter != "" {
+			return m.styles.dim.Render(fmt.Sprintf("No sessions for %s yet.\nThey appear after the agent runs: agentssh run %s -- <cmd>", m.hostFilter, m.hostFilter))
+		}
+		return m.styles.dim.Render("No sessions recorded yet.\nThey appear after the agent runs: agentssh run <host> -- <cmd>")
 	}
 	height := m.listHeight() - 1 // reserve one line for the column header
 	if height < 1 {
@@ -520,8 +542,8 @@ func (m model) renderList() string {
 		end = len(m.rows)
 	}
 	var b strings.Builder
-	widths := auditListWidths(m.styles.glyphs, m.groups[start:end], m.hosts, m.contentWidth())
-	b.WriteString(m.styles.dim.Render(auditListHeader(widths)))
+	widths := sessionListWidths(m.styles.glyphs, m.groups[start:end], m.contentWidth())
+	b.WriteString(m.styles.dim.Render(sessionListHeader(widths)))
 	b.WriteString("\n")
 	for i := start; i < end; i++ {
 		b.WriteString(m.renderRow(i, widths))
@@ -530,132 +552,125 @@ func (m model) renderList() string {
 	return b.String()
 }
 
-func (m model) renderRow(i int, widths auditListColumnWidths) string {
+func (m model) renderRow(i int, widths sessionListColumnWidths) string {
 	r := m.rows[i]
 	g := m.groups[r.gi]
 	cursor := "  "
 	if i == m.cursor {
 		cursor = m.styles.cursor.Render("> ")
 	}
-	label := labelOr(g.label)
-	unit := "commands"
-	if g.commandCount == 1 {
-		unit = "command"
-	}
-	status := sessionStatus(m.styles.glyphs, g)
-	updated := "updated " + clockOf(g.end)
-	host := sessionHosts(g, m.hosts)
-	counts := sessionCounts(g)
-	sessionID := g.id
-	if sessionID == "" {
-		sessionID = "(none)"
-	}
-	cmds := fmt.Sprintf("%d %s", g.commandCount, unit)
 	cells := []string{
-		padRight(truncate(status, widths.status), widths.status),
-		padRight(truncate(sessionID, widths.session), widths.session),
-		padRight(truncate(label, widths.label), widths.label),
-		padRight(truncate(updated, widths.updated), widths.updated),
-		padRight(truncate(cmds, widths.commands), widths.commands),
-		padRight(truncate(host, widths.hosts), widths.hosts),
-		truncate(counts, widths.flags),
+		padRight(truncate(sessionListID(g), widths.id), widths.id),
+		padRight(truncate(labelOr(g.label), widths.label), widths.label),
+		padRight(truncate(sessionWindow(g), widths.window), widths.window),
+		padLeft(strconv.Itoa(g.commandCount), widths.cmds),
+		padLeft(sessionCountCell(m.styles.glyphs, g.denied), widths.den),
+		padLeft(sessionCountCell(m.styles.glyphs, g.failed), widths.fail),
 	}
 	head := strings.Join(cells, "  ")
-	if counts == "" {
-		head = strings.TrimRight(head, " ")
-	}
-	switch {
-	case sessionHasBrokenSeq(g, m.brokenSeq):
+	// Calm palette: rows render in the default color. Only a tamper-evidence break
+	// — the one state an audit viewer must never let blend in — is flagged in red.
+	if sessionHasBrokenSeq(g, m.brokenSeq) {
 		return cursor + m.styles.bad.Render(head+"  "+m.styles.glyphs.Warn+" TAMPERED")
-	case g.failed > 0:
-		return cursor + m.styles.bad.Render(head)
-	case g.denied > 0:
-		return cursor + m.styles.deny.Render(head)
-	case g.running > 0:
-		return cursor + m.styles.header.Render(head)
-	default:
-		return cursor + head
 	}
+	return cursor + head
 }
 
-type auditListColumnWidths struct {
-	status   int
-	session  int
-	label    int
-	updated  int
-	commands int
-	hosts    int
-	flags    int
+type sessionListColumnWidths struct {
+	id     int
+	label  int
+	window int
+	cmds   int
+	den    int
+	fail   int
 }
 
-// auditListWidths fits the seven session-list columns into availableWidth so the
-// row stays on one line at the default terminal size and spreads to fill a wide
-// one (see fitColumns). LABEL and HOSTS carry the scanning value, so they take
-// the lion's share of slack and the brunt of the squeeze; STATUS/UPDATED/COMMANDS
-// are rigid so the glyph word, the clock, and the count never truncate.
-func auditListWidths(glyphs theme.Glyphs, groups []sessionGroup, hosts map[string]HostMeta, availableWidth int) auditListColumnWidths {
-	nat := auditListColumnWidths{
-		status:   lipgloss.Width("STATUS"),
-		session:  lipgloss.Width("SESSION"),
-		label:    lipgloss.Width("LABEL"),
-		updated:  lipgloss.Width("UPDATED"),
-		commands: lipgloss.Width("COMMANDS"),
-		hosts:    lipgloss.Width("HOSTS"),
-		flags:    lipgloss.Width("FLAGS"),
+// sessionListWidths fits the six session-list columns into availableWidth so the
+// row stays on one line at the default terminal size and spreads to fill a wide one
+// (see fitColumns). LABEL carries the scanning value, so it absorbs the slack on a
+// wide frame and the brunt of a narrow squeeze; WINDOW and the CMDS/DEN/FAIL counts
+// are rigid so the clock span and the numbers never truncate. The list is always
+// scoped to one host (the detail screen), so it has no HOSTS column.
+func sessionListWidths(glyphs theme.Glyphs, groups []sessionGroup, availableWidth int) sessionListColumnWidths {
+	nat := sessionListColumnWidths{
+		id:     lipgloss.Width("ID"),
+		label:  lipgloss.Width("LABEL"),
+		window: lipgloss.Width("WINDOW"),
+		cmds:   lipgloss.Width("CMDS"),
+		den:    lipgloss.Width("DEN"),
+		fail:   lipgloss.Width("FAIL"),
 	}
 	for _, g := range groups {
-		sessionID := g.id
-		if sessionID == "" {
-			sessionID = "(none)"
-		}
-		unit := "commands"
-		if g.commandCount == 1 {
-			unit = "command"
-		}
-		nat.status = maxInt(nat.status, lipgloss.Width(sessionStatus(glyphs, g)))
-		nat.session = maxInt(nat.session, lipgloss.Width(sessionID))
+		nat.id = maxInt(nat.id, lipgloss.Width(sessionListID(g)))
 		nat.label = maxInt(nat.label, lipgloss.Width(labelOr(g.label)))
-		nat.updated = maxInt(nat.updated, lipgloss.Width("updated "+clockOf(g.end)))
-		nat.commands = maxInt(nat.commands, lipgloss.Width(fmt.Sprintf("%d %s", g.commandCount, unit)))
-		nat.hosts = maxInt(nat.hosts, lipgloss.Width(sessionHosts(g, hosts)))
-		nat.flags = maxInt(nat.flags, lipgloss.Width(sessionCounts(g)))
+		nat.window = maxInt(nat.window, lipgloss.Width(sessionWindow(g)))
+		nat.cmds = maxInt(nat.cmds, lipgloss.Width(strconv.Itoa(g.commandCount)))
+		nat.den = maxInt(nat.den, lipgloss.Width(sessionCountCell(glyphs, g.denied)))
+		nat.fail = maxInt(nat.fail, lipgloss.Width(sessionCountCell(glyphs, g.failed)))
 	}
 
 	fits := []colFit{
-		{min: nat.status, max: nat.status},                   // STATUS: rigid at content
-		{min: lipgloss.Width("SESSION"), max: 16, weight: 1}, // SESSION
-		{min: lipgloss.Width("LABEL"), max: 48, weight: 3},   // LABEL
-		{min: nat.updated, max: nat.updated},                 // UPDATED: rigid (fixed clock)
-		{min: nat.commands, max: nat.commands},               // COMMANDS: rigid
-		{min: lipgloss.Width("HOSTS"), max: 48, weight: 2},   // HOSTS
-		{min: lipgloss.Width("FLAGS"), max: 24, weight: 1},   // FLAGS (anomaly counts)
+		// ID is rigid at its (capped) content width: a session identifier must never
+		// truncate to a stub the operator can't act on, so it holds its width and the
+		// squeeze falls on LABEL instead.
+		{min: lipgloss.Width("ID"), max: 18, weight: 0},
+		// LABEL is the uncapped stretch column: it takes the brunt of a narrow squeeze
+		// and absorbs all the slack on a wide frame, so the row fills the terminal
+		// naturally instead of capping short and leaving a dead strip on the right.
+		{min: lipgloss.Width("LABEL"), max: 0, weight: 3},
+		{min: nat.window, max: nat.window}, // WINDOW: rigid clock span
+		{min: nat.cmds, max: nat.cmds},     // CMDS: rigid count
+		{min: nat.den, max: nat.den},       // DEN: rigid count
+		{min: nat.fail, max: nat.fail},     // FAIL: rigid count
 	}
-	natural := []int{nat.status, nat.session, nat.label, nat.updated, nat.commands, nat.hosts, nat.flags}
-	// Budget = availableWidth minus the 2-col cursor and the six 2-space gutters
-	// between the seven columns.
-	w := fitColumns(fits, natural, availableWidth-2-2*6)
-	return auditListColumnWidths{
-		status:   w[0],
-		session:  w[1],
-		label:    w[2],
-		updated:  w[3],
-		commands: w[4],
-		hosts:    w[5],
-		flags:    w[6],
+	natural := []int{nat.id, nat.label, nat.window, nat.cmds, nat.den, nat.fail}
+	// Budget = availableWidth minus the 2-col cursor and the five 2-space gutters
+	// between the six columns.
+	w := fitColumns(fits, natural, availableWidth-2-2*5)
+	return sessionListColumnWidths{
+		id:     w[0],
+		label:  w[1],
+		window: w[2],
+		cmds:   w[3],
+		den:    w[4],
+		fail:   w[5],
 	}
 }
 
-func auditListHeader(w auditListColumnWidths) string {
+func sessionListHeader(w sessionListColumnWidths) string {
 	cells := []string{
-		padRight("STATUS", w.status),
-		padRight("SESSION", w.session),
+		padRight("ID", w.id),
 		padRight("LABEL", w.label),
-		padRight("UPDATED", w.updated),
-		padRight("COMMANDS", w.commands),
-		padRight("HOSTS", w.hosts),
-		"FLAGS",
+		padRight("WINDOW", w.window),
+		padLeft("CMDS", w.cmds),
+		padLeft("DEN", w.den),
+		padLeft("FAIL", w.fail),
 	}
 	return "  " + strings.Join(cells, "  ")
+}
+
+// sessionListID is the session identifier shown in the list; the synthetic
+// no-session bucket (id "") renders as "(none)".
+func sessionListID(g sessionGroup) string {
+	if g.id == "" {
+		return "(none)"
+	}
+	return g.id
+}
+
+// sessionWindow renders a session's active span as start–end wall clocks, far
+// narrower than two RFC3339 stamps and stable in width for a rigid column.
+func sessionWindow(g sessionGroup) string {
+	return clockOf(g.start) + "–" + clockOf(g.end)
+}
+
+// sessionCountCell shows n, or the absent glyph ("·"/".") when zero, so a non-zero
+// denied/failed count stands out in a column of mostly-zeros without needing color.
+func sessionCountCell(glyphs theme.Glyphs, n int) string {
+	if n == 0 {
+		return glyphs.Absent
+	}
+	return strconv.Itoa(n)
 }
 
 func padRight(value string, width int) string {
@@ -664,6 +679,14 @@ func padRight(value string, width int) string {
 		return value
 	}
 	return value + strings.Repeat(" ", padding)
+}
+
+func padLeft(value string, width int) string {
+	padding := width - lipgloss.Width(value)
+	if padding <= 0 {
+		return value
+	}
+	return strings.Repeat(" ", padding) + value
 }
 
 // ---- pure helpers (unit-tested) ----
@@ -758,9 +781,6 @@ func makeGroup(id string, runs []runSummary) sessionGroup {
 		}
 		if run.end > g.end {
 			g.end = run.end
-		}
-		if run.latest.Agent != "" && g.agent == "" {
-			g.agent = run.latest.Agent
 		}
 		switch run.latest.Event {
 		case audit.EventDenied:
@@ -893,93 +913,161 @@ func (m model) renderSessionDetail() string {
 	m.runCursor = clamp(m.runCursor, 0, len(g.runs)-1)
 	w := m.detailWidth()
 	var b strings.Builder
-	title := fmt.Sprintf("Session %s · %s", orDash(g.id), labelOr(g.label))
-	fmt.Fprintf(&b, "%s\n", m.styles.header.Render(truncate(title, w)))
-	// Keep the hint short enough to fit one line at the default width; the full
-	// "records stay hidden" caveat lives in the docs and the v/verify affordance.
-	fmt.Fprintf(&b, "%s\n\n", m.styles.dim.Render(truncate("Commands in this session, newest first. Press v to verify the chain.", w)))
-	fmt.Fprintf(&b, "%s\n", m.renderSessionSummary(g))
+	// Single-line header: session id + label and the bound host with its user@ip,
+	// all on one row. Over-wide content is clamped by the final MaxWidth below.
+	fmt.Fprintf(&b, "%s\n", m.renderSessionHeader(g))
 	fmt.Fprintf(&b, "%s\n\n", m.styles.dim.Render(strings.Repeat("─", clamp(w, 1, 72))))
-	start, end := scrollWindow(m.runCursor, len(g.runs), m.detailCommandHeight())
-	for i := start; i < end; i++ {
-		run := g.runs[i]
-		if i > 0 {
-			b.WriteString("\n")
-		}
-		b.WriteString(m.renderCommandResult(run, i == m.runCursor))
-	}
-	if len(g.runs) == 0 {
-		fmt.Fprintf(&b, "%s\n", m.styles.dim.Render("No commands matched this session."))
-	}
-	// Clamp every line to the frame so a long summary/meta line truncates (ANSI
-	// aware) instead of wrapping onto a second row under the shell's Width().
+	b.WriteString(m.renderCommandList(g))
+	// Clamp every line to the frame so an over-wide row truncates (ANSI aware)
+	// instead of wrapping onto a second row under the shell's Width().
 	return m.styles.normal.MaxWidth(w).Render(b.String())
 }
 
-func (m model) renderSessionSummary(g sessionGroup) string {
-	parts := []string{
-		fmt.Sprintf("%d %s", g.commandCount, plural(g.commandCount, "command", "commands")),
-		"updated " + clockOf(g.end),
-		"agent " + orDash(g.agent),
+// renderCommandList renders the session's commands as a responsive, aligned table
+// (one row per command, newest first) that fits the frame the same way the session
+// list does — columns squeeze on a narrow terminal and spread on a wide one.
+func (m model) renderCommandList(g sessionGroup) string {
+	if len(g.runs) == 0 {
+		return m.styles.dim.Render("No commands matched this session.")
 	}
-	if hosts := sessionHosts(g, m.hosts); hosts != "" {
-		parts = append(parts, "hosts "+hosts)
+	avail := m.contentWidth()
+	start, end := scrollWindow(m.runCursor, len(g.runs), m.detailCommandHeight())
+	widths := commandListWidths(m.styles.glyphs, g.runs[start:end], avail)
+	var b strings.Builder
+	b.WriteString(m.styles.dim.Render(commandListHeader(widths)))
+	for i := start; i < end; i++ {
+		b.WriteString("\n")
+		b.WriteString(m.renderCommandRow(g.runs[i], widths, i == m.runCursor))
 	}
-	if totals := sessionCounts(g); totals != "" {
-		parts = append(parts, totals)
+	return b.String()
+}
+
+// renderSessionHeader is the session detail's single identity line: the session id
+// and label (bold), then the bound host with its user@ip connection (dim context).
+// Aggregate statistics (command/denied/failed counts, last-activity clock) are
+// intentionally omitted — each command below shows its own status and time. Tamper
+// evidence stays: it is a security signal, not a statistic.
+func (m model) renderSessionHeader(g sessionGroup) string {
+	parts := []string{m.styles.header.Render(orDash(g.id) + " · " + labelOr(g.label))}
+	if host := sessionHost(g); host != "" {
+		parts = append(parts, m.styles.dim.Render(hostLine(host, m.hosts)))
 	}
 	if sessionHasBrokenSeq(g, m.brokenSeq) {
 		parts = append(parts, m.styles.bad.Render(m.styles.glyphs.Warn+" tamper evidence in this session"))
 	}
-	return strings.Join(parts, " · ")
+	return strings.Join(parts, m.styles.dim.Render(" · "))
 }
 
-func (m model) renderCommandResult(run runSummary, selected bool) string {
+type commandListColumnWidths struct {
+	status int
+	cmd    int
+	policy int
+	exit   int
+	dur    int
+	clock  int
+	notes  int
+}
+
+// commandListWidths fits the seven command columns into availableWidth so each
+// command row stays on one line at the default size and spreads to fill a wide
+// one. COMMAND is the uncapped stretch column (it takes the slack and the brunt of
+// a squeeze); STATUS/EXIT/DUR/TIME are rigid so the outcome, codes, and clock never
+// truncate; POLICY and OUTPUT flex within caps.
+func commandListWidths(glyphs theme.Glyphs, runs []runSummary, availableWidth int) commandListColumnWidths {
+	nat := commandListColumnWidths{
+		status: lipgloss.Width("STATUS"),
+		cmd:    lipgloss.Width("COMMAND"),
+		policy: lipgloss.Width("POLICY"),
+		exit:   lipgloss.Width("EXIT"),
+		dur:    lipgloss.Width("DUR"),
+		clock:  lipgloss.Width("TIME"),
+		notes:  lipgloss.Width("OUTPUT"),
+	}
+	for _, run := range runs {
+		nat.status = maxInt(nat.status, lipgloss.Width(commandStatus(glyphs, run)))
+		nat.cmd = maxInt(nat.cmd, lipgloss.Width(run.latest.Cmd))
+		nat.policy = maxInt(nat.policy, lipgloss.Width(commandPolicyCell(run)))
+		nat.exit = maxInt(nat.exit, lipgloss.Width(runExit(run)))
+		nat.dur = maxInt(nat.dur, lipgloss.Width(durStr(run.latest.DurationMS)))
+		nat.clock = maxInt(nat.clock, lipgloss.Width(clockOf(run.end)))
+		nat.notes = maxInt(nat.notes, lipgloss.Width(commandOutputCell(glyphs, run.latest)))
+	}
+	fits := []colFit{
+		{min: nat.status, max: nat.status},                  // STATUS: rigid outcome
+		{min: lipgloss.Width("COMMAND"), max: 0, weight: 3}, // COMMAND: stretch column
+		{min: lipgloss.Width("POLICY"), max: 28, weight: 2}, // POLICY: action/rule
+		{min: nat.exit, max: nat.exit},                      // EXIT: rigid code
+		{min: nat.dur, max: nat.dur},                        // DUR: rigid
+		{min: nat.clock, max: nat.clock},                    // TIME: rigid clock
+		{min: lipgloss.Width("OUTPUT"), max: 24, weight: 1}, // OUTPUT: squeezable notes
+	}
+	natural := []int{nat.status, nat.cmd, nat.policy, nat.exit, nat.dur, nat.clock, nat.notes}
+	// Budget = availableWidth minus the 2-col cursor and the six 2-space gutters.
+	w := fitColumns(fits, natural, availableWidth-2-2*6)
+	return commandListColumnWidths{
+		status: w[0], cmd: w[1], policy: w[2], exit: w[3], dur: w[4], clock: w[5], notes: w[6],
+	}
+}
+
+func commandListHeader(w commandListColumnWidths) string {
+	cells := []string{
+		padRight("STATUS", w.status),
+		padRight("COMMAND", w.cmd),
+		padRight("POLICY", w.policy),
+		padLeft("EXIT", w.exit),
+		padLeft("DUR", w.dur),
+		padRight("TIME", w.clock),
+		padRight("OUTPUT", w.notes),
+	}
+	return "  " + strings.Join(cells, "  ")
+}
+
+func (m model) renderCommandRow(run runSummary, w commandListColumnWidths, selected bool) string {
 	rec := run.latest
 	cursor := "  "
 	if selected {
 		cursor = m.styles.cursor.Render("> ")
 	}
-	status := commandStatus(m.styles.glyphs, run)
-	line := fmt.Sprintf("%s%s  %s", cursor, status, truncate(rec.Cmd, commandWidth(m.w)))
+	cells := []string{
+		padRight(truncate(commandStatus(m.styles.glyphs, run), w.status), w.status),
+		padRight(truncate(rec.Cmd, w.cmd), w.cmd),
+		padRight(truncate(commandPolicyCell(run), w.policy), w.policy),
+		padLeft(truncate(runExit(run), w.exit), w.exit),
+		padLeft(truncate(durStr(rec.DurationMS), w.dur), w.dur),
+		padRight(truncate(clockOf(run.end), w.clock), w.clock),
+		padRight(truncate(commandOutputCell(m.styles.glyphs, rec), w.notes), w.notes),
+	}
+	head := strings.Join(cells, "  ")
+	// Calm palette: the STATUS glyph (✓/✗/⊘) carries the outcome, so rows render in
+	// the default color. Only a tamper break or a genuine failure takes a color.
 	if runHasSeq(run, m.brokenSeq) {
-		line += "  " + m.styles.glyphs.Warn + " TAMPERED"
+		return cursor + m.styles.bad.Render(head+"  "+m.styles.glyphs.Warn+" TAMPERED")
 	}
-	meta := fmt.Sprintf("    %s · host %s · policy %s/%s · exit %s · %s · %s",
-		clockOf(run.end), hostLine(rec.Host, m.hosts), orDash(rec.PolicyAction), orDash(rec.PolicyRule),
-		runExit(run), durStr(rec.DurationMS), outputSummary(rec))
-	if rec.Event == audit.EventDenied {
-		meta += " · not executed"
+	if rec.Event == audit.EventFailed {
+		return cursor + m.styles.bad.Render(head)
 	}
-	// The meta line is the widest part of a command result; cap it to the frame so
-	// it never wraps. (Plain text here — safe to rune-truncate before styling.)
-	meta = truncate(meta, m.detailWidth())
-	out := line + "\n" + m.styles.dim.Render(meta)
-	switch {
-	case runHasSeq(run, m.brokenSeq):
-		return m.styles.bad.Render(out)
-	case rec.Event == audit.EventDenied:
-		return m.styles.deny.Render(out)
-	case rec.Event == audit.EventFailed:
-		return m.styles.bad.Render(out)
-	case rec.Event == audit.EventCompleted:
-		return m.styles.normal.Render(out)
-	default:
-		return m.styles.header.Render(out)
-	}
+	return cursor + head
 }
 
-func sessionStatus(g theme.Glyphs, group sessionGroup) string {
-	switch {
-	case group.failed > 0:
-		return g.Cross + " FAIL"
-	case group.denied > 0:
-		return g.Deny + " DENIED"
-	case group.running > 0:
-		return g.OK + " LIVE"
-	default:
-		return g.Check + " OK"
+// commandPolicyCell is the POLICY column: the decision and the rule that made it.
+func commandPolicyCell(run runSummary) string {
+	return orDash(run.latest.PolicyAction) + "/" + orDash(run.latest.PolicyRule)
+}
+
+// commandOutputCell is the OUTPUT column: a compact note on output handling. Clean
+// output reads as the absent glyph so only truncation or redaction draws the eye.
+func commandOutputCell(glyphs theme.Glyphs, rec audit.Record) string {
+	var parts []string
+	if rec.OutputTruncated {
+		parts = append(parts, "trunc")
 	}
+	if rec.Redactions > 0 {
+		parts = append(parts, fmt.Sprintf("red %d", rec.Redactions))
+	}
+	if len(parts) == 0 {
+		return glyphs.Absent
+	}
+	return strings.Join(parts, " · ")
 }
 
 func commandStatus(g theme.Glyphs, run runSummary) string {
@@ -997,44 +1085,15 @@ func commandStatus(g theme.Glyphs, run runSummary) string {
 	}
 }
 
-func sessionCounts(g sessionGroup) string {
-	var parts []string
-	if g.denied > 0 {
-		parts = append(parts, fmt.Sprintf("%d denied", g.denied))
-	}
-	if g.failed > 0 {
-		parts = append(parts, fmt.Sprintf("%d failed", g.failed))
-	}
-	if g.running > 0 {
-		parts = append(parts, fmt.Sprintf("%d running", g.running))
-	}
-	return strings.Join(parts, " · ")
-}
-
-func sessionHosts(g sessionGroup, hosts map[string]HostMeta) string {
-	seen := map[string]struct{}{}
-	values := make([]string, 0, 2)
+// sessionHost is the single host a session is bound to: the first non-empty host
+// across its runs. Sessions are one-host by construction, so this is unambiguous.
+func sessionHost(g sessionGroup) string {
 	for _, run := range g.runs {
-		host := run.latest.Host
-		if host == "" {
-			continue
-		}
-		if _, ok := seen[host]; ok {
-			continue
-		}
-		seen[host] = struct{}{}
-		if len(values) < 2 {
-			label := host
-			if isProd(hosts, host) {
-				label += " [prod]"
-			}
-			values = append(values, label)
+		if run.latest.Host != "" {
+			return run.latest.Host
 		}
 	}
-	if len(seen) > len(values) {
-		values = append(values, fmt.Sprintf("+%d", len(seen)-len(values)))
-	}
-	return strings.Join(values, ", ")
+	return ""
 }
 
 func sessionHasBrokenSeq(g sessionGroup, seq *uint64) bool {
@@ -1044,20 +1103,6 @@ func sessionHasBrokenSeq(g sessionGroup, seq *uint64) bool {
 		}
 	}
 	return false
-}
-
-func outputSummary(record audit.Record) string {
-	var parts []string
-	if record.OutputTruncated {
-		parts = append(parts, "output truncated")
-	}
-	if record.Redactions > 0 {
-		parts = append(parts, fmt.Sprintf("redactions %d", record.Redactions))
-	}
-	if len(parts) == 0 {
-		return "output clean"
-	}
-	return strings.Join(parts, " · ")
 }
 
 func runExit(run runSummary) string {
@@ -1082,32 +1127,6 @@ func runHasSeq(run runSummary, seq *uint64) bool {
 	return false
 }
 
-func reasonText(reason string) string {
-	switch reason {
-	case "seq":
-		return "seq out of order"
-	case "prev_hash":
-		return "chain link broken (record deleted/inserted?)"
-	case "hash":
-		return "record body altered"
-	default:
-		return reason
-	}
-}
-
-func isProd(hosts map[string]HostMeta, host string) bool {
-	meta, ok := hosts[host]
-	if !ok {
-		return false
-	}
-	for _, tag := range meta.Tags {
-		if tag == "prod" {
-			return true
-		}
-	}
-	return false
-}
-
 func hostLine(host string, hosts map[string]HostMeta) string {
 	meta, ok := hosts[host]
 	if !ok || (meta.User == "" && meta.Addr == "") {
@@ -1117,11 +1136,7 @@ func hostLine(host string, hosts map[string]HostMeta) string {
 	if meta.User != "" {
 		target = meta.User + "@" + meta.Addr
 	}
-	line := fmt.Sprintf("%s (%s)", host, target)
-	if isProd(hosts, host) {
-		line += " [prod]"
-	}
-	return line
+	return fmt.Sprintf("%s (%s)", host, target)
 }
 
 func spanOf(records []audit.Record) (string, string) {
@@ -1138,16 +1153,6 @@ func spanOf(records []audit.Record) (string, string) {
 		}
 	}
 	return start, end
-}
-
-func commandWidth(w int) int {
-	if w <= 0 {
-		return 76
-	}
-	if w < 64 {
-		return 36
-	}
-	return w - 24
 }
 
 func clamp(value, min, max int) int {

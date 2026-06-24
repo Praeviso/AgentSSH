@@ -148,7 +148,7 @@ nginx.service - A high performance web server
   enter 展开/折叠会话 · l 会话详情 · v 校验链 · / 过滤 · j/k 移动 · q 退出
 ```
 
-- 顶层按**会话**倒序;会话头显示 `id · label · agent · 起止 · 命令数`,折叠态附一行异常摘要(有 deny/失败时)。
+- 顶层按**会话**倒序;会话头单行显示 `id · label · host(user@ip)`,有篡改时附一段异常提示。
 - 展开后是该会话内的 run,时间倒序;状态图标:`✓` 成功 · `✗` 失败 · `⊘` 拒绝(policy deny)· `●` 执行中。
 - 每行一眼看全:**时间 · 状态 · 主机(prod 加红角标) · 手册 · 真实命令 · policy 判定 · exit/耗时**。
 - 危险/拒绝用红、prod 主机加红色 `prod` 角标、含异常的会话头标红;颜色仅作强调,信息不只靠颜色(同时有文字)。
@@ -159,7 +159,7 @@ nginx.service - A high performance web server
 
 ```
 ┌ Record seq 42 · req a3f2c1 ──────────────────────────────────────┐
-│ Agent    claude-code           时间   2026-06-16 08:32:11Z        │
+│ 时间     2026-06-16 08:32:11Z                                     │
 │ Session  s_91be0c "fix 502"    Host   web-1 (deploy@10.0.0.11)    │
 │ Tags     web, prod                                                │
 │ Command  sudo systemctl restart nginx                             │

@@ -24,6 +24,10 @@ type Host struct {
 	SSHConfigAlias string   `yaml:"ssh_config_alias,omitempty" json:"ssh_config_alias"`
 	IdentityFile   string   `yaml:"identity_file,omitempty" json:"identity_file"`
 	Tags           []string `yaml:"tags,omitempty" json:"tags"`
+	// OS is the host's operating system family (e.g. linux, macos, windows, bsd).
+	// It is display-only metadata: the TUI picks the host card's icon from it. An
+	// empty or unrecognized value renders the generic server icon.
+	OS string `yaml:"os,omitempty" json:"os"`
 }
 
 // Group selects hosts by tag.

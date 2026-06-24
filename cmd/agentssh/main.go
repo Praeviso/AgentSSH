@@ -1139,10 +1139,7 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 	if err != nil {
 		return newUsageError("invalid output filter in policy.yaml: %v\n  fix the regex under output.redact in ~/.agentssh/policy.yaml", err)
 	}
-	sessionCtx, err := session.Resolver{Path: cfg.Paths.SessionFile}.Resolve(flags.session, flags.sessionLabel)
-	if err != nil {
-		return fmt.Errorf("resolve session: %w", err)
-	}
+	sessionResolver := session.Resolver{Path: cfg.Paths.SessionFile}
 	store := audit.NewStore(cfg.Paths.AuditFile)
 	ssh := newExecutor(cfg)
 	exitCode := exitOK
@@ -1150,6 +1147,15 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 	for _, target := range resolved.Targets {
 		reqID, err := newReqID()
 		if err != nil {
+			return err
+		}
+		// Bind the session to this target host. A group run therefore records one
+		// session per host, never a single session spanning several hosts.
+		sessionCtx, err := sessionResolver.Resolve(target.Name, flags.session, flags.sessionLabel)
+		if err != nil {
+			return fmt.Errorf("resolve session: %w", err)
+		}
+		if err := sessionResolver.Update(target.Name, sessionCtx.ID, time.Now().UTC()); err != nil {
 			return err
 		}
 		decision, err := engine.Evaluate(target.Name, remoteCommand)
@@ -1254,9 +1260,6 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 		}
 	}
 
-	if err := (session.Resolver{Path: cfg.Paths.SessionFile}).Update(sessionCtx.ID, time.Now().UTC()); err != nil {
-		return err
-	}
 	if exitCode != exitOK {
 		return commandExitError{Code: exitCode}
 	}
@@ -1642,7 +1645,6 @@ func baseAuditRecord(reqID string, sessionCtx session.Context, event audit.Event
 		SessionID:       sessionCtx.ID,
 		SessionLabel:    sessionCtx.Label,
 		Event:           event,
-		Agent:           os.Getenv("AGENTSSH_AGENT"),
 		Host:            host,
 		Cmd:             command,
 		PolicyAction:    string(decision.Action),

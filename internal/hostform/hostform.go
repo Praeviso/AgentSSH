@@ -31,6 +31,7 @@ type Options struct {
 	Addr          string
 	User          string
 	Port          int
+	OS            string
 	Tags          []string
 	Alias         string
 	IdentityFile  string
@@ -43,6 +44,7 @@ type Result struct {
 	Addr      string
 	User      string
 	Port      int
+	OS        string
 	Tags      []string
 	Alias     string
 	Identity  string
@@ -57,6 +59,7 @@ func Validate(opts Options) (Result, map[string]string) {
 		addr:     strings.TrimSpace(opts.Addr),
 		user:     strings.TrimSpace(opts.User),
 		port:     portString(opts.Port),
+		os:       strings.TrimSpace(opts.OS),
 		tags:     strings.Join(opts.Tags, ","),
 		alias:    strings.TrimSpace(opts.Alias),
 		identity: strings.TrimSpace(opts.IdentityFile),
@@ -122,10 +125,32 @@ type formValues struct {
 	addr     string
 	user     string
 	port     string
+	os       string
 	tags     string
 	alias    string
 	identity string
 	password string
+}
+
+// knownOS is the recognized OS family vocabulary the host card has icons for.
+// Validation is lenient: an unknown value is kept (the card falls back to the
+// generic icon), so the field never blocks a submit.
+var knownOS = map[string]struct{}{"linux": {}, "macos": {}, "windows": {}, "bsd": {}}
+
+// normalizeOS lowercases/trims the OS family and maps common aliases to the
+// canonical vocabulary used by the card icons.
+func normalizeOS(value string) string {
+	v := strings.ToLower(strings.TrimSpace(value))
+	switch v {
+	case "darwin", "mac", "osx", "mac os", "macos":
+		return "macos"
+	case "win", "windows":
+		return "windows"
+	case "freebsd", "openbsd", "netbsd", "bsd":
+		return "bsd"
+	default:
+		return v
+	}
 }
 
 func validateValues(values formValues, existing map[string]struct{}) (Result, map[string]string) {
@@ -170,6 +195,7 @@ func validateValues(values formValues, existing map[string]struct{}) (Result, ma
 		Addr:      addr,
 		User:      userName,
 		Port:      port,
+		OS:        normalizeOS(values.os),
 		Tags:      SplitTags(values.tags),
 		Alias:     alias,
 		Identity:  strings.TrimSpace(values.identity),
@@ -200,6 +226,7 @@ const (
 	fieldAddr
 	fieldUser
 	fieldPort
+	fieldOS
 	fieldTags
 	fieldAlias
 	fieldIdentity
@@ -207,7 +234,7 @@ const (
 	fieldCount
 )
 
-var fieldKeys = []string{"name", "addr", "user", "port", "tags", "alias", "identity", "password"}
+var fieldKeys = []string{"name", "addr", "user", "port", "os", "tags", "alias", "identity", "password"}
 
 type keyMap struct {
 	Next      key.Binding
@@ -250,11 +277,11 @@ func newStyles(r *lipgloss.Renderer) styles {
 }
 
 // fieldLabels are the display labels indexed by field.
-var fieldLabels = []string{"name", "addr", "user", "port", "tags", "ssh_config_alias", "identity_file", "password"}
+var fieldLabels = []string{"name", "addr", "user", "port", "os", "tags", "ssh_config_alias", "identity_file", "password"}
 
 // fieldWidths are the textinput widths indexed by field, sized for the grouped
 // layout (short fields pair on one row).
-var fieldWidths = []int{18, 44, 12, 5, 22, 20, 38, 24}
+var fieldWidths = []int{18, 44, 12, 5, 14, 22, 20, 38, 24}
 
 // Model is the embeddable add-host form model.
 type Model struct {
@@ -266,6 +293,18 @@ type Model struct {
 	existing map[string]struct{}
 	result   Result
 	done     bool
+	// w, h are the live render budget (the section body the shell allocates). They
+	// drive responsive field widths and the height scroll window; 0 means "size
+	// unknown" and the form falls back to its natural fixed widths (see
+	// layoutWidths) so a direct, sizeless render keeps full content.
+	w, h int
+}
+
+// SetSize records the render budget so the next View recomputes field widths and
+// the scroll window. Returned by value (the form is an embeddable value model).
+func (m Model) SetSize(w, h int) Model {
+	m.w, m.h = w, h
+	return m
 }
 
 // New constructs an add-host form without starting a Bubble Tea program.
@@ -278,8 +317,8 @@ func New(opts Options, r *lipgloss.Renderer) Model {
 
 func newModel(opts Options, st styles) Model {
 	inputs := make([]textinput.Model, fieldCount)
-	placeholders := []string{"web-1", "10.0.0.11", "$USER", "22", "web,prod", "ssh-config-host", "~/.ssh/web-1", "optional"}
-	values := []string{opts.Name, opts.Addr, opts.User, portString(opts.Port), strings.Join(opts.Tags, ","), opts.Alias, opts.IdentityFile, ""}
+	placeholders := []string{"web-1", "10.0.0.11", "$USER", "22", "linux/macos/windows/bsd", "web,prod", "ssh-config-host", "~/.ssh/web-1", "optional"}
+	values := []string{opts.Name, opts.Addr, opts.User, portString(opts.Port), normalizeOS(opts.OS), strings.Join(opts.Tags, ","), opts.Alias, opts.IdentityFile, ""}
 	for i := range inputs {
 		ti := textinput.New()
 		ti.Placeholder = placeholders[i]
@@ -306,22 +345,28 @@ func (m Model) Init() tea.Cmd {
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	if keyMsg, ok := msg.(tea.KeyMsg); ok {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		// Recompute layout from the live budget; the textinput needs no resize
+		// message, so don't forward it.
+		m.w, m.h = msg.Width, msg.Height
+		return m, nil
+	case tea.KeyMsg:
 		switch {
-		case key.Matches(keyMsg, m.keys.ForceQuit):
+		case key.Matches(msg, m.keys.ForceQuit):
 			// Ctrl+C means quit, not just cancel the form: return tea.Quit so it
 			// propagates up and exits the whole program (the standalone runner and
 			// the embedded TUI both honor it).
 			return m, tea.Quit
-		case key.Matches(keyMsg, m.keys.Cancel):
+		case key.Matches(msg, m.keys.Cancel):
 			m.result = Result{Submitted: false}
 			m.done = true
 			return m, nil
-		case key.Matches(keyMsg, m.keys.Next):
+		case key.Matches(msg, m.keys.Next):
 			return m.move(1)
-		case key.Matches(keyMsg, m.keys.Prev):
+		case key.Matches(msg, m.keys.Prev):
 			return m.move(-1)
-		case key.Matches(keyMsg, m.keys.Submit):
+		case key.Matches(msg, m.keys.Submit):
 			return m.submit()
 		}
 	}
@@ -338,68 +383,261 @@ func (m Model) Done() bool { return m.done }
 func (m Model) Result() Result { return m.result }
 
 func (m Model) View() string {
-	var b strings.Builder
-	b.WriteString(m.styles.title.Render("Add inventory host"))
-	b.WriteString("\n\n")
-
-	b.WriteString(m.groupHeader("Connection"))
-	b.WriteString("\n")
-	b.WriteString(joinFields(m.field(fieldName), m.field(fieldUser), m.field(fieldPort)))
-	b.WriteString("\n")
-	b.WriteString(m.field(fieldAddr))
-	b.WriteString("\n\n")
-
-	b.WriteString(m.groupHeader("Routing"))
-	b.WriteString("\n")
-	b.WriteString(joinFields(m.field(fieldTags), m.field(fieldAlias)))
-	b.WriteString("\n\n")
-
-	b.WriteString(m.groupHeader("Auth"))
-	b.WriteString("\n")
-	b.WriteString(m.field(fieldIdentity))
-	b.WriteString("\n")
-	b.WriteString(m.field(fieldPassword))
-	b.WriteString("\n")
-	b.WriteString(m.styles.help.Render("identity_file is a path saved in inventory; password is encrypted (age) and never shown."))
-	b.WriteString("\n")
-	if strings.TrimSpace(m.inputs[fieldPassword].Value()) != "" && os.Getenv("AGENTSSH_MASTER_PASSWORD") == "" {
-		b.WriteString(m.styles.warn.Render(m.styles.glyphs.Warn + " AGENTSSH_MASTER_PASSWORD not set — the password won't be saved."))
+	widths := m.layoutWidths()
+	// fieldBlock renders one labelled input (+ inline error) at its computed width,
+	// as a block for horizontal joining.
+	fieldBlock := func(f field) string {
+		in := m.inputs[f]
+		in.Width = widths[f]
+		var b strings.Builder
+		b.WriteString(m.styles.label.Render(fieldLabels[f]))
 		b.WriteString("\n")
+		b.WriteString(in.View())
+		if m.errs[f] != "" {
+			b.WriteString("\n")
+			b.WriteString(m.styles.err.Render(m.errs[f]))
+		}
+		return b.String()
 	}
 
-	b.WriteString("\n")
-	b.WriteString(m.styles.help.Render("tab/down next · shift+tab/up prev · enter submit · esc cancel"))
-	return b.String()
+	var lines []string
+	focusLine := 0
+	add := func(s string) { lines = append(lines, strings.Split(s, "\n")...) }
+	// addRow appends a field block (whose input is its 2nd line) and records the
+	// focus line when the focused field lives in this row, so the height window can
+	// keep the active input on screen.
+	addRow := func(block string, fs ...field) {
+		for _, f := range fs {
+			if f == m.focus {
+				focusLine = len(lines) + 1
+			}
+		}
+		lines = append(lines, strings.Split(block, "\n")...)
+	}
+
+	add(m.fit(m.styles.title, "Add inventory host"))
+	add("")
+	add(m.groupHeader("Connection"))
+	addRow(joinFields(fieldBlock(fieldName), fieldBlock(fieldUser), fieldBlock(fieldPort)), fieldName, fieldUser, fieldPort)
+	addRow(joinFields(fieldBlock(fieldAddr), fieldBlock(fieldOS)), fieldAddr, fieldOS)
+	add("")
+	add(m.groupHeader("Routing"))
+	addRow(joinFields(fieldBlock(fieldTags), fieldBlock(fieldAlias)), fieldTags, fieldAlias)
+	add("")
+	add(m.groupHeader("Auth"))
+	addRow(fieldBlock(fieldIdentity), fieldIdentity)
+	addRow(fieldBlock(fieldPassword), fieldPassword)
+	add(m.fit(m.styles.help, "identity_file is a path saved in inventory; password is encrypted (age) and never shown."))
+	if strings.TrimSpace(m.inputs[fieldPassword].Value()) != "" && os.Getenv("AGENTSSH_MASTER_PASSWORD") == "" {
+		add(m.fit(m.styles.warn, m.styles.glyphs.Warn+" AGENTSSH_MASTER_PASSWORD not set — the password won't be saved."))
+	}
+	add("")
+	add(m.fit(m.styles.help, "tab/down next · shift+tab/up prev · enter submit · esc cancel"))
+
+	// Height window: when the form is taller than the budget, scroll it so the
+	// focused field stays visible instead of letting the bottom clip off-screen
+	// (mirrors the Sessions list's scrollWindow contract).
+	if m.h > 0 && len(lines) > m.h {
+		start, end := windowLines(focusLine, len(lines), m.h)
+		lines = lines[start:end]
+	}
+	return strings.Join(lines, "\n")
+}
+
+// fit renders s in style, clipping it to the form width so a long line never
+// wraps past the frame (mirrors the Sessions list's MaxWidth contract).
+func (m Model) fit(style lipgloss.Style, s string) string {
+	if m.w > 0 {
+		return style.MaxWidth(m.w).Render(s)
+	}
+	return style.Render(s)
 }
 
 func (m Model) groupHeader(name string) string {
-	return m.styles.group.Render("── " + name + " " + strings.Repeat("─", 24-len(name)))
+	prefix := "── " + name + " "
+	fill := 24 - len(name)
+	if m.w > 0 {
+		fill = m.w - lipgloss.Width(prefix)
+	}
+	if fill < 0 {
+		fill = 0
+	}
+	return m.fit(m.styles.group, prefix+strings.Repeat("─", fill))
 }
 
-// field renders one labelled input plus its inline error, as a block for
-// horizontal joining.
-func (m Model) field(f field) string {
-	var b strings.Builder
-	b.WriteString(m.styles.label.Render(fieldLabels[f]))
-	b.WriteString("\n")
-	b.WriteString(m.inputs[f].View())
-	if m.errs[f] != "" {
-		b.WriteString("\n")
-		b.WriteString(m.styles.err.Render(m.errs[f]))
-	}
-	return b.String()
-}
+// formGutter separates horizontally-joined field blocks.
+const formGutter = "  "
 
 // joinFields lays out field blocks side by side with a gutter between them.
 func joinFields(blocks ...string) string {
 	parts := make([]string, 0, len(blocks)*2-1)
 	for i, blk := range blocks {
 		if i > 0 {
-			parts = append(parts, "  ")
+			parts = append(parts, formGutter)
 		}
 		parts = append(parts, blk)
 	}
 	return lipgloss.JoinHorizontal(lipgloss.Top, parts...)
+}
+
+// rowField is a flex spec for one input on a horizontally-joined form row:
+// weight 0 is rigid (holds min); max 0 is uncapped.
+type rowField struct {
+	f      field
+	weight int
+	min    int
+	max    int
+}
+
+type fittedField struct {
+	f field
+	w int
+}
+
+// layoutWidths returns the textinput content width for every field, derived from
+// the live form width so the form fills a wide frame and shrinks on a narrow one
+// instead of being hard-clipped by the shell. With an unknown size (w<=0) it
+// returns the natural fixed widths so a sizeless render keeps the original layout.
+func (m Model) layoutWidths() []int {
+	widths := make([]int, fieldCount)
+	if m.w <= 0 {
+		copy(widths, fieldWidths)
+		return widths
+	}
+	prompt := 2
+	if len(m.inputs) > 0 {
+		prompt = lipgloss.Width(m.inputs[0].Prompt)
+	}
+	// A textinput renders its prompt + content width + a trailing cursor cell, so
+	// each field costs prompt+1 columns of chrome beyond its content width.
+	chrome := prompt + 1
+	avail := m.w - 1 // a column of slack so the widest input never touches the edge
+	if avail < 12 {
+		avail = 12
+	}
+	gut := lipgloss.Width(formGutter)
+	// Row: name | user | port (two gutters + three fields of chrome).
+	row1 := fitRow(avail-2*gut-3*chrome, []rowField{
+		{f: fieldName, weight: 3, min: 8, max: 24},
+		{f: fieldUser, weight: 2, min: 6, max: 16},
+		{f: fieldPort, weight: 0, min: 5, max: 5},
+	})
+	// Row: addr | os (one gutter + two fields of chrome). addr stretches; os is
+	// rigid since an OS family name is short.
+	rowAddr := fitRow(avail-gut-2*chrome, []rowField{
+		{f: fieldAddr, weight: 3, min: 12, max: 0},
+		{f: fieldOS, weight: 0, min: 10, max: 16},
+	})
+	// Row: tags | alias (one gutter + two fields of chrome).
+	row2 := fitRow(avail-gut-2*chrome, []rowField{
+		{f: fieldTags, weight: 1, min: 8, max: 40},
+		{f: fieldAlias, weight: 1, min: 8, max: 40},
+	})
+	for _, r := range append(append(row1, rowAddr...), row2...) {
+		widths[r.f] = r.w
+	}
+	// Single-field rows fill the row (minus their own chrome).
+	widths[fieldIdentity] = clampW(avail-chrome, 12, 0)
+	widths[fieldPassword] = clampW(avail-chrome, 8, 48)
+	return widths
+}
+
+// fitRow assigns each field a width so the row (its widths plus the chrome the
+// caller already subtracted) fills avail: start at min, grow weighted fields by
+// weight up to max, then shrink toward 1 if avail is below the sum of mins.
+func fitRow(avail int, fields []rowField) []fittedField {
+	out := make([]fittedField, len(fields))
+	used := 0
+	for i, f := range fields {
+		out[i] = fittedField{f: f.f, w: f.min}
+		used += f.min
+	}
+	for {
+		slack := avail - used
+		if slack <= 0 {
+			break
+		}
+		weight := 0
+		for i := range fields {
+			if fields[i].weight > 0 && (fields[i].max == 0 || out[i].w < fields[i].max) {
+				weight += fields[i].weight
+			}
+		}
+		if weight == 0 {
+			break
+		}
+		grew := false
+		for i := range fields {
+			if slack <= 0 {
+				break
+			}
+			if fields[i].weight == 0 || (fields[i].max != 0 && out[i].w >= fields[i].max) {
+				continue
+			}
+			add := slack * fields[i].weight / weight
+			if add < 1 {
+				add = 1
+			}
+			if fields[i].max != 0 && out[i].w+add > fields[i].max {
+				add = fields[i].max - out[i].w
+			}
+			if add <= 0 {
+				continue
+			}
+			out[i].w += add
+			used += add
+			slack -= add
+			grew = true
+		}
+		if !grew {
+			break
+		}
+	}
+	for used > avail {
+		shrunk := false
+		for i := range out {
+			if used <= avail {
+				break
+			}
+			if out[i].w > 1 {
+				out[i].w--
+				used--
+				shrunk = true
+			}
+		}
+		if !shrunk {
+			break
+		}
+	}
+	return out
+}
+
+func clampW(v, min, max int) int {
+	if v < min {
+		v = min
+	}
+	if max > 0 && v > max {
+		v = max
+	}
+	return v
+}
+
+// windowLines returns the [start,end) bounds of a height-line scroll window that
+// keeps focus visible, centering it within the window where possible.
+func windowLines(focus, n, height int) (start, end int) {
+	if height <= 0 || height >= n {
+		return 0, n
+	}
+	start = focus - height/2
+	if start < 0 {
+		start = 0
+	}
+	end = start + height
+	if end > n {
+		end = n
+		start = end - height
+	}
+	return start, end
 }
 
 func (m Model) move(delta int) (tea.Model, tea.Cmd) {
@@ -444,6 +682,7 @@ func (m Model) values() formValues {
 		addr:     m.inputs[fieldAddr].Value(),
 		user:     m.inputs[fieldUser].Value(),
 		port:     m.inputs[fieldPort].Value(),
+		os:       m.inputs[fieldOS].Value(),
 		tags:     m.inputs[fieldTags].Value(),
 		alias:    m.inputs[fieldAlias].Value(),
 		identity: m.inputs[fieldIdentity].Value(),
