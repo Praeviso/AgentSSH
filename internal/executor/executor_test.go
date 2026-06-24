@@ -51,9 +51,12 @@ func TestBuildSSHArgvUsesSSHConfigAlias(t *testing.T) {
 }
 
 func TestSSHExecutorUsesInjectedRunner(t *testing.T) {
-	var captured []string
+	var calls [][]string
 	runner := RunnerFunc(func(_ context.Context, argv []string) RunResult {
-		captured = append([]string{}, argv...)
+		calls = append(calls, append([]string{}, argv...))
+		if argv[len(argv)-1] == OSProbeCommand {
+			return RunResult{Stdout: "Linux\n", ExitCode: 0}
+		}
 		return RunResult{Stdout: "ok\n", ExitCode: 0}
 	})
 	exec := NewSSHExecutor(runner)
@@ -67,14 +70,61 @@ func TestSSHExecutorUsesInjectedRunner(t *testing.T) {
 	})
 
 	wantArgv := []string{"ssh", "deploy@10.0.0.11", "echo ok"}
-	if !reflect.DeepEqual(captured, wantArgv) {
-		t.Fatalf("captured argv = %#v, want %#v", captured, wantArgv)
+	if len(calls) != 2 {
+		t.Fatalf("runner calls = %#v, want command + OS probe", calls)
+	}
+	if !reflect.DeepEqual(calls[0], wantArgv) {
+		t.Fatalf("command argv = %#v, want %#v", calls[0], wantArgv)
 	}
 	if !reflect.DeepEqual(result.Argv, wantArgv) {
 		t.Fatalf("result argv = %#v, want %#v", result.Argv, wantArgv)
 	}
 	if result.Stdout != "ok\n" || result.ExitCode != 0 || result.Err != nil {
 		t.Fatalf("result = %#v", result)
+	}
+	if result.OS != "linux" {
+		t.Fatalf("result OS = %q, want linux", result.OS)
+	}
+	wantProbeArgv := []string{"ssh", "deploy@10.0.0.11", OSProbeCommand}
+	if !reflect.DeepEqual(calls[1], wantProbeArgv) {
+		t.Fatalf("probe argv = %#v, want %#v", calls[1], wantProbeArgv)
+	}
+}
+
+func TestSSHExecutorDoesNotParseUserStdoutAsOS(t *testing.T) {
+	var probeCalled bool
+	runner := RunnerFunc(func(_ context.Context, argv []string) RunResult {
+		if argv[len(argv)-1] == OSProbeCommand {
+			probeCalled = true
+			return RunResult{Stdout: "Darwin\n", ExitCode: 0}
+		}
+		return RunResult{Stdout: "Linux\n", ExitCode: 0}
+	})
+	exec := NewSSHExecutor(runner)
+	result := exec.Run(context.Background(), Request{
+		Target:  inventory.Target{Name: "web-1", Host: inventory.Host{Addr: "10.0.0.11", User: "deploy"}},
+		Command: "echo Linux",
+	})
+	if !probeCalled {
+		t.Fatal("expected a separate OS probe")
+	}
+	if result.Stdout != "Linux\n" || result.OS != "macos" {
+		t.Fatalf("result stdout=%q OS=%q, want user stdout preserved and OS from probe", result.Stdout, result.OS)
+	}
+}
+
+func TestNormalizeOS(t *testing.T) {
+	tests := map[string]string{
+		"Linux\n":      "linux",
+		"Darwin":       "macos",
+		"FreeBSD":      "bsd",
+		"MINGW64_NT":   "windows",
+		"unknown-plan": "",
+	}
+	for input, want := range tests {
+		if got := NormalizeOS(input); got != want {
+			t.Fatalf("NormalizeOS(%q) = %q, want %q", input, got, want)
+		}
 	}
 }
 

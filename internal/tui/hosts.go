@@ -103,6 +103,7 @@ type hostProbeMsg struct {
 	err  error
 	ok   bool
 	dur  time.Duration
+	os   string
 }
 
 // hostProbe is the remembered verdict of the last connectivity test for a host.
@@ -224,6 +225,9 @@ func (s hostsSection) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			s.err = nil
 			s.status = "OK " + msg.name
 			s.probes[msg.name] = hostProbe{ok: true, detail: "ok", dur: msg.dur}
+			if msg.os != "" {
+				s.setHostOS(msg.name, msg.os)
+			}
 		case msg.hint != "":
 			s.err = nil
 			s.status = "FAILED " + msg.name + ": " + msg.hint
@@ -457,7 +461,7 @@ func (s hostsSection) probeHostCmd(name string) tea.Cmd {
 		defer cancel()
 		result := exec.Probe(ctx, inventory.Target{Name: name, Host: host})
 		if result.Err == nil && result.ExitCode == 0 {
-			return hostProbeMsg{name: name, ok: true, dur: result.Duration}
+			return hostProbeMsg{name: name, ok: true, dur: result.Duration, os: result.OS}
 		}
 		if result.Err != nil {
 			return hostProbeMsg{name: name, err: result.Err, hint: executor.ConnectHint(result.Err), dur: result.Duration}
@@ -685,7 +689,6 @@ func (s *hostsSection) addInventoryHost(base inventory.Inventory, result hostfor
 		SSHConfigAlias: result.Alias,
 		IdentityFile:   result.Identity,
 		Tags:           result.Tags,
-		OS:             result.OS,
 	})
 	if err != nil {
 		return err
@@ -696,6 +699,36 @@ func (s *hostsSection) addInventoryHost(base inventory.Inventory, result hostfor
 	s.inventory = next
 	s.rebuildNames()
 	return nil
+}
+
+func (s *hostsSection) setHostOS(name string, osName string) {
+	osName = strings.TrimSpace(osName)
+	if name == "" || osName == "" {
+		return
+	}
+	host, ok := s.inventory.Hosts[name]
+	if !ok || host.OS == osName {
+		return
+	}
+	base, err := inventory.Load(s.paths.InventoryFile)
+	if err != nil {
+		s.err = err
+		return
+	}
+	if host, ok = base.Hosts[name]; !ok || host.OS == osName {
+		return
+	}
+	next, err := inventory.SetHostOS(base, name, osName)
+	if err != nil {
+		s.err = err
+		return
+	}
+	if err := inventory.Save(s.paths.InventoryFile, next); err != nil {
+		s.err = err
+		return
+	}
+	s.inventory = next
+	s.rebuildNames()
 }
 
 func (s *hostsSection) removeHostByName(name string) error {

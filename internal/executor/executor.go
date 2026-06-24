@@ -29,6 +29,7 @@ type Result struct {
 	Duration time.Duration
 	Err      error
 	Argv     []string
+	OS       string
 }
 
 // Executor runs commands against remote hosts.
@@ -81,7 +82,7 @@ func (e SSHExecutor) Run(ctx context.Context, request Request) Result {
 	start := time.Now()
 	argv := BuildSSHArgv(request.Target, request.Command)
 	runResult := e.Runner.Run(ctx, argv)
-	return Result{
+	result := Result{
 		Stdout:   runResult.Stdout,
 		Stderr:   runResult.Stderr,
 		ExitCode: runResult.ExitCode,
@@ -89,17 +90,69 @@ func (e SSHExecutor) Run(ctx context.Context, request Request) Result {
 		Err:      runResult.Err,
 		Argv:     append([]string{}, argv...),
 	}
+	if sshResultConnected(result) {
+		if request.Command == OSProbeCommand {
+			result.OS = NormalizeOS(result.Stdout)
+		} else {
+			result.OS = e.detectOS(ctx, request.Target)
+		}
+	}
+	return result
 }
 
 func (e SSHExecutor) RunStreaming(ctx context.Context, request Request, stdout io.Writer, stderr io.Writer) Result {
 	start := time.Now()
 	argv := BuildSSHArgv(request.Target, request.Command)
 	runResult := runStreamingProcess(ctx, argv, stdout, stderr)
-	return Result{
+	result := Result{
 		ExitCode: runResult.ExitCode,
 		Duration: time.Since(start),
 		Err:      runResult.Err,
 		Argv:     append([]string{}, argv...),
+	}
+	if sshResultConnected(result) {
+		if request.Command != OSProbeCommand {
+			result.OS = e.detectOS(ctx, request.Target)
+		}
+	}
+	return result
+}
+
+func sshResultConnected(result Result) bool {
+	return (result.Err == nil || IsProcessExit(result)) && result.ExitCode != 255
+}
+
+func (e SSHExecutor) detectOS(ctx context.Context, target inventory.Target) string {
+	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	result := e.Runner.Run(probeCtx, BuildSSHArgv(target, OSProbeCommand))
+	if result.Err != nil || result.ExitCode != 0 {
+		return ""
+	}
+	return NormalizeOS(result.Stdout)
+}
+
+// OSProbeCommand is the remote command AgentSSH uses for internal host metadata
+// refreshes. Callers must never mix its stdout into agent-visible command output.
+const OSProbeCommand = "uname -s"
+
+// NormalizeOS maps common remote OS probe outputs to the inventory display
+// vocabulary. Unknown values are ignored so a failed or unusual probe never
+// overwrites a known host OS with noisy metadata.
+func NormalizeOS(value string) string {
+	v := strings.ToLower(strings.TrimSpace(value))
+	switch v {
+	case "linux":
+		return "linux"
+	case "darwin":
+		return "macos"
+	case "freebsd", "openbsd", "netbsd":
+		return "bsd"
+	default:
+		if strings.Contains(v, "mingw") || strings.Contains(v, "msys") || strings.Contains(v, "cygwin") || strings.Contains(v, "windows") {
+			return "windows"
+		}
+		return ""
 	}
 }
 

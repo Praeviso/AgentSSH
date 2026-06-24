@@ -124,7 +124,7 @@ gw      ssh_config     gw.example:22   idfile  no           待认证
 ```
 
 ### 6.2 探测(`--probe`,真连)
-- 对每个候选用 `NativeExecutor` 拨号+认证+开 session 跑空操作(或 `true`),短超时(默认 5s),**并发限速**。
+- 对每个候选用 `NativeExecutor` 拨号+认证+开 session 跑 `uname -s`,短超时(默认 5s),**并发限速**;成功时可顺带得到 OS metadata 用于 Hosts 图标。
 - 分类:`可直连` / `认证失败` / `主机密钥问题` / `不可达`,失败附 §5 提示。
 - **真实出网连接**——有副作用,故藏在 flag 后,文档明示。
 

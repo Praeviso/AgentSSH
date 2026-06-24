@@ -47,6 +47,9 @@ func TestFormGroupedAndWarnsOnPasswordWithoutMaster(t *testing.T) {
 	if strings.Contains(m.View(), "ssh-secret") {
 		t.Fatal("password value leaked into the rendered form")
 	}
+	if strings.Contains(m.View(), "linux/macos/windows/bsd") || strings.Contains(m.View(), "\nos\n") {
+		t.Fatalf("OS should be detected after connecting, not manually entered:\n%s", m.View())
+	}
 }
 
 func TestValidateNormalizesHostFields(t *testing.T) {

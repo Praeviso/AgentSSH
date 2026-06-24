@@ -709,6 +709,29 @@ func writeInventoryAtomic(home string, path string, inv inventory.Inventory) err
 	return inventory.Save(path, inv)
 }
 
+func refreshInventoryHostOS(paths config.Paths, hostName string, osName string) {
+	_ = updateInventoryHostOS(paths, hostName, osName)
+}
+
+func updateInventoryHostOS(paths config.Paths, hostName string, osName string) error {
+	osName = strings.TrimSpace(osName)
+	if hostName == "" || osName == "" || paths.InventoryFile == "" {
+		return nil
+	}
+	inv, err := inventory.Load(paths.InventoryFile)
+	if err != nil {
+		return err
+	}
+	if host, ok := inv.Hosts[hostName]; !ok || host.OS == osName {
+		return nil
+	}
+	next, err := inventory.SetHostOS(inv, hostName, osName)
+	if err != nil {
+		return err
+	}
+	return inventory.Save(paths.InventoryFile, next)
+}
+
 func runSecretSet(cmd *cobra.Command, host string) error {
 	paths, err := resolvePathsForWrite()
 	if err != nil {
@@ -901,6 +924,9 @@ func hostParts(host inventory.Host) []string {
 	if host.SSHConfigAlias != "" {
 		parts = append(parts, "alias="+host.SSHConfigAlias)
 	}
+	if host.OS != "" {
+		parts = append(parts, "os="+host.OS)
+	}
 	if host.IdentityFile != "" {
 		parts = append(parts, "identity_file="+host.IdentityFile)
 	}
@@ -1054,6 +1080,7 @@ func runInventoryTest(cmd *cobra.Command, name string) error {
 	})
 	result := exec.Probe(context.Background(), resolved.Targets[0])
 	if result.Err == nil && result.ExitCode == 0 {
+		refreshInventoryHostOS(cfg.Paths, name, result.OS)
 		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "OK %s\n", name)
 		return nil
 	}
@@ -1166,6 +1193,9 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 			if _, err := store.Append(baseAuditRecord(reqID, sessionCtx, audit.EventDenied, target.Name, remoteCommand, decision, nil, "", 0)); err != nil {
 				return err
 			}
+			if err := sessionResolver.Update(target.Name, sessionCtx.ID, time.Now().UTC()); err != nil {
+				return err
+			}
 			response := runResponse{
 				ReqID:        reqID,
 				SessionID:    sessionCtx.ID,
@@ -1205,6 +1235,12 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 			if _, err := store.Append(baseAuditRecord(reqID, sessionCtx, event, target.Name, remoteCommand, decision, &result.ExitCode, outputHash, result.Duration.Milliseconds(), filtered)); err != nil {
 				return err
 			}
+			if err := sessionResolver.Update(target.Name, sessionCtx.ID, time.Now().UTC()); err != nil {
+				return err
+			}
+			if !isSSHErrorResult(result) {
+				refreshInventoryHostOS(cfg.Paths, target.Name, result.OS)
+			}
 			printRunStreamFooter(cmd, target.Name, result, streamed.Stdout)
 			exitCode = mergeExitCode(exitCode, exitCodeForResult(result))
 			continue
@@ -1224,6 +1260,12 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 		outputHash := audit.ComputeOutputSHA256(filtered.Stdout, filtered.Stderr)
 		if _, err := store.Append(baseAuditRecord(reqID, sessionCtx, event, target.Name, remoteCommand, decision, &result.ExitCode, outputHash, result.Duration.Milliseconds(), filtered)); err != nil {
 			return err
+		}
+		if err := sessionResolver.Update(target.Name, sessionCtx.ID, time.Now().UTC()); err != nil {
+			return err
+		}
+		if !isSSHErrorResult(result) {
+			refreshInventoryHostOS(cfg.Paths, target.Name, result.OS)
 		}
 		if flags.jsonOutput {
 			responses = append(responses, runResponse{

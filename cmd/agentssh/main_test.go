@@ -514,6 +514,67 @@ func TestRunAllowWritesStartedAndCompleted(t *testing.T) {
 	}
 }
 
+func TestRunRefreshesSessionActivityAfterExecution(t *testing.T) {
+	home := t.TempDir()
+	writeTestInventory(t, home)
+	writeTestPolicy(t, home)
+	t.Setenv("AGENTSSH_HOME", home)
+
+	sessionPath := filepath.Join(home, "session")
+	restoreExecutor := newExecutor
+	newExecutor = func(_ *config.Config) executor.Executor {
+		return staleSessionExecutor{sessionPath: sessionPath, staleAt: time.Now().UTC().Add(-31 * time.Minute)}
+	}
+	defer func() {
+		newExecutor = restoreExecutor
+	}()
+
+	if _, _, err := runCommandForTest(t, "run", "web-1", "--", "echo", "hi"); err != nil {
+		t.Fatalf("first run err = %v", err)
+	}
+	firstID, firstActivity := readSessionPointerForTest(t, sessionPath, "web-1")
+	if firstID == "" || time.Since(firstActivity) > time.Minute {
+		t.Fatalf("first pointer id=%q last_activity=%s", firstID, firstActivity)
+	}
+
+	if _, _, err := runCommandForTest(t, "run", "web-1", "--", "echo", "again"); err != nil {
+		t.Fatalf("second run err = %v", err)
+	}
+	secondID, _ := readSessionPointerForTest(t, sessionPath, "web-1")
+	if secondID != firstID {
+		t.Fatalf("session id changed after fresh completion update: first=%q second=%q", firstID, secondID)
+	}
+}
+
+func TestRunUpdatesInventoryOSAfterConnection(t *testing.T) {
+	home := t.TempDir()
+	writeInventory(t, home, `
+version: 1
+hosts:
+  web-1:
+    addr: 10.0.0.11
+    user: deploy
+    os: windows
+`)
+	writeTestPolicy(t, home)
+	t.Setenv("AGENTSSH_HOME", home)
+
+	restoreExecutor := newExecutor
+	newExecutor = func(_ *config.Config) executor.Executor {
+		return osDetectingExecutor{osName: "linux"}
+	}
+	defer func() {
+		newExecutor = restoreExecutor
+	}()
+
+	if _, _, err := runCommandForTest(t, "run", "web-1", "--", "echo", "hi"); err != nil {
+		t.Fatalf("run err = %v", err)
+	}
+	if got := readInventoryFile(t, home).Hosts["web-1"].OS; got != "linux" {
+		t.Fatalf("inventory OS = %q, want linux", got)
+	}
+}
+
 func TestRunAppliesOutputFilterToReturnAndAudit(t *testing.T) {
 	home := t.TempDir()
 	writeTestInventory(t, home)
@@ -845,6 +906,9 @@ Host web-1
 	if host.SSHConfigAlias != "web-1" || host.Addr != "" || host.Port != 0 {
 		t.Fatalf("imported host = %#v", host)
 	}
+	if host.OS != "linux" {
+		t.Fatalf("imported host OS = %q, want linux", host.OS)
+	}
 }
 
 func TestPrintM2RunAuditDemo(t *testing.T) {
@@ -1112,6 +1176,95 @@ func (e fakeExecutor) RunStreaming(_ context.Context, request executor.Request, 
 
 var _ executor.StreamingExecutor = fakeExecutor{}
 
+type osDetectingExecutor struct {
+	osName string
+}
+
+func (e osDetectingExecutor) Run(_ context.Context, request executor.Request) executor.Result {
+	return executor.Result{
+		Stdout:   "ok\n",
+		ExitCode: 0,
+		Argv:     []string{"native-ssh", request.Target.Name, request.Command},
+		OS:       e.osName,
+	}
+}
+
+var _ executor.Executor = osDetectingExecutor{}
+
+type staleSessionExecutor struct {
+	sessionPath string
+	staleAt     time.Time
+}
+
+func (e staleSessionExecutor) Run(_ context.Context, request executor.Request) executor.Result {
+	id, _ := readSessionPointerForTest(nil, e.sessionPath, request.Target.Name)
+	if id != "" {
+		writeSessionPointerForTest(nil, e.sessionPath, request.Target.Name, id, e.staleAt)
+	}
+	return executor.Result{
+		Stdout:   "ok\n",
+		ExitCode: 0,
+		Argv:     []string{"native-ssh", request.Target.Name, request.Command},
+	}
+}
+
+var _ executor.Executor = staleSessionExecutor{}
+
+func readSessionPointerForTest(t *testing.T, path string, host string) (string, time.Time) {
+	if t != nil {
+		t.Helper()
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if t != nil {
+			t.Fatalf("read session pointer: %v", err)
+		}
+		return "", time.Time{}
+	}
+	var current struct {
+		Hosts map[string]struct {
+			ID           string    `json:"id"`
+			LastActivity time.Time `json:"last_activity"`
+		} `json:"hosts"`
+	}
+	if err := json.Unmarshal(data, &current); err != nil {
+		if t != nil {
+			t.Fatalf("unmarshal session pointer: %v\n%s", err, data)
+		}
+		return "", time.Time{}
+	}
+	pointer := current.Hosts[host]
+	return pointer.ID, pointer.LastActivity
+}
+
+func writeSessionPointerForTest(t *testing.T, path string, host string, id string, when time.Time) {
+	if t != nil {
+		t.Helper()
+	}
+	data, err := json.Marshal(struct {
+		Hosts map[string]struct {
+			ID           string    `json:"id"`
+			LastActivity time.Time `json:"last_activity"`
+		} `json:"hosts"`
+	}{
+		Hosts: map[string]struct {
+			ID           string    `json:"id"`
+			LastActivity time.Time `json:"last_activity"`
+		}{
+			host: {ID: id, LastActivity: when.UTC()},
+		},
+	})
+	if err != nil {
+		if t != nil {
+			t.Fatalf("marshal session pointer: %v", err)
+		}
+		return
+	}
+	if err := os.WriteFile(path, append(data, '\n'), 0o600); err != nil && t != nil {
+		t.Fatalf("write session pointer: %v", err)
+	}
+}
+
 func writeInChunks(w io.Writer, data []byte, size int) {
 	for len(data) > 0 {
 		n := size
@@ -1347,7 +1500,9 @@ func handleCLITestSession(channel ssh.Channel, requests <-chan *ssh.Request) {
 		var payload struct{ Command string }
 		_ = ssh.Unmarshal(req.Payload, &payload)
 		_ = req.Reply(true, nil)
-		if strings.Contains(payload.Command, "stream-secret") {
+		if payload.Command == executor.OSProbeCommand {
+			_, _ = channel.Write([]byte("Linux\n"))
+		} else if strings.Contains(payload.Command, "stream-secret") {
 			_, _ = channel.Write([]byte("line1\npassword="))
 			_, _ = channel.Write([]byte("secret123\nline3\n"))
 		} else {
@@ -1420,12 +1575,12 @@ func TestEndpointKeysSkipsAliasOnlyHosts(t *testing.T) {
 }
 
 func TestImportHostUsesAliasForSSHConfig(t *testing.T) {
-	h := discovery.ImportHost(discovery.Candidate{Source: discovery.SourceSSHConfig, Name: "prod-web", Addr: "10.0.0.11", Port: 22})
-	if h.SSHConfigAlias != "prod-web" || h.Addr != "" {
+	h := discovery.ImportHost(discovery.Candidate{Source: discovery.SourceSSHConfig, Name: "prod-web", Addr: "10.0.0.11", Port: 22, OS: "linux"})
+	if h.SSHConfigAlias != "prod-web" || h.Addr != "" || h.OS != "linux" {
 		t.Fatalf("ssh_config import should reference the alias: %#v", h)
 	}
-	h2 := discovery.ImportHost(discovery.Candidate{Source: discovery.SourceKnownHosts, Addr: "10.0.0.20", Port: 2222, IdentityFile: "~/.ssh/db"})
-	if h2.Addr != "10.0.0.20" || h2.Port != 2222 || h2.IdentityFile != "~/.ssh/db" || h2.SSHConfigAlias != "" {
+	h2 := discovery.ImportHost(discovery.Candidate{Source: discovery.SourceKnownHosts, Addr: "10.0.0.20", Port: 2222, IdentityFile: "~/.ssh/db", OS: "bsd"})
+	if h2.Addr != "10.0.0.20" || h2.Port != 2222 || h2.IdentityFile != "~/.ssh/db" || h2.SSHConfigAlias != "" || h2.OS != "bsd" {
 		t.Fatalf("known_hosts import should be a concrete host: %#v", h2)
 	}
 }

@@ -31,7 +31,6 @@ type Options struct {
 	Addr          string
 	User          string
 	Port          int
-	OS            string
 	Tags          []string
 	Alias         string
 	IdentityFile  string
@@ -44,7 +43,6 @@ type Result struct {
 	Addr      string
 	User      string
 	Port      int
-	OS        string
 	Tags      []string
 	Alias     string
 	Identity  string
@@ -59,7 +57,6 @@ func Validate(opts Options) (Result, map[string]string) {
 		addr:     strings.TrimSpace(opts.Addr),
 		user:     strings.TrimSpace(opts.User),
 		port:     portString(opts.Port),
-		os:       strings.TrimSpace(opts.OS),
 		tags:     strings.Join(opts.Tags, ","),
 		alias:    strings.TrimSpace(opts.Alias),
 		identity: strings.TrimSpace(opts.IdentityFile),
@@ -125,32 +122,10 @@ type formValues struct {
 	addr     string
 	user     string
 	port     string
-	os       string
 	tags     string
 	alias    string
 	identity string
 	password string
-}
-
-// knownOS is the recognized OS family vocabulary the host card has icons for.
-// Validation is lenient: an unknown value is kept (the card falls back to the
-// generic icon), so the field never blocks a submit.
-var knownOS = map[string]struct{}{"linux": {}, "macos": {}, "windows": {}, "bsd": {}}
-
-// normalizeOS lowercases/trims the OS family and maps common aliases to the
-// canonical vocabulary used by the card icons.
-func normalizeOS(value string) string {
-	v := strings.ToLower(strings.TrimSpace(value))
-	switch v {
-	case "darwin", "mac", "osx", "mac os", "macos":
-		return "macos"
-	case "win", "windows":
-		return "windows"
-	case "freebsd", "openbsd", "netbsd", "bsd":
-		return "bsd"
-	default:
-		return v
-	}
 }
 
 func validateValues(values formValues, existing map[string]struct{}) (Result, map[string]string) {
@@ -195,7 +170,6 @@ func validateValues(values formValues, existing map[string]struct{}) (Result, ma
 		Addr:      addr,
 		User:      userName,
 		Port:      port,
-		OS:        normalizeOS(values.os),
 		Tags:      SplitTags(values.tags),
 		Alias:     alias,
 		Identity:  strings.TrimSpace(values.identity),
@@ -226,7 +200,6 @@ const (
 	fieldAddr
 	fieldUser
 	fieldPort
-	fieldOS
 	fieldTags
 	fieldAlias
 	fieldIdentity
@@ -234,7 +207,7 @@ const (
 	fieldCount
 )
 
-var fieldKeys = []string{"name", "addr", "user", "port", "os", "tags", "alias", "identity", "password"}
+var fieldKeys = []string{"name", "addr", "user", "port", "tags", "alias", "identity", "password"}
 
 type keyMap struct {
 	Next      key.Binding
@@ -277,11 +250,11 @@ func newStyles(r *lipgloss.Renderer) styles {
 }
 
 // fieldLabels are the display labels indexed by field.
-var fieldLabels = []string{"name", "addr", "user", "port", "os", "tags", "ssh_config_alias", "identity_file", "password"}
+var fieldLabels = []string{"name", "addr", "user", "port", "tags", "ssh_config_alias", "identity_file", "password"}
 
 // fieldWidths are the textinput widths indexed by field, sized for the grouped
 // layout (short fields pair on one row).
-var fieldWidths = []int{18, 44, 12, 5, 14, 22, 20, 38, 24}
+var fieldWidths = []int{18, 44, 12, 5, 22, 20, 38, 24}
 
 // Model is the embeddable add-host form model.
 type Model struct {
@@ -317,8 +290,8 @@ func New(opts Options, r *lipgloss.Renderer) Model {
 
 func newModel(opts Options, st styles) Model {
 	inputs := make([]textinput.Model, fieldCount)
-	placeholders := []string{"web-1", "10.0.0.11", "$USER", "22", "linux/macos/windows/bsd", "web,prod", "ssh-config-host", "~/.ssh/web-1", "optional"}
-	values := []string{opts.Name, opts.Addr, opts.User, portString(opts.Port), normalizeOS(opts.OS), strings.Join(opts.Tags, ","), opts.Alias, opts.IdentityFile, ""}
+	placeholders := []string{"web-1", "10.0.0.11", "$USER", "22", "web,prod", "ssh-config-host", "~/.ssh/web-1", "optional"}
+	values := []string{opts.Name, opts.Addr, opts.User, portString(opts.Port), strings.Join(opts.Tags, ","), opts.Alias, opts.IdentityFile, ""}
 	for i := range inputs {
 		ti := textinput.New()
 		ti.Placeholder = placeholders[i]
@@ -419,7 +392,7 @@ func (m Model) View() string {
 	add("")
 	add(m.groupHeader("Connection"))
 	addRow(joinFields(fieldBlock(fieldName), fieldBlock(fieldUser), fieldBlock(fieldPort)), fieldName, fieldUser, fieldPort)
-	addRow(joinFields(fieldBlock(fieldAddr), fieldBlock(fieldOS)), fieldAddr, fieldOS)
+	addRow(fieldBlock(fieldAddr), fieldAddr)
 	add("")
 	add(m.groupHeader("Routing"))
 	addRow(joinFields(fieldBlock(fieldTags), fieldBlock(fieldAlias)), fieldTags, fieldAlias)
@@ -522,11 +495,9 @@ func (m Model) layoutWidths() []int {
 		{f: fieldUser, weight: 2, min: 6, max: 16},
 		{f: fieldPort, weight: 0, min: 5, max: 5},
 	})
-	// Row: addr | os (one gutter + two fields of chrome). addr stretches; os is
-	// rigid since an OS family name is short.
-	rowAddr := fitRow(avail-gut-2*chrome, []rowField{
+	// Row: addr stretches across the available width.
+	rowAddr := fitRow(avail-chrome, []rowField{
 		{f: fieldAddr, weight: 3, min: 12, max: 0},
-		{f: fieldOS, weight: 0, min: 10, max: 16},
 	})
 	// Row: tags | alias (one gutter + two fields of chrome).
 	row2 := fitRow(avail-gut-2*chrome, []rowField{
@@ -682,7 +653,6 @@ func (m Model) values() formValues {
 		addr:     m.inputs[fieldAddr].Value(),
 		user:     m.inputs[fieldUser].Value(),
 		port:     m.inputs[fieldPort].Value(),
-		os:       m.inputs[fieldOS].Value(),
 		tags:     m.inputs[fieldTags].Value(),
 		alias:    m.inputs[fieldAlias].Value(),
 		identity: m.inputs[fieldIdentity].Value(),

@@ -70,6 +70,7 @@
 - **`Argv[0]` 不能是 `"ssh"`**(用 `"native-ssh"` 之类),否则远端合法返回 255 会被 255 启发式误判成连接错。native 用 `Err` 而非 255 技巧来表达连接失败。
 - `Result.Argv` 仅用于该启发式(其余只读 `Argv[0]`);填 `["native-ssh", user@host, cmd]` 便于审计可读且避开误判。
 - `Stdout/Stderr/Duration` 语义与 shell-out 一致(原始输出交给 output.Filter 脱敏+截断;Duration 用 `time.Since(start)`)。
+- `Result.OS` 是 best-effort 元数据:连接成功后通过内部 `uname -s` 探测并归一化为 `linux/macos/windows/bsd`;探测失败不改变命令输出、审计、退出码。
 
 ## 7. 安全不变量(不得破坏)
 

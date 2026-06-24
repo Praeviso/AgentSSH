@@ -104,6 +104,22 @@ func RemoveHost(inv Inventory, name string) (Inventory, error) {
 	return next, nil
 }
 
+// SetHostOS returns a copy of inv with the host OS metadata replaced.
+func SetHostOS(inv Inventory, name string, osName string) (Inventory, error) {
+	host, ok := inv.Hosts[name]
+	if !ok {
+		return inv, ErrHostNotFound
+	}
+	if host.OS == osName {
+		return inv, nil
+	}
+	next := inv
+	next.Hosts = copyHosts(inv.Hosts)
+	host.OS = osName
+	next.Hosts[name] = host
+	return next, nil
+}
+
 // HostNames returns the inventory host names as a set.
 func HostNames(inv Inventory) map[string]struct{} {
 	names := make(map[string]struct{}, len(inv.Hosts))
