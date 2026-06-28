@@ -166,13 +166,42 @@ func TestWelcomeBannerFitsAndDismisses(t *testing.T) {
 	if max, lines := maxLineWidth(v); max > 60 || lines > 16 {
 		t.Fatalf("welcome overflow: %dx%d", max, lines)
 	}
-	// Any key dismisses the banner.
-	m = press(t, m, "x")
+	// A neutral key dismisses the banner and lands on the grid.
+	m = press(t, m, "g")
 	if m.firstRun {
 		t.Fatal("first key should dismiss the welcome banner")
 	}
 	if strings.Contains(m.View(), "Welcome to AgentSSH") {
 		t.Fatal("welcome banner still shown after a keypress")
+	}
+	if m.hosts.focus != hostFocusList {
+		t.Fatalf("neutral first key left grid in focus %v, want list", m.hosts.focus)
+	}
+}
+
+// The first keystroke isn't wasted: it dismisses the banner and also performs its
+// action (here, 'a' opens the add form) — except 'q', which only dismisses so a
+// curious keypress can't quit on the greeting.
+func TestWelcomeBannerReDispatchesFirstKey(t *testing.T) {
+	m := sized(t, func() appModel { mm := buildApp(t); mm.firstRun = true; return mm }(), 80, 24)
+	m = press(t, m, "a")
+	if m.firstRun {
+		t.Fatal("'a' should dismiss the banner")
+	}
+	if m.hosts.focus != hostFocusForm {
+		t.Fatalf("'a' on first run did not open the add form: focus=%v", m.hosts.focus)
+	}
+}
+
+func TestWelcomeBannerQuitKeyOnlyDismisses(t *testing.T) {
+	m := sized(t, func() appModel { mm := buildApp(t); mm.firstRun = true; return mm }(), 80, 24)
+	m = press(t, m, "q")
+	if m.firstRun {
+		t.Fatal("'q' should still dismiss the banner")
+	}
+	// q must not have quit to a confirm/form; the grid is shown with hosts.
+	if m.hosts.focus != hostFocusList || !strings.Contains(m.View(), "bare") {
+		t.Fatalf("'q' on first run did not land cleanly on the grid:\n%s", m.View())
 	}
 }
 

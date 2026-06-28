@@ -35,6 +35,8 @@ type Options struct {
 	Alias         string
 	IdentityFile  string
 	ExistingNames map[string]struct{}
+	FixedName     bool
+	Title         string
 }
 
 // Result is the normalized submitted form value.
@@ -252,20 +254,27 @@ func newStyles(r *lipgloss.Renderer) styles {
 // fieldLabels are the display labels indexed by field.
 var fieldLabels = []string{"name", "addr", "user", "port", "tags", "ssh_config_alias", "identity_file", "password"}
 
+// requiredFields are marked with a * so the operator sees what's mandatory before
+// submitting. addr is technically required only when no ssh_config_alias is set
+// (see validateValues), but it's marked because it's needed in the common case.
+var requiredFields = map[field]bool{fieldName: true, fieldAddr: true}
+
 // fieldWidths are the textinput widths indexed by field, sized for the grouped
 // layout (short fields pair on one row).
 var fieldWidths = []int{18, 44, 12, 5, 22, 20, 38, 24}
 
 // Model is the embeddable add-host form model.
 type Model struct {
-	inputs   []textinput.Model
-	focus    field
-	errs     []string
-	keys     keyMap
-	styles   styles
-	existing map[string]struct{}
-	result   Result
-	done     bool
+	inputs    []textinput.Model
+	focus     field
+	errs      []string
+	keys      keyMap
+	styles    styles
+	existing  map[string]struct{}
+	fixedName bool
+	title     string
+	result    Result
+	done      bool
 	// w, h are the live render budget (the section body the shell allocates). They
 	// drive responsive field widths and the height scroll window; 0 means "size
 	// unknown" and the form falls back to its natural fixed widths (see
@@ -302,14 +311,25 @@ func newModel(opts Options, st styles) Model {
 		}
 		inputs[i] = ti
 	}
-	_ = inputs[fieldName].Focus()
+	focus := fieldName
+	if opts.FixedName {
+		focus = fieldAddr
+	}
+	_ = inputs[focus].Focus()
+	title := opts.Title
+	if title == "" {
+		title = "Add inventory host"
+	}
 
 	return Model{
-		inputs:   inputs,
-		keys:     defaultKeys(),
-		styles:   st,
-		errs:     make([]string, fieldCount),
-		existing: opts.ExistingNames,
+		inputs:    inputs,
+		focus:     focus,
+		keys:      defaultKeys(),
+		styles:    st,
+		errs:      make([]string, fieldCount),
+		existing:  opts.ExistingNames,
+		fixedName: opts.FixedName,
+		title:     title,
 	}
 }
 
@@ -364,6 +384,9 @@ func (m Model) View() string {
 		in.Width = widths[f]
 		var b strings.Builder
 		b.WriteString(m.styles.label.Render(fieldLabels[f]))
+		if requiredFields[f] {
+			b.WriteString(m.styles.warn.Render(" *"))
+		}
 		b.WriteString("\n")
 		b.WriteString(in.View())
 		if m.errs[f] != "" {
@@ -388,7 +411,7 @@ func (m Model) View() string {
 		lines = append(lines, strings.Split(block, "\n")...)
 	}
 
-	add(m.fit(m.styles.title, "Add inventory host"))
+	add(m.fit(m.styles.title, m.title))
 	add("")
 	add(m.groupHeader("Connection"))
 	addRow(joinFields(fieldBlock(fieldName), fieldBlock(fieldUser), fieldBlock(fieldPort)), fieldName, fieldUser, fieldPort)
@@ -405,7 +428,7 @@ func (m Model) View() string {
 		add(m.fit(m.styles.warn, m.styles.glyphs.Warn+" AGENTSSH_MASTER_PASSWORD not set — the password won't be saved."))
 	}
 	add("")
-	add(m.fit(m.styles.help, "tab/down next · shift+tab/up prev · enter submit · esc cancel"))
+	add(m.fit(m.styles.help, "tab/down next · shift+tab/up prev · enter submit · esc cancel · * required"))
 
 	// Height window: when the form is taller than the budget, scroll it so the
 	// focused field stays visible instead of letting the bottom clip off-screen
@@ -615,6 +638,9 @@ func (m Model) move(delta int) (tea.Model, tea.Cmd) {
 	m.validateField(m.focus)
 	m.inputs[m.focus].Blur()
 	next := (int(m.focus) + delta + int(fieldCount)) % int(fieldCount)
+	if m.fixedName && field(next) == fieldName {
+		next = (next + delta + int(fieldCount)) % int(fieldCount)
+	}
 	m.focus = field(next)
 	cmd := m.inputs[m.focus].Focus()
 	return m, cmd

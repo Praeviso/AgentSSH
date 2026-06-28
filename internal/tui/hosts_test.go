@@ -1,8 +1,14 @@
 package tui
 
 import (
+	"os"
 	"strings"
 	"testing"
+
+	"github.com/Praeviso/AgentSSH/internal/audit"
+	"github.com/Praeviso/AgentSSH/internal/hostform"
+	"github.com/Praeviso/AgentSSH/internal/inventory"
+	"github.com/Praeviso/AgentSSH/internal/policy"
 )
 
 func TestOSMeta(t *testing.T) {
@@ -116,4 +122,133 @@ func TestGrid2DNavigation(t *testing.T) {
 	if m.hosts.cursor != 4 {
 		t.Fatalf("G: cursor = %d, want 4", m.hosts.cursor)
 	}
+}
+
+func TestHostsEditUpdatesInventory(t *testing.T) {
+	m := sized(t, buildApp(t), 100, 30)
+	m.hosts.cursor = hostIndex(t, m.hosts.names, "prod-web-01")
+	m = press(t, m, "e")
+	if m.hosts.focus != hostFocusForm || m.hosts.editingHost != "prod-web-01" {
+		t.Fatalf("edit state focus=%v editing=%q", m.hosts.focus, m.hosts.editingHost)
+	}
+	if err := m.hosts.updateHost(hostform.Result{
+		Name:     "prod-web-01",
+		Addr:     "10.0.0.99",
+		User:     "admin",
+		Port:     2222,
+		Tags:     []string{"prod", "api"},
+		Alias:    "prod-web",
+		Identity: "~/.ssh/prod-web",
+	}); err != nil {
+		t.Fatalf("updateHost: %v", err)
+	}
+	inv, err := inventory.Load(m.hosts.paths.InventoryFile)
+	if err != nil {
+		t.Fatalf("load inventory: %v", err)
+	}
+	host := inv.Hosts["prod-web-01"]
+	if host.Addr != "10.0.0.99" || host.User != "admin" || host.Port != 2222 || host.SSHConfigAlias != "prod-web" || host.IdentityFile != "~/.ssh/prod-web" || host.OS != "linux" {
+		t.Fatalf("updated host = %#v", host)
+	}
+	if got := strings.Join(host.Tags, ","); got != "prod,api" {
+		t.Fatalf("tags = %q", got)
+	}
+}
+
+func TestHostsRemoveSelectedWritesAudit(t *testing.T) {
+	m := sized(t, buildApp(t), 100, 30)
+	m.hosts.cursor = hostIndex(t, m.hosts.names, "prod-web-01")
+	removed, _ := m.hosts.removeSelected()
+	if !removed {
+		t.Fatalf("removeSelected failed: status=%q err=%v", m.hosts.status, m.hosts.err)
+	}
+	if _, ok := m.hosts.inventory.Hosts["prod-web-01"]; ok {
+		t.Fatalf("prod-web-01 still present: %#v", m.hosts.inventory.Hosts)
+	}
+	records, err := audit.NewStore(m.hosts.paths.AuditFile).ReadAll()
+	if err != nil {
+		t.Fatalf("read audit: %v", err)
+	}
+	if len(records) != 1 || records[0].Event != audit.EventCompleted || records[0].Host != "prod-web-01" || records[0].Cmd != "inventory rm prod-web-01" {
+		t.Fatalf("delete audit records = %#v", records)
+	}
+}
+
+func TestHostsRemoveSelectedClearsOnlyDeletedHostRules(t *testing.T) {
+	m := sized(t, buildAppWith(t, sampleInventory, `version: 1
+host_overrides:
+  host:prod-web-01:
+    rules:
+      - match: { cmd_regex: '^whoami$' }
+        action: allow
+  web:
+    rules:
+      - match: { cmd_regex: '^id$' }
+        action: deny
+rule_groups:
+  readonly:
+    rules:
+      - match: { cmd_regex: '^ls$' }
+        action: allow
+`), 100, 30)
+	m.hosts.cursor = hostIndex(t, m.hosts.names, "prod-web-01")
+
+	removed, cmd := m.hosts.removeSelected()
+	if !removed {
+		t.Fatalf("removeSelected failed: status=%q err=%v", m.hosts.status, m.hosts.err)
+	}
+	if cmd == nil {
+		t.Fatal("removeSelected did not emit policyChangedMsg")
+	}
+	msg := cmd()
+	changed, ok := msg.(policyChangedMsg)
+	if !ok {
+		t.Fatalf("policy command message = %T %[1]v, want policyChangedMsg", msg)
+	}
+	if _, ok := changed.config.HostOverrides["host:prod-web-01"]; ok {
+		t.Fatalf("deleted host rules still present in message: %#v", changed.config.HostOverrides)
+	}
+	cfg, err := policy.Load(m.paths.PolicyFile)
+	if err != nil {
+		t.Fatalf("load policy: %v", err)
+	}
+	if _, ok := cfg.HostOverrides["host:prod-web-01"]; ok {
+		t.Fatalf("deleted host rules still present: %#v", cfg.HostOverrides)
+	}
+	if _, ok := cfg.HostOverrides["web"]; !ok {
+		t.Fatalf("group override removed: %#v", cfg.HostOverrides)
+	}
+	if _, ok := cfg.RuleGroups["readonly"]; !ok {
+		t.Fatalf("rule group removed: %#v", cfg.RuleGroups)
+	}
+}
+
+func TestHostsRemoveSelectedParseFailureWritesAudit(t *testing.T) {
+	m := sized(t, buildApp(t), 100, 30)
+	m.hosts.cursor = hostIndex(t, m.hosts.names, "prod-web-01")
+	if err := os.WriteFile(m.hosts.paths.InventoryFile, []byte("::: not: yaml: ["), 0o600); err != nil {
+		t.Fatalf("write malformed inventory: %v", err)
+	}
+	removed, _ := m.hosts.removeSelected()
+	if removed {
+		t.Fatal("removeSelected unexpectedly succeeded")
+	}
+	records, err := audit.NewStore(m.hosts.paths.AuditFile).ReadAll()
+	if err != nil {
+		t.Fatalf("read audit: %v", err)
+	}
+	if len(records) != 1 || records[0].Event != audit.EventFailed || records[0].Host != "prod-web-01" || !strings.Contains(records[0].Error, "yaml") {
+		t.Fatalf("failed delete audit records = %#v", records)
+	}
+}
+
+func hostIndex(t *testing.T, names []string, name string) int {
+	t.Helper()
+	for i, got := range names {
+		if got == name {
+			return i
+		}
+	}
+	t.Fatalf("host %q not found in %#v", name, names)
+	return 0
 }

@@ -355,6 +355,491 @@ func TestInventoryAddNonInteractiveRequiresFields(t *testing.T) {
 	}
 }
 
+func TestInventoryUpdateFlagPathPreservesUnchangedFields(t *testing.T) {
+	home := t.TempDir()
+	writeInventory(t, home, `
+version: 1
+hosts:
+  web-1:
+    addr: 10.0.0.11
+    user: deploy
+    port: 22
+    identity_file: ~/.ssh/web-1
+    os: linux
+    tags: [web, prod]
+`)
+	t.Setenv("AGENTSSH_HOME", home)
+
+	stdout, stderr, err := runCommandForTest(t, "inventory", "update", "web-1", "--addr", "10.0.0.12", "--port", "2222", "--tags", "api,prod")
+	if err != nil {
+		t.Fatalf("inventory update err = %v stdout=%s stderr=%s", err, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "updated host web-1") {
+		t.Fatalf("update stdout = %q", stdout)
+	}
+	host := readInventoryFile(t, home).Hosts["web-1"]
+	if host.Addr != "10.0.0.12" || host.User != "deploy" || host.Port != 2222 || host.IdentityFile != "~/.ssh/web-1" || host.OS != "linux" {
+		t.Fatalf("updated host = %#v", host)
+	}
+	if got := strings.Join(host.Tags, ","); got != "api,prod" {
+		t.Fatalf("tags = %q", got)
+	}
+}
+
+func TestInventoryUpdateRejectsInvalidFinalHost(t *testing.T) {
+	home := t.TempDir()
+	writeInventory(t, home, `
+version: 1
+hosts:
+  web-1:
+    addr: 10.0.0.11
+`)
+	t.Setenv("AGENTSSH_HOME", home)
+
+	_, _, err := runCommandForTest(t, "inventory", "update", "web-1")
+	if err == nil || !isUsageError(err) {
+		t.Fatalf("missing update fields err = %T %[1]v, want usageError", err)
+	}
+	_, _, err = runCommandForTest(t, "inventory", "update", "web-1", "--addr", "")
+	if err == nil || !isUsageError(err) {
+		t.Fatalf("invalid update err = %T %[1]v, want usageError", err)
+	}
+}
+
+func TestInventoryRemoveDeletesHostAndWritesAudit(t *testing.T) {
+	home := t.TempDir()
+	writeInventory(t, home, `
+version: 1
+hosts:
+  web-1:
+    addr: 10.0.0.11
+  db-1:
+    addr: 10.0.0.12
+`)
+	t.Setenv("AGENTSSH_HOME", home)
+
+	stdout, stderr, err := runCommandForTest(t, "inventory", "rm", "web-1")
+	if err != nil {
+		t.Fatalf("inventory rm err = %v stdout=%s stderr=%s", err, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "removed host web-1") {
+		t.Fatalf("rm stdout = %q", stdout)
+	}
+	inv := readInventoryFile(t, home)
+	if _, ok := inv.Hosts["web-1"]; ok {
+		t.Fatalf("web-1 still present: %#v", inv.Hosts)
+	}
+	if _, ok := inv.Hosts["db-1"]; !ok {
+		t.Fatalf("db-1 missing after rm: %#v", inv.Hosts)
+	}
+	records := mustReadAudit(t, home)
+	if len(records) != 1 || records[0].Event != audit.EventCompleted || records[0].Host != "web-1" || records[0].Cmd != "inventory rm web-1" {
+		t.Fatalf("delete audit records = %#v", records)
+	}
+	if records[0].ExitCode == nil || *records[0].ExitCode != exitOK || records[0].Error != "" {
+		t.Fatalf("delete audit record = %#v", records[0])
+	}
+	if result, err := audit.NewStore(filepath.Join(home, "audit.log")).Verify(); err != nil || !result.OK {
+		t.Fatalf("verify delete audit = %#v err=%v", result, err)
+	}
+}
+
+func TestInventoryRemoveClearsOnlyDeletedHostRules(t *testing.T) {
+	home := t.TempDir()
+	writeInventory(t, home, `
+version: 1
+hosts:
+  web-1:
+    addr: 10.0.0.11
+    tags: [prod]
+  web-2:
+    addr: 10.0.0.12
+    tags: [prod]
+groups:
+  prod:
+    tags: [prod]
+`)
+	writePolicy(t, home, `
+version: 1
+host_overrides:
+  host:web-1:
+    rules:
+      - match: { cmd_regex: '^whoami$' }
+        action: allow
+  host:web-2:
+    rules:
+      - match: { cmd_regex: '^uptime$' }
+        action: allow
+  prod:
+    rules:
+      - match: { cmd_regex: '^id$' }
+        action: deny
+rule_groups:
+  readonly:
+    rules:
+      - match: { cmd_regex: '^ls$' }
+        action: allow
+`)
+	t.Setenv("AGENTSSH_HOME", home)
+
+	stdout, stderr, err := runCommandForTest(t, "inventory", "rm", "web-1")
+	if err != nil {
+		t.Fatalf("inventory rm err = %v stdout=%s stderr=%s", err, stdout, stderr)
+	}
+	cfg := readPolicyFile(t, home)
+	if _, ok := cfg.HostOverrides["host:web-1"]; ok {
+		t.Fatalf("deleted host rules still present: %#v", cfg.HostOverrides)
+	}
+	if _, ok := cfg.HostOverrides["host:web-2"]; !ok {
+		t.Fatalf("other host rules removed: %#v", cfg.HostOverrides)
+	}
+	if _, ok := cfg.HostOverrides["prod"]; !ok {
+		t.Fatalf("group override removed: %#v", cfg.HostOverrides)
+	}
+	if _, ok := cfg.RuleGroups["readonly"]; !ok {
+		t.Fatalf("rule group removed: %#v", cfg.RuleGroups)
+	}
+}
+
+func TestInventoryRemoveMissingWritesFailedAudit(t *testing.T) {
+	home := t.TempDir()
+	writeInventory(t, home, `
+version: 1
+hosts:
+  web-1:
+    addr: 10.0.0.11
+`)
+	t.Setenv("AGENTSSH_HOME", home)
+
+	_, _, err := runCommandForTest(t, "inventory", "rm", "missing")
+	if err == nil || !isUsageError(err) {
+		t.Fatalf("missing rm err = %T %[1]v, want usageError", err)
+	}
+	records := mustReadAudit(t, home)
+	if len(records) != 1 || records[0].Event != audit.EventFailed || records[0].Host != "missing" || records[0].Cmd != "inventory rm missing" {
+		t.Fatalf("failed delete audit records = %#v", records)
+	}
+	if records[0].ExitCode == nil || *records[0].ExitCode != exitUsage || !strings.Contains(records[0].Error, "inventory host not found") {
+		t.Fatalf("failed delete audit record = %#v", records[0])
+	}
+	stdout, stderr, err := runCommandForTest(t, "audit", "ls", "--status", "failed")
+	if err != nil {
+		t.Fatalf("audit ls failed err = %v stderr=%s", err, stderr)
+	}
+	if !strings.Contains(stdout, `err="inventory host not found"`) || !strings.Contains(stdout, `cmd="inventory rm missing"`) {
+		t.Fatalf("audit ls missing delete failure context:\n%s", stdout)
+	}
+}
+
+func TestPolicyRuleCRUDCommands(t *testing.T) {
+	home := t.TempDir()
+	writePolicy(t, home, `
+version: 1
+rules:
+  - name: old
+    priority: 1
+    match: { cmd_regex: '^ls' }
+    action: allow
+output:
+  max_bytes: 1024
+`)
+	t.Setenv("AGENTSSH_HOME", home)
+
+	stdout, stderr, err := runCommandForTest(t, "policy", "rule", "add", "danger", "--cmd-regex", "rm -rf", "--action", "deny", "--priority", "50")
+	if err != nil {
+		t.Fatalf("policy rule add err = %v stdout=%s stderr=%s", err, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "added policy rule danger") {
+		t.Fatalf("add stdout = %q", stdout)
+	}
+	stdout, stderr, err = runCommandForTest(t, "policy", "rule", "ls")
+	if err != nil {
+		t.Fatalf("policy rule ls err = %v stderr=%s", err, stderr)
+	}
+	for _, want := range []string{"name=old", "priority=1", "cmd_regex=\"^ls\"", "name=danger", "priority=50", "action=deny", "cmd_regex=\"rm -rf\""} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("policy rule ls missing %q:\n%s", want, stdout)
+		}
+	}
+
+	stdout, stderr, err = runCommandForTest(t, "policy", "rule", "update", "danger", "--name", "catastrophic", "--cmd-regex", "mkfs", "--action", "deny", "--priority", "99")
+	if err != nil {
+		t.Fatalf("policy rule update err = %v stdout=%s stderr=%s", err, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "updated policy rule catastrophic") {
+		t.Fatalf("update stdout = %q", stdout)
+	}
+	stdout, stderr, err = runCommandForTest(t, "policy", "rule", "rm", "old")
+	if err != nil {
+		t.Fatalf("policy rule rm err = %v stdout=%s stderr=%s", err, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "removed policy rule old") {
+		t.Fatalf("rm stdout = %q", stdout)
+	}
+	var cfg policy.Config
+	raw := readFileString(t, filepath.Join(home, "policy.yaml"))
+	if err := yaml.Unmarshal([]byte(raw), &cfg); err != nil {
+		t.Fatalf("decode policy: %v\n%s", err, raw)
+	}
+	if len(cfg.Rules) != 1 || cfg.Rules[0].Name != "catastrophic" || cfg.Rules[0].Match.CmdRegex != "mkfs" || cfg.Rules[0].Priority != 99 {
+		t.Fatalf("policy after crud = %#v", cfg.Rules)
+	}
+	if _, _, err = runCommandForTest(t, "policy", "rule", "add", "missing-action", "--cmd-regex", "^ls"); err == nil || !isUsageError(err) {
+		t.Fatalf("missing action err = %T %[1]v, want usageError", err)
+	}
+	if _, _, err = runCommandForTest(t, "policy", "rule", "add", "broken", "--cmd-regex", "[", "--action", "deny"); err == nil || !isUsageError(err) {
+		t.Fatalf("invalid regex err = %T %[1]v, want usageError", err)
+	}
+}
+
+func TestPolicyHostCRUDCommands(t *testing.T) {
+	home := t.TempDir()
+	writeInventory(t, home, `
+version: 1
+hosts:
+  web-1:
+    addr: 10.0.0.11
+  web-2:
+    addr: 10.0.0.12
+`)
+	writePolicy(t, home, `
+version: 1
+rules:
+  - name: allow-cat
+    match: { cmd_regex: '^cat\b' }
+    action: allow
+output:
+  max_bytes: 1024
+`)
+	t.Setenv("AGENTSSH_HOME", home)
+
+	stdout, stderr, err := runCommandForTest(t, "policy", "host", "rule", "add", "web-1", "--cmd-regex", "^cat\\b", "--action", "deny", "--priority", "20")
+	if err != nil {
+		t.Fatalf("policy host rule add err = %v stdout=%s stderr=%s", err, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "added policy host rule web-1[0]") {
+		t.Fatalf("add stdout = %q", stdout)
+	}
+	stdout, stderr, err = runCommandForTest(t, "policy", "host", "ls")
+	if err != nil {
+		t.Fatalf("policy host ls err = %v stderr=%s", err, stderr)
+	}
+	for _, want := range []string{"host=web-1", "rules=1", "key=host:web-1", "priority=20", "action=deny", `cmd_regex="^cat\\b"`} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("policy host ls missing %q:\n%s", want, stdout)
+		}
+	}
+
+	stdout, stderr, err = runCommandForTest(t, "policy", "test", "--host", "web-1", "cat", "/etc/passwd")
+	if err != nil {
+		t.Fatalf("policy test web-1 err = %v stdout=%s stderr=%s", err, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "deny") || !strings.Contains(stdout, "host:web-1/rules[0]") {
+		t.Fatalf("policy test web-1 output = %q", stdout)
+	}
+	stdout, stderr, err = runCommandForTest(t, "policy", "test", "--host", "web-2", "cat", "/etc/passwd")
+	if err != nil {
+		t.Fatalf("policy test web-2 err = %v stdout=%s stderr=%s", err, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "allow") || strings.Contains(stdout, "host:web-1") {
+		t.Fatalf("policy test web-2 output = %q", stdout)
+	}
+
+	stdout, stderr, err = runCommandForTest(t, "policy", "host", "rule", "add", "web-1", "--cmd-regex", "^uptime$", "--action", "allow")
+	if err != nil {
+		t.Fatalf("policy host rule add err = %v stdout=%s stderr=%s", err, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "added policy host rule web-1[1]") {
+		t.Fatalf("rule add stdout = %q", stdout)
+	}
+	stdout, stderr, err = runCommandForTest(t, "policy", "host", "rule", "rm", "web-1", "0")
+	if err != nil {
+		t.Fatalf("policy host rule rm err = %v stdout=%s stderr=%s", err, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "removed policy host rule web-1[0]") {
+		t.Fatalf("rule rm stdout = %q", stdout)
+	}
+
+	var cfg policy.Config
+	raw := readFileString(t, filepath.Join(home, "policy.yaml"))
+	if err := yaml.Unmarshal([]byte(raw), &cfg); err != nil {
+		t.Fatalf("decode policy: %v\n%s", err, raw)
+	}
+	override, ok := cfg.HostOverrides["host:web-1"]
+	if !ok || len(override.Rules) != 1 || override.Rules[0].Action != policy.ActionAllow || override.Rules[0].Match.CmdRegex != "^uptime$" {
+		t.Fatalf("host override after crud = %#v ok=%v", override, ok)
+	}
+
+	stdout, stderr, err = runCommandForTest(t, "policy", "host", "rm", "web-1")
+	if err != nil {
+		t.Fatalf("policy host rm err = %v stdout=%s stderr=%s", err, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "removed policy host web-1") {
+		t.Fatalf("rm stdout = %q", stdout)
+	}
+	raw = readFileString(t, filepath.Join(home, "policy.yaml"))
+	if strings.Contains(raw, "host:web-1") {
+		t.Fatalf("host rules still present:\n%s", raw)
+	}
+	if _, _, err = runCommandForTest(t, "policy", "host", "rule", "add", "missing", "--cmd-regex", "^ls", "--action", "allow"); err == nil || !isUsageError(err) {
+		t.Fatalf("missing host err = %T %[1]v, want usageError", err)
+	}
+	if _, _, err = runCommandForTest(t, "policy", "host", "rule", "add", "web-1", "--cmd-regex", "[", "--action", "allow"); err == nil || !isUsageError(err) {
+		t.Fatalf("invalid host regex err = %T %[1]v, want usageError", err)
+	}
+}
+
+func TestPolicyGroupCommands(t *testing.T) {
+	home := t.TempDir()
+	writeInventory(t, home, `
+version: 1
+hosts:
+  web-1:
+    addr: 10.0.0.11
+`)
+	writePolicy(t, home, `
+version: 1
+output:
+  max_bytes: 1024
+`)
+	t.Setenv("AGENTSSH_HOME", home)
+
+	stdout, stderr, err := runCommandForTest(t, "policy", "group", "add", "readonly")
+	if err != nil {
+		t.Fatalf("policy group add err = %v stdout=%s stderr=%s", err, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "added policy group readonly") {
+		t.Fatalf("group add stdout = %q", stdout)
+	}
+	stdout, stderr, err = runCommandForTest(t, "policy", "group", "rule", "add", "readonly", "--cmd-regex", "^uptime$", "--action", "allow", "--priority", "5")
+	if err != nil {
+		t.Fatalf("policy group rule add err = %v stdout=%s stderr=%s", err, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "added policy group rule readonly[0]") {
+		t.Fatalf("group rule add stdout = %q", stdout)
+	}
+	stdout, stderr, err = runCommandForTest(t, "policy", "group", "ls")
+	if err != nil {
+		t.Fatalf("policy group ls err = %v stderr=%s", err, stderr)
+	}
+	for _, want := range []string{"readonly", "rules=1", "allow=1", "deny=0"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("policy group ls missing %q:\n%s", want, stdout)
+		}
+	}
+	stdout, stderr, err = runCommandForTest(t, "policy", "group", "rule", "ls", "readonly")
+	if err != nil {
+		t.Fatalf("policy group rule ls err = %v stderr=%s", err, stderr)
+	}
+	for _, want := range []string{`0 priority=5`, `action=allow`, `cmd_regex="^uptime$"`} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("policy group rule ls missing %q:\n%s", want, stdout)
+		}
+	}
+
+	stdout, stderr, err = runCommandForTest(t, "policy", "host", "rule", "add", "web-1", "--from-group", "readonly")
+	if err != nil {
+		t.Fatalf("policy host rule add --from-group err = %v stdout=%s stderr=%s", err, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "stamped policy group readonly onto host web-1 (1 rule(s))") {
+		t.Fatalf("stamp stdout = %q", stdout)
+	}
+	var cfg policy.Config
+	raw := readFileString(t, filepath.Join(home, "policy.yaml"))
+	if err := yaml.Unmarshal([]byte(raw), &cfg); err != nil {
+		t.Fatalf("decode policy: %v\n%s", err, raw)
+	}
+	rules := cfg.HostOverrides["host:web-1"].Rules
+	if len(rules) != 1 || rules[0].Group != "readonly" || rules[0].Match.CmdRegex != "^uptime$" {
+		t.Fatalf("stamped host rules = %#v", rules)
+	}
+
+	stdout, stderr, err = runCommandForTest(t, "policy", "host", "rule", "ls", "web-1")
+	if err != nil {
+		t.Fatalf("policy host rule ls err = %v stderr=%s", err, stderr)
+	}
+	if !strings.Contains(stdout, `group="readonly"`) {
+		t.Fatalf("host rule ls missing provenance:\n%s", stdout)
+	}
+	stdout, stderr, err = runCommandForTest(t, "policy", "host", "group", "rm", "web-1", "readonly")
+	if err != nil {
+		t.Fatalf("policy host group rm err = %v stdout=%s stderr=%s", err, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "removed policy host group web-1[readonly]") {
+		t.Fatalf("host group rm stdout = %q", stdout)
+	}
+	raw = readFileString(t, filepath.Join(home, "policy.yaml"))
+	if strings.Contains(raw, "group: readonly") {
+		t.Fatalf("stamped group still present after host group rm:\n%s", raw)
+	}
+
+	stdout, stderr, err = runCommandForTest(t, "policy", "group", "rule", "rm", "readonly", "0")
+	if err != nil {
+		t.Fatalf("policy group rule rm err = %v stdout=%s stderr=%s", err, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "removed policy group rule readonly[0]") {
+		t.Fatalf("group rule rm stdout = %q", stdout)
+	}
+	stdout, stderr, err = runCommandForTest(t, "policy", "group", "rm", "readonly")
+	if err != nil {
+		t.Fatalf("policy group rm err = %v stdout=%s stderr=%s", err, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "removed policy group readonly") {
+		t.Fatalf("group rm stdout = %q", stdout)
+	}
+
+	if _, _, err = runCommandForTest(t, "policy", "group", "rule", "add", "missing", "--cmd-regex", "^ls", "--action", "allow"); err == nil || !isUsageError(err) {
+		t.Fatalf("missing group err = %T %[1]v, want usageError", err)
+	}
+	if _, _, err = runCommandForTest(t, "policy", "host", "rule", "add", "web-1", "--from-group", "missing"); err == nil || !isUsageError(err) {
+		t.Fatalf("stamp missing group err = %T %[1]v, want usageError", err)
+	}
+	if _, _, err = runCommandForTest(t, "policy", "host", "rule", "add", "web-1", "--from-group", "readonly", "--cmd-regex", "^ls", "--action", "allow"); err == nil || !isUsageError(err) {
+		t.Fatalf("from-group mutual exclusion err = %T %[1]v, want usageError", err)
+	}
+}
+
+func TestAuditRepairTruncatesBrokenTail(t *testing.T) {
+	home := t.TempDir()
+	writeTestInventory(t, home)
+	writeTestPolicy(t, home)
+	t.Setenv("AGENTSSH_HOME", home)
+
+	store := audit.NewStore(filepath.Join(home, "audit.log"))
+	for _, record := range []audit.Record{
+		{ReqID: "r1", Event: audit.EventCompleted, Host: "web-1"},
+		{ReqID: "r2", Event: audit.EventCompleted, Host: "web-1"},
+		{ReqID: "r3", Event: audit.EventCompleted, Host: "web-1"},
+	} {
+		if _, err := store.Append(record); err != nil {
+			t.Fatalf("append audit: %v", err)
+		}
+	}
+	records := mustReadAudit(t, home)
+	records[1].Host = "evil"
+	writeAuditRecords(t, filepath.Join(home, "audit.log"), records)
+
+	stdout, stderr, err := runCommandForTest(t, "audit", "repair", "--truncate-broken")
+	if err != nil {
+		t.Fatalf("audit repair err = %v stdout=%s stderr=%s", err, stdout, stderr)
+	}
+	for _, want := range []string{"audit repaired", "broken_seq=1", "reason=hash", "kept=1", "removed=2", "backup="} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("repair stdout missing %q:\n%s", want, stdout)
+		}
+	}
+	repaired := mustReadAudit(t, home)
+	if len(repaired) != 1 || repaired[0].ReqID != "r1" {
+		t.Fatalf("repaired records = %#v", repaired)
+	}
+	if result, err := store.Verify(); err != nil || !result.OK || result.Count != 1 {
+		t.Fatalf("verify repaired = %#v err=%v", result, err)
+	}
+	if _, _, err = runCommandForTest(t, "audit", "repair"); err == nil || !isUsageError(err) {
+		t.Fatalf("repair without flag err = %T %[1]v, want usageError", err)
+	}
+}
+
 func TestInventoryAddDoesNotOverwriteMalformedInventory(t *testing.T) {
 	home := t.TempDir()
 	bad := "::: not: yaml: ["
@@ -422,7 +907,9 @@ func runJSONShapeDemo(t *testing.T) (string, string, string, string) {
 	t.Helper()
 	home := t.TempDir()
 	writeTestInventory(t, home)
+	writeTestPolicy(t, home)
 	t.Setenv("AGENTSSH_HOME", home)
+	t.Setenv("AGENTSSH_SESSION", "s_test")
 
 	restoreExecutor := newExecutor
 	newExecutor = func(_ *config.Config) executor.Executor {
@@ -514,35 +1001,28 @@ func TestRunAllowWritesStartedAndCompleted(t *testing.T) {
 	}
 }
 
-func TestRunRefreshesSessionActivityAfterExecution(t *testing.T) {
-	home := t.TempDir()
-	writeTestInventory(t, home)
-	writeTestPolicy(t, home)
-	t.Setenv("AGENTSSH_HOME", home)
+// A run with neither --session nor AGENTSSH_SESSION is a usage error (exit 2): the
+// caller must declare a session so each task maps to one auditable session.
+func TestRunWithoutSessionIsUsageError(t *testing.T) {
+	setupHome(t)
+	t.Setenv("AGENTSSH_SESSION", "") // override setupHome's session
+	withFakeExecutor(t, fakeExecutor{})
+	_, _, err := runCommandForTest(t, "run", "web-1", "--", "echo", "hi")
+	if got := exitCodeForError(err); got != exitUsage {
+		t.Fatalf("exit = %d, want %d (usage); err=%v", got, exitUsage, err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "session must be declared") {
+		t.Fatalf("err = %v, want it to mention a missing session", err)
+	}
+}
 
-	sessionPath := filepath.Join(home, "session")
-	restoreExecutor := newExecutor
-	newExecutor = func(_ *config.Config) executor.Executor {
-		return staleSessionExecutor{sessionPath: sessionPath, staleAt: time.Now().UTC().Add(-31 * time.Minute)}
-	}
-	defer func() {
-		newExecutor = restoreExecutor
-	}()
-
-	if _, _, err := runCommandForTest(t, "run", "web-1", "--", "echo", "hi"); err != nil {
-		t.Fatalf("first run err = %v", err)
-	}
-	firstID, firstActivity := readSessionPointerForTest(t, sessionPath, "web-1")
-	if firstID == "" || time.Since(firstActivity) > time.Minute {
-		t.Fatalf("first pointer id=%q last_activity=%s", firstID, firstActivity)
-	}
-
-	if _, _, err := runCommandForTest(t, "run", "web-1", "--", "echo", "again"); err != nil {
-		t.Fatalf("second run err = %v", err)
-	}
-	secondID, _ := readSessionPointerForTest(t, sessionPath, "web-1")
-	if secondID != firstID {
-		t.Fatalf("session id changed after fresh completion update: first=%q second=%q", firstID, secondID)
+// --session declared on the run satisfies the requirement without any env var.
+func TestRunSessionFlagSatisfiesRequirement(t *testing.T) {
+	setupHome(t)
+	t.Setenv("AGENTSSH_SESSION", "")
+	withFakeExecutor(t, fakeExecutor{})
+	if code, _, stderr := runExit(t, "run", "web-1", "--session", "s_flag", "--", "echo", "hi"); code != exitOK {
+		t.Fatalf("code = %d, want 0; stderr=%q", code, stderr)
 	}
 }
 
@@ -558,6 +1038,7 @@ hosts:
 `)
 	writeTestPolicy(t, home)
 	t.Setenv("AGENTSSH_HOME", home)
+	t.Setenv("AGENTSSH_SESSION", "s_test")
 
 	restoreExecutor := newExecutor
 	newExecutor = func(_ *config.Config) executor.Executor {
@@ -647,7 +1128,7 @@ func TestAuditLSIncludesCommandAndOutcomeContext(t *testing.T) {
 		"denied",
 		"host=web-1",
 		"session=s_test",
-		"policy=allow/default",
+		"policy=allow/rules:allow-test-commands",
 		"policy=deny/rules:catastrophic",
 		"exit=0",
 		"exit=6",
@@ -742,8 +1223,10 @@ func TestRunRejectsMultiLineRedactPatternAsUsage(t *testing.T) {
 	writeTestInventory(t, home)
 	writePolicy(t, home, `
 version: 1
-defaults:
-  policy: allow
+rules:
+  - name: allow-echo
+    match: { cmd_regex: '^echo\b' }
+    action: allow
 output:
   redact:
     - '(?s)BEGIN.*END'
@@ -1058,6 +1541,19 @@ func readInventoryFile(t *testing.T, home string) inventory.Inventory {
 	return inv
 }
 
+func readPolicyFile(t *testing.T, home string) policy.Config {
+	t.Helper()
+	var cfg policy.Config
+	data, err := os.ReadFile(filepath.Join(home, "policy.yaml"))
+	if err != nil {
+		t.Fatalf("read policy: %v", err)
+	}
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("unmarshal policy: %v\n%s", err, data)
+	}
+	return cfg
+}
+
 func readFileString(t *testing.T, path string) string {
 	t.Helper()
 	data, err := os.ReadFile(path)
@@ -1071,12 +1567,15 @@ func writeTestPolicy(t *testing.T, home string) {
 	t.Helper()
 	writePolicy(t, home, `
 version: 1
-defaults:
-  policy: allow
 rules:
   - name: catastrophic
+    priority: 100
     match: { cmd_regex: 'rm\s+-rf' }
     action: deny
+  - name: allow-test-commands
+    priority: 0
+    match: { cmd_regex: '^(echo|false|systemctl status|sudo systemctl restart|uptime|stream-secret|ok)\b' }
+    action: allow
 output:
   max_bytes: 24
   redact:
@@ -1111,6 +1610,22 @@ func mustReadAudit(t *testing.T, home string) []audit.Record {
 		t.Fatalf("read audit: %v", err)
 	}
 	return records
+}
+
+func writeAuditRecords(t *testing.T, path string, records []audit.Record) {
+	t.Helper()
+	var builder strings.Builder
+	for _, record := range records {
+		line, err := json.Marshal(record)
+		if err != nil {
+			t.Fatalf("marshal audit record: %v", err)
+		}
+		builder.Write(line)
+		builder.WriteByte('\n')
+	}
+	if err := os.WriteFile(path, []byte(builder.String()), 0o600); err != nil {
+		t.Fatalf("write audit records: %v", err)
+	}
 }
 
 func formatExit(exitCode *int) string {
@@ -1190,80 +1705,6 @@ func (e osDetectingExecutor) Run(_ context.Context, request executor.Request) ex
 }
 
 var _ executor.Executor = osDetectingExecutor{}
-
-type staleSessionExecutor struct {
-	sessionPath string
-	staleAt     time.Time
-}
-
-func (e staleSessionExecutor) Run(_ context.Context, request executor.Request) executor.Result {
-	id, _ := readSessionPointerForTest(nil, e.sessionPath, request.Target.Name)
-	if id != "" {
-		writeSessionPointerForTest(nil, e.sessionPath, request.Target.Name, id, e.staleAt)
-	}
-	return executor.Result{
-		Stdout:   "ok\n",
-		ExitCode: 0,
-		Argv:     []string{"native-ssh", request.Target.Name, request.Command},
-	}
-}
-
-var _ executor.Executor = staleSessionExecutor{}
-
-func readSessionPointerForTest(t *testing.T, path string, host string) (string, time.Time) {
-	if t != nil {
-		t.Helper()
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if t != nil {
-			t.Fatalf("read session pointer: %v", err)
-		}
-		return "", time.Time{}
-	}
-	var current struct {
-		Hosts map[string]struct {
-			ID           string    `json:"id"`
-			LastActivity time.Time `json:"last_activity"`
-		} `json:"hosts"`
-	}
-	if err := json.Unmarshal(data, &current); err != nil {
-		if t != nil {
-			t.Fatalf("unmarshal session pointer: %v\n%s", err, data)
-		}
-		return "", time.Time{}
-	}
-	pointer := current.Hosts[host]
-	return pointer.ID, pointer.LastActivity
-}
-
-func writeSessionPointerForTest(t *testing.T, path string, host string, id string, when time.Time) {
-	if t != nil {
-		t.Helper()
-	}
-	data, err := json.Marshal(struct {
-		Hosts map[string]struct {
-			ID           string    `json:"id"`
-			LastActivity time.Time `json:"last_activity"`
-		} `json:"hosts"`
-	}{
-		Hosts: map[string]struct {
-			ID           string    `json:"id"`
-			LastActivity time.Time `json:"last_activity"`
-		}{
-			host: {ID: id, LastActivity: when.UTC()},
-		},
-	})
-	if err != nil {
-		if t != nil {
-			t.Fatalf("marshal session pointer: %v", err)
-		}
-		return
-	}
-	if err := os.WriteFile(path, append(data, '\n'), 0o600); err != nil && t != nil {
-		t.Fatalf("write session pointer: %v", err)
-	}
-}
 
 func writeInChunks(w io.Writer, data []byte, size int) {
 	for len(data) > 0 {

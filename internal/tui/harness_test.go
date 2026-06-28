@@ -52,20 +52,33 @@ groups:
 `
 
 const samplePolicy = `version: 1
-defaults:
-  policy: allow
 rules:
   - name: no-rm
+    priority: 100
     match:
       cmd_regex: "rm -rf"
     action: deny
+  - name: allow-readonly
+    priority: 0
+    match:
+      cmd_regex: "^(whoami|ls)\\b"
+    action: allow
 host_overrides:
   web:
-    policy: deny
-    allow_rules:
-      - cmd_regex: "^ls"
+    rules:
+      - priority: 10
+        match:
+          cmd_regex: "^ls"
+        action: allow
 output:
   max_bytes: 1048576
+rule_groups:
+  readonly:
+    rules:
+      - priority: 5
+        match:
+          cmd_regex: "^uptime$"
+        action: allow
 `
 
 // buildApp constructs an appModel backed by temp inventory/policy files. The
@@ -90,7 +103,6 @@ func buildAppWith(t *testing.T, inv, pol string) appModel {
 		InventoryFile: filepath.Join(dir, "inventory.yaml"),
 		PolicyFile:    filepath.Join(dir, "policy.yaml"),
 		AuditFile:     filepath.Join(dir, "audit.log"),
-		SessionFile:   filepath.Join(dir, "session"),
 		SecretsFile:   filepath.Join(dir, "secrets.enc"),
 	}
 	return newAppModel(paths, lipgloss.NewRenderer(os.Stdout))

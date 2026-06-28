@@ -58,8 +58,9 @@ const (
 type keyMap struct {
 	Up      key.Binding
 	Down    key.Binding
+	Home    key.Binding
+	End     key.Binding
 	Toggle  key.Binding
-	Detail  key.Binding
 	Session key.Binding
 	Filter  key.Binding
 	Back    key.Binding
@@ -69,8 +70,9 @@ func defaultKeys() keyMap {
 	return keyMap{
 		Up:      key.NewBinding(key.WithKeys("up", "k")),
 		Down:    key.NewBinding(key.WithKeys("down", "j")),
+		Home:    key.NewBinding(key.WithKeys("home", "g")),
+		End:     key.NewBinding(key.WithKeys("end", "G")),
 		Toggle:  key.NewBinding(key.WithKeys("enter", " ")),
-		Detail:  key.NewBinding(key.WithKeys("d")),
 		Session: key.NewBinding(key.WithKeys("l")),
 		Filter:  key.NewBinding(key.WithKeys("/")),
 		Back:    key.NewBinding(key.WithKeys("esc")),
@@ -271,15 +273,15 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.cursor < len(m.rows)-1 {
 			m.cursor++
 		}
+	case key.Matches(msg, m.keys.Home):
+		m.cursor = 0
+	case key.Matches(msg, m.keys.End):
+		m.cursor = maxInt(len(m.rows)-1, 0)
 	case key.Matches(msg, m.keys.Toggle):
 		if len(m.rows) == 0 {
 			return m, nil
 		}
 		m.openSessionDetail(m.rows[m.cursor].gi)
-	case key.Matches(msg, m.keys.Detail):
-		if len(m.rows) > 0 {
-			m.openSessionDetail(m.rows[m.cursor].gi)
-		}
 	case key.Matches(msg, m.keys.Session):
 		if len(m.rows) > 0 {
 			if m.sessionFocus == "" {
@@ -328,7 +330,7 @@ func (m *model) openSessionDetail(groupIndex int) {
 
 func (m model) updateDetail(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch {
-	case key.Matches(msg, m.keys.Back), key.Matches(msg, m.keys.Detail):
+	case key.Matches(msg, m.keys.Back):
 		m.focus = focusList
 		m.detailGroup = -1
 		return m, nil
@@ -339,6 +341,12 @@ func (m model) updateDetail(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case key.Matches(msg, m.keys.Down):
 		if g, ok := m.detailSession(); ok && m.runCursor < len(g.runs)-1 {
 			m.runCursor++
+		}
+	case key.Matches(msg, m.keys.Home):
+		m.runCursor = 0
+	case key.Matches(msg, m.keys.End):
+		if g, ok := m.detailSession(); ok {
+			m.runCursor = maxInt(len(g.runs)-1, 0)
 		}
 	}
 	return m, nil
@@ -442,12 +450,12 @@ func (m model) chainBadge() string {
 		return ""
 	}
 	if m.verifyErr != nil {
-		return m.styles.bad.Render("审计日志校验失败")
+		return m.styles.bad.Render(m.styles.glyphs.Warn + " audit verify error")
 	}
 	if m.verifyResult.OK {
 		return ""
 	}
-	return m.styles.bad.Render(fmt.Sprintf("审计日志异常 seq=%d", m.verifyResult.BrokenSeq))
+	return m.styles.bad.Render(fmt.Sprintf("%s audit chain broken at seq=%d", m.styles.glyphs.Warn, m.verifyResult.BrokenSeq))
 }
 
 func (m model) helpKeyMap() help.KeyMap {
@@ -459,7 +467,14 @@ func (m model) helpKeyMap() help.KeyMap {
 	case m.sessionFocus != "":
 		return helpMap{short: []key.Binding{hk("j/k", "move"), hk("enter", "open"), hk("esc", "exit focus")}}
 	default:
-		return helpMap{short: []key.Binding{hk("j/k", "move"), hk("enter", "open"), hk("d", "open"), hk("l", "focus session"), hk("/", "filter")}}
+		return helpMap{
+			short: []key.Binding{hk("enter", "open"), hk("l", "focus"), hk("/", "filter")},
+			full: [][]key.Binding{
+				{hk("j/k", "move"), hk("g/G", "home/end")},
+				{hk("enter", "open session"), hk("l", "focus session")},
+				{hk("/", "filter")},
+			},
+		}
 	}
 }
 
@@ -891,6 +906,20 @@ func (m model) detailSession() (sessionGroup, bool) {
 	return sessionGroup{}, false
 }
 
+// detailSessionID returns the focused session's id while the viewer is drilled into
+// a session's command detail, so the shell breadcrumb can carry the session identity.
+// It reports false at the list (no session is the active subject).
+func (m model) detailSessionID() (string, bool) {
+	if m.focus != focusDetail {
+		return "", false
+	}
+	g, ok := m.detailSession()
+	if !ok {
+		return "", false
+	}
+	return g.id, true
+}
+
 func (m model) renderSessionDetail() string {
 	g, ok := m.detailSession()
 	if !ok {
@@ -899,10 +928,12 @@ func (m model) renderSessionDetail() string {
 	m.runCursor = clamp(m.runCursor, 0, len(g.runs)-1)
 	w := m.detailWidth()
 	var b strings.Builder
-	// Single-line header: session id + label and the bound host with its user@ip,
-	// all on one row. Over-wide content is clamped by the final MaxWidth below.
-	fmt.Fprintf(&b, "%s\n", m.renderSessionHeader(g))
-	fmt.Fprintf(&b, "%s\n\n", m.styles.dim.Render(strings.Repeat("─", clamp(w, 1, 72))))
+	// The session's identity (id, host, user@ip) now lives in the shell breadcrumb, so
+	// the body opens straight into the command list. Only tamper evidence — a security
+	// signal, not a statistic — still surfaces here, above the commands.
+	if sessionHasBrokenSeq(g, m.brokenSeq) {
+		fmt.Fprintf(&b, "%s\n\n", m.styles.bad.Render(m.styles.glyphs.Warn+" tamper evidence in this session"))
+	}
 	b.WriteString(m.renderCommandList(g))
 	// Clamp every line to the frame so an over-wide row truncates (ANSI aware)
 	// instead of wrapping onto a second row under the shell's Width().
@@ -926,22 +957,6 @@ func (m model) renderCommandList(g sessionGroup) string {
 		b.WriteString(m.renderCommandRow(g.runs[i], widths, i == m.runCursor))
 	}
 	return b.String()
-}
-
-// renderSessionHeader is the session detail's single identity line: the session id
-// and label (bold), then the bound host with its user@ip connection (dim context).
-// Aggregate statistics (command/denied/failed counts, last-activity clock) are
-// intentionally omitted — each command below shows its own status and time. Tamper
-// evidence stays: it is a security signal, not a statistic.
-func (m model) renderSessionHeader(g sessionGroup) string {
-	parts := []string{m.styles.header.Render(orDash(g.id) + " · " + labelOr(g.label))}
-	if host := sessionHost(g); host != "" {
-		parts = append(parts, m.styles.dim.Render(hostLine(host, m.hosts)))
-	}
-	if sessionHasBrokenSeq(g, m.brokenSeq) {
-		parts = append(parts, m.styles.bad.Render(m.styles.glyphs.Warn+" tamper evidence in this session"))
-	}
-	return strings.Join(parts, m.styles.dim.Render(" · "))
 }
 
 type commandListColumnWidths struct {
@@ -1071,17 +1086,6 @@ func commandStatus(g theme.Glyphs, run runSummary) string {
 	}
 }
 
-// sessionHost is the single host a session is bound to: the first non-empty host
-// across its runs. Sessions are one-host by construction, so this is unambiguous.
-func sessionHost(g sessionGroup) string {
-	for _, run := range g.runs {
-		if run.latest.Host != "" {
-			return run.latest.Host
-		}
-	}
-	return ""
-}
-
 func sessionHasBrokenSeq(g sessionGroup, seq *uint64) bool {
 	for _, run := range g.runs {
 		if runHasSeq(run, seq) {
@@ -1111,18 +1115,6 @@ func runHasSeq(run runSummary, seq *uint64) bool {
 		}
 	}
 	return false
-}
-
-func hostLine(host string, hosts map[string]HostMeta) string {
-	meta, ok := hosts[host]
-	if !ok || (meta.User == "" && meta.Addr == "") {
-		return host
-	}
-	target := meta.Addr
-	if meta.User != "" {
-		target = meta.User + "@" + meta.Addr
-	}
-	return fmt.Sprintf("%s (%s)", host, target)
 }
 
 func spanOf(records []audit.Record) (string, string) {
@@ -1163,6 +1155,13 @@ func plural(n int, one string, many string) string {
 
 func maxInt(a, b int) int {
 	if a > b {
+		return a
+	}
+	return b
+}
+
+func minInt(a, b int) int {
+	if a < b {
 		return a
 	}
 	return b

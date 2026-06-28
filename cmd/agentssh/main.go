@@ -2,8 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -281,6 +279,40 @@ func newInventoryCommand() *cobra.Command {
 	addCmd.Flags().BoolVar(&add.Password, "password", false, "prompt for and store an encrypted SSH password")
 	addCmd.Flags().StringVar(&add.Tags, "tags", "", "comma-separated tags")
 
+	var update inventoryUpdateOptions
+	updateCmd := &cobra.Command{
+		Use:   "update <name> [--addr <addr>] [--user <user>] [--port <port>] [--alias <ssh_config_alias>] [--identity-file <path>] [--tags <a,b>]",
+		Short: "Update an existing host in inventory.yaml.",
+		Args:  exactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			update.Name = args[0]
+			flags := cmd.Flags()
+			update.AddrSet = flags.Changed("addr")
+			update.UserSet = flags.Changed("user")
+			update.PortSet = flags.Changed("port")
+			update.AliasSet = flags.Changed("alias")
+			update.IdentityFileSet = flags.Changed("identity-file")
+			update.TagsSet = flags.Changed("tags")
+			return runInventoryUpdate(cmd, update)
+		},
+	}
+	updateCmd.Flags().StringVar(&update.Addr, "addr", "", "host address")
+	updateCmd.Flags().StringVar(&update.User, "user", "", "SSH user")
+	updateCmd.Flags().IntVar(&update.Port, "port", 0, "SSH port")
+	updateCmd.Flags().StringVar(&update.Alias, "alias", "", "ssh_config host alias")
+	updateCmd.Flags().StringVar(&update.IdentityFile, "identity-file", "", "identity file path")
+	updateCmd.Flags().StringVar(&update.Tags, "tags", "", "comma-separated tags; empty clears tags")
+
+	rmCmd := &cobra.Command{
+		Use:     "rm <name>",
+		Aliases: []string{"remove", "delete"},
+		Short:   "Remove a host from inventory.yaml.",
+		Args:    exactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runInventoryRM(cmd, args[0])
+		},
+	}
+
 	var discover inventoryDiscoverOptions
 	discoverCmd := &cobra.Command{
 		Use:   "discover [--probe] [--json] [--import]",
@@ -306,6 +338,8 @@ func newInventoryCommand() *cobra.Command {
 	cmd.AddCommand(
 		lsCmd,
 		addCmd,
+		updateCmd,
+		rmCmd,
 		discoverCmd,
 		testCmd,
 		leafNoArgs("edit", "Edit inventory.yaml.", "edit ~/.agentssh/inventory.yaml directly"),
@@ -359,6 +393,7 @@ func newPolicyCommand() *cobra.Command {
 		Use:   "policy",
 		Short: "Manage command policy.",
 	}
+	cmd.AddCommand(newPolicyRuleCommand(), newPolicyGroupCommand(), newPolicyHostCommand())
 	var testHost string
 	testCmd := &cobra.Command{
 		Use:   "test <cmd>",
@@ -381,6 +416,260 @@ func newPolicyCommand() *cobra.Command {
 		leafNoArgs("edit", "Edit policy.yaml.", "edit ~/.agentssh/policy.yaml directly (validate with: agentssh policy show)"),
 		testCmd,
 	)
+	return cmd
+}
+
+func newPolicyHostCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "host",
+		Short: "Manage per-host policy rules.",
+	}
+	lsCmd := &cobra.Command{
+		Use:   "ls",
+		Short: "List per-host policy rules.",
+		Args:  noArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runPolicyHostLS(cmd)
+		},
+	}
+
+	ruleCmd := newPolicyHostRuleCommand()
+	groupCmd := newPolicyHostGroupCommand()
+
+	rmCmd := &cobra.Command{
+		Use:     "rm <host>",
+		Aliases: []string{"remove", "delete"},
+		Short:   "Clear per-host policy rules.",
+		Args:    exactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runPolicyHostRM(cmd, args[0])
+		},
+	}
+	cmd.AddCommand(lsCmd, ruleCmd, groupCmd, rmCmd)
+	return cmd
+}
+
+func newPolicyHostRuleCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "rule",
+		Short: "Manage per-host policy rules.",
+	}
+	var add policyHostRuleOptions
+	addCmd := &cobra.Command{
+		Use:   "add <host> (--cmd-regex <regex> --action allow|deny [--priority <int>] | --from-group <name>)",
+		Short: "Append a manual rule or stamp a rule group onto host rules.",
+		Args:  exactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			add.Host = args[0]
+			cmdRegexSet := cmd.Flags().Changed("cmd-regex")
+			fromGroupSet := cmd.Flags().Changed("from-group")
+			if cmdRegexSet && fromGroupSet {
+				return newUsageError("policy host rule add accepts either --cmd-regex or --from-group, not both")
+			}
+			if !cmdRegexSet && !fromGroupSet {
+				return newUsageError("policy host rule add requires --cmd-regex or --from-group")
+			}
+			if fromGroupSet && (cmd.Flags().Changed("action") || cmd.Flags().Changed("priority")) {
+				return newUsageError("policy host rule add --from-group does not accept --action or --priority")
+			}
+			if cmdRegexSet && !cmd.Flags().Changed("action") {
+				return newUsageError("policy host rule add requires --action allow|deny")
+			}
+			return runPolicyHostRuleAdd(cmd, add)
+		},
+	}
+	addCmd.Flags().StringVar(&add.CmdRegex, "cmd-regex", "", "command regex to match")
+	addCmd.Flags().StringVar(&add.Action, "action", "", "policy action: allow or deny")
+	addCmd.Flags().IntVar(&add.Priority, "priority", 0, "rule priority; higher values evaluate first")
+	addCmd.Flags().StringVar(&add.FromGroup, "from-group", "", "stamp all rules from a reusable rule group")
+
+	lsCmd := &cobra.Command{
+		Use:   "ls <host>",
+		Short: "List host-specific policy rules.",
+		Args:  exactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runPolicyHostRuleLS(cmd, args[0])
+		},
+	}
+
+	rmCmd := &cobra.Command{
+		Use:     "rm <host> <index>",
+		Aliases: []string{"remove", "delete"},
+		Short:   "Remove a host-specific policy rule by index.",
+		Args:    exactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			index, err := strconv.Atoi(args[1])
+			if err != nil {
+				return newUsageError("host rule index must be a number")
+			}
+			return runPolicyHostRuleRM(cmd, args[0], index)
+		},
+	}
+
+	cmd.AddCommand(addCmd, lsCmd, rmCmd)
+	return cmd
+}
+
+func newPolicyHostGroupCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "group",
+		Short: "Manage rule-group snapshots stamped onto hosts.",
+	}
+	rmCmd := &cobra.Command{
+		Use:     "rm <host> <name>",
+		Aliases: []string{"remove", "delete"},
+		Short:   "Remove all host rules stamped from a group.",
+		Args:    exactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runPolicyHostGroupRM(cmd, args[0], args[1])
+		},
+	}
+	cmd.AddCommand(rmCmd)
+	return cmd
+}
+
+func newPolicyGroupCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "group",
+		Short: "Manage reusable policy rule groups.",
+	}
+	lsCmd := &cobra.Command{
+		Use:   "ls",
+		Short: "List policy rule groups.",
+		Args:  noArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runPolicyGroupLS(cmd)
+		},
+	}
+	addCmd := &cobra.Command{
+		Use:   "add <name>",
+		Short: "Create a reusable policy rule group.",
+		Args:  exactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runPolicyGroupAdd(cmd, args[0])
+		},
+	}
+	rmCmd := &cobra.Command{
+		Use:     "rm <name>",
+		Aliases: []string{"remove", "delete"},
+		Short:   "Delete a reusable policy rule group.",
+		Args:    exactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runPolicyGroupRM(cmd, args[0])
+		},
+	}
+	ruleCmd := newPolicyGroupRuleCommand()
+	cmd.AddCommand(lsCmd, addCmd, rmCmd, ruleCmd)
+	return cmd
+}
+
+func newPolicyGroupRuleCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "rule",
+		Short: "Manage rules inside reusable policy groups.",
+	}
+	var add policyGroupRuleOptions
+	addCmd := &cobra.Command{
+		Use:   "add <group> --cmd-regex <regex> --action allow|deny [--priority <int>]",
+		Short: "Append a rule to a policy rule group.",
+		Args:  exactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			add.Group = args[0]
+			if !cmd.Flags().Changed("action") {
+				return newUsageError("policy group rule add requires --action allow|deny")
+			}
+			return runPolicyGroupRuleAdd(cmd, add)
+		},
+	}
+	addCmd.Flags().StringVar(&add.CmdRegex, "cmd-regex", "", "command regex to match")
+	addCmd.Flags().StringVar(&add.Action, "action", "", "policy action: allow or deny")
+	addCmd.Flags().IntVar(&add.Priority, "priority", 0, "rule priority; higher values evaluate first")
+
+	lsCmd := &cobra.Command{
+		Use:   "ls <group>",
+		Short: "List rules inside a policy rule group.",
+		Args:  exactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runPolicyGroupRuleLS(cmd, args[0])
+		},
+	}
+	rmCmd := &cobra.Command{
+		Use:     "rm <group> <index>",
+		Aliases: []string{"remove", "delete"},
+		Short:   "Remove a rule from a policy rule group by index.",
+		Args:    exactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			index, err := strconv.Atoi(args[1])
+			if err != nil {
+				return newUsageError("group rule index must be a number")
+			}
+			return runPolicyGroupRuleRM(cmd, args[0], index)
+		},
+	}
+	cmd.AddCommand(addCmd, lsCmd, rmCmd)
+	return cmd
+}
+
+func newPolicyRuleCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "rule",
+		Short: "Manage global policy rules.",
+	}
+	lsCmd := &cobra.Command{
+		Use:   "ls",
+		Short: "List global policy rules.",
+		Args:  noArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runPolicyRuleLS(cmd)
+		},
+	}
+	var add policyRuleOptions
+	addCmd := &cobra.Command{
+		Use:   "add <name> --cmd-regex <regex> --action allow|deny [--priority <int>]",
+		Short: "Add a global policy rule.",
+		Args:  exactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			add.Name = args[0]
+			if !cmd.Flags().Changed("action") {
+				return newUsageError("policy rule add requires --action allow|deny")
+			}
+			return runPolicyRuleAdd(cmd, add)
+		},
+	}
+	addCmd.Flags().StringVar(&add.CmdRegex, "cmd-regex", "", "command regex to match")
+	addCmd.Flags().StringVar(&add.Action, "action", "", "policy action: allow or deny")
+	addCmd.Flags().IntVar(&add.Priority, "priority", 0, "rule priority; higher values evaluate first")
+
+	var update policyRuleOptions
+	updateCmd := &cobra.Command{
+		Use:   "update <name> [--name <new-name>] [--cmd-regex <regex>] [--action allow|deny] [--priority <int>]",
+		Short: "Update a global policy rule.",
+		Args:  exactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			update.Name = args[0]
+			flags := cmd.Flags()
+			update.NewNameSet = flags.Changed("name")
+			update.CmdRegexSet = flags.Changed("cmd-regex")
+			update.ActionSet = flags.Changed("action")
+			update.PrioritySet = flags.Changed("priority")
+			return runPolicyRuleUpdate(cmd, update)
+		},
+	}
+	updateCmd.Flags().StringVar(&update.NewName, "name", "", "new rule name")
+	updateCmd.Flags().StringVar(&update.CmdRegex, "cmd-regex", "", "command regex to match")
+	updateCmd.Flags().StringVar(&update.Action, "action", "", "policy action: allow or deny")
+	updateCmd.Flags().IntVar(&update.Priority, "priority", 0, "rule priority; higher values evaluate first")
+
+	rmCmd := &cobra.Command{
+		Use:     "rm <name>",
+		Aliases: []string{"remove", "delete"},
+		Short:   "Remove a global policy rule.",
+		Args:    exactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runPolicyRuleRM(cmd, args[0])
+		},
+	}
+	cmd.AddCommand(lsCmd, addCmd, updateCmd, rmCmd)
 	return cmd
 }
 
@@ -419,7 +708,25 @@ func newAuditCommand() *cobra.Command {
 				return runAuditVerify(cmd)
 			},
 		},
+		newAuditRepairCommand(),
 	)
+	return cmd
+}
+
+func newAuditRepairCommand() *cobra.Command {
+	var truncateBroken bool
+	cmd := &cobra.Command{
+		Use:   "repair --truncate-broken",
+		Short: "Repair a broken audit log by truncating the unverifiable tail.",
+		Args:  noArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if !truncateBroken {
+				return newUsageError("audit repair requires --truncate-broken")
+			}
+			return runAuditRepair(cmd)
+		},
+	}
+	cmd.Flags().BoolVar(&truncateBroken, "truncate-broken", false, "remove the first broken audit record and every later record")
 	return cmd
 }
 
@@ -434,6 +741,21 @@ func newSessionCommand() *cobra.Command {
 		Args:  noArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runSessionLS(cmd)
+		},
+	})
+	cmd.AddCommand(&cobra.Command{
+		Use:   "new",
+		Short: "Mint a fresh session id for a task.",
+		Long: "Print a fresh session id. Bind a task's runs to it so audit groups them:\n" +
+			"  AGENTSSH_SESSION=$(agentssh session new)",
+		Args: noArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			id, err := session.NewID()
+			if err != nil {
+				return err
+			}
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), id)
+			return nil
 		},
 	})
 	return cmd
@@ -575,10 +897,53 @@ type inventoryAddOptions struct {
 	Tags         string
 }
 
+type inventoryUpdateOptions struct {
+	Name            string
+	Addr            string
+	User            string
+	Port            int
+	Alias           string
+	IdentityFile    string
+	Tags            string
+	AddrSet         bool
+	UserSet         bool
+	PortSet         bool
+	AliasSet        bool
+	IdentityFileSet bool
+	TagsSet         bool
+}
+
 type inventoryDiscoverOptions struct {
 	Probe  bool
 	JSON   bool
 	Import bool
+}
+
+type policyRuleOptions struct {
+	Name        string
+	NewName     string
+	CmdRegex    string
+	Action      string
+	Priority    int
+	NewNameSet  bool
+	CmdRegexSet bool
+	ActionSet   bool
+	PrioritySet bool
+}
+
+type policyHostRuleOptions struct {
+	Host      string
+	CmdRegex  string
+	Action    string
+	Priority  int
+	FromGroup string
+}
+
+type policyGroupRuleOptions struct {
+	Group    string
+	CmdRegex string
+	Action   string
+	Priority int
 }
 
 func runInventoryAdd(opts inventoryAddOptions) error {
@@ -650,7 +1015,10 @@ func removeInventoryHostByName(paths config.Paths, name string) error {
 	if err != nil {
 		return err
 	}
-	return writeInventoryAtomic(paths.Home, paths.InventoryFile, next)
+	if err := writeInventoryAtomic(paths.Home, paths.InventoryFile, next); err != nil {
+		return err
+	}
+	return clearHostRulesForDeletedHost(paths, name)
 }
 
 func resultFromFlags(opts hostform.Options) (hostform.Result, error) {
@@ -704,9 +1072,143 @@ func addInventoryHost(paths config.Paths, inv inventory.Inventory, result hostfo
 	return writeInventoryAtomic(paths.Home, paths.InventoryFile, next)
 }
 
+func runInventoryUpdate(cmd *cobra.Command, opts inventoryUpdateOptions) error {
+	if !opts.AddrSet && !opts.UserSet && !opts.PortSet && !opts.AliasSet && !opts.IdentityFileSet && !opts.TagsSet {
+		return newUsageError("inventory update requires at least one field flag")
+	}
+	paths, err := resolvePathsForWrite()
+	if err != nil {
+		return err
+	}
+	base, err := loadInventoryForWrite(paths.InventoryFile)
+	if err != nil {
+		return err
+	}
+	existing, ok := base.Hosts[opts.Name]
+	if !ok {
+		return newUsageError("inventory host %q not found", opts.Name)
+	}
+	nextHost := existing
+	if opts.AddrSet {
+		nextHost.Addr = strings.TrimSpace(opts.Addr)
+	}
+	if opts.UserSet {
+		nextHost.User = strings.TrimSpace(opts.User)
+	}
+	if opts.PortSet {
+		nextHost.Port = opts.Port
+	}
+	if opts.AliasSet {
+		nextHost.SSHConfigAlias = strings.TrimSpace(opts.Alias)
+	}
+	if opts.IdentityFileSet {
+		nextHost.IdentityFile = strings.TrimSpace(opts.IdentityFile)
+	}
+	if opts.TagsSet {
+		nextHost.Tags = hostform.SplitTags(opts.Tags)
+	}
+	if nextHost.Addr == "" && nextHost.SSHConfigAlias == "" {
+		return newUsageError("inventory host requires --addr or --alias")
+	}
+	if opts.PortSet && (nextHost.Port < 1 || nextHost.Port > 65535) {
+		return newUsageError("port must be a number from 1 to 65535")
+	}
+	next, err := inventory.UpdateHost(base, opts.Name, nextHost)
+	if err != nil {
+		return err
+	}
+	if err := writeInventoryAtomic(paths.Home, paths.InventoryFile, next); err != nil {
+		return err
+	}
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "updated host %s\n", opts.Name)
+	return nil
+}
+
+func runInventoryRM(cmd *cobra.Command, name string) error {
+	paths, err := resolvePathsForWrite()
+	if err != nil {
+		return err
+	}
+	base, err := loadInventoryForWrite(paths.InventoryFile)
+	if err != nil {
+		if auditErr := appendInventoryAudit(paths, audit.EventFailed, name, "inventory rm "+name, err.Error(), exitRemoteFailed); auditErr != nil {
+			return auditErr
+		}
+		return err
+	}
+	next, err := inventory.RemoveHost(base, name)
+	if err != nil {
+		if errors.Is(err, inventory.ErrHostNotFound) {
+			if auditErr := appendInventoryAudit(paths, audit.EventFailed, name, "inventory rm "+name, err.Error(), exitUsage); auditErr != nil {
+				return auditErr
+			}
+			return newUsageError("inventory host %q not found", name)
+		}
+		if auditErr := appendInventoryAudit(paths, audit.EventFailed, name, "inventory rm "+name, err.Error(), exitRemoteFailed); auditErr != nil {
+			return auditErr
+		}
+		return err
+	}
+	if err := writeInventoryAtomic(paths.Home, paths.InventoryFile, next); err != nil {
+		if auditErr := appendInventoryAudit(paths, audit.EventFailed, name, "inventory rm "+name, err.Error(), exitRemoteFailed); auditErr != nil {
+			return auditErr
+		}
+		return err
+	}
+	if err := clearHostRulesForDeletedHost(paths, name); err != nil {
+		if auditErr := appendInventoryAudit(paths, audit.EventFailed, name, "inventory rm "+name, err.Error(), exitRemoteFailed); auditErr != nil {
+			return auditErr
+		}
+		return err
+	}
+	if err := appendInventoryAudit(paths, audit.EventCompleted, name, "inventory rm "+name, "", exitOK); err != nil {
+		return err
+	}
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "removed host %s\n", name)
+	return nil
+}
+
+func clearHostRulesForDeletedHost(paths config.Paths, name string) error {
+	cfg, err := policy.Load(paths.PolicyFile)
+	if err != nil {
+		return config.ParseError{File: paths.PolicyFile, Err: err}
+	}
+	next, err := policy.ClearHostRules(policy.Bundle{Policy: cfg}, name)
+	if errors.Is(err, policy.ErrNoHostRules) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if err := validatePolicyConfig(next.Policy); err != nil {
+		return err
+	}
+	return policy.Save(paths.PolicyFile, next.Policy)
+}
+
 func writeInventoryAtomic(home string, path string, inv inventory.Inventory) error {
 	_ = home
 	return inventory.Save(path, inv)
+}
+
+func appendInventoryAudit(paths config.Paths, event audit.Event, host string, command string, errText string, exitCode int) error {
+	reqID, err := audit.NewReqID()
+	if err != nil {
+		return err
+	}
+	exit := exitCode
+	record := audit.Record{
+		ReqID:        reqID,
+		Event:        event,
+		Host:         host,
+		Cmd:          command,
+		Error:        errText,
+		ExitCode:     &exit,
+		SessionID:    "",
+		SessionLabel: "",
+	}
+	_, err = audit.NewStore(paths.AuditFile).Append(record)
+	return err
 }
 
 func refreshInventoryHostOS(paths config.Paths, hostName string, osName string) {
@@ -1166,7 +1668,7 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 	if err != nil {
 		return newUsageError("invalid output filter in policy.yaml: %v\n  fix the regex under output.redact in ~/.agentssh/policy.yaml", err)
 	}
-	sessionResolver := session.Resolver{Path: cfg.Paths.SessionFile}
+	sessionResolver := session.Resolver{}
 	store := audit.NewStore(cfg.Paths.AuditFile)
 	ssh := newExecutor(cfg)
 	exitCode := exitOK
@@ -1177,13 +1679,17 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 			return err
 		}
 		// Bind the session to this target host. A group run therefore records one
-		// session per host, never a single session spanning several hosts.
+		// session per host, never a single session spanning several hosts. A session
+		// must be declared (--session / AGENTSSH_SESSION) — one session per task keeps
+		// the audit trail grouped by task rather than by an arbitrary time window.
 		sessionCtx, err := sessionResolver.Resolve(target.Name, flags.session, flags.sessionLabel)
 		if err != nil {
+			if errors.Is(err, session.ErrNoSession) {
+				return newUsageError("a session must be declared for run\n" +
+					"  pass --session <id> or set AGENTSSH_SESSION (e.g. AGENTSSH_SESSION=$(agentssh session new))\n" +
+					"  one session per task keeps the audit trail grouped by task")
+			}
 			return fmt.Errorf("resolve session: %w", err)
-		}
-		if err := sessionResolver.Update(target.Name, sessionCtx.ID, time.Now().UTC()); err != nil {
-			return err
 		}
 		decision, err := engine.Evaluate(target.Name, remoteCommand)
 		if err != nil {
@@ -1191,9 +1697,6 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 		}
 		if decision.Action == policy.ActionDeny {
 			if _, err := store.Append(baseAuditRecord(reqID, sessionCtx, audit.EventDenied, target.Name, remoteCommand, decision, nil, "", 0)); err != nil {
-				return err
-			}
-			if err := sessionResolver.Update(target.Name, sessionCtx.ID, time.Now().UTC()); err != nil {
 				return err
 			}
 			response := runResponse{
@@ -1235,9 +1738,6 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 			if _, err := store.Append(baseAuditRecord(reqID, sessionCtx, event, target.Name, remoteCommand, decision, &result.ExitCode, outputHash, result.Duration.Milliseconds(), filtered)); err != nil {
 				return err
 			}
-			if err := sessionResolver.Update(target.Name, sessionCtx.ID, time.Now().UTC()); err != nil {
-				return err
-			}
 			if !isSSHErrorResult(result) {
 				refreshInventoryHostOS(cfg.Paths, target.Name, result.OS)
 			}
@@ -1259,9 +1759,6 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 		// were returned to the agent after output filtering.
 		outputHash := audit.ComputeOutputSHA256(filtered.Stdout, filtered.Stderr)
 		if _, err := store.Append(baseAuditRecord(reqID, sessionCtx, event, target.Name, remoteCommand, decision, &result.ExitCode, outputHash, result.Duration.Milliseconds(), filtered)); err != nil {
-			return err
-		}
-		if err := sessionResolver.Update(target.Name, sessionCtx.ID, time.Now().UTC()); err != nil {
 			return err
 		}
 		if !isSSHErrorResult(result) {
@@ -1401,7 +1898,7 @@ func printSSHErrorHint(cmd *cobra.Command, result executor.Result) {
 
 func printDenyHuman(cmd *cobra.Command, host string, command string, decision policy.Decision) {
 	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "✗ denied by policy · %s · 命中规则 %q\n", host, decision.Rule)
-	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "  %s 属于不可执行的危险命令或未被 allowlist 放行;此拦截无法临场放行。\n", command)
+	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "  %s 命中了 deny 规则或没有命中 allow 规则;此拦截无法临场放行。\n", command)
 	_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "  如确需放宽,请人类修改 ~/.agentssh/policy.yaml。")
 }
 
@@ -1471,6 +1968,603 @@ func runPolicyShow(cmd *cobra.Command) error {
 	return writeJSON(cmd, cfg.Policy)
 }
 
+func runPolicyRuleLS(cmd *cobra.Command) error {
+	cfg, err := config.Load()
+	if err != nil {
+		return classifyConfigError(err)
+	}
+	out := cmd.OutOrStdout()
+	if len(cfg.Policy.Rules) == 0 {
+		_, _ = fmt.Fprintln(out, "(none)")
+		return nil
+	}
+	for i, rule := range cfg.Policy.Rules {
+		_, _ = fmt.Fprintf(out, "%d name=%s priority=%d action=%s cmd_regex=%s\n", i, rule.Name, rule.Priority, rule.Action, strconv.Quote(rule.Match.CmdRegex))
+	}
+	return nil
+}
+
+func runPolicyRuleAdd(cmd *cobra.Command, opts policyRuleOptions) error {
+	paths, cfg, err := loadPolicyForWrite()
+	if err != nil {
+		return err
+	}
+	rule, err := policyRuleFromOptions(opts.Name, opts.CmdRegex, opts.Action, opts.Priority)
+	if err != nil {
+		return err
+	}
+	next, err := policy.AddRule(cfg, rule)
+	if errors.Is(err, policy.ErrRuleExists) {
+		return newUsageError("policy rule %q already exists", opts.Name)
+	}
+	if err != nil {
+		return err
+	}
+	if err := validatePolicyConfig(next); err != nil {
+		return err
+	}
+	if err := policy.Save(paths.PolicyFile, next); err != nil {
+		return err
+	}
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "added policy rule %s\n", rule.Name)
+	return nil
+}
+
+func runPolicyRuleUpdate(cmd *cobra.Command, opts policyRuleOptions) error {
+	if !opts.NewNameSet && !opts.CmdRegexSet && !opts.ActionSet && !opts.PrioritySet {
+		return newUsageError("policy rule update requires at least one field flag")
+	}
+	paths, cfg, err := loadPolicyForWrite()
+	if err != nil {
+		return err
+	}
+	current, err := policyRuleByName(cfg, opts.Name)
+	if err != nil {
+		return policyRuleUsageError(opts.Name, err)
+	}
+	nextRule := current
+	if opts.NewNameSet {
+		nextRule.Name = strings.TrimSpace(opts.NewName)
+	}
+	if opts.CmdRegexSet {
+		nextRule.Match.CmdRegex = strings.TrimSpace(opts.CmdRegex)
+	}
+	if opts.ActionSet {
+		action, err := parsePolicyAction(opts.Action)
+		if err != nil {
+			return err
+		}
+		nextRule.Action = action
+	}
+	if opts.PrioritySet {
+		nextRule.Priority = opts.Priority
+	}
+	if err := validatePolicyRule(nextRule); err != nil {
+		return err
+	}
+	next, err := policy.UpdateRule(cfg, opts.Name, nextRule)
+	if errors.Is(err, policy.ErrRuleExists) {
+		return newUsageError("policy rule %q already exists", nextRule.Name)
+	}
+	if err != nil {
+		return policyRuleUsageError(opts.Name, err)
+	}
+	if err := validatePolicyConfig(next); err != nil {
+		return err
+	}
+	if err := policy.Save(paths.PolicyFile, next); err != nil {
+		return err
+	}
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "updated policy rule %s\n", nextRule.Name)
+	return nil
+}
+
+func runPolicyRuleRM(cmd *cobra.Command, name string) error {
+	paths, cfg, err := loadPolicyForWrite()
+	if err != nil {
+		return err
+	}
+	next, err := policy.RemoveRule(cfg, name)
+	if err != nil {
+		return policyRuleUsageError(name, err)
+	}
+	if err := validatePolicyConfig(next); err != nil {
+		return err
+	}
+	if err := policy.Save(paths.PolicyFile, next); err != nil {
+		return err
+	}
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "removed policy rule %s\n", name)
+	return nil
+}
+
+func runPolicyGroupLS(cmd *cobra.Command) error {
+	cfg, err := config.Load()
+	if err != nil {
+		return classifyConfigError(err)
+	}
+	names := sortedPolicyGroupNames(cfg.Policy.RuleGroups)
+	out := cmd.OutOrStdout()
+	if len(names) == 0 {
+		_, _ = fmt.Fprintln(out, "(none)")
+		return nil
+	}
+	for _, name := range names {
+		group := cfg.Policy.RuleGroups[name]
+		allow, deny := ruleActionCounts(group.Rules)
+		_, _ = fmt.Fprintf(out, "%s rules=%d allow=%d deny=%d\n", name, len(group.Rules), allow, deny)
+	}
+	return nil
+}
+
+func runPolicyGroupAdd(cmd *cobra.Command, name string) error {
+	paths, bundle, err := loadPolicyBundleForWrite()
+	if err != nil {
+		return err
+	}
+	next, err := policy.CreateGroup(bundle, name)
+	if errors.Is(err, policy.ErrGroupExists) {
+		return newUsageError("policy group %q already exists", strings.TrimSpace(name))
+	}
+	if err != nil {
+		return policyGroupUsageError(name, err)
+	}
+	if err := validatePolicyConfig(next.Policy); err != nil {
+		return err
+	}
+	if err := policy.Save(paths.PolicyFile, next.Policy); err != nil {
+		return err
+	}
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "added policy group %s\n", strings.TrimSpace(name))
+	return nil
+}
+
+func runPolicyGroupRM(cmd *cobra.Command, name string) error {
+	paths, bundle, err := loadPolicyBundleForWrite()
+	if err != nil {
+		return err
+	}
+	next, err := policy.DeleteGroup(bundle, name)
+	if err != nil {
+		return policyGroupUsageError(name, err)
+	}
+	if err := validatePolicyConfig(next.Policy); err != nil {
+		return err
+	}
+	if err := policy.Save(paths.PolicyFile, next.Policy); err != nil {
+		return err
+	}
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "removed policy group %s\n", strings.TrimSpace(name))
+	return nil
+}
+
+func runPolicyGroupRuleAdd(cmd *cobra.Command, opts policyGroupRuleOptions) error {
+	paths, bundle, err := loadPolicyBundleForWrite()
+	if err != nil {
+		return err
+	}
+	rule, err := policyGroupRuleFromOptions(opts)
+	if err != nil {
+		return err
+	}
+	next, err := policy.AddGroupRule(bundle, opts.Group, rule)
+	if err != nil {
+		return policyGroupUsageError(opts.Group, err)
+	}
+	if err := validatePolicyConfig(next.Policy); err != nil {
+		return err
+	}
+	if err := policy.Save(paths.PolicyFile, next.Policy); err != nil {
+		return err
+	}
+	group := next.Policy.RuleGroups[strings.TrimSpace(opts.Group)]
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "added policy group rule %s[%d]\n", strings.TrimSpace(opts.Group), len(group.Rules)-1)
+	return nil
+}
+
+func runPolicyGroupRuleLS(cmd *cobra.Command, groupName string) error {
+	cfg, err := config.Load()
+	if err != nil {
+		return classifyConfigError(err)
+	}
+	group, ok := cfg.Policy.RuleGroups[strings.TrimSpace(groupName)]
+	if !ok {
+		return policyGroupUsageError(groupName, policy.ErrGroupNotFound)
+	}
+	out := cmd.OutOrStdout()
+	if len(group.Rules) == 0 {
+		_, _ = fmt.Fprintln(out, "(none)")
+		return nil
+	}
+	for i, rule := range group.Rules {
+		_, _ = fmt.Fprintln(out, formatIndexedRule(i, rule, false))
+	}
+	return nil
+}
+
+func runPolicyGroupRuleRM(cmd *cobra.Command, groupName string, index int) error {
+	paths, bundle, err := loadPolicyBundleForWrite()
+	if err != nil {
+		return err
+	}
+	next, err := policy.RemoveGroupRule(bundle, groupName, index)
+	if err != nil {
+		return policyGroupUsageError(groupName, err)
+	}
+	if err := validatePolicyConfig(next.Policy); err != nil {
+		return err
+	}
+	if err := policy.Save(paths.PolicyFile, next.Policy); err != nil {
+		return err
+	}
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "removed policy group rule %s[%d]\n", strings.TrimSpace(groupName), index)
+	return nil
+}
+
+func runPolicyHostLS(cmd *cobra.Command) error {
+	cfg, err := config.Load()
+	if err != nil {
+		return classifyConfigError(err)
+	}
+	ruleSets := policy.HostRuleSets(policy.Bundle{Policy: cfg.Policy, Inventory: cfg.Inventory})
+	out := cmd.OutOrStdout()
+	if len(ruleSets) == 0 {
+		_, _ = fmt.Fprintln(out, "(none)")
+		return nil
+	}
+	for _, ruleSet := range ruleSets {
+		status := "effective"
+		if !ruleSet.Effective {
+			status = "missing-host"
+		}
+		_, _ = fmt.Fprintf(out, "host=%s rules=%d status=%s key=%s\n", ruleSet.Host, len(ruleSet.Override.Rules), status, ruleSet.Key)
+		for i, rule := range ruleSet.Override.Rules {
+			_, _ = fmt.Fprintf(out, "  rule[%d] %s\n", i, formatRuleFields(rule, true))
+		}
+	}
+	return nil
+}
+
+func runPolicyHostRuleAdd(cmd *cobra.Command, opts policyHostRuleOptions) error {
+	paths, bundle, err := loadPolicyBundleForWrite()
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(opts.FromGroup) != "" {
+		next, err := policy.StampGroupOntoHost(bundle, opts.Host, opts.FromGroup)
+		if err != nil {
+			return policyGroupOrHostUsageError(opts.Host, opts.FromGroup, err)
+		}
+		if err := validatePolicyConfig(next.Policy); err != nil {
+			return err
+		}
+		if err := policy.Save(paths.PolicyFile, next.Policy); err != nil {
+			return err
+		}
+		group := next.Policy.RuleGroups[strings.TrimSpace(opts.FromGroup)]
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "stamped policy group %s onto host %s (%d rule(s))\n", strings.TrimSpace(opts.FromGroup), strings.TrimSpace(opts.Host), len(group.Rules))
+		return nil
+	}
+	rule, err := policyHostRuleFromOptions(opts)
+	if err != nil {
+		return err
+	}
+	next, err := policy.AddHostRule(bundle, opts.Host, rule)
+	if errors.Is(err, policy.ErrHostNotFound) {
+		return newUsageError("inventory host %q not found", opts.Host)
+	}
+	if err != nil {
+		return policyHostUsageError(opts.Host, err)
+	}
+	if err := validatePolicyConfig(next.Policy); err != nil {
+		return err
+	}
+	if err := policy.Save(paths.PolicyFile, next.Policy); err != nil {
+		return err
+	}
+	ruleSet, _ := policy.LookupHostRules(next, opts.Host)
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "added policy host rule %s[%d]\n", strings.TrimSpace(opts.Host), len(ruleSet.Override.Rules)-1)
+	return nil
+}
+
+func runPolicyHostRuleLS(cmd *cobra.Command, host string) error {
+	cfg, err := config.Load()
+	if err != nil {
+		return classifyConfigError(err)
+	}
+	ruleSet, ok := policy.LookupHostRules(policy.Bundle{Policy: cfg.Policy, Inventory: cfg.Inventory}, host)
+	if !ok {
+		return policyHostUsageError(host, policy.ErrNoHostRules)
+	}
+	out := cmd.OutOrStdout()
+	if len(ruleSet.Override.Rules) == 0 {
+		_, _ = fmt.Fprintln(out, "(none)")
+		return nil
+	}
+	for i, rule := range ruleSet.Override.Rules {
+		_, _ = fmt.Fprintln(out, formatIndexedRule(i, rule, true))
+	}
+	return nil
+}
+
+func runPolicyHostRuleRM(cmd *cobra.Command, host string, index int) error {
+	paths, bundle, err := loadPolicyBundleForWrite()
+	if err != nil {
+		return err
+	}
+	next, err := policy.RemoveHostRule(bundle, host, index)
+	if err != nil {
+		return policyHostUsageError(host, err)
+	}
+	if err := validatePolicyConfig(next.Policy); err != nil {
+		return err
+	}
+	if err := policy.Save(paths.PolicyFile, next.Policy); err != nil {
+		return err
+	}
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "removed policy host rule %s[%d]\n", strings.TrimSpace(host), index)
+	return nil
+}
+
+func runPolicyHostGroupRM(cmd *cobra.Command, host string, groupName string) error {
+	paths, bundle, err := loadPolicyBundleForWrite()
+	if err != nil {
+		return err
+	}
+	next, err := policy.RemoveHostGroup(bundle, host, groupName)
+	if err != nil {
+		return policyGroupOrHostUsageError(host, groupName, err)
+	}
+	if err := validatePolicyConfig(next.Policy); err != nil {
+		return err
+	}
+	if err := policy.Save(paths.PolicyFile, next.Policy); err != nil {
+		return err
+	}
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "removed policy host group %s[%s]\n", strings.TrimSpace(host), strings.TrimSpace(groupName))
+	return nil
+}
+
+func runPolicyHostRM(cmd *cobra.Command, host string) error {
+	paths, bundle, err := loadPolicyBundleForWrite()
+	if err != nil {
+		return err
+	}
+	next, err := policy.ClearHostRules(bundle, host)
+	if err != nil {
+		return policyHostUsageError(host, err)
+	}
+	if err := validatePolicyConfig(next.Policy); err != nil {
+		return err
+	}
+	if err := policy.Save(paths.PolicyFile, next.Policy); err != nil {
+		return err
+	}
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "removed policy host %s\n", strings.TrimSpace(host))
+	return nil
+}
+
+func loadPolicyForWrite() (config.Paths, policy.Config, error) {
+	home, err := config.ResolveHome()
+	if err != nil {
+		return config.Paths{}, policy.Config{}, err
+	}
+	paths := config.NewPaths(home)
+	cfg, err := policy.Load(paths.PolicyFile)
+	if err != nil {
+		return paths, cfg, config.ParseError{File: paths.PolicyFile, Err: err}
+	}
+	return paths, cfg, nil
+}
+
+func loadPolicyBundleForWrite() (config.Paths, policy.Bundle, error) {
+	paths, cfg, err := loadPolicyForWrite()
+	if err != nil {
+		return paths, policy.Bundle{}, err
+	}
+	inv, err := loadInventoryForWrite(paths.InventoryFile)
+	if err != nil {
+		return paths, policy.Bundle{}, err
+	}
+	return paths, policy.Bundle{Policy: cfg, Inventory: inv}, nil
+}
+
+func policyRuleFromOptions(name string, cmdRegex string, actionValue string, priority int) (policy.Rule, error) {
+	action, err := parsePolicyAction(actionValue)
+	if err != nil {
+		return policy.Rule{}, err
+	}
+	rule := policy.Rule{
+		Name:     strings.TrimSpace(name),
+		Priority: priority,
+		Match: policy.Match{
+			CmdRegex: strings.TrimSpace(cmdRegex),
+		},
+		Action: action,
+	}
+	if err := validatePolicyRule(rule); err != nil {
+		return policy.Rule{}, err
+	}
+	return rule, nil
+}
+
+func policyHostRuleFromOptions(opts policyHostRuleOptions) (policy.Rule, error) {
+	action, err := parsePolicyAction(opts.Action)
+	if err != nil {
+		return policy.Rule{}, err
+	}
+	rule := policy.Rule{
+		Priority: opts.Priority,
+		Match: policy.Match{
+			CmdRegex: strings.TrimSpace(opts.CmdRegex),
+		},
+		Action: action,
+	}
+	if err := validatePolicyRuleShape(rule, "policy host rule --cmd-regex"); err != nil {
+		return policy.Rule{}, err
+	}
+	return rule, nil
+}
+
+func policyGroupRuleFromOptions(opts policyGroupRuleOptions) (policy.Rule, error) {
+	action, err := parsePolicyAction(opts.Action)
+	if err != nil {
+		return policy.Rule{}, err
+	}
+	rule := policy.Rule{
+		Priority: opts.Priority,
+		Match: policy.Match{
+			CmdRegex: strings.TrimSpace(opts.CmdRegex),
+		},
+		Action: action,
+	}
+	if err := validatePolicyRuleShape(rule, "policy group rule --cmd-regex"); err != nil {
+		return policy.Rule{}, err
+	}
+	return rule, nil
+}
+
+func parsePolicyAction(value string) (policy.Action, error) {
+	switch policy.Action(strings.TrimSpace(value)) {
+	case policy.ActionAllow:
+		return policy.ActionAllow, nil
+	case policy.ActionDeny:
+		return policy.ActionDeny, nil
+	default:
+		return "", newUsageError("invalid policy action %q; expected allow or deny", value)
+	}
+}
+
+func validatePolicyRule(rule policy.Rule) error {
+	if strings.TrimSpace(rule.Name) == "" {
+		return newUsageError("policy rule name is required")
+	}
+	if strings.IndexFunc(rule.Name, func(r rune) bool { return r == '\t' || r == '\n' || r == '\r' }) >= 0 {
+		return newUsageError("policy rule name must not contain control whitespace")
+	}
+	return validatePolicyRuleShape(rule, "policy rule --cmd-regex")
+}
+
+func validatePolicyRuleShape(rule policy.Rule, source string) error {
+	if strings.TrimSpace(rule.Match.CmdRegex) == "" {
+		return newUsageError("%s is required", source)
+	}
+	if _, err := parsePolicyAction(string(rule.Action)); err != nil {
+		return err
+	}
+	_, err := policy.NewEngine(policy.Config{Rules: []policy.Rule{{
+		Name:     "validate",
+		Match:    rule.Match,
+		Action:   rule.Action,
+		Priority: rule.Priority,
+	}}}, inventory.Inventory{})
+	if err != nil {
+		return newUsageError("%v", err)
+	}
+	return nil
+}
+
+func validatePolicyConfig(cfg policy.Config) error {
+	if _, err := policy.NewEngine(cfg, inventory.Inventory{}); err != nil {
+		return newUsageError("policy.yaml would be invalid: %v", err)
+	}
+	return nil
+}
+
+func policyRuleByName(cfg policy.Config, name string) (policy.Rule, error) {
+	found := -1
+	for i, rule := range cfg.Rules {
+		if rule.Name != name {
+			continue
+		}
+		if found >= 0 {
+			return policy.Rule{}, policy.ErrRuleAmbiguous
+		}
+		found = i
+	}
+	if found < 0 {
+		return policy.Rule{}, policy.ErrRuleNotFound
+	}
+	return cfg.Rules[found], nil
+}
+
+func policyRuleUsageError(name string, err error) error {
+	switch {
+	case errors.Is(err, policy.ErrRuleNotFound):
+		return newUsageError("policy rule %q not found", name)
+	case errors.Is(err, policy.ErrRuleAmbiguous):
+		return newUsageError("policy rule %q is ambiguous; edit policy.yaml directly", name)
+	default:
+		return err
+	}
+}
+
+func policyHostUsageError(host string, err error) error {
+	switch {
+	case errors.Is(err, policy.ErrHostNotFound):
+		return newUsageError("inventory host %q not found", host)
+	case errors.Is(err, policy.ErrNoHostRules):
+		return newUsageError("host %q has no policy rules", host)
+	default:
+		return err
+	}
+}
+
+func policyGroupUsageError(group string, err error) error {
+	switch {
+	case errors.Is(err, policy.ErrGroupNotFound):
+		return newUsageError("policy group %q not found", strings.TrimSpace(group))
+	case errors.Is(err, policy.ErrGroupExists):
+		return newUsageError("policy group %q already exists", strings.TrimSpace(group))
+	default:
+		return err
+	}
+}
+
+func policyGroupOrHostUsageError(host string, group string, err error) error {
+	if errors.Is(err, policy.ErrGroupNotFound) {
+		return policyGroupUsageError(group, err)
+	}
+	return policyHostUsageError(host, err)
+}
+
+func sortedPolicyGroupNames(groups map[string]policy.RuleGroup) []string {
+	names := make([]string, 0, len(groups))
+	for name := range groups {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func ruleActionCounts(rules []policy.Rule) (allow, deny int) {
+	for _, rule := range rules {
+		switch rule.Action {
+		case policy.ActionAllow:
+			allow++
+		case policy.ActionDeny:
+			deny++
+		}
+	}
+	return allow, deny
+}
+
+func formatIndexedRule(index int, rule policy.Rule, includeGroup bool) string {
+	return strconv.Itoa(index) + " " + formatRuleFields(rule, includeGroup)
+}
+
+func formatRuleFields(rule policy.Rule, includeGroup bool) string {
+	parts := []string{
+		fmt.Sprintf("priority=%d", rule.Priority),
+		fmt.Sprintf("action=%s", rule.Action),
+		fmt.Sprintf("cmd_regex=%s", strconv.Quote(rule.Match.CmdRegex)),
+	}
+	if includeGroup && strings.TrimSpace(rule.Group) != "" {
+		parts = append(parts, "group="+strconv.Quote(rule.Group))
+	}
+	return strings.Join(parts, " ")
+}
+
 func runPolicyTest(cmd *cobra.Command, host string, command string) error {
 	cfg, err := config.Load()
 	if err != nil {
@@ -1524,6 +2618,9 @@ func formatAuditListRecord(record audit.Record) string {
 	}
 	if output := auditListOutput(record); output != "" {
 		parts = append(parts, "out="+output)
+	}
+	if record.Error != "" {
+		parts = append(parts, "err="+strconv.Quote(truncateRunes(record.Error, 96)))
 	}
 	if record.Cmd != "" {
 		parts = append(parts, "cmd="+strconv.Quote(truncateRunes(record.Cmd, 96)))
@@ -1658,6 +2755,23 @@ func runAuditVerify(cmd *cobra.Command) error {
 	return commandExitError{Code: exitRemoteFailed}
 }
 
+func runAuditRepair(cmd *cobra.Command) error {
+	cfg, err := config.Load()
+	if err != nil {
+		return classifyConfigError(err)
+	}
+	result, err := audit.NewStore(cfg.Paths.AuditFile).TruncateBroken()
+	if err != nil {
+		return err
+	}
+	if !result.Changed {
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "audit chain already ok · records=%d\n", result.Kept)
+		return nil
+	}
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "audit repaired · broken_seq=%d · reason=%s · kept=%d · removed=%d · backup=%s\n", result.BrokenSeq, result.Reason, result.Kept, result.Removed, result.BackupPath)
+	return nil
+}
+
 func runSessionLS(cmd *cobra.Command) error {
 	cfg, err := config.Load()
 	if err != nil {
@@ -1700,11 +2814,7 @@ func baseAuditRecord(reqID string, sessionCtx session.Context, event audit.Event
 }
 
 func newReqID() (string, error) {
-	var bytes [3]byte
-	if _, err := rand.Read(bytes[:]); err != nil {
-		return "", fmt.Errorf("generate request id: %w", err)
-	}
-	return hex.EncodeToString(bytes[:]), nil
+	return audit.NewReqID()
 }
 
 type eventValue audit.Event

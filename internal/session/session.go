@@ -3,38 +3,26 @@ package session
 import (
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"sort"
-	"time"
 
 	"github.com/Praeviso/AgentSSH/internal/audit"
 )
 
 const EnvSession = "AGENTSSH_SESSION"
 
-const idleWindow = 30 * time.Minute
+// ErrNoSession is returned when a run declares no session id. Sessions are
+// caller-declared so each task maps to exactly one session that audit can review as
+// a unit. AgentSSH never infers task boundaries from time (two unrelated tasks on
+// the same host minutes apart would merge), so a missing id is a hard error, not a
+// guess — see docs/architecture/overview.md §6.1.
+var ErrNoSession = errors.New("no session declared (pass --session or set AGENTSSH_SESSION)")
 
-// Clock supplies the current time for deterministic tests.
-type Clock interface {
-	Now() time.Time
-}
-
-type realClock struct{}
-
-func (realClock) Now() time.Time {
-	return time.Now().UTC()
-}
-
-// Resolver resolves the session id for a run.
-type Resolver struct {
-	Path  string
-	Clock Clock
-	NewID func() (string, error)
-}
+// Resolver resolves the session id for a run. It holds no state: a session is
+// whatever the caller declares, nothing is persisted between runs.
+type Resolver struct{}
 
 // Context is the resolved session information for a run. A session is bound to
 // exactly one host: Host records which host this session id belongs to, so a
@@ -45,10 +33,11 @@ type Context struct {
 	Label string
 }
 
-// Resolve binds a session id to host, following --session, AGENTSSH_SESSION, then
-// the per-host current-session pointer. The pointer is keyed by host so resuming
-// within the idle window never crosses hosts — a run against a different host
-// always gets that host's own session, enforcing one-session-per-host.
+// Resolve binds a session id to host from --session or AGENTSSH_SESSION. A run MUST
+// declare one so logically distinct tasks never merge into a single audit session;
+// absent both, Resolve returns ErrNoSession rather than inventing or resuming an id.
+// The explicit flag wins over the env var so a single task can override a harness's
+// ambient session for one run.
 func (r Resolver) Resolve(host string, explicitID string, label string) (Context, error) {
 	if explicitID != "" {
 		return Context{ID: explicitID, Host: host, Label: label}, nil
@@ -56,141 +45,17 @@ func (r Resolver) Resolve(host string, explicitID string, label string) (Context
 	if envID := os.Getenv(EnvSession); envID != "" {
 		return Context{ID: envID, Host: host, Label: label}, nil
 	}
-
-	clock := r.clock()
-	now := clock.Now().UTC()
-	pointers, err := readPointers(r.Path)
-	if err != nil {
-		return Context{}, err
-	}
-	if current, ok := pointers.Hosts[host]; ok && current.ID != "" && now.Sub(current.LastActivity) <= idleWindow {
-		return Context{ID: current.ID, Host: host, Label: label}, nil
-	}
-
-	newID, err := r.newID()
-	if err != nil {
-		return Context{}, err
-	}
-	if err := r.Update(host, newID, now); err != nil {
-		return Context{}, err
-	}
-	return Context{ID: newID, Host: host, Label: label}, nil
+	return Context{}, ErrNoSession
 }
 
-// Update writes the current-session pointer activity time for host.
-func (r Resolver) Update(host string, id string, when time.Time) error {
-	if id == "" || host == "" || r.Path == "" {
-		return nil
-	}
-	if err := os.MkdirAll(filepath.Dir(r.Path), 0o700); err != nil {
-		return fmt.Errorf("create session directory: %w", err)
-	}
-	current, err := readPointers(r.Path)
-	if err != nil {
-		return err
-	}
-	if current.Hosts == nil {
-		current.Hosts = map[string]pointer{}
-	}
-	current.Hosts[host] = pointer{ID: id, LastActivity: when.UTC()}
-	data, err := json.Marshal(current)
-	if err != nil {
-		return fmt.Errorf("marshal session pointer: %w", err)
-	}
-	// Write atomically (temp + rename) so a concurrent or interrupted write can't
-	// leave a torn file that readPointers would treat as empty — that would reset
-	// every host's pointer at once. The residual read-modify-write race between
-	// two processes can still lose an update, but the cost is only a fresh session
-	// for one host (pointers are ephemeral), never a corrupt file.
-	return writeFileAtomic(r.Path, append(data, '\n'))
-}
-
-func writeFileAtomic(path string, data []byte) error {
-	dir := filepath.Dir(path)
-	file, err := os.CreateTemp(dir, "session-*.tmp")
-	if err != nil {
-		return fmt.Errorf("create temporary session file: %w", err)
-	}
-	tempName := file.Name()
-	cleanup := true
-	defer func() {
-		if cleanup {
-			_ = os.Remove(tempName)
-		}
-	}()
-	if err := file.Chmod(0o600); err != nil {
-		_ = file.Close()
-		return fmt.Errorf("chmod temporary session file: %w", err)
-	}
-	if _, err := file.Write(data); err != nil {
-		_ = file.Close()
-		return fmt.Errorf("write session pointer: %w", err)
-	}
-	if err := file.Close(); err != nil {
-		return fmt.Errorf("close temporary session file: %w", err)
-	}
-	if err := os.Rename(tempName, path); err != nil {
-		return fmt.Errorf("replace session pointer: %w", err)
-	}
-	cleanup = false
-	return nil
-}
-
-func (r Resolver) clock() Clock {
-	if r.Clock != nil {
-		return r.Clock
-	}
-	return realClock{}
-}
-
-func (r Resolver) newID() (string, error) {
-	if r.NewID != nil {
-		return r.NewID()
-	}
-	return NewID()
-}
-
-// NewID creates a short random session id.
+// NewID creates a short random session id (e.g. "s_1a2b3c4d"). Callers that need a
+// fresh per-task id — `agentssh session new`, a harness — use this to mint one.
 func NewID() (string, error) {
 	var bytes [4]byte
 	if _, err := rand.Read(bytes[:]); err != nil {
 		return "", fmt.Errorf("generate session id: %w", err)
 	}
 	return "s_" + hex.EncodeToString(bytes[:]), nil
-}
-
-type pointer struct {
-	ID           string    `json:"id"`
-	LastActivity time.Time `json:"last_activity"`
-}
-
-// pointers is the on-disk current-session file: a per-host map so each host
-// tracks its own active session id independently.
-type pointers struct {
-	Hosts map[string]pointer `json:"hosts"`
-}
-
-// readPointers loads the per-host pointer file. A missing file is an empty set.
-// A file in the legacy single-pointer format (no "hosts" key) is treated as
-// empty: sessions are ephemeral (30-min idle window), so starting fresh is
-// harmless and avoids binding a pre-existing global session to a host.
-func readPointers(path string) (pointers, error) {
-	if path == "" {
-		return pointers{}, nil
-	}
-	data, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return pointers{}, nil
-	}
-	if err != nil {
-		return pointers{}, fmt.Errorf("read session pointer: %w", err)
-	}
-	var current pointers
-	if err := json.Unmarshal(data, &current); err != nil {
-		// Unparseable (or legacy single-pointer) file: start fresh rather than fail.
-		return pointers{}, nil
-	}
-	return current, nil
 }
 
 // Summary is one aggregated session row from audit.log. A session is bound to a

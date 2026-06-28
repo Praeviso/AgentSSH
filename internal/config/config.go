@@ -30,19 +30,38 @@ hosts: {}
 `
 
 // seedPolicyYAML is written on first run when policy.yaml is absent. It ships a
-// safe starting point: allow by default, deny a handful of catastrophic
-// commands, and redact obvious secrets from output. 'deny' is a hard boundary
-// the agent cannot override.
-const seedPolicyYAML = `# AgentSSH policy — allow/deny rules + output filtering.
-# 'deny' is a hard boundary the agent cannot override. See docs/architecture/overview.md.
+// default-deny scaffold with no active rules; operators must add explicit allow
+// rules before an agent can execute commands.
+const seedPolicyYAML = `# AgentSSH policy — priority-ordered allow/deny rules + output filtering.
+# No command runs until an allow rule matches. See docs/architecture/overview.md.
 version: 1
-defaults:
-  policy: allow
-rules:
-  - name: catastrophic
-    match:
-      cmd_regex: '\b(rm\s+-rf|mkfs|dd|shutdown|reboot|init\s+0|userdel)'
-    action: deny
+# rules:
+#   - name: allow-readonly
+#     priority: 10
+#     match:
+#       cmd_regex: '^(echo|uptime|whoami)\b'
+#     action: allow
+#   - name: deny-dangerous
+#     priority: 100
+#     match:
+#       cmd_regex: '\b(rm\s+-rf|mkfs|dd|shutdown|reboot|init\s+0|userdel)'
+#     action: deny
+# host_overrides:
+#   host:web-1:
+#     rules:
+#       - priority: 20
+#         match:
+#           cmd_regex: '^systemctl status\b'
+#         action: allow
+# rule_groups:
+#   readonly:
+#     rules:
+#       - priority: 10
+#         match:
+#           cmd_regex: '^(uptime|whoami)\b'
+#         action: allow
+# Use 'agentssh policy host rule add web-1 --from-group readonly' to copy a
+# group's current rules onto a host. Later group edits do not change the host copy.
 output:
   max_bytes: 16384
   redact:
@@ -55,7 +74,6 @@ type Paths struct {
 	InventoryFile string
 	PolicyFile    string
 	AuditFile     string
-	SessionFile   string
 	SecretsFile   string
 }
 
@@ -172,7 +190,6 @@ func NewPaths(home string) Paths {
 		InventoryFile: filepath.Join(home, "inventory.yaml"),
 		PolicyFile:    filepath.Join(home, "policy.yaml"),
 		AuditFile:     filepath.Join(home, "audit.log"),
-		SessionFile:   filepath.Join(home, "session"),
 		SecretsFile:   filepath.Join(home, "secrets.enc"),
 	}
 }

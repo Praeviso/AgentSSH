@@ -11,16 +11,19 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Praeviso/AgentSSH/internal/audit"
 	"github.com/Praeviso/AgentSSH/internal/config"
 	"github.com/Praeviso/AgentSSH/internal/discovery"
 	"github.com/Praeviso/AgentSSH/internal/executor"
 	"github.com/Praeviso/AgentSSH/internal/hostform"
 	"github.com/Praeviso/AgentSSH/internal/inventory"
+	"github.com/Praeviso/AgentSSH/internal/policy"
 	"github.com/Praeviso/AgentSSH/internal/secrets"
 	"github.com/Praeviso/AgentSSH/internal/theme"
 	"github.com/charmbracelet/bubbles/help"
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/spinner"
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -36,6 +39,17 @@ const (
 	hostFocusDiscover                  // the discover overlay owns the screen
 )
 
+// statusLevel tags the transient grid status line so it renders in a color that
+// matches its meaning. Without it every status — including "FAILED <host>" — was
+// painted in the green success style, so a failed connectivity test read as a win.
+type statusLevel int
+
+const (
+	statusInfo statusLevel = iota // neutral progress / cancellation (dim)
+	statusOK                      // success (green)
+	statusErr                     // failure (red)
+)
+
 type hostsSection struct {
 	paths       config.Paths
 	renderer    *lipgloss.Renderer
@@ -45,10 +59,15 @@ type hostsSection struct {
 	cursor      int
 	open        bool // set when the operator opened the selected host (enter); the shell consumes it
 	status      string
-	err         error // transient operation error (shown inline)
-	loadErr     error // inventory load/parse error (blocking; shows the error card)
+	statusLevel statusLevel // severity of status, drives its color (see statusLevel)
+	err         error       // transient operation error (shown inline)
+	loadErr     error       // inventory load/parse error (blocking; shows the error card)
 	form        hostform.Model
 	focus       hostFocus
+	filter      textinput.Model // the / search box that narrows the grid
+	filtering   bool            // the filter box is focused and capturing keys
+	query       string          // the live/committed filter query ("" = no filter)
+	editingHost string
 	testing     bool // a host connectivity probe is in flight
 	discover    discoveryOverlay
 	discoverSeq int
@@ -65,6 +84,13 @@ type hostsSection struct {
 // spinner's tick loop and its visibility.
 func (s hostsSection) busy() bool {
 	return s.testing || s.discover.loading || s.discover.probing
+}
+
+// setStatus sets the transient grid status line together with its severity so the
+// two never drift — the level decides the color the status renders in (see View).
+func (s *hostsSection) setStatus(level statusLevel, text string) {
+	s.status = text
+	s.statusLevel = level
 }
 
 type inventoryChangedMsg struct {
@@ -120,6 +146,10 @@ func newHostsSection(paths config.Paths, renderer *lipgloss.Renderer, st appStyl
 		sp.Style = renderer.NewStyle().Foreground(lipgloss.Color("212"))
 	}
 	s.spinner = sp
+	ti := textinput.New()
+	ti.Placeholder = "name, tag, addr, or user"
+	ti.Prompt = "/ "
+	s.filter = ti
 	s.probes = map[string]hostProbe{}
 	if master := os.Getenv("AGENTSSH_MASTER_PASSWORD"); master != "" {
 		if store, err := secrets.Open(paths.SecretsFile, master); err == nil {
@@ -134,23 +164,66 @@ func newHostsSection(paths config.Paths, renderer *lipgloss.Renderer, st appStyl
 	return s
 }
 
-// selectedHost returns the host name under the grid cursor, or "".
+// selectedHost returns the host name under the grid cursor, or "". The cursor
+// indexes the visible (filtered) list, so this resolves against it.
 func (s hostsSection) selectedHost() string {
-	if s.cursor < 0 || s.cursor >= len(s.names) {
+	vis := s.visible()
+	if s.cursor < 0 || s.cursor >= len(vis) {
 		return ""
 	}
-	return s.names[s.cursor]
+	return vis[s.cursor]
 }
+
+// visible is the subset of hosts the grid shows: the full sorted list, narrowed
+// to those matching the active filter query (by name, tag, addr, or user).
+func (s hostsSection) visible() []string {
+	q := strings.ToLower(strings.TrimSpace(s.query))
+	if q == "" {
+		return s.names
+	}
+	out := make([]string, 0, len(s.names))
+	for _, name := range s.names {
+		if hostMatchesQuery(s.inventory.Hosts[name], name, q) {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+// hostMatchesQuery reports whether a host matches the (lowercased) filter query,
+// matching its name, any tag, its address, or its user as a substring.
+func hostMatchesQuery(h inventory.Host, name, q string) bool {
+	if strings.Contains(strings.ToLower(name), q) ||
+		strings.Contains(strings.ToLower(h.Addr), q) ||
+		strings.Contains(strings.ToLower(h.User), q) {
+		return true
+	}
+	for _, tag := range h.Tags {
+		if strings.Contains(strings.ToLower(tag), q) {
+			return true
+		}
+	}
+	return false
+}
+
+// filterActive reports whether a filter query is currently narrowing the grid.
+func (s hostsSection) filterActive() bool { return strings.TrimSpace(s.query) != "" }
+
+// visibleCount is the number of hosts currently shown under the active filter.
+func (s hostsSection) visibleCount() int { return len(s.visible()) }
 
 // capturing reports whether the grid owns the keyboard (a modal/text mode), so
 // the shell must not steal q/?.
 func (s hostsSection) capturing() bool {
-	return s.focus == hostFocusForm || s.focus == hostFocusConfirm || s.focus == hostFocusDiscover
+	return s.filtering || s.focus == hostFocusForm || s.focus == hostFocusConfirm || s.focus == hostFocusDiscover
 }
 
 func (s hostsSection) helpKeyMap() help.KeyMap {
 	if s.loadErr != nil {
 		return helpMap{short: []key.Binding{hk("r", "reload inventory")}}
+	}
+	if s.filtering {
+		return helpMap{short: []key.Binding{hk("enter", "apply"), hk("esc", "clear")}}
 	}
 	switch s.focus {
 	case hostFocusForm:
@@ -160,7 +233,15 @@ func (s hostsSection) helpKeyMap() help.KeyMap {
 	case hostFocusConfirm:
 		return helpMap{short: []key.Binding{hk("y", "confirm"), hk("n/esc", "cancel")}}
 	default:
-		return helpMap{short: []key.Binding{hk("↑↓←→/hjkl", "move"), hk("enter", "open"), hk("a", "add"), hk("d", "discover"), hk("t", "test"), hk("r/x", "remove")}}
+		// Footer stays terse; ? expands to the grouped full help below.
+		short := []key.Binding{hk("enter", "open"), hk("/", "filter"), hk("a", "add")}
+		// Grouped full help (shown on ?): movement, finding, and actions as columns.
+		full := [][]key.Binding{
+			{hk("↑↓←→/hjkl", "move"), hk("g/G", "home/end"), hk("/", "filter")},
+			{hk("enter/i", "open"), hk("a", "add"), hk("e", "edit"), hk("d/x", "delete")},
+			{hk("D", "discover"), hk("t", "test"), hk("r", "reload")},
+		}
+		return helpMap{short: short, full: full}
 	}
 }
 
@@ -169,6 +250,13 @@ func (s hostsSection) Init() tea.Cmd { return nil }
 func (s hostsSection) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if ws, ok := msg.(tea.WindowSizeMsg); ok {
 		s.w, s.h = ws.Width, ws.Height
+		if s.w > 0 {
+			fw := s.w - lipgloss.Width(s.filter.Prompt) - 1
+			if fw < 8 {
+				fw = 8
+			}
+			s.filter.Width = fw
+		}
 	}
 
 	switch msg := msg.(type) {
@@ -221,22 +309,34 @@ func (s hostsSection) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch {
 		case msg.ok:
 			s.err = nil
-			s.status = "OK " + msg.name
+			s.setStatus(statusOK, "OK "+msg.name)
 			s.probes[msg.name] = hostProbe{ok: true, detail: "ok", dur: msg.dur}
 			if msg.os != "" {
 				s.setHostOS(msg.name, msg.os)
 			}
 		case msg.hint != "":
 			s.err = nil
-			s.status = "FAILED " + msg.name + ": " + msg.hint
+			s.setStatus(statusErr, "FAILED "+msg.name+": "+msg.hint)
 			s.probes[msg.name] = hostProbe{ok: false, detail: msg.hint, dur: msg.dur}
 		case msg.err != nil:
 			s.err = nil
 			hint := executor.ConnectHint(msg.err)
-			s.status = "FAILED " + msg.name + ": " + hint
+			s.setStatus(statusErr, "FAILED "+msg.name+": "+hint)
 			s.probes[msg.name] = hostProbe{ok: false, detail: hint, dur: msg.dur}
 		}
 		return s, nil
+	}
+
+	// The filter box overlays the grid (not a modal screen), so it intercepts keys
+	// before the focus switch while it is open; non-key messages still flow to it so
+	// its cursor keeps blinking.
+	if s.filtering {
+		if km, ok := msg.(tea.KeyMsg); ok {
+			return s.updateFilter(km)
+		}
+		var cmd tea.Cmd
+		s.filter, cmd = s.filter.Update(msg)
+		return s, cmd
 	}
 
 	switch s.focus {
@@ -251,13 +351,40 @@ func (s hostsSection) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 }
 
+// updateFilter handles keys while the / filter box is focused: enter commits and
+// returns to grid navigation (keeping the filter applied), esc clears it, and any
+// other key edits the query with live, as-you-type filtering.
+func (s hostsSection) updateFilter(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "enter":
+		s.filtering = false
+		s.filter.Blur()
+		s.query = strings.TrimSpace(s.filter.Value())
+		s.clampCursor()
+		return s, nil
+	case "esc":
+		s.filtering = false
+		s.filter.Blur()
+		s.filter.SetValue("")
+		s.query = ""
+		s.clampCursor()
+		return s, nil
+	}
+	var cmd tea.Cmd
+	s.filter, cmd = s.filter.Update(msg)
+	s.query = s.filter.Value()
+	s.cursor = 0 // jump to the first match as the query narrows
+	s.clampCursor()
+	return s, cmd
+}
+
 // startProbe begins a connectivity test for name (used by the Info pane in the
 // detail screen). The result lands back via hostProbeMsg.
 func (s hostsSection) startProbe(name string) (hostsSection, tea.Cmd) {
 	if s.testing || name == "" {
 		return s, nil
 	}
-	s.status = "testing " + name + "…"
+	s.setStatus(statusInfo, "testing "+name+"…")
 	s.err = nil
 	s.testing = true
 	return s, tea.Batch(s.probeHostCmd(name), s.spinner.Tick)
@@ -273,18 +400,33 @@ func (s hostsSection) updateForm(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 	result := s.form.Result()
 	s.focus = hostFocusList
+	editingHost := s.editingHost
+	s.editingHost = ""
 	s.form = hostform.Model{}
 	if !result.Submitted {
-		s.status = "add cancelled"
+		if editingHost != "" {
+			s.setStatus(statusInfo, "edit cancelled")
+		} else {
+			s.setStatus(statusInfo, "add cancelled")
+		}
 		return s, nil
 	}
-	if err := s.addHost(result); err != nil {
+	var err error
+	var toastText string
+	if editingHost != "" {
+		err = s.updateHost(result)
+		toastText = "host updated: " + result.Name
+	} else {
+		err = s.addHost(result)
+		toastText = "host added: " + result.Name
+	}
+	if err != nil {
 		s.err = err
 		s.status = ""
 		return s, nil
 	}
 	s.err = nil
-	return s, tea.Batch(inventoryChangedCmd(s.inventory), toastCmd("host added: "+result.Name))
+	return s, tea.Batch(inventoryChangedCmd(s.inventory), toastCmd(toastText))
 }
 
 func (s hostsSection) updateConfirm(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -294,14 +436,11 @@ func (s hostsSection) updateConfirm(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 	switch keyMsg.String() {
 	case "y":
-		name := ""
-		if len(s.names) > 0 {
-			name = s.names[s.cursor]
-		}
-		removed := s.removeSelected()
+		name := s.selectedHost()
+		removed, policyCmd := s.removeSelected()
 		s.focus = hostFocusList
 		if removed {
-			return s, tea.Batch(inventoryChangedCmd(s.inventory), toastCmd("host removed: "+name))
+			return s, tea.Batch(inventoryChangedCmd(s.inventory), policyCmd, toastCmd("host removed: "+name))
 		}
 		return s, nil
 	case "n", "esc":
@@ -323,8 +462,13 @@ func (s hostsSection) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return s, nil
 	}
 	cols := s.gridCols()
-	last := len(s.names) - 1
+	last := len(s.visible()) - 1
 	switch keyMsg.String() {
+	case "/":
+		s.filtering = true
+		s.filter.SetValue(s.query)
+		s.filter.CursorEnd()
+		return s, s.filter.Focus()
 	case "left", "h":
 		if s.cursor > 0 {
 			s.cursor--
@@ -350,10 +494,33 @@ func (s hostsSection) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 		s.cursor = maxInt(last, 0)
 	case "a":
 		s.focus = hostFocusForm
+		s.editingHost = ""
 		s.form = hostform.New(hostform.Options{ExistingNames: inventory.HostNames(s.inventory)}, s.renderer)
 		s.form = s.form.SetSize(s.w, s.h)
 		return s, s.form.Init()
-	case "d":
+	case "e":
+		if s.selectedHost() == "" {
+			s.setStatus(statusInfo, "no host selected")
+			return s, nil
+		}
+		name := s.selectedHost()
+		host := s.inventory.Hosts[name]
+		s.focus = hostFocusForm
+		s.editingHost = name
+		s.form = hostform.New(hostform.Options{
+			Name:         name,
+			Addr:         host.Addr,
+			User:         host.User,
+			Port:         host.Port,
+			Tags:         host.Tags,
+			Alias:        host.SSHConfigAlias,
+			IdentityFile: host.IdentityFile,
+			FixedName:    true,
+			Title:        "Edit inventory host",
+		}, s.renderer)
+		s.form = s.form.SetSize(s.w, s.h)
+		return s, s.form.Init()
+	case "D":
 		s.focus = hostFocusDiscover
 		s.discoverSeq++
 		s.discover = discoveryOverlay{
@@ -368,25 +535,37 @@ func (s hostsSection) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if s.testing {
 			return s, nil
 		}
-		if len(s.names) == 0 {
-			s.status = "no host selected"
+		if s.selectedHost() == "" {
+			s.setStatus(statusInfo, "no host selected")
 			return s, nil
 		}
-		name := s.names[s.cursor]
-		s.status = "testing " + name + "…"
+		name := s.selectedHost()
+		s.setStatus(statusInfo, "testing "+name+"…")
 		s.err = nil
 		s.testing = true
 		return s, tea.Batch(s.probeHostCmd(name), s.spinner.Tick)
-	case "r", "x":
-		if len(s.names) > 0 {
+	case "d", "x":
+		if s.selectedHost() != "" {
 			s.focus = hostFocusConfirm
 		}
+	case "r":
+		// Reload inventory.yaml from disk (e.g. after editing it externally); the
+		// same key reloads from the parse-error card.
+		return s.reloadInventory()
 	case "enter", "i":
-		if len(s.names) > 0 {
+		if s.selectedHost() != "" {
 			s.open = true
 		}
 	case "esc":
-		s.status = ""
+		// esc clears an active filter first; only when there is none does it drop the
+		// transient status line.
+		if s.filterActive() {
+			s.query = ""
+			s.filter.SetValue("")
+			s.clampCursor()
+		} else {
+			s.status = ""
+		}
 	}
 	return s, nil
 }
@@ -552,7 +731,7 @@ func (s hostsSection) updateDiscovery(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case "esc", "q":
 		s.discover = discoveryOverlay{}
 		s.focus = hostFocusList
-		s.status = "discover cancelled"
+		s.setStatus(statusInfo, "discover cancelled")
 	}
 	return s, nil
 }
@@ -699,6 +878,67 @@ func (s *hostsSection) addInventoryHost(base inventory.Inventory, result hostfor
 	return nil
 }
 
+func (s *hostsSection) updateHost(result hostform.Result) error {
+	base, err := inventory.Load(s.paths.InventoryFile)
+	if err != nil {
+		return err
+	}
+	existing, ok := base.Hosts[result.Name]
+	if !ok {
+		return inventory.ErrHostNotFound
+	}
+	nextHost := inventory.Host{
+		Addr:           result.Addr,
+		User:           result.User,
+		Port:           result.Port,
+		SSHConfigAlias: result.Alias,
+		IdentityFile:   result.Identity,
+		Tags:           result.Tags,
+		OS:             existing.OS,
+	}
+	var store *secrets.Store
+	var master string
+	if result.Password != "" {
+		master = os.Getenv("AGENTSSH_MASTER_PASSWORD")
+		if master == "" {
+			return fmt.Errorf("set AGENTSSH_MASTER_PASSWORD to store a password in the TUI, or use `agentssh secret set <host>`")
+		}
+		store, err = secrets.Open(s.paths.SecretsFile, master)
+		if errors.Is(err, secrets.ErrWrongMaster) {
+			return fmt.Errorf("cannot open secrets: wrong master password or corrupt secrets file")
+		}
+		if err != nil {
+			return err
+		}
+	}
+	next, err := inventory.UpdateHost(base, result.Name, nextHost)
+	if err != nil {
+		return err
+	}
+	if err := inventory.Save(s.paths.InventoryFile, next); err != nil {
+		return err
+	}
+	s.inventory = next
+	s.rebuildNames()
+	if store != nil {
+		store.Set(result.Name, result.Password)
+		if err := store.Save(master); err != nil {
+			if rbErr := inventory.Save(s.paths.InventoryFile, base); rbErr != nil {
+				return fmt.Errorf("failed to store password (%v) and to roll back inventory update: %w", err, rbErr)
+			}
+			s.inventory = base
+			s.rebuildNames()
+			return fmt.Errorf("failed to store password; rolled back inventory update: %w", err)
+		}
+		if s.secretHosts == nil {
+			s.secretHosts = map[string]bool{}
+		}
+		s.secretHosts[result.Name] = true
+		s.secretsReadable = true
+	}
+	return nil
+}
+
 func (s *hostsSection) setHostOS(name string, osName string) {
 	osName = strings.TrimSpace(osName)
 	if name == "" || osName == "" {
@@ -743,42 +983,111 @@ func (s *hostsSection) removeHostByName(name string) error {
 	}
 	s.inventory = next
 	s.rebuildNames()
-	return nil
+	_, err = s.clearHostRulesForDeletedHost(name)
+	return err
 }
 
-func (s *hostsSection) removeSelected() bool {
-	if len(s.names) == 0 {
-		return false
+func (s hostsSection) appendDeleteAudit(name string, event audit.Event, errText string, exitCode int) error {
+	reqID, err := audit.NewReqID()
+	if err != nil {
+		return err
 	}
-	name := s.names[s.cursor]
+	exit := exitCode
+	_, err = audit.NewStore(s.paths.AuditFile).Append(audit.Record{
+		ReqID:    reqID,
+		Event:    event,
+		Host:     name,
+		Cmd:      "inventory rm " + name,
+		Error:    errText,
+		ExitCode: &exit,
+	})
+	return err
+}
+
+func (s *hostsSection) removeSelected() (bool, tea.Cmd) {
+	name := s.selectedHost()
+	if name == "" {
+		return false, nil
+	}
 	base, err := inventory.Load(s.paths.InventoryFile)
 	if err != nil {
+		if auditErr := s.appendDeleteAudit(name, audit.EventFailed, err.Error(), 1); auditErr != nil {
+			err = fmt.Errorf("%v; audit failed: %w", err, auditErr)
+		}
 		s.err = err
 		s.status = ""
-		return false
+		return false, nil
 	}
 	next, err := inventory.RemoveHost(base, name)
 	if err != nil {
+		if auditErr := s.appendDeleteAudit(name, audit.EventFailed, err.Error(), 2); auditErr != nil {
+			err = fmt.Errorf("%v; audit failed: %w", err, auditErr)
+		}
 		s.err = err
 		s.status = ""
-		return false
+		return false, nil
 	}
 	if err := inventory.Save(s.paths.InventoryFile, next); err != nil {
+		if auditErr := s.appendDeleteAudit(name, audit.EventFailed, err.Error(), 1); auditErr != nil {
+			err = fmt.Errorf("%v; audit failed: %w", err, auditErr)
+		}
 		s.err = err
 		s.status = ""
-		return false
+		return false, nil
 	}
 	s.inventory = next
 	s.rebuildNames()
 	delete(s.secretHosts, name)
 	s.err = nil
-	return true
+	policyCmd, err := s.clearHostRulesForDeletedHost(name)
+	if err != nil {
+		if auditErr := s.appendDeleteAudit(name, audit.EventFailed, err.Error(), 1); auditErr != nil {
+			err = fmt.Errorf("%v; audit failed: %w", err, auditErr)
+		}
+		s.err = err
+		s.status = ""
+		return true, inventoryChangedCmd(s.inventory)
+	}
+	if err := s.appendDeleteAudit(name, audit.EventCompleted, "", 0); err != nil {
+		s.err = err
+		s.setStatus(statusErr, "removed "+name+" but failed to audit deletion")
+		return true, policyCmd
+	}
+	return true, policyCmd
+}
+
+func (s *hostsSection) clearHostRulesForDeletedHost(name string) (tea.Cmd, error) {
+	cfg, err := policy.Load(s.paths.PolicyFile)
+	if err != nil {
+		return nil, err
+	}
+	next, err := policy.ClearHostRules(policy.Bundle{Policy: cfg}, name)
+	if errors.Is(err, policy.ErrNoHostRules) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := validatePolicyForTUI(next.Policy, s.inventory); err != nil {
+		return nil, err
+	}
+	if err := policy.Save(s.paths.PolicyFile, next.Policy); err != nil {
+		return nil, err
+	}
+	return policyChangedCmd(next.Policy, "host rules cleared: "+name), nil
 }
 
 func (s *hostsSection) rebuildNames() {
 	s.names = sortedHostNames(s.inventory.Hosts)
-	if s.cursor >= len(s.names) {
-		s.cursor = len(s.names) - 1
+	s.clampCursor()
+}
+
+// clampCursor keeps the grid cursor within the visible (filtered) list after the
+// inventory or the filter query changes.
+func (s *hostsSection) clampCursor() {
+	n := len(s.visible())
+	if s.cursor >= n {
+		s.cursor = n - 1
 	}
 	if s.cursor < 0 {
 		s.cursor = 0
@@ -806,8 +1115,8 @@ func (s hostsSection) gridCols() int {
 	if cols < 1 {
 		cols = 1
 	}
-	if cols > len(s.names) && len(s.names) > 0 {
-		cols = len(s.names)
+	if n := len(s.visible()); cols > n && n > 0 {
+		cols = n
 	}
 	return cols
 }
@@ -835,7 +1144,24 @@ func (s hostsSection) listChromeHeight() int {
 	if s.status != "" {
 		h++
 	}
+	// The filter input (while editing) or the committed-filter chip costs one line.
+	if s.filtering || s.filterActive() {
+		h++
+	}
 	return h
+}
+
+// statusStyle maps the status severity to its color: green for success, red for
+// failure, dim for neutral progress and cancellations.
+func (s hostsSection) statusStyle() lipgloss.Style {
+	switch s.statusLevel {
+	case statusOK:
+		return s.styles.ok
+	case statusErr:
+		return s.styles.err
+	default:
+		return s.styles.dim
+	}
 }
 
 func (s hostsSection) View() string {
@@ -862,7 +1188,17 @@ func (s hostsSection) View() string {
 			b.WriteString(s.spinner.View())
 			b.WriteString(" ")
 		}
-		b.WriteString(truncate(s.styles.ok.Render(s.status), s.w))
+		b.WriteString(truncate(s.statusStyle().Render(s.status), s.w))
+		b.WriteString("\n")
+	}
+	// Filter affordance: the live input while editing, or a static chip once a
+	// committed filter is narrowing the grid.
+	if s.filtering {
+		b.WriteString(truncate(s.filter.View(), s.w))
+		b.WriteString("\n")
+	} else if s.filterActive() {
+		chip := fmt.Sprintf("filter %q · esc clears", strings.TrimSpace(s.query))
+		b.WriteString(truncate(s.styles.dim.Render(chip), s.w))
 		b.WriteString("\n")
 	}
 	if len(s.names) == 0 {
@@ -873,6 +1209,10 @@ func (s hostsSection) View() string {
 		b.WriteString(keyHint(s.styles, "d", "discover hosts you can already reach"))
 		return b.String()
 	}
+	if len(s.visible()) == 0 {
+		b.WriteString(s.styles.dim.Render(fmt.Sprintf("No hosts match %q.", strings.TrimSpace(s.query))))
+		return b.String()
+	}
 	b.WriteString(s.gridView())
 	return b.String()
 }
@@ -880,9 +1220,10 @@ func (s hostsSection) View() string {
 // gridView renders the responsive, equal-sized card grid, windowed vertically so
 // the selected card stays on screen.
 func (s hostsSection) gridView() string {
+	vis := s.visible()
 	cols := s.gridCols()
 	cardW := s.cardOuterWidth(cols)
-	totalRows := (len(s.names) + cols - 1) / cols
+	totalRows := (len(vis) + cols - 1) / cols
 
 	// How many card rows fit in the remaining body height. Reserve one line for
 	// the "rows x–y of z" indicator when the grid can't show every row at once.
@@ -910,13 +1251,13 @@ func (s hostsSection) gridView() string {
 		cards := make([]string, 0, cols*2)
 		for c := 0; c < cols; c++ {
 			idx := r*cols + c
-			if idx >= len(s.names) {
+			if idx >= len(vis) {
 				break
 			}
 			if c > 0 {
 				cards = append(cards, strings.Repeat(" ", cardGap))
 			}
-			cards = append(cards, s.renderHostCard(s.names[idx], cardW, idx == s.cursor))
+			cards = append(cards, s.renderHostCard(vis[idx], cardW, idx == s.cursor))
 		}
 		rows = append(rows, lipgloss.JoinHorizontal(lipgloss.Top, cards...))
 	}
@@ -1046,6 +1387,10 @@ func (s hostsSection) infoView(name string, box, height int, focused bool) strin
 		} else {
 			field("probe", s.probeCell(name))
 		}
+		// Bridge the human viewer to the CLI that actually executes: show the run
+		// template for this host (full width so the command isn't over-truncated).
+		b.WriteString("\n")
+		b.WriteString(truncate(s.styles.dim.Render("run · agentssh run "+name+" -- <cmd>"), textW))
 	}
 
 	panel := s.styles.panel.Width(box)
@@ -1133,10 +1478,7 @@ func (s hostsSection) errorCardView() string {
 
 func (s hostsSection) confirmCardView() string {
 	cw := s.cardContentWidth()
-	name := ""
-	if len(s.names) > 0 {
-		name = s.names[s.cursor]
-	}
+	name := s.selectedHost()
 	var b strings.Builder
 	b.WriteString(s.styles.confirm.Render(s.styles.glyphs.Warn + " Remove host"))
 	b.WriteString("\n\n")

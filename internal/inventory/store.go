@@ -104,6 +104,21 @@ func RemoveHost(inv Inventory, name string) (Inventory, error) {
 	return next, nil
 }
 
+// UpdateHost returns a copy of inv with name replaced by host.
+func UpdateHost(inv Inventory, name string, host Host) (Inventory, error) {
+	if _, ok := inv.Hosts[name]; !ok {
+		return inv, ErrHostNotFound
+	}
+	next := inv
+	next.Hosts = copyHosts(inv.Hosts)
+	next.Groups = copyGroups(inv.Groups)
+	if next.Version == 0 {
+		next.Version = 1
+	}
+	next.Hosts[name] = host
+	return next, nil
+}
+
 // SetHostOS returns a copy of inv with the host OS metadata replaced.
 func SetHostOS(inv Inventory, name string, osName string) (Inventory, error) {
 	host, ok := inv.Hosts[name]

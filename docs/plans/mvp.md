@@ -43,9 +43,9 @@
 - [ ] `internal/policy`:规则匹配、`allow|deny`、`defaults.policy`、`host_overrides`(支持切 allowlist)。
 - [ ] `policy show` / `policy test <cmd>`(打印命中规则 + allow|deny 判定)。
 - [ ] `internal/audit`:JSONL 追加、hash 链、`audit ls|show|verify`;记录含 `session_id`/`session_label`。
-- [ ] 会话:解析 `--session` / `$AGENTSSH_SESSION` / `~/.agentssh/session`(空闲 30m 新建)→ 贯穿审计;`session ls`。
+- [ ] 会话:解析 `--session` / `$AGENTSSH_SESSION`(必须声明,否则 exit 2)→ 贯穿审计;`session ls` / `session new`。
 - [ ] `run` 接入 policy:`allow` 执行、`deny` 拒绝(exit 6,记 denied)。
-- [ ] 单测:规则顺序/override/allowlist、链构造、篡改检测、`deny` 路径、会话解析顺序与空闲窗口。
+- [ ] 单测:规则顺序/override/allowlist、链构造、篡改检测、`deny` 路径、会话解析顺序与「未声明即报错」。
 
 ### M3 TUI 审计查看器
 - [ ] `internal/tui`:单一审计视图 —— **按会话分组/折叠** + run 详情面板 + 会话过滤 + 校验链(见 DESIGN §B)。
@@ -54,7 +54,7 @@
 
 ### M4 输出控制 + 手册
 - [ ] `internal/output`:按 policy 脱敏 + 截断;审计记 redactions/truncated。
-- [ ] `skills/restart-service/SKILL.md`、`skills/investigate-cpu/SKILL.md` 示例。
+- [ ] `skills/agentssh-usage/SKILL.md`:AgentSSH 使用手册 / 最佳实践(信任边界、会话纪律、策略、输出、审计)。
 - [ ] README + 文档串联。
 
 ### M5 加固/打磨
@@ -69,7 +69,7 @@ agentssh/
   go.mod
   cmd/agentssh/main.go
   internal/{config,inventory,policy,executor,audit,output,tui}/   # approval 预留(MVP 空)
-  skills/                # 示例手册(M4 填充)
+  skills/                # AgentSSH 使用手册(M4 填充)
   docs/                  # 已就位:prds/ architecture/ plans/ DESIGN.md
   .github/workflows/ci.yml
   README.md
