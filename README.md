@@ -13,8 +13,8 @@ AgentSSH uses standard SSH from the local machine (its built-in Go SSH client by
 
 ```bash
 # 1. Install — static binary, no Go required (see "Install" for macOS / arm64).
-curl -fsSL https://github.com/Praeviso/AgentSSH/releases/download/v0.5.1/agentssh_v0.5.1_linux_amd64.tar.gz \
-  | sudo tar xz --strip-components=1 -C /usr/local/bin agentssh_v0.5.1_linux_amd64/agentssh
+curl -fsSL https://github.com/Praeviso/AgentSSH/releases/download/v0.6.0/agentssh_v0.6.0_linux_amd64.tar.gz \
+  | sudo tar xz --strip-components=1 -C /usr/local/bin agentssh_v0.6.0_linux_amd64/agentssh
 
 # 2. Open the console — this is your main entry point:
 agentssh tui
@@ -22,10 +22,11 @@ agentssh tui
 #   policy.yaml scaffold. Out of the box every command is denied until you add
 #   allow rules.
 #   In the Hosts tab:
-#     d  discover the SSH hosts you can already reach (from ~/.ssh/config + known_hosts),
+#     D  discover the SSH hosts you can already reach (from ~/.ssh/config + known_hosts),
 #        select with space, p to probe, enter to import
 #     a  add a host by hand (addr/user, optional identity_file, optional password)
 #     t  test connectivity to the selected host
+#     enter  open a host's detail screen — its Info pane edits fields inline (incl. key/password auth)
 #   Switch entry tabs with 1/2 or tab: Hosts · Policy.
 
 # 3. Add an explicit allow rule before running anything:
@@ -54,12 +55,13 @@ That is the whole loop: you own hosts, policy, and the audit trail through `agen
 | **Hosts** | onboard, inspect, edit, test, and remove hosts; manage credentials |
 | **Policy** | manage the Global rule list and reusable rule groups as cards; open a card to add/edit/remove rules |
 
-**Hosts tab keys** — `j/k move · a add · e edit · d discover · t test · r/x remove · tab switch`:
+**Hosts grid keys** — `↑↓←→/hjkl move · / filter · a add · D discover · t test · enter/i open · r reload`. The grid is a pure navigator; per-host **edit** and **delete** live on the host's detail screen (open it with `enter`/`i`).
 
-- **`d` Discover** — opens an overlay of hosts you can likely already reach, gathered from `~/.ssh/config` and `~/.ssh/known_hosts`, annotated with key/known-hosts/in-inventory status. `space` selects, `p` probes (a real connection test), `enter`/`i` imports the connectable, not-yet-known ones into your inventory. `esc`/`q` closes.
-- **`a` Add** — a form with `name / addr / user / port / tags / ssh_config_alias / identity_file / password`. `identity_file` points at a private key for that host. `password` is optional and **masked**; it is stored encrypted, never in `inventory.yaml`. Setting a password in the TUI requires `AGENTSSH_MASTER_PASSWORD` to be set (bubbletea owns the terminal, so there is no separate master prompt) — otherwise use `agentssh secret set`.
-- **`e` Edit** — opens the same host form with the selected host prefilled. The host name stays fixed; edit addr/user/port/tags/ssh_config_alias/identity_file.
+- **`D` Discover** — opens an overlay of hosts you can likely already reach, gathered from `~/.ssh/config` and `~/.ssh/known_hosts`, annotated with key/known-hosts/in-inventory status. `space` selects, `p` probes (a real connection test), `enter`/`i` imports the connectable, not-yet-known ones into your inventory. `esc`/`q` closes.
+- **`a` Add** — a form for a *new* host: `name / addr / user / port / tags / ssh_config_alias / identity_file / password`. `identity_file` points at a private key for that host. `password` is optional and **masked**; it is stored encrypted, never in `inventory.yaml`. Setting a password in the TUI requires `AGENTSSH_MASTER_PASSWORD` to be set (bubbletea owns the terminal, so there is no separate master prompt) — otherwise use `agentssh secret set`.
 - **`t` Test** — runs a real connectivity check against the selected host, updates its detected OS metadata, and shows `OK` or an actionable hint (missing credentials, unknown host key, unreachable, …).
+- **Host detail (`enter`/`i`)** — a three-pane screen for the selected host: `1` Info · `2` Sessions · `3` Policy (switch with `tab` or `1`–`3`; `esc` returns to the grid).
+- **Info pane** — the field list doubles as the editor: `j/k` move a field cursor, `enter` edits the focused field **in place** and saves on `enter` (`esc` cancels) — no separate form. Editable rows: `addr / user / port / alias / auth / tags`. The **`auth`** row is a two-mode edit — **key** (a private-key path; empty falls back to the default `~/.ssh` keys the client already scans) or **password** (masked, stored encrypted; needs `AGENTSSH_MASTER_PASSWORD`). `t` tests connectivity; `d`/`x` delete the host (with confirm).
 - **Policy tab** — Global and each reusable rule group render as cards with rule counts. `enter` opens the selected card; `a/e/r` add, edit, and remove rules; `n` creates a group; `d` deletes a group. Rule groups are presets: stamping one onto a host copies its current rules and records the group name as provenance.
 - **Host detail Policy pane** — press `enter`/`i` on a host, then `3` for Policy. The pane shows one unified, borderless rule list with host-tier rows first and global rows below as read-only context. `a` adds a manual host rule (`allow|deny [priority] <regex>`), `p` stamps a rule group, `j/k` selects rows, `r` removes editable host rows, `R` removes all rows stamped from the selected group, and `x` clears that host's rules.
 
@@ -73,23 +75,23 @@ Static binaries (`CGO_ENABLED=0`, no runtime deps). Pick your platform; each is 
 
 ```bash
 # Linux x86_64
-curl -fsSL https://github.com/Praeviso/AgentSSH/releases/download/v0.5.1/agentssh_v0.5.1_linux_amd64.tar.gz \
-  | sudo tar xz --strip-components=1 -C /usr/local/bin agentssh_v0.5.1_linux_amd64/agentssh
+curl -fsSL https://github.com/Praeviso/AgentSSH/releases/download/v0.6.0/agentssh_v0.6.0_linux_amd64.tar.gz \
+  | sudo tar xz --strip-components=1 -C /usr/local/bin agentssh_v0.6.0_linux_amd64/agentssh
 
 # Linux arm64
-curl -fsSL https://github.com/Praeviso/AgentSSH/releases/download/v0.5.1/agentssh_v0.5.1_linux_arm64.tar.gz \
-  | sudo tar xz --strip-components=1 -C /usr/local/bin agentssh_v0.5.1_linux_arm64/agentssh
+curl -fsSL https://github.com/Praeviso/AgentSSH/releases/download/v0.6.0/agentssh_v0.6.0_linux_arm64.tar.gz \
+  | sudo tar xz --strip-components=1 -C /usr/local/bin agentssh_v0.6.0_linux_arm64/agentssh
 
 # macOS Apple Silicon (arm64)
-curl -fsSL https://github.com/Praeviso/AgentSSH/releases/download/v0.5.1/agentssh_v0.5.1_darwin_arm64.tar.gz \
-  | sudo tar xz --strip-components=1 -C /usr/local/bin agentssh_v0.5.1_darwin_arm64/agentssh
+curl -fsSL https://github.com/Praeviso/AgentSSH/releases/download/v0.6.0/agentssh_v0.6.0_darwin_arm64.tar.gz \
+  | sudo tar xz --strip-components=1 -C /usr/local/bin agentssh_v0.6.0_darwin_arm64/agentssh
 
 # macOS Intel (amd64)
-curl -fsSL https://github.com/Praeviso/AgentSSH/releases/download/v0.5.1/agentssh_v0.5.1_darwin_amd64.tar.gz \
-  | sudo tar xz --strip-components=1 -C /usr/local/bin agentssh_v0.5.1_darwin_amd64/agentssh
+curl -fsSL https://github.com/Praeviso/AgentSSH/releases/download/v0.6.0/agentssh_v0.6.0_darwin_amd64.tar.gz \
+  | sudo tar xz --strip-components=1 -C /usr/local/bin agentssh_v0.6.0_darwin_amd64/agentssh
 ```
 
-Verify: `agentssh --version`. (Bump `v0.5.1` for a different release; checksums are in `SHA256SUMS.txt` on the Releases page.)
+Verify: `agentssh --version`. (Bump `v0.6.0` for a different release; checksums are in `SHA256SUMS.txt` on the Releases page.)
 
 ### From source (needs Go matching the go.mod directive)
 
