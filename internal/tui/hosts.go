@@ -67,12 +67,25 @@ type hostsSection struct {
 	filter      textinput.Model // the / search box that narrows the grid
 	filtering   bool            // the filter box is focused and capturing keys
 	query       string          // the live/committed filter query ("" = no filter)
-	editingHost string
-	testing     bool // a host connectivity probe is in flight
-	discover    discoveryOverlay
-	discoverSeq int
-	spinner     spinner.Model
-	probes      map[string]hostProbe // last probe verdict per host
+	// Inline editing of the detail screen's Info pane: the same field list is both
+	// the read view and the editor — a field cursor browses the editable rows, and
+	// one row at a time turns into infoInput. No separate form, no staged save.
+	infoFieldCursor int
+	infoEditing     bool
+	infoEditField   string
+	infoEditErr     string
+	infoInput       textinput.Model
+	// The "auth" row is a two-stage edit: first pick a mode (key/password), then
+	// enter its value. infoAuthChoosing is the mode-select stage; infoAuthMode is
+	// the chosen mode. Key edits inventory's IdentityFile (empty = default ssh keys);
+	// password writes the encrypted secrets store.
+	infoAuthChoosing bool
+	infoAuthMode     string
+	testing          bool // a host connectivity probe is in flight
+	discover         discoveryOverlay
+	discoverSeq      int
+	spinner          spinner.Model
+	probes           map[string]hostProbe // last probe verdict per host
 	// secretHosts/secretsReadable are populated only when AGENTSSH_MASTER_PASSWORD
 	// lets us read the encrypted store; otherwise the password indicator is "unknown".
 	secretHosts     map[string]bool
@@ -238,7 +251,7 @@ func (s hostsSection) helpKeyMap() help.KeyMap {
 		// Grouped full help (shown on ?): movement, finding, and actions as columns.
 		full := [][]key.Binding{
 			{hk("↑↓←→/hjkl", "move"), hk("g/G", "home/end"), hk("/", "filter")},
-			{hk("enter/i", "open"), hk("a", "add"), hk("e", "edit"), hk("d/x", "delete")},
+			{hk("enter/i", "open"), hk("a", "add")},
 			{hk("D", "discover"), hk("t", "test"), hk("r", "reload")},
 		}
 		return helpMap{short: short, full: full}
@@ -390,6 +403,289 @@ func (s hostsSection) startProbe(name string) (hostsSection, tea.Cmd) {
 	return s, tea.Batch(s.probeHostCmd(name), s.spinner.Tick)
 }
 
+// editableInfoFields lists the Info-pane rows that can be edited in place, in the
+// order they render. os is auto-detected by probing and password is held in the
+// encrypted secrets store (`agentssh secret`), so neither is editable here.
+func editableInfoFields() []string {
+	return []string{"addr", "user", "port", "alias", "auth", "tags"}
+}
+
+// infoFieldRaw is the editable (unstyled) value of one field, as the inline input
+// should prefill it. An unset port prefills empty so saving it keeps the default.
+func infoFieldRaw(h inventory.Host, key string) string {
+	switch key {
+	case "addr":
+		return h.Addr
+	case "user":
+		return h.User
+	case "port":
+		if h.Port == 0 {
+			return ""
+		}
+		return strconv.Itoa(h.Port)
+	case "alias":
+		return h.SSHConfigAlias
+	case "tags":
+		return strings.Join(h.Tags, ", ")
+	}
+	return ""
+}
+
+// resetInfoEdit returns the Info pane to its browse state with the field cursor at
+// the top — called when a host's detail screen is (re)opened.
+func (s hostsSection) resetInfoEdit() hostsSection {
+	s.infoFieldCursor = 0
+	s.infoEditing = false
+	s.infoEditField = ""
+	s.infoEditErr = ""
+	s.infoAuthChoosing = false
+	s.infoAuthMode = ""
+	return s
+}
+
+// cancelInfoEdit returns the pane to its browse state, keeping the field cursor.
+func (s hostsSection) cancelInfoEdit() hostsSection {
+	s.infoEditing = false
+	s.infoAuthChoosing = false
+	s.infoEditErr = ""
+	s.infoInput.Blur()
+	return s
+}
+
+func (s *hostsSection) infoFieldDown() {
+	if s.infoFieldCursor < len(editableInfoFields())-1 {
+		s.infoFieldCursor++
+	}
+}
+
+func (s *hostsSection) infoFieldUp() {
+	if s.infoFieldCursor > 0 {
+		s.infoFieldCursor--
+	}
+}
+
+// beginInfoEdit turns the focused field row into an editor prefilled with its
+// current value — the pane layout is unchanged, only that one row becomes editable.
+// The auth row opens in its mode-select stage instead of a text input.
+func (s hostsSection) beginInfoEdit(name string) (hostsSection, tea.Cmd) {
+	host, ok := s.inventory.Hosts[name]
+	if !ok {
+		return s, nil
+	}
+	fields := editableInfoFields()
+	if s.infoFieldCursor < 0 || s.infoFieldCursor >= len(fields) {
+		return s, nil
+	}
+	key := fields[s.infoFieldCursor]
+	s.infoEditField = key
+	s.infoEditErr = ""
+	s.infoEditing = true
+	if key == "auth" {
+		// Open in the mode-select stage, defaulting to the mode already in effect.
+		s.infoAuthChoosing = true
+		if host.IdentityFile == "" && s.secretsReadable && s.secretHosts[name] {
+			s.infoAuthMode = "password"
+		} else {
+			s.infoAuthMode = "key"
+		}
+		return s, nil
+	}
+	s.infoAuthChoosing = false
+	s.infoInput = s.newInfoInput(infoFieldRaw(host, key), false, "")
+	return s, s.infoInput.Focus()
+}
+
+// newInfoInput builds an inline value input sized to the value column, optionally
+// masked (passwords), reserving room for the auth mode prefix when editing auth.
+func (s hostsSection) newInfoInput(value string, masked bool, placeholder string) textinput.Model {
+	ti := textinput.New()
+	ti.Prompt = ""
+	ti.Placeholder = placeholder
+	if masked {
+		ti.EchoMode = textinput.EchoPassword
+	}
+	ti.SetValue(value)
+	ti.CursorEnd()
+	reserve := 0
+	if s.infoEditField == "auth" {
+		reserve = len(s.infoAuthMode) + 2 // the "key  " / "password  " prefix
+	}
+	if w := s.w - infoValGutter - reserve; w > 6 {
+		ti.Width = w
+	} else {
+		ti.Width = 6
+	}
+	return ti
+}
+
+// beginAuthValue advances the auth edit from mode-select to the value input: a path
+// for key (empty = default ssh keys) or a masked password.
+func (s hostsSection) beginAuthValue(name string) (hostsSection, tea.Cmd) {
+	s.infoAuthChoosing = false
+	if s.infoAuthMode == "password" {
+		s.infoInput = s.newInfoInput("", true, "new password · empty keeps current")
+	} else {
+		s.infoInput = s.newInfoInput(s.inventory.Hosts[name].IdentityFile, false, "path · empty = default ssh keys")
+	}
+	return s, s.infoInput.Focus()
+}
+
+// updateInfoEdit drives the inline editor: the auth row first picks a mode, then any
+// field takes a value — enter commits, esc discards, other keys edit.
+func (s hostsSection) updateInfoEdit(msg tea.Msg, name string) (hostsSection, tea.Cmd) {
+	km, isKey := msg.(tea.KeyMsg)
+	if s.infoAuthChoosing {
+		if !isKey {
+			return s, nil
+		}
+		switch km.String() {
+		case "left", "h", "right", "l", "tab", " ":
+			if s.infoAuthMode == "password" {
+				s.infoAuthMode = "key"
+			} else {
+				s.infoAuthMode = "password"
+			}
+		case "enter":
+			return s.beginAuthValue(name)
+		case "esc":
+			return s.cancelInfoEdit(), nil
+		}
+		return s, nil
+	}
+	if isKey {
+		switch km.String() {
+		case "enter":
+			return s.commitInfoEdit(name)
+		case "esc":
+			return s.cancelInfoEdit(), nil
+		}
+	}
+	var cmd tea.Cmd
+	s.infoInput, cmd = s.infoInput.Update(msg)
+	return s, cmd
+}
+
+// commitInfoEdit writes the edited field. Plain fields and the auth key go to
+// inventory.yaml; the auth password goes to the encrypted secrets store. On a
+// validation error it keeps the input open and shows the message inline; on success
+// it returns to browse and (for inventory edits) signals the change to the panes.
+func (s hostsSection) commitInfoEdit(name string) (hostsSection, tea.Cmd) {
+	val := s.infoInput.Value()
+	if s.infoEditField == "auth" {
+		if s.infoAuthMode == "password" {
+			if val == "" {
+				// Empty means "no change" — removing a stored password is a CLI action.
+				return s.cancelInfoEdit(), toastCmd("password unchanged · " + name)
+			}
+			if err := s.setHostPassword(name, val); err != nil {
+				s.infoEditErr = err.Error()
+				return s, nil
+			}
+			return s.cancelInfoEdit(), toastCmd("password updated · " + name)
+		}
+		// key mode writes the identity path (empty clears it → default ssh keys).
+		if err := s.setHostField(name, "identity", val); err != nil {
+			s.infoEditErr = err.Error()
+			return s, nil
+		}
+		return s.cancelInfoEdit(), tea.Batch(inventoryChangedCmd(s.inventory), toastCmd("key updated · "+name))
+	}
+	if err := s.setHostField(name, s.infoEditField, val); err != nil {
+		s.infoEditErr = err.Error()
+		return s, nil
+	}
+	return s.cancelInfoEdit(), tea.Batch(inventoryChangedCmd(s.inventory), toastCmd(s.infoEditField+" updated · "+name))
+}
+
+// setHostPassword stores the encrypted password for name. It needs
+// AGENTSSH_MASTER_PASSWORD, mirroring the add form's password path.
+func (s *hostsSection) setHostPassword(name, password string) error {
+	master := os.Getenv("AGENTSSH_MASTER_PASSWORD")
+	if master == "" {
+		return fmt.Errorf("set AGENTSSH_MASTER_PASSWORD to edit passwords here, or use `agentssh secret set %s`", name)
+	}
+	store, err := secrets.Open(s.paths.SecretsFile, master)
+	if errors.Is(err, secrets.ErrWrongMaster) {
+		return fmt.Errorf("cannot open secrets: wrong master password or corrupt secrets file")
+	}
+	if err != nil {
+		return err
+	}
+	store.Set(name, password)
+	if err := store.Save(master); err != nil {
+		return err
+	}
+	if s.secretHosts == nil {
+		s.secretHosts = map[string]bool{}
+	}
+	s.secretHosts[name] = true
+	s.secretsReadable = true
+	return nil
+}
+
+// setHostField applies a single edited field to name in inventory.yaml, preserving
+// every other field (including the probed OS).
+func (s *hostsSection) setHostField(name, field, raw string) error {
+	base, err := inventory.Load(s.paths.InventoryFile)
+	if err != nil {
+		return err
+	}
+	host, ok := base.Hosts[name]
+	if !ok {
+		return inventory.ErrHostNotFound
+	}
+	switch field {
+	case "addr":
+		v := strings.TrimSpace(raw)
+		if v == "" {
+			return fmt.Errorf("addr cannot be empty")
+		}
+		host.Addr = v
+	case "user":
+		host.User = strings.TrimSpace(raw)
+	case "port":
+		v := strings.TrimSpace(raw)
+		if v == "" {
+			host.Port = 0
+		} else {
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 1 || n > 65535 {
+				return fmt.Errorf("port must be a number 1–65535")
+			}
+			host.Port = n
+		}
+	case "alias":
+		host.SSHConfigAlias = strings.TrimSpace(raw)
+	case "identity":
+		host.IdentityFile = strings.TrimSpace(raw)
+	case "tags":
+		host.Tags = hostform.SplitTags(raw)
+	default:
+		return fmt.Errorf("unknown field %q", field)
+	}
+	next, err := inventory.UpdateHost(base, name, host)
+	if err != nil {
+		return err
+	}
+	if err := inventory.Save(s.paths.InventoryFile, next); err != nil {
+		return err
+	}
+	s.inventory = next
+	s.rebuildNames()
+	return nil
+}
+
+// startDelete opens the delete-confirm. Like inline edit it is driven from the Info
+// pane; updateConfirm/removeSelected resolve the target via selectedHost, which
+// equals the detail host because the grid cursor stays put while detail is open.
+func (s hostsSection) startDelete(name string) hostsSection {
+	if name == "" {
+		return s
+	}
+	s.focus = hostFocusConfirm
+	return s
+}
+
 func (s hostsSection) updateForm(msg tea.Msg) (tea.Model, tea.Cmd) {
 	updated, cmd := s.form.Update(msg)
 	if form, ok := updated.(hostform.Model); ok {
@@ -400,33 +696,20 @@ func (s hostsSection) updateForm(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 	result := s.form.Result()
 	s.focus = hostFocusList
-	editingHost := s.editingHost
-	s.editingHost = ""
 	s.form = hostform.Model{}
+	// The form only ever creates hosts now — editing an existing host happens inline
+	// on the Info pane (see beginInfoEdit), so there is no update branch here.
 	if !result.Submitted {
-		if editingHost != "" {
-			s.setStatus(statusInfo, "edit cancelled")
-		} else {
-			s.setStatus(statusInfo, "add cancelled")
-		}
+		s.setStatus(statusInfo, "add cancelled")
 		return s, nil
 	}
-	var err error
-	var toastText string
-	if editingHost != "" {
-		err = s.updateHost(result)
-		toastText = "host updated: " + result.Name
-	} else {
-		err = s.addHost(result)
-		toastText = "host added: " + result.Name
-	}
-	if err != nil {
+	if err := s.addHost(result); err != nil {
 		s.err = err
 		s.status = ""
 		return s, nil
 	}
 	s.err = nil
-	return s, tea.Batch(inventoryChangedCmd(s.inventory), toastCmd(toastText))
+	return s, tea.Batch(inventoryChangedCmd(s.inventory), toastCmd("host added: "+result.Name))
 }
 
 func (s hostsSection) updateConfirm(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -494,30 +777,7 @@ func (s hostsSection) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 		s.cursor = maxInt(last, 0)
 	case "a":
 		s.focus = hostFocusForm
-		s.editingHost = ""
 		s.form = hostform.New(hostform.Options{ExistingNames: inventory.HostNames(s.inventory)}, s.renderer)
-		s.form = s.form.SetSize(s.w, s.h)
-		return s, s.form.Init()
-	case "e":
-		if s.selectedHost() == "" {
-			s.setStatus(statusInfo, "no host selected")
-			return s, nil
-		}
-		name := s.selectedHost()
-		host := s.inventory.Hosts[name]
-		s.focus = hostFocusForm
-		s.editingHost = name
-		s.form = hostform.New(hostform.Options{
-			Name:         name,
-			Addr:         host.Addr,
-			User:         host.User,
-			Port:         host.Port,
-			Tags:         host.Tags,
-			Alias:        host.SSHConfigAlias,
-			IdentityFile: host.IdentityFile,
-			FixedName:    true,
-			Title:        "Edit inventory host",
-		}, s.renderer)
 		s.form = s.form.SetSize(s.w, s.h)
 		return s, s.form.Init()
 	case "D":
@@ -544,10 +804,6 @@ func (s hostsSection) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 		s.err = nil
 		s.testing = true
 		return s, tea.Batch(s.probeHostCmd(name), s.spinner.Tick)
-	case "d", "x":
-		if s.selectedHost() != "" {
-			s.focus = hostFocusConfirm
-		}
 	case "r":
 		// Reload inventory.yaml from disk (e.g. after editing it externally); the
 		// same key reloads from the parse-error card.
@@ -875,67 +1131,6 @@ func (s *hostsSection) addInventoryHost(base inventory.Inventory, result hostfor
 	}
 	s.inventory = next
 	s.rebuildNames()
-	return nil
-}
-
-func (s *hostsSection) updateHost(result hostform.Result) error {
-	base, err := inventory.Load(s.paths.InventoryFile)
-	if err != nil {
-		return err
-	}
-	existing, ok := base.Hosts[result.Name]
-	if !ok {
-		return inventory.ErrHostNotFound
-	}
-	nextHost := inventory.Host{
-		Addr:           result.Addr,
-		User:           result.User,
-		Port:           result.Port,
-		SSHConfigAlias: result.Alias,
-		IdentityFile:   result.Identity,
-		Tags:           result.Tags,
-		OS:             existing.OS,
-	}
-	var store *secrets.Store
-	var master string
-	if result.Password != "" {
-		master = os.Getenv("AGENTSSH_MASTER_PASSWORD")
-		if master == "" {
-			return fmt.Errorf("set AGENTSSH_MASTER_PASSWORD to store a password in the TUI, or use `agentssh secret set <host>`")
-		}
-		store, err = secrets.Open(s.paths.SecretsFile, master)
-		if errors.Is(err, secrets.ErrWrongMaster) {
-			return fmt.Errorf("cannot open secrets: wrong master password or corrupt secrets file")
-		}
-		if err != nil {
-			return err
-		}
-	}
-	next, err := inventory.UpdateHost(base, result.Name, nextHost)
-	if err != nil {
-		return err
-	}
-	if err := inventory.Save(s.paths.InventoryFile, next); err != nil {
-		return err
-	}
-	s.inventory = next
-	s.rebuildNames()
-	if store != nil {
-		store.Set(result.Name, result.Password)
-		if err := store.Save(master); err != nil {
-			if rbErr := inventory.Save(s.paths.InventoryFile, base); rbErr != nil {
-				return fmt.Errorf("failed to store password (%v) and to roll back inventory update: %w", err, rbErr)
-			}
-			s.inventory = base
-			s.rebuildNames()
-			return fmt.Errorf("failed to store password; rolled back inventory update: %w", err)
-		}
-		if s.secretHosts == nil {
-			s.secretHosts = map[string]bool{}
-		}
-		s.secretHosts[result.Name] = true
-		s.secretsReadable = true
-	}
 	return nil
 }
 
@@ -1337,18 +1532,25 @@ func osMeta(osName string) (code string, color lipgloss.TerminalColor) {
 
 // ---- info pane (host detail) ----
 
-// infoView renders the selected host's facts as a bordered panel. box is the
-// lipgloss box width (padding included; border sits outside it), clamped to
-// height. focused accents the border (the active pane).
+// infoValGutter is the chrome (border + padding + cursor gutter + label + space,
+// on both sides) around the Info pane's value column, so the inline input width is
+// s.w - infoValGutter — matching where the read-only value would sit.
+const infoValGutter = 16
+
+// infoView renders the selected host's facts as a bordered panel that doubles as
+// the editor: a field cursor browses the editable rows and one row at a time turns
+// into infoInput, all in the same layout. box is the lipgloss box width (padding
+// included; border sits outside it), clamped to height. focused accents the border
+// (the active pane) and enables the field cursor.
 func (s hostsSection) infoView(name string, box, height int, focused bool) string {
 	host, ok := s.inventory.Hosts[name]
-	// Floor at 16 so the field layout (9-col label + space + a >=4-col value) fits
-	// the text area (box-2) without overflowing, even if a caller passes a tiny box.
-	if box < 16 {
-		box = 16
+	// Floor at 18 so the field layout (2-col cursor gutter + 9-col label + space + a
+	// >=4-col value) fits the text area (box-2) without overflowing on a tiny box.
+	if box < 18 {
+		box = 18
 	}
 	textW := box - 2 // padding
-	valW := textW - 10
+	valW := textW - 12
 	if valW < 4 {
 		valW = 4
 	}
@@ -1362,35 +1564,54 @@ func (s hostsSection) infoView(name string, box, height int, focused bool) strin
 	if !ok {
 		b.WriteString(s.styles.dim.Render("host not found"))
 	} else {
-		field := func(label, val string) {
-			fmt.Fprintf(&b, "%s %s\n", s.styles.dim.Render(fmt.Sprintf("%-9s", label)), truncate(val, valW))
+		// Read-only row: a 2-col gutter keeps its label aligned with editable rows.
+		roRow := func(label, val string) {
+			fmt.Fprintf(&b, "  %s %s\n", s.styles.dim.Render(fmt.Sprintf("%-9s", label)), truncate(val, valW))
+		}
+		// Editable row idx: the field cursor (›) marks the focused row — while browsing
+		// and while editing — and the inline input replaces its value during an edit.
+		// The auth row (key "auth") has its own mode-select / value cells.
+		editRow := func(idx int, key, val string) {
+			gutter := "  "
+			cell := truncate(val, valW)
+			if focused && idx == s.infoFieldCursor {
+				gutter = s.styles.cursor.Render("› ")
+				switch {
+				case key == "auth" && s.infoEditing && s.infoAuthChoosing:
+					cell = s.authModeCell()
+				case s.infoEditing && key == "auth":
+					cell = s.styles.dim.Render(s.infoAuthMode+"  ") + s.infoInput.View()
+				case s.infoEditing:
+					cell = s.infoInput.View()
+				}
+			}
+			fmt.Fprintf(&b, "%s%s %s\n", gutter, s.styles.dim.Render(fmt.Sprintf("%-9s", key)), cell)
 		}
 		port := "22"
 		if host.Port != 0 {
 			port = strconv.Itoa(host.Port)
 		}
-		field("os", osLabel(host.OS))
-		field("addr", orDash(host.Addr))
-		field("user", orDash(host.User))
-		field("port", port)
-		field("alias", orDash(host.SSHConfigAlias))
-		identity := orDash(host.IdentityFile)
-		if host.IdentityFile != "" {
-			identity += " " + s.styles.dim.Render("[key]")
-		}
-		field("identity", identity)
-		field("password", s.passwordCell(name))
-		field("tags", orDash(strings.Join(host.Tags, ", ")))
+		roRow("os", osLabel(host.OS))
+		editRow(0, "addr", orDash(host.Addr))
+		editRow(1, "user", orDash(host.User))
+		editRow(2, "port", port)
+		editRow(3, "alias", orDash(host.SSHConfigAlias))
+		editRow(4, "auth", s.authSummary(name, host))
+		editRow(5, "tags", orDash(strings.Join(host.Tags, ", ")))
 		b.WriteString("\n")
 		if s.testing {
-			fmt.Fprintf(&b, "%s %s%s\n", s.styles.dim.Render(fmt.Sprintf("%-9s", "probe")), s.spinner.View(), s.styles.dim.Render(" testing…"))
+			fmt.Fprintf(&b, "  %s %s%s\n", s.styles.dim.Render(fmt.Sprintf("%-9s", "probe")), s.spinner.View(), s.styles.dim.Render(" testing…"))
 		} else {
-			field("probe", s.probeCell(name))
+			roRow("probe", s.probeCell(name))
 		}
 		// Bridge the human viewer to the CLI that actually executes: show the run
 		// template for this host (full width so the command isn't over-truncated).
 		b.WriteString("\n")
 		b.WriteString(truncate(s.styles.dim.Render("run · agentssh run "+name+" -- <cmd>"), textW))
+		if focused && s.infoEditing && s.infoEditErr != "" {
+			b.WriteString("\n")
+			b.WriteString(truncate(s.styles.err.Render(s.styles.glyphs.Fail+" "+s.infoEditErr), textW))
+		}
 	}
 
 	panel := s.styles.panel.Width(box)
@@ -1423,14 +1644,29 @@ func (s hostsSection) probeCell(name string) string {
 	return s.styles.err.Render(s.styles.glyphs.Fail + " " + truncate(p.detail, 40))
 }
 
-func (s hostsSection) passwordCell(name string) string {
+// authSummary is the browse-mode value of the auth row: the configured key path,
+// else a stored-password indicator, else the default-ssh-keys fallback.
+func (s hostsSection) authSummary(name string, host inventory.Host) string {
+	if host.IdentityFile != "" {
+		return "key · " + host.IdentityFile
+	}
+	if s.secretsReadable && s.secretHosts[name] {
+		return s.styles.ok.Render(s.styles.glyphs.OK + " password · stored (encrypted)")
+	}
 	if !s.secretsReadable {
-		return s.styles.dim.Render("managed via `agentssh secret`")
+		return s.styles.dim.Render("default ssh keys · password via `agentssh secret`")
 	}
-	if s.secretHosts[name] {
-		return s.styles.ok.Render(s.styles.glyphs.OK + " stored (encrypted)")
+	return s.styles.dim.Render("default ssh keys")
+}
+
+// authModeCell renders the mode-select stage of an auth edit: the two modes with
+// the chosen one highlighted.
+func (s hostsSection) authModeCell() string {
+	key, pw := "key", "password"
+	if s.infoAuthMode == "password" {
+		return s.styles.dim.Render(key) + "  " + s.styles.cursor.Render("["+pw+"]")
 	}
-	return s.styles.dim.Render("— (not stored)")
+	return s.styles.cursor.Render("["+key+"]") + "  " + s.styles.dim.Render(pw)
 }
 
 // ---- modal overlays (centered cards + discovery) ----

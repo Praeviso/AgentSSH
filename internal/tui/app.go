@@ -385,6 +385,7 @@ func (m appModel) enterDetail(host string) (tea.Model, tea.Cmd) {
 	m.screen = screenDetail
 	m.pane = paneInfo
 	m.detailHost = host
+	m.hosts = m.hosts.resetInfoEdit()
 	m.sessions = m.sessions.withHostFilter(host)
 	m.policy = m.policy.withHost(host)
 	return m.propagateSize()
@@ -444,17 +445,41 @@ func (m appModel) routeDetail(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// updateInfoPane handles keys for the Info pane: t probes the selected host using
-// the Hosts section's probe machinery (its result lands back via hostProbeMsg).
+// updateInfoPane handles keys for the Info pane, where the per-host actions live
+// (the host's fields are on screen here, not on the card grid). The same field
+// list is both the read view and the editor: j/k move a field cursor, enter edits
+// the focused field in place, t probes, and d/x delete. Edits/probe/delete reuse
+// the Hosts section's machinery (results land via hostProbeMsg/inventoryChangedMsg).
 func (m appModel) updateInfoPane(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// The delete-confirm overlay owns the keyboard while open.
+	if m.hosts.focus == hostFocusConfirm {
+		return m.updateHosts(msg)
+	}
+	// An open inline field input owns the keyboard until it commits or cancels.
+	if m.hosts.infoEditing {
+		hs, cmd := m.hosts.updateInfoEdit(msg, m.detailHost)
+		m.hosts = hs
+		return m, cmd
+	}
 	keyMsg, ok := msg.(tea.KeyMsg)
 	if !ok {
 		return m, nil
 	}
-	if keyMsg.String() == "t" {
+	switch keyMsg.String() {
+	case "j", "down":
+		m.hosts.infoFieldDown()
+	case "k", "up":
+		m.hosts.infoFieldUp()
+	case "enter", "i":
+		hs, cmd := m.hosts.beginInfoEdit(m.detailHost)
+		m.hosts = hs
+		return m, cmd
+	case "t":
 		hs, cmd := m.hosts.startProbe(m.detailHost)
 		m.hosts = hs
 		return m, cmd
+	case "d", "x":
+		m.hosts = m.hosts.startDelete(m.detailHost)
 	}
 	return m, nil
 }
@@ -491,6 +516,9 @@ func (m appModel) paneCapturing() bool {
 		return m.sessions.capturing()
 	case panePolicy:
 		return m.policy.capturing()
+	case paneInfo:
+		// The Info pane captures while editing a field inline or its delete-confirm is open.
+		return m.hosts.infoEditing || m.hosts.focus == hostFocusConfirm
 	default:
 		return false
 	}
@@ -621,6 +649,11 @@ func (m appModel) renderDetail() string {
 	case panePolicy:
 		return m.policy.View()
 	default:
+		// The Info pane edits fields inline (rendered by infoView); only the
+		// delete-confirm takes over the whole pane.
+		if m.hosts.focus == hostFocusConfirm {
+			return m.hosts.confirmCardView()
+		}
 		return m.hosts.infoView(m.detailHost, m.w-2, m.bodyHeight(), true)
 	}
 }
@@ -741,6 +774,11 @@ func (m appModel) activeHelpKeyMap() help.KeyMap {
 		return mergeHelp(section, nav)
 	}
 	nav := []key.Binding{hk("tab/1-3", "panes"), hk("esc", "back")}
+	if m.paneCapturing() {
+		// A pane that owns the keyboard (text input or overlay) consumes tab/esc, so
+		// don't advertise pane-nav keys that won't fire while it is open.
+		nav = nil
+	}
 	var pane help.KeyMap
 	switch m.pane {
 	case paneSessions:
@@ -748,12 +786,28 @@ func (m appModel) activeHelpKeyMap() help.KeyMap {
 	case panePolicy:
 		pane = m.policy.helpKeyMap()
 	default:
-		pane = helpMap{
-			short: []key.Binding{hk("t", "test")},
-			full:  [][]key.Binding{{hk("t", "test host connection")}},
-		}
+		pane = m.infoPaneHelp()
 	}
 	return mergeHelp(pane, nav)
+}
+
+// infoPaneHelp is the Info pane's key help. It mirrors the pane's state: editing a
+// field inline and the delete-confirm advertise their own keys; otherwise it lists
+// the per-host actions, which now live on the detail screen with in-place editing.
+func (m appModel) infoPaneHelp() help.KeyMap {
+	if m.hosts.focus == hostFocusConfirm {
+		return helpMap{short: []key.Binding{hk("y", "confirm"), hk("n/esc", "cancel")}}
+	}
+	if m.hosts.infoAuthChoosing {
+		return helpMap{short: []key.Binding{hk("←/→", "mode"), hk("enter", "next"), hk("esc", "cancel")}}
+	}
+	if m.hosts.infoEditing {
+		return helpMap{short: []key.Binding{hk("enter", "save"), hk("esc", "cancel")}}
+	}
+	return helpMap{
+		short: []key.Binding{hk("enter", "edit"), hk("t", "test")},
+		full:  [][]key.Binding{{hk("j/k", "field"), hk("enter", "edit field"), hk("t", "test"), hk("d/x", "delete")}},
+	}
 }
 
 // mergeHelp appends nav bindings to a section's short help (footer) and adds them

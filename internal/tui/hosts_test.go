@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	"github.com/Praeviso/AgentSSH/internal/audit"
-	"github.com/Praeviso/AgentSSH/internal/hostform"
 	"github.com/Praeviso/AgentSSH/internal/inventory"
 	"github.com/Praeviso/AgentSSH/internal/policy"
 )
@@ -126,23 +125,22 @@ func TestGrid2DNavigation(t *testing.T) {
 
 func TestHostsEditUpdatesInventory(t *testing.T) {
 	m := sized(t, buildApp(t), 100, 30)
-	m.hosts.cursor = hostIndex(t, m.hosts.names, "prod-web-01")
-	m = press(t, m, "e")
-	if m.hosts.focus != hostFocusForm || m.hosts.editingHost != "prod-web-01" {
-		t.Fatalf("edit state focus=%v editing=%q", m.hosts.focus, m.hosts.editingHost)
+	hs := m.hosts
+	// Each Info-pane field is committed on its own (enter saves one field), and every
+	// other field — including the probed OS — is preserved.
+	for _, f := range []struct{ key, val string }{
+		{"addr", "10.0.0.99"},
+		{"user", "admin"},
+		{"port", "2222"},
+		{"alias", "prod-web"},
+		{"identity", "~/.ssh/prod-web"},
+		{"tags", "prod, api"},
+	} {
+		if err := hs.setHostField("prod-web-01", f.key, f.val); err != nil {
+			t.Fatalf("setHostField %s: %v", f.key, err)
+		}
 	}
-	if err := m.hosts.updateHost(hostform.Result{
-		Name:     "prod-web-01",
-		Addr:     "10.0.0.99",
-		User:     "admin",
-		Port:     2222,
-		Tags:     []string{"prod", "api"},
-		Alias:    "prod-web",
-		Identity: "~/.ssh/prod-web",
-	}); err != nil {
-		t.Fatalf("updateHost: %v", err)
-	}
-	inv, err := inventory.Load(m.hosts.paths.InventoryFile)
+	inv, err := inventory.Load(hs.paths.InventoryFile)
 	if err != nil {
 		t.Fatalf("load inventory: %v", err)
 	}
@@ -152,6 +150,25 @@ func TestHostsEditUpdatesInventory(t *testing.T) {
 	}
 	if got := strings.Join(host.Tags, ","); got != "prod,api" {
 		t.Fatalf("tags = %q", got)
+	}
+}
+
+func TestSetHostFieldRejectsBadInput(t *testing.T) {
+	m := sized(t, buildApp(t), 100, 30)
+	hs := m.hosts
+	if err := hs.setHostField("prod-web-01", "addr", "   "); err == nil {
+		t.Fatal("empty addr should be rejected")
+	}
+	if err := hs.setHostField("prod-web-01", "port", "notaport"); err == nil {
+		t.Fatal("non-numeric port should be rejected")
+	}
+	// A rejected edit must not have touched inventory.yaml.
+	inv, err := inventory.Load(hs.paths.InventoryFile)
+	if err != nil {
+		t.Fatalf("load inventory: %v", err)
+	}
+	if got := inv.Hosts["prod-web-01"].Addr; got != "10.0.0.11" {
+		t.Fatalf("addr changed despite rejected edits: %q", got)
 	}
 }
 

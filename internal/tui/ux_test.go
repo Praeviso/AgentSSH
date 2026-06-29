@@ -9,9 +9,22 @@ import (
 	"github.com/Praeviso/AgentSSH/internal/audit"
 	"github.com/Praeviso/AgentSSH/internal/hostform"
 	"github.com/Praeviso/AgentSSH/internal/inventory"
+	"github.com/Praeviso/AgentSSH/internal/secrets"
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
+
+// fieldIndex is the position of an editable Info-pane field, so tests place the
+// field cursor without hard-coding the order.
+func fieldIndex(key string) int {
+	for i, k := range editableInfoFields() {
+		if k == key {
+			return i
+		}
+	}
+	return -1
+}
 
 // filterFor enters the host grid's / filter and types query through the real key
 // path, asserting it actually opened the filter box.
@@ -230,18 +243,165 @@ func TestPolicyRuleCursorMoves(t *testing.T) {
 
 // --- round 2: keybinding rework, form markers, info hint ---
 
-// d/x delete the selected host (with confirm); D opens discovery (was d).
+// D opens discovery on the grid; d/x are no longer grid delete shortcuts — delete
+// moved to the Info pane (see TestInfoPaneDeleteFlow).
 func TestGridDeleteAndDiscoverKeys(t *testing.T) {
 	base := sized(t, buildApp(t), 100, 30)
 
-	if md := press(t, base, "d"); md.hosts.focus != hostFocusConfirm {
-		t.Fatalf("'d' should open the delete confirm, focus = %v", md.hosts.focus)
-	}
-	if mx := press(t, base, "x"); mx.hosts.focus != hostFocusConfirm {
-		t.Fatalf("'x' should open the delete confirm, focus = %v", mx.hosts.focus)
-	}
 	if mD := press(t, base, "D"); mD.hosts.focus != hostFocusDiscover {
 		t.Fatalf("'D' should open discovery, focus = %v", mD.hosts.focus)
+	}
+	if md := press(t, base, "d"); md.hosts.focus != hostFocusList {
+		t.Fatalf("'d' on the grid should be inert now, focus = %v", md.hosts.focus)
+	}
+	if mx := press(t, base, "x"); mx.hosts.focus != hostFocusList {
+		t.Fatalf("'x' on the grid should be inert now, focus = %v", mx.hosts.focus)
+	}
+}
+
+// Delete now lives on the Info pane: open a host's detail, d opens the confirm,
+// and y removes the host and pops back to the grid (its detail host is gone).
+func TestInfoPaneDeleteFlow(t *testing.T) {
+	m := sized(t, buildApp(t), 100, 30)
+	m.hosts.cursor = hostIndex(t, m.hosts.names, "prod-web-01")
+	m = press(t, m, "enter")
+	m = press(t, m, "d")
+	if m.hosts.focus != hostFocusConfirm {
+		t.Fatalf("'d' did not open the delete confirm, focus = %v", m.hosts.focus)
+	}
+	if v := m.View(); !strings.Contains(v, "Remove host") {
+		t.Fatalf("confirm card not rendered in the detail body:\n%s", v)
+	}
+	m = press(t, m, "y")
+	if _, ok := m.hosts.inventory.Hosts["prod-web-01"]; ok {
+		t.Fatalf("prod-web-01 still present after delete")
+	}
+	// The runtime runs updateConfirm's inventoryChangedCmd; deliver it so the shell
+	// applies the change and pops the now-deleted host's detail back to the grid.
+	next, _ := m.Update(inventoryChangedMsg{inventory: m.hosts.inventory})
+	m = next.(appModel)
+	if m.screen != screenGrid {
+		t.Fatalf("after delete screen = %v, want grid", m.screen)
+	}
+}
+
+// Editing happens in place on the Info pane — the same field list, no separate
+// form: enter opens the focused field as an input, enter saves just that field.
+func TestInfoPaneInlineEdit(t *testing.T) {
+	m := sized(t, buildApp(t), 100, 30)
+	m.hosts.cursor = hostIndex(t, m.hosts.names, "prod-web-01")
+	m = press(t, m, "enter") // open detail; field cursor starts on addr
+	m = press(t, m, "enter") // edit the focused field in place
+	if !m.hosts.infoEditing || m.hosts.infoEditField != "addr" {
+		t.Fatalf("enter did not begin inline edit of addr: editing=%v field=%q", m.hosts.infoEditing, m.hosts.infoEditField)
+	}
+	// No separate form swaps in — it is still the Info pane, same layout.
+	if v := m.View(); strings.Contains(v, "Edit inventory host") {
+		t.Fatalf("inline edit must not show a separate form:\n%s", v)
+	}
+	m.hosts.infoInput.SetValue("10.0.0.99")
+	m = press(t, m, "enter") // save just this field
+	if m.hosts.infoEditing {
+		t.Fatalf("enter did not commit the field")
+	}
+	if got := m.hosts.inventory.Hosts["prod-web-01"].Addr; got != "10.0.0.99" {
+		t.Fatalf("addr not saved inline: %q", got)
+	}
+
+	// esc while editing cancels without saving.
+	m = press(t, m, "j")     // move cursor to user
+	m = press(t, m, "enter") // edit user
+	if m.hosts.infoEditField != "user" {
+		t.Fatalf("field cursor did not move to user: %q", m.hosts.infoEditField)
+	}
+	m.hosts.infoInput.SetValue("nope")
+	m = press(t, m, "esc")
+	if m.hosts.infoEditing {
+		t.Fatalf("esc did not cancel the inline edit")
+	}
+	if m.screen != screenDetail {
+		t.Fatalf("esc cancel should stay in detail, screen = %v", m.screen)
+	}
+	if got := m.hosts.inventory.Hosts["prod-web-01"].User; got != "deploy" {
+		t.Fatalf("esc cancel must not save: user = %q", got)
+	}
+
+	// esc from browse exits the detail screen.
+	m = press(t, m, "esc")
+	if m.screen != screenGrid {
+		t.Fatalf("esc from browse did not exit to grid, screen = %v", m.screen)
+	}
+}
+
+// The auth row is a two-stage edit: pick "key", then enter a path that lands in
+// inventory's IdentityFile (empty would fall back to the default ssh keys).
+func TestInfoPaneAuthKeyEdit(t *testing.T) {
+	m := sized(t, buildApp(t), 100, 30)
+	m.hosts.cursor = hostIndex(t, m.hosts.names, "prod-web-01")
+	m = press(t, m, "enter") // detail
+	m.hosts.infoFieldCursor = fieldIndex("auth")
+	m = press(t, m, "enter") // begin auth edit → mode-select
+	if !m.hosts.infoEditing || !m.hosts.infoAuthChoosing {
+		t.Fatalf("auth edit did not open mode-select: editing=%v choosing=%v", m.hosts.infoEditing, m.hosts.infoAuthChoosing)
+	}
+	if m.hosts.infoAuthMode != "key" {
+		t.Fatalf("default auth mode = %q, want key", m.hosts.infoAuthMode)
+	}
+	m = press(t, m, "enter") // pick key → value input
+	if m.hosts.infoAuthChoosing {
+		t.Fatalf("enter did not advance to the value input")
+	}
+	m.hosts.infoInput.SetValue("~/.ssh/prod-web")
+	m = press(t, m, "enter") // save
+	if m.hosts.infoEditing {
+		t.Fatalf("enter did not commit the key path")
+	}
+	if got := m.hosts.inventory.Hosts["prod-web-01"].IdentityFile; got != "~/.ssh/prod-web" {
+		t.Fatalf("identity not saved: %q", got)
+	}
+}
+
+// The auth row's password mode masks the input and writes the encrypted secrets
+// store (requires AGENTSSH_MASTER_PASSWORD).
+func TestInfoPaneAuthPasswordEdit(t *testing.T) {
+	t.Setenv("AGENTSSH_MASTER_PASSWORD", "correct-horse")
+	m := sized(t, buildApp(t), 100, 30)
+	m.hosts.cursor = hostIndex(t, m.hosts.names, "prod-web-01")
+	m = press(t, m, "enter") // detail
+	m.hosts.infoFieldCursor = fieldIndex("auth")
+	m = press(t, m, "enter") // mode-select
+	m = press(t, m, "right") // key → password
+	if m.hosts.infoAuthMode != "password" {
+		t.Fatalf("toggle did not select password: %q", m.hosts.infoAuthMode)
+	}
+	m = press(t, m, "enter") // value input (masked)
+	if m.hosts.infoInput.EchoMode != textinput.EchoPassword {
+		t.Fatalf("password input is not masked")
+	}
+	m.hosts.infoInput.SetValue("s3cret")
+	m = press(t, m, "enter") // save → secrets store
+	if m.hosts.infoEditing {
+		t.Fatalf("enter did not commit the password")
+	}
+	if !m.hosts.secretHosts["prod-web-01"] {
+		t.Fatalf("password not recorded for host")
+	}
+	store, err := secrets.Open(m.hosts.paths.SecretsFile, "correct-horse")
+	if err != nil {
+		t.Fatalf("open secrets: %v", err)
+	}
+	if pw, ok := store.Password("prod-web-01"); !ok || pw != "s3cret" {
+		t.Fatalf("stored password = %q ok=%v", pw, ok)
+	}
+}
+
+// Editing a password without a master password set is refused with guidance.
+func TestSetHostPasswordRequiresMaster(t *testing.T) {
+	t.Setenv("AGENTSSH_MASTER_PASSWORD", "")
+	m := sized(t, buildApp(t), 100, 30)
+	hs := m.hosts
+	if err := hs.setHostPassword("prod-web-01", "x"); err == nil {
+		t.Fatal("setHostPassword without a master password should error")
 	}
 }
 
