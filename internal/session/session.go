@@ -24,9 +24,9 @@ var ErrNoSession = errors.New("no session declared (pass --session or set AGENTS
 // whatever the caller declares, nothing is persisted between runs.
 type Resolver struct{}
 
-// Context is the resolved session information for a run. A session is bound to
-// exactly one host: Host records which host this session id belongs to, so a
-// session never spans more than one target.
+// Context is the resolved session information for a run. Callers that fan out
+// across multiple hosts must derive a host-specific ID before writing audit
+// records, so one stored session id stays bound to one host.
 type Context struct {
 	ID    string
 	Host  string
@@ -58,8 +58,8 @@ func NewID() (string, error) {
 	return "s_" + hex.EncodeToString(bytes[:]), nil
 }
 
-// Summary is one aggregated session row from audit.log. A session is bound to a
-// single host (see Context.Host), so Host is scalar; legacy multi-host audit
+// Summary is one aggregated session row from audit.log. Host is scalar because
+// new run paths write one stored session id per host; legacy multi-host audit
 // data resolves to the first host seen for that session id.
 type Summary struct {
 	ID           string
@@ -115,7 +115,10 @@ func Summaries(records []audit.Record) []Summary {
 		result = append(result, *summary)
 	}
 	sort.Slice(result, func(i, j int) bool {
-		return result[i].End > result[j].End
+		if result[i].End != result[j].End {
+			return result[i].End > result[j].End
+		}
+		return result[i].ID < result[j].ID
 	})
 	return result
 }

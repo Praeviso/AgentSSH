@@ -95,12 +95,7 @@ func (s policySection) withHost(host string) policySection {
 	s.mode = policyModeBrowse
 	s.ruleCursor = 0
 	s.groupCursor = 0
-	if host != "" {
-		s.target = policyTarget{}
-	}
-	if host == "" {
-		s.target = policyTarget{}
-	}
+	s.target = policyTarget{}
 	return s
 }
 
@@ -593,8 +588,13 @@ func (s *policySection) editRuleFromInput() tea.Cmd {
 			s.result = ""
 			return nil
 		}
+		rule.Name = next.Policy.Rules[s.ruleCursor].Name
 		next.Policy.Rules[s.ruleCursor] = rule
 	case policyTargetGroup:
+		group := bundle.Policy.RuleGroups[strings.TrimSpace(s.target.group)]
+		if s.ruleCursor >= 0 && s.ruleCursor < len(group.Rules) {
+			rule.Name = group.Rules[s.ruleCursor].Name
+		}
 		next, err = policy.UpdateGroupRule(bundle, s.target.group, s.ruleCursor, rule)
 		if err != nil {
 			s.err = err
@@ -928,10 +928,6 @@ func parseRuleInput(value string) (policy.Rule, error) {
 		Match:    policy.Match{CmdRegex: cmdRegex},
 		Action:   action,
 	}, nil
-}
-
-func parseHostRuleInput(value string) (policy.Rule, error) {
-	return parseRuleInput(value)
 }
 
 func formatRuleInput(rule policy.Rule) string {

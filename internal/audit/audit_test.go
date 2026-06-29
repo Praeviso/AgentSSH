@@ -120,6 +120,25 @@ func TestTruncateBrokenRemovesBrokenTailAndBacksUp(t *testing.T) {
 	}
 }
 
+func TestTruncateBrokenUsesBrokenIndexNotSeqValue(t *testing.T) {
+	store := testStoreWithRecords(t)
+	records := mustRead(t, store)
+	records[1].Seq = 0
+	writeRecords(t, store.Path, records)
+
+	result, err := store.TruncateBroken()
+	if err != nil {
+		t.Fatalf("TruncateBroken: %v", err)
+	}
+	if !result.Changed || result.Kept != 1 || result.Removed != 2 || result.BrokenSeq != 0 || result.BrokenIndex != 1 || result.Reason != "seq" {
+		t.Fatalf("repair result = %#v", result)
+	}
+	repaired := mustRead(t, store)
+	if len(repaired) != 1 || repaired[0].ReqID != "r1" {
+		t.Fatalf("repaired records = %#v", repaired)
+	}
+}
+
 func TestTruncateBrokenNoopsWhenChainOK(t *testing.T) {
 	store := testStoreWithRecords(t)
 	result, err := store.TruncateBroken()

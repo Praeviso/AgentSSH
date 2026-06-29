@@ -1,9 +1,11 @@
 package policy
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/Praeviso/AgentSSH/internal/inventory"
+	"gopkg.in/yaml.v3"
 )
 
 func TestEvaluateHostTierBeforeGlobalPriority(t *testing.T) {
@@ -275,10 +277,61 @@ func TestInvalidPolicyRules(t *testing.T) {
 	}, inventory.Inventory{}); err == nil {
 		t.Fatal("NewEngine invalid regex error = nil")
 	}
-	if _, err := NewEngine(Config{
+	engine, err := NewEngine(Config{
 		Rules: []Rule{{Name: "missing-action", Match: Match{CmdRegex: "^ls"}}},
+	}, inventory.Inventory{})
+	if err != nil {
+		t.Fatalf("NewEngine missing action: %v", err)
+	}
+	decision, err := engine.Evaluate("", "ls")
+	if err != nil {
+		t.Fatalf("Evaluate missing action: %v", err)
+	}
+	if decision.Action != ActionAllow {
+		t.Fatalf("missing action decision = %#v, want allow", decision)
+	}
+	if _, err := NewEngine(Config{
+		Rules: []Rule{{Name: "bad-action", Match: Match{CmdRegex: "^ls"}, Action: Action("prompt")}},
 	}, inventory.Inventory{}); err == nil {
-		t.Fatal("NewEngine missing action error = nil")
+		t.Fatal("NewEngine invalid action error = nil")
+	}
+}
+
+func TestUnmarshalRejectsLegacySchemaKeys(t *testing.T) {
+	tests := []struct {
+		name string
+		yml  string
+		want string
+	}{
+		{
+			name: "defaults",
+			yml:  "version: 1\ndefaults:\n  policy: allow\n",
+			want: `removed v0.5.1 key "defaults" at defaults`,
+		},
+		{
+			name: "top level allow_rules",
+			yml:  "version: 1\nallow_rules:\n  - '^ls$'\n",
+			want: `removed v0.5.1 key "allow_rules" at allow_rules`,
+		},
+		{
+			name: "host override policy",
+			yml:  "version: 1\nhost_overrides:\n  web:\n    policy: deny\n",
+			want: `removed v0.5.1 key "policy" at host_overrides.web.policy`,
+		},
+		{
+			name: "host override allow_rules",
+			yml:  "version: 1\nhost_overrides:\n  web:\n    allow_rules:\n      - '^ls$'\n",
+			want: `removed v0.5.1 key "allow_rules" at host_overrides.web.allow_rules`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var cfg Config
+			err := yaml.Unmarshal([]byte(tt.yml), &cfg)
+			if err == nil || !strings.Contains(err.Error(), tt.want) || !strings.Contains(err.Error(), "migrate to schema version 1") {
+				t.Fatalf("err = %v, want %q with migration hint", err, tt.want)
+			}
+		})
 	}
 }
 

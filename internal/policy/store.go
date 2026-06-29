@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/Praeviso/AgentSSH/internal/fileutil"
 	"github.com/Praeviso/AgentSSH/internal/inventory"
 	"gopkg.in/yaml.v3"
 )
@@ -73,32 +74,9 @@ func Save(path string, cfg Config) error {
 	if err != nil {
 		return fmt.Errorf("marshal policy: %w", err)
 	}
-	file, err := os.CreateTemp(dir, "policy-*.yaml")
-	if err != nil {
-		return fmt.Errorf("create temporary policy file: %w", err)
+	if err := fileutil.WriteFileAtomic(path, data, 0o600, "policy-*.yaml"); err != nil {
+		return fileutil.LabelAtomicError(err, "policy")
 	}
-	tempName := file.Name()
-	cleanup := true
-	defer func() {
-		if cleanup {
-			_ = os.Remove(tempName)
-		}
-	}()
-	if err := file.Chmod(0o600); err != nil {
-		_ = file.Close()
-		return fmt.Errorf("chmod temporary policy file: %w", err)
-	}
-	if _, err := file.Write(data); err != nil {
-		_ = file.Close()
-		return fmt.Errorf("write temporary policy file: %w", err)
-	}
-	if err := file.Close(); err != nil {
-		return fmt.Errorf("close temporary policy file: %w", err)
-	}
-	if err := os.Rename(tempName, path); err != nil {
-		return fmt.Errorf("replace policy file: %w", err)
-	}
-	cleanup = false
 	return nil
 }
 
@@ -284,7 +262,7 @@ func RemoveHostRule(bundle Bundle, host string, index int) (Bundle, error) {
 	override := ruleSet.Override
 	override.Rules = append([]Rule(nil), override.Rules...)
 	override.Rules = append(override.Rules[:index], override.Rules[index+1:]...)
-	return SetHostRules(bundle, host, override)
+	return setExistingHostRules(bundle, host, override)
 }
 
 // CreateGroup returns a copy of bundle with a new empty authoring rule group.
@@ -394,6 +372,7 @@ func StampGroupOntoHost(bundle Bundle, host string, groupName string) (Bundle, e
 		override = ruleSet.Override
 	}
 	override.Rules = copyRules(override.Rules)
+	override.Rules = removeRulesFromGroup(override.Rules, groupName)
 	for _, rule := range group.Rules {
 		copied := rule
 		copied.Group = groupName
@@ -422,7 +401,39 @@ func RemoveHostGroup(bundle Bundle, host string, groupName string) (Bundle, erro
 		}
 		override.Rules = append(override.Rules, rule)
 	}
-	return SetHostRules(bundle, host, override)
+	return setExistingHostRules(bundle, host, override)
+}
+
+func setExistingHostRules(bundle Bundle, host string, override HostOverride) (Bundle, error) {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return bundle, fmt.Errorf("policy host name is required")
+	}
+	key := HostRulesKey(host)
+	if _, ok := bundle.Policy.HostOverrides[key]; !ok {
+		return bundle, ErrNoHostRules
+	}
+	next := copyBundle(bundle)
+	if next.Policy.Version == 0 {
+		next.Policy.Version = 1
+	}
+	if next.Policy.HostOverrides == nil {
+		next.Policy.HostOverrides = map[string]HostOverride{}
+	}
+	override.Rules = append([]Rule(nil), override.Rules...)
+	next.Policy.HostOverrides[key] = override
+	return next, nil
+}
+
+func removeRulesFromGroup(rules []Rule, groupName string) []Rule {
+	out := make([]Rule, 0, len(rules))
+	for _, rule := range rules {
+		if rule.Group == groupName {
+			continue
+		}
+		out = append(out, rule)
+	}
+	return out
 }
 
 func ruleIndex(rules []Rule, name string) (int, error) {

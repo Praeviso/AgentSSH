@@ -145,6 +145,9 @@ func (c Config) withMaps() Config {
 // host_overrides. That order is only a tie-breaker before priority sorting; rule
 // groups remain authoring-only and are not part of engine evaluation.
 func (c *Config) UnmarshalYAML(value *yaml.Node) error {
+	if err := rejectLegacySchemaKeys(value); err != nil {
+		return err
+	}
 	type configYAML struct {
 		Version       int                     `yaml:"version"`
 		Rules         []Rule                  `yaml:"rules"`
@@ -165,6 +168,101 @@ func (c *Config) UnmarshalYAML(value *yaml.Node) error {
 		hostOrder:     hostOverrideOrder(value),
 	}
 	return nil
+}
+
+func (c Config) MarshalYAML() (any, error) {
+	c = c.withMaps()
+	root := &yaml.Node{Kind: yaml.MappingNode}
+	appendNode(root, "version", scalarNode(c.Version))
+	appendNode(root, "rules", mustYAMLNode(c.Rules))
+	appendNode(root, "rule_groups", mustYAMLNode(c.RuleGroups))
+	appendNode(root, "host_overrides", c.hostOverridesNode())
+	appendNode(root, "output", mustYAMLNode(c.Output))
+	return root, nil
+}
+
+func appendNode(mapping *yaml.Node, key string, value *yaml.Node) {
+	mapping.Content = append(mapping.Content, scalarNode(key), value)
+}
+
+func scalarNode(value any) *yaml.Node {
+	var node yaml.Node
+	if err := node.Encode(value); err != nil {
+		panic(err)
+	}
+	return &node
+}
+
+func mustYAMLNode(value any) *yaml.Node {
+	var node yaml.Node
+	if err := node.Encode(value); err != nil {
+		panic(err)
+	}
+	return &node
+}
+
+func (c Config) hostOverridesNode() *yaml.Node {
+	node := &yaml.Node{Kind: yaml.MappingNode}
+	seen := map[string]struct{}{}
+	for _, key := range c.hostOrder {
+		override, ok := c.HostOverrides[key]
+		if !ok {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		appendNode(node, key, mustYAMLNode(override))
+		seen[key] = struct{}{}
+	}
+	var missing []string
+	for key := range c.HostOverrides {
+		if _, ok := seen[key]; !ok {
+			missing = append(missing, key)
+		}
+	}
+	sort.Strings(missing)
+	for _, key := range missing {
+		appendNode(node, key, mustYAMLNode(c.HostOverrides[key]))
+	}
+	return node
+}
+
+func rejectLegacySchemaKeys(value *yaml.Node) error {
+	if value == nil || value.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(value.Content); i += 2 {
+		key := value.Content[i].Value
+		if key == "defaults" || key == "policy" || key == "allow_rules" {
+			return legacySchemaError(key, key)
+		}
+		if key != "host_overrides" {
+			continue
+		}
+		overrides := value.Content[i+1]
+		if overrides == nil || overrides.Kind != yaml.MappingNode {
+			continue
+		}
+		for j := 0; j+1 < len(overrides.Content); j += 2 {
+			overrideName := overrides.Content[j].Value
+			override := overrides.Content[j+1]
+			if override == nil || override.Kind != yaml.MappingNode {
+				continue
+			}
+			for k := 0; k+1 < len(override.Content); k += 2 {
+				overrideKey := override.Content[k].Value
+				if overrideKey == "policy" || overrideKey == "allow_rules" {
+					return legacySchemaError(overrideKey, fmt.Sprintf("host_overrides.%s.%s", overrideName, overrideKey))
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func legacySchemaError(key string, path string) error {
+	return fmt.Errorf("policy.yaml uses removed v0.5.1 key %q at %s; migrate to schema version 1 using top-level rules and host_overrides.<target>.rules with explicit action allow|deny", key, path)
 }
 
 func hostOverrideOrder(value *yaml.Node) []string {
@@ -333,7 +431,7 @@ func validateAction(action Action, source string) (Action, error) {
 	case ActionAllow, ActionDeny:
 		return action, nil
 	case "":
-		return "", fmt.Errorf("policy %s is missing action", source)
+		return ActionAllow, nil
 	default:
 		return "", fmt.Errorf("policy %s has invalid action %q", source, action)
 	}

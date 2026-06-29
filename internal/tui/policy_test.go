@@ -229,9 +229,32 @@ func TestTopLevelPolicyGlobalRuleCRUD(t *testing.T) {
 	if got := m.policy.config.Rules[len(m.policy.config.Rules)-1]; got.Action != policy.ActionDeny || got.Priority != 12 {
 		t.Fatalf("global rule after edit = %#v", got)
 	}
+	if got := m.policy.config.Rules[len(m.policy.config.Rules)-1]; got.Name != "" {
+		t.Fatalf("new unnamed global rule gained name: %#v", got)
+	}
 	m = press(t, m, "r")
 	if len(m.policy.config.Rules) != initial {
 		t.Fatalf("global rules after remove = %#v", m.policy.config.Rules)
+	}
+}
+
+func TestTopLevelPolicyGlobalRuleEditPreservesName(t *testing.T) {
+	m := sized(t, buildApp(t), 100, 30)
+	m = press(t, m, "2")
+	m.policy.cardCursor = 0
+	m = press(t, m, "enter")
+	m.policy.ruleCursor = 1 // sample policy's named allow-readonly rule.
+
+	m = press(t, m, "e")
+	m.policy.input.SetValue("deny 3 ^whoami$")
+	m = press(t, m, "enter")
+
+	got := m.policy.config.Rules[1]
+	if got.Name != "allow-readonly" || got.Action != policy.ActionDeny || got.Priority != 3 || got.Match.CmdRegex != "^whoami$" {
+		t.Fatalf("edited named global rule = %#v", got)
+	}
+	if _, err := policy.RemoveRule(m.policy.config, "allow-readonly"); err != nil {
+		t.Fatalf("edited global rule should remain removable by name: %v", err)
 	}
 }
 

@@ -110,6 +110,19 @@ func TestSummaries(t *testing.T) {
 	}
 }
 
+func TestSummariesSortsSameEndBySessionID(t *testing.T) {
+	summaries := Summaries([]audit.Record{
+		{ReqID: "r2", SessionID: "s_b", TS: "2026-06-20T10:00:00Z"},
+		{ReqID: "r1", SessionID: "s_a", TS: "2026-06-20T10:00:00Z"},
+	})
+	if len(summaries) != 2 {
+		t.Fatalf("summaries = %#v", summaries)
+	}
+	if summaries[0].ID != "s_a" || summaries[1].ID != "s_b" {
+		t.Fatalf("sort = %#v, want same End sorted by id", summaries)
+	}
+}
+
 func TestMain(m *testing.M) {
 	_ = os.Unsetenv(EnvSession)
 	os.Exit(m.Run())

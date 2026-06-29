@@ -215,13 +215,13 @@ func (s Store) Verify() (VerifyResult, error) {
 	prevHash := ZeroHash
 	for i, record := range records {
 		if record.Seq != uint64(i) {
-			return VerifyResult{OK: false, BrokenSeq: record.Seq, Reason: "seq"}, nil
+			return VerifyResult{OK: false, BrokenSeq: record.Seq, BrokenIndex: i, Reason: "seq"}, nil
 		}
 		if record.PrevHash != prevHash {
-			return VerifyResult{OK: false, BrokenSeq: record.Seq, Reason: "prev_hash"}, nil
+			return VerifyResult{OK: false, BrokenSeq: record.Seq, BrokenIndex: i, Reason: "prev_hash"}, nil
 		}
 		if ComputeHash(record) != record.Hash {
-			return VerifyResult{OK: false, BrokenSeq: record.Seq, Reason: "hash"}, nil
+			return VerifyResult{OK: false, BrokenSeq: record.Seq, BrokenIndex: i, Reason: "hash"}, nil
 		}
 		prevHash = record.Hash
 	}
@@ -230,20 +230,22 @@ func (s Store) Verify() (VerifyResult, error) {
 
 // VerifyResult describes audit chain verification.
 type VerifyResult struct {
-	OK        bool
-	Count     int
-	BrokenSeq uint64
-	Reason    string
+	OK          bool
+	Count       int
+	BrokenSeq   uint64
+	BrokenIndex int
+	Reason      string
 }
 
 // RepairResult describes a destructive audit-log repair.
 type RepairResult struct {
-	Changed    bool
-	Kept       int
-	Removed    int
-	BrokenSeq  uint64
-	Reason     string
-	BackupPath string
+	Changed     bool
+	Kept        int
+	Removed     int
+	BrokenSeq   uint64
+	BrokenIndex int
+	Reason      string
+	BackupPath  string
 }
 
 // TruncateBroken removes the first broken record and every later record.
@@ -262,7 +264,7 @@ func (s Store) TruncateBroken() (RepairResult, error) {
 	if result.OK {
 		return RepairResult{Changed: false, Kept: len(records)}, nil
 	}
-	cut := int(result.BrokenSeq)
+	cut := result.BrokenIndex
 	if cut < 0 || cut > len(records) {
 		cut = len(records)
 	}
@@ -274,12 +276,13 @@ func (s Store) TruncateBroken() (RepairResult, error) {
 		return RepairResult{}, err
 	}
 	return RepairResult{
-		Changed:    true,
-		Kept:       cut,
-		Removed:    len(records) - cut,
-		BrokenSeq:  result.BrokenSeq,
-		Reason:     result.Reason,
-		BackupPath: backup,
+		Changed:     true,
+		Kept:        cut,
+		Removed:     len(records) - cut,
+		BrokenSeq:   result.BrokenSeq,
+		BrokenIndex: result.BrokenIndex,
+		Reason:      result.Reason,
+		BackupPath:  backup,
 	}, nil
 }
 

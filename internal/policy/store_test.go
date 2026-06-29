@@ -2,7 +2,9 @@ package policy
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/Praeviso/AgentSSH/internal/inventory"
@@ -93,6 +95,60 @@ func TestPolicySaveLoadRoundTrip(t *testing.T) {
 	}
 }
 
+func TestPolicySavePreservesHostOverrideOrder(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "policy.yaml")
+	if err := os.WriteFile(path, []byte(`
+version: 1
+host_overrides:
+  z:
+    rules:
+      - priority: 0
+        match: { cmd_regex: '^uptime$' }
+        action: deny
+  a:
+    rules:
+      - priority: 0
+        match: { cmd_regex: '^uptime$' }
+        action: allow
+`), 0o600); err != nil {
+		t.Fatalf("write policy: %v", err)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if err := Save(path, loaded); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	reloaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load after save: %v", err)
+	}
+	engine, err := NewEngine(reloaded, inventory.Inventory{
+		Hosts:  map[string]inventory.Host{"web-1": {Tags: []string{"both"}}},
+		Groups: map[string]inventory.Group{"z": {Tags: []string{"both"}}, "a": {Tags: []string{"both"}}},
+	})
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	decision, err := engine.Evaluate("web-1", "uptime")
+	if err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	}
+	if decision.Action != ActionDeny || decision.Rule != "z/rules[0]" {
+		t.Fatalf("decision = %#v, want z deny to remain first after save/load", decision)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read policy: %v", err)
+	}
+	zIndex := strings.Index(string(raw), "z:")
+	aIndex := strings.Index(string(raw), "a:")
+	if zIndex < 0 || aIndex < 0 || zIndex > aIndex {
+		t.Fatalf("host override order not preserved:\n%s", raw)
+	}
+}
+
 func TestRuleAmbiguous(t *testing.T) {
 	cfg := Config{Rules: []Rule{
 		{Name: "dup", Match: Match{CmdRegex: "a"}, Action: ActionDeny},
@@ -157,6 +213,34 @@ func TestHostRuleSetCRUD(t *testing.T) {
 	_, err = SetHostRules(bundle, "missing", HostOverride{Rules: []Rule{{Match: Match{CmdRegex: "^ls"}, Action: ActionAllow}}})
 	if !errors.Is(err, ErrHostNotFound) {
 		t.Fatalf("missing host err = %v, want ErrHostNotFound", err)
+	}
+}
+
+func TestRemoveHostRuleAndGroupWorkForOrphanedOverride(t *testing.T) {
+	bundle := Bundle{
+		Policy: Config{HostOverrides: map[string]HostOverride{
+			HostRulesKey("old-web"): {Rules: []Rule{
+				{Match: Match{CmdRegex: "^uptime$"}, Action: ActionAllow},
+				{Match: Match{CmdRegex: "^id$"}, Action: ActionDeny, Group: "readonly"},
+			}},
+		}},
+		Inventory: inventory.Inventory{Hosts: map[string]inventory.Host{}},
+	}
+	next, err := RemoveHostRule(bundle, "old-web", 0)
+	if err != nil {
+		t.Fatalf("RemoveHostRule: %v", err)
+	}
+	ruleSet, ok := LookupHostRules(next, "old-web")
+	if !ok || len(ruleSet.Override.Rules) != 1 || ruleSet.Override.Rules[0].Match.CmdRegex != "^id$" {
+		t.Fatalf("after RemoveHostRule = %#v ok=%v", ruleSet, ok)
+	}
+	next, err = RemoveHostGroup(next, "old-web", "readonly")
+	if err != nil {
+		t.Fatalf("RemoveHostGroup: %v", err)
+	}
+	ruleSet, ok = LookupHostRules(next, "old-web")
+	if !ok || len(ruleSet.Override.Rules) != 0 {
+		t.Fatalf("after RemoveHostGroup = %#v ok=%v", ruleSet, ok)
 	}
 }
 
@@ -264,6 +348,29 @@ func TestStampGroupOntoHostCopiesWithProvenance(t *testing.T) {
 	ruleSet, _ = LookupHostRules(edited, "web-1")
 	if got := ruleSet.Override.Rules[0].Match.CmdRegex; got != "^uptime$" {
 		t.Fatalf("stamped snapshot changed after group edit: %q", got)
+	}
+}
+
+func TestStampGroupOntoHostIsIdempotentForSameGroup(t *testing.T) {
+	bundle := Bundle{
+		Policy: Config{
+			RuleGroups: map[string]RuleGroup{
+				"readonly": {Rules: []Rule{{Priority: 5, Match: Match{CmdRegex: "^uptime$"}, Action: ActionAllow}}},
+			},
+		},
+		Inventory: inventory.Inventory{Hosts: map[string]inventory.Host{"web-1": {}}},
+	}
+	next, err := StampGroupOntoHost(bundle, "web-1", "readonly")
+	if err != nil {
+		t.Fatalf("first StampGroupOntoHost: %v", err)
+	}
+	next, err = StampGroupOntoHost(next, "web-1", "readonly")
+	if err != nil {
+		t.Fatalf("second StampGroupOntoHost: %v", err)
+	}
+	ruleSet, ok := LookupHostRules(next, "web-1")
+	if !ok || len(ruleSet.Override.Rules) != 1 || ruleSet.Override.Rules[0].Group != "readonly" {
+		t.Fatalf("host rules = %#v ok=%v", ruleSet, ok)
 	}
 }
 

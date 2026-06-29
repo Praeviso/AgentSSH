@@ -714,7 +714,10 @@ func buildGroups(records []audit.Record, query string, sessionFocus string) []se
 		groups = append(groups, makeGroup(id, runs))
 	}
 	sort.Slice(groups, func(i, j int) bool {
-		return groups[i].end > groups[j].end
+		if groups[i].end != groups[j].end {
+			return groups[i].end > groups[j].end
+		}
+		return groups[i].id < groups[j].id
 	})
 
 	if noSession := grouped[""]; len(noSession) > 0 {

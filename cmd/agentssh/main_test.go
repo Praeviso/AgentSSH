@@ -501,6 +501,44 @@ rule_groups:
 	}
 }
 
+func TestInventoryRemoveDoesNotWriteInventoryWhenPolicyClearFails(t *testing.T) {
+	home := t.TempDir()
+	writeInventory(t, home, `
+version: 1
+hosts:
+  web-1:
+    addr: 10.0.0.11
+  db-1:
+    addr: 10.0.0.12
+`)
+	writePolicy(t, home, `
+version: 1
+host_overrides:
+  host:web-1:
+    rules:
+      - match: { cmd_regex: '^whoami$' }
+        action: allow
+rules:
+  - name: broken
+    match: { cmd_regex: '[' }
+    action: deny
+`)
+	t.Setenv("AGENTSSH_HOME", home)
+
+	_, _, err := runCommandForTest(t, "inventory", "rm", "web-1")
+	if err == nil {
+		t.Fatal("inventory rm err = nil, want invalid policy error")
+	}
+	inv := readInventoryFile(t, home)
+	if _, ok := inv.Hosts["web-1"]; !ok {
+		t.Fatalf("web-1 was removed despite policy failure: %#v", inv.Hosts)
+	}
+	rawPolicy := readFileString(t, filepath.Join(home, "policy.yaml"))
+	if !strings.Contains(rawPolicy, "host:web-1") {
+		t.Fatalf("host policy was removed despite policy failure:\n%s", rawPolicy)
+	}
+}
+
 func TestInventoryRemoveMissingWritesFailedAudit(t *testing.T) {
 	home := t.TempDir()
 	writeInventory(t, home, `
@@ -1023,6 +1061,43 @@ func TestRunSessionFlagSatisfiesRequirement(t *testing.T) {
 	withFakeExecutor(t, fakeExecutor{})
 	if code, _, stderr := runExit(t, "run", "web-1", "--session", "s_flag", "--", "echo", "hi"); code != exitOK {
 		t.Fatalf("code = %d, want 0; stderr=%q", code, stderr)
+	}
+}
+
+func TestRunGroupDerivesSessionPerHost(t *testing.T) {
+	home := t.TempDir()
+	writeTestInventory(t, home)
+	writeTestPolicy(t, home)
+	t.Setenv("AGENTSSH_HOME", home)
+	t.Setenv("AGENTSSH_SESSION", "")
+	withFakeExecutor(t, fakeExecutor{})
+
+	stdout, stderr, err := runCommandForTest(t, "run", "web", "--session", "s_batch", "--json", "--", "echo", "hi")
+	if err != nil {
+		t.Fatalf("group run err = %v stdout=%s stderr=%s", err, stdout, stderr)
+	}
+	var responses []runResponse
+	if err := json.Unmarshal([]byte(stdout), &responses); err != nil {
+		t.Fatalf("decode group response: %v\n%s", err, stdout)
+	}
+	if len(responses) != 2 {
+		t.Fatalf("responses = %#v", responses)
+	}
+	want := map[string]string{"web-1": "s_batch@web-1", "web-2": "s_batch@web-2"}
+	for _, response := range responses {
+		if response.SessionID != want[response.Host] {
+			t.Fatalf("response session for %s = %q, want %q in %#v", response.Host, response.SessionID, want[response.Host], responses)
+		}
+	}
+	records := mustReadAudit(t, home)
+	seen := map[string]string{}
+	for _, record := range records {
+		seen[record.Host] = record.SessionID
+	}
+	for host, sessionID := range want {
+		if seen[host] != sessionID {
+			t.Fatalf("audit session for %s = %q, want %q; records=%#v", host, seen[host], sessionID, records)
+		}
 	}
 }
 

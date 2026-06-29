@@ -1149,13 +1149,13 @@ func runInventoryRM(cmd *cobra.Command, name string) error {
 		}
 		return err
 	}
-	if err := writeInventoryAtomic(paths.Home, paths.InventoryFile, next); err != nil {
+	if err := clearHostRulesForDeletedHost(paths, name); err != nil {
 		if auditErr := appendInventoryAudit(paths, audit.EventFailed, name, "inventory rm "+name, err.Error(), exitRemoteFailed); auditErr != nil {
 			return auditErr
 		}
 		return err
 	}
-	if err := clearHostRulesForDeletedHost(paths, name); err != nil {
+	if err := writeInventoryAtomic(paths.Home, paths.InventoryFile, next); err != nil {
 		if auditErr := appendInventoryAudit(paths, audit.EventFailed, name, "inventory rm "+name, err.Error(), exitRemoteFailed); auditErr != nil {
 			return auditErr
 		}
@@ -1180,10 +1180,7 @@ func clearHostRulesForDeletedHost(paths config.Paths, name string) error {
 	if err != nil {
 		return err
 	}
-	if err := validatePolicyConfig(next.Policy); err != nil {
-		return err
-	}
-	return policy.Save(paths.PolicyFile, next.Policy)
+	return saveValidatedPolicy(paths, next.Policy)
 }
 
 func writeInventoryAtomic(home string, path string, inv inventory.Inventory) error {
@@ -1678,10 +1675,8 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 		if err != nil {
 			return err
 		}
-		// Bind the session to this target host. A group run therefore records one
-		// session per host, never a single session spanning several hosts. A session
-		// must be declared (--session / AGENTSSH_SESSION) — one session per task keeps
-		// the audit trail grouped by task rather than by an arbitrary time window.
+		// Resolve the declared session id, then derive a host-specific id for
+		// multi-target runs so a session never spans several hosts.
 		sessionCtx, err := sessionResolver.Resolve(target.Name, flags.session, flags.sessionLabel)
 		if err != nil {
 			if errors.Is(err, session.ErrNoSession) {
@@ -1691,6 +1686,7 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 			}
 			return fmt.Errorf("resolve session: %w", err)
 		}
+		sessionCtx.ID = sessionIDForTarget(sessionCtx.ID, target.Name, len(resolved.Targets) > 1)
 		decision, err := engine.Evaluate(target.Name, remoteCommand)
 		if err != nil {
 			return fmt.Errorf("evaluate policy for %s: %w", target.Name, err)
@@ -1803,6 +1799,13 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 		return commandExitError{Code: exitCode}
 	}
 	return nil
+}
+
+func sessionIDForTarget(baseID string, host string, multiTarget bool) string {
+	if !multiTarget || strings.TrimSpace(host) == "" {
+		return baseID
+	}
+	return baseID + "@" + strings.TrimSpace(host)
 }
 
 func printRunHuman(cmd *cobra.Command, host string, result executor.Result, filtered output.FilterResult) {
@@ -2000,10 +2003,7 @@ func runPolicyRuleAdd(cmd *cobra.Command, opts policyRuleOptions) error {
 	if err != nil {
 		return err
 	}
-	if err := validatePolicyConfig(next); err != nil {
-		return err
-	}
-	if err := policy.Save(paths.PolicyFile, next); err != nil {
+	if err := saveValidatedPolicy(paths, next); err != nil {
 		return err
 	}
 	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "added policy rule %s\n", rule.Name)
@@ -2049,10 +2049,7 @@ func runPolicyRuleUpdate(cmd *cobra.Command, opts policyRuleOptions) error {
 	if err != nil {
 		return policyRuleUsageError(opts.Name, err)
 	}
-	if err := validatePolicyConfig(next); err != nil {
-		return err
-	}
-	if err := policy.Save(paths.PolicyFile, next); err != nil {
+	if err := saveValidatedPolicy(paths, next); err != nil {
 		return err
 	}
 	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "updated policy rule %s\n", nextRule.Name)
@@ -2068,10 +2065,7 @@ func runPolicyRuleRM(cmd *cobra.Command, name string) error {
 	if err != nil {
 		return policyRuleUsageError(name, err)
 	}
-	if err := validatePolicyConfig(next); err != nil {
-		return err
-	}
-	if err := policy.Save(paths.PolicyFile, next); err != nil {
+	if err := saveValidatedPolicy(paths, next); err != nil {
 		return err
 	}
 	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "removed policy rule %s\n", name)
@@ -2109,10 +2103,7 @@ func runPolicyGroupAdd(cmd *cobra.Command, name string) error {
 	if err != nil {
 		return policyGroupUsageError(name, err)
 	}
-	if err := validatePolicyConfig(next.Policy); err != nil {
-		return err
-	}
-	if err := policy.Save(paths.PolicyFile, next.Policy); err != nil {
+	if err := saveValidatedPolicy(paths, next.Policy); err != nil {
 		return err
 	}
 	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "added policy group %s\n", strings.TrimSpace(name))
@@ -2128,10 +2119,7 @@ func runPolicyGroupRM(cmd *cobra.Command, name string) error {
 	if err != nil {
 		return policyGroupUsageError(name, err)
 	}
-	if err := validatePolicyConfig(next.Policy); err != nil {
-		return err
-	}
-	if err := policy.Save(paths.PolicyFile, next.Policy); err != nil {
+	if err := saveValidatedPolicy(paths, next.Policy); err != nil {
 		return err
 	}
 	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "removed policy group %s\n", strings.TrimSpace(name))
@@ -2151,10 +2139,7 @@ func runPolicyGroupRuleAdd(cmd *cobra.Command, opts policyGroupRuleOptions) erro
 	if err != nil {
 		return policyGroupUsageError(opts.Group, err)
 	}
-	if err := validatePolicyConfig(next.Policy); err != nil {
-		return err
-	}
-	if err := policy.Save(paths.PolicyFile, next.Policy); err != nil {
+	if err := saveValidatedPolicy(paths, next.Policy); err != nil {
 		return err
 	}
 	group := next.Policy.RuleGroups[strings.TrimSpace(opts.Group)]
@@ -2191,10 +2176,7 @@ func runPolicyGroupRuleRM(cmd *cobra.Command, groupName string, index int) error
 	if err != nil {
 		return policyGroupUsageError(groupName, err)
 	}
-	if err := validatePolicyConfig(next.Policy); err != nil {
-		return err
-	}
-	if err := policy.Save(paths.PolicyFile, next.Policy); err != nil {
+	if err := saveValidatedPolicy(paths, next.Policy); err != nil {
 		return err
 	}
 	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "removed policy group rule %s[%d]\n", strings.TrimSpace(groupName), index)
@@ -2235,10 +2217,7 @@ func runPolicyHostRuleAdd(cmd *cobra.Command, opts policyHostRuleOptions) error 
 		if err != nil {
 			return policyGroupOrHostUsageError(opts.Host, opts.FromGroup, err)
 		}
-		if err := validatePolicyConfig(next.Policy); err != nil {
-			return err
-		}
-		if err := policy.Save(paths.PolicyFile, next.Policy); err != nil {
+		if err := saveValidatedPolicy(paths, next.Policy); err != nil {
 			return err
 		}
 		group := next.Policy.RuleGroups[strings.TrimSpace(opts.FromGroup)]
@@ -2256,10 +2235,7 @@ func runPolicyHostRuleAdd(cmd *cobra.Command, opts policyHostRuleOptions) error 
 	if err != nil {
 		return policyHostUsageError(opts.Host, err)
 	}
-	if err := validatePolicyConfig(next.Policy); err != nil {
-		return err
-	}
-	if err := policy.Save(paths.PolicyFile, next.Policy); err != nil {
+	if err := saveValidatedPolicy(paths, next.Policy); err != nil {
 		return err
 	}
 	ruleSet, _ := policy.LookupHostRules(next, opts.Host)
@@ -2296,10 +2272,7 @@ func runPolicyHostRuleRM(cmd *cobra.Command, host string, index int) error {
 	if err != nil {
 		return policyHostUsageError(host, err)
 	}
-	if err := validatePolicyConfig(next.Policy); err != nil {
-		return err
-	}
-	if err := policy.Save(paths.PolicyFile, next.Policy); err != nil {
+	if err := saveValidatedPolicy(paths, next.Policy); err != nil {
 		return err
 	}
 	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "removed policy host rule %s[%d]\n", strings.TrimSpace(host), index)
@@ -2315,10 +2288,7 @@ func runPolicyHostGroupRM(cmd *cobra.Command, host string, groupName string) err
 	if err != nil {
 		return policyGroupOrHostUsageError(host, groupName, err)
 	}
-	if err := validatePolicyConfig(next.Policy); err != nil {
-		return err
-	}
-	if err := policy.Save(paths.PolicyFile, next.Policy); err != nil {
+	if err := saveValidatedPolicy(paths, next.Policy); err != nil {
 		return err
 	}
 	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "removed policy host group %s[%s]\n", strings.TrimSpace(host), strings.TrimSpace(groupName))
@@ -2334,10 +2304,7 @@ func runPolicyHostRM(cmd *cobra.Command, host string) error {
 	if err != nil {
 		return policyHostUsageError(host, err)
 	}
-	if err := validatePolicyConfig(next.Policy); err != nil {
-		return err
-	}
-	if err := policy.Save(paths.PolicyFile, next.Policy); err != nil {
+	if err := saveValidatedPolicy(paths, next.Policy); err != nil {
 		return err
 	}
 	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "removed policy host %s\n", strings.TrimSpace(host))
@@ -2469,6 +2436,13 @@ func validatePolicyConfig(cfg policy.Config) error {
 		return newUsageError("policy.yaml would be invalid: %v", err)
 	}
 	return nil
+}
+
+func saveValidatedPolicy(paths config.Paths, cfg policy.Config) error {
+	if err := validatePolicyConfig(cfg); err != nil {
+		return err
+	}
+	return policy.Save(paths.PolicyFile, cfg)
 }
 
 func policyRuleByName(cfg policy.Config, name string) (policy.Rule, error) {
