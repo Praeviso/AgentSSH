@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"regexp"
 	"sort"
+	"strings"
 
 	"github.com/Praeviso/AgentSSH/internal/inventory"
+	"gopkg.in/yaml.v3"
 )
 
 // Action is the binary policy action used by AgentSSH.
@@ -22,25 +24,39 @@ type Decision struct {
 	Rule   string `json:"rule,omitempty"`
 }
 
+// EffectiveRule is a display/editing projection of rules in the same tier order
+// the engine uses: host tier first, then global tier. Index is the file-order
+// index inside Source.
+type EffectiveRule struct {
+	Scope  string
+	Source string
+	Index  int
+	Rule   Rule
+}
+
 // Config is the parsed policy.yaml document.
 type Config struct {
 	Version       int                     `yaml:"version" json:"version"`
-	Defaults      Defaults                `yaml:"defaults" json:"defaults"`
 	Rules         []Rule                  `yaml:"rules" json:"rules"`
+	RuleGroups    map[string]RuleGroup    `yaml:"rule_groups" json:"rule_groups"`
 	HostOverrides map[string]HostOverride `yaml:"host_overrides" json:"host_overrides"`
 	Output        Output                  `yaml:"output" json:"output"`
+	hostOrder     []string
 }
 
-// Defaults contains the fallback policy action.
-type Defaults struct {
-	Policy Action `yaml:"policy" json:"policy"`
+// RuleGroup is an authoring-only preset. The engine ignores it; callers stamp a
+// snapshot copy onto a concrete host override when they want it to take effect.
+type RuleGroup struct {
+	Rules []Rule `yaml:"rules" json:"rules"`
 }
 
 // Rule is a named first-match policy rule.
 type Rule struct {
-	Name   string `yaml:"name" json:"name"`
-	Match  Match  `yaml:"match" json:"match"`
-	Action Action `yaml:"action" json:"action"`
+	Name     string `yaml:"name,omitempty" json:"name,omitempty"`
+	Priority int    `yaml:"priority,omitempty" json:"priority,omitempty"`
+	Match    Match  `yaml:"match" json:"match"`
+	Action   Action `yaml:"action" json:"action"`
+	Group    string `yaml:"group,omitempty" json:"group,omitempty"`
 }
 
 // Match contains command matching criteria.
@@ -48,10 +64,9 @@ type Match struct {
 	CmdRegex string `yaml:"cmd_regex" json:"cmd_regex"`
 }
 
-// HostOverride contains group-specific default and allowlist rules.
+// HostOverride contains host- or group-scoped rules.
 type HostOverride struct {
-	Policy     Action  `yaml:"policy" json:"policy"`
-	AllowRules []Match `yaml:"allow_rules" json:"allow_rules"`
+	Rules []Rule `yaml:"rules" json:"rules"`
 }
 
 // Output contains output filtering policy.
@@ -68,39 +83,57 @@ type Engine interface {
 // NewEngine compiles a policy config against an inventory.
 func NewEngine(config Config, inv inventory.Inventory) (Engine, error) {
 	compiled := &compiledEngine{
-		config:    config.withDefaults(),
+		config:    config.withMaps(),
 		inventory: inv,
+		hostRules: map[string][]compiledRule{},
 	}
 	for i, rule := range compiled.config.Rules {
 		expr, err := compileRegex(rule.Match.CmdRegex, fmt.Sprintf("rules[%d]", i))
 		if err != nil {
 			return nil, err
 		}
-		compiled.rules = append(compiled.rules, compiledRule{
-			name:   rule.Name,
-			action: normalizeAction(rule.Action),
-			regex:  expr,
+		action, err := validateAction(rule.Action, fmt.Sprintf("rules[%d]", i))
+		if err != nil {
+			return nil, err
+		}
+		source := fmt.Sprintf("rules[%d]", i)
+		if rule.Name != "" {
+			source = "rules:" + rule.Name
+		}
+		compiled.globalRules = append(compiled.globalRules, compiledRule{
+			source:   source,
+			priority: rule.Priority,
+			action:   action,
+			regex:    expr,
 		})
 	}
+	sortRules(compiled.globalRules)
+
 	for groupName, override := range compiled.config.HostOverrides {
-		for i, rule := range override.AllowRules {
-			expr, err := compileRegex(rule.CmdRegex, fmt.Sprintf("%s/allow_rules[%d]", groupName, i))
+		for i, rule := range override.Rules {
+			source := fmt.Sprintf("%s/rules[%d]", groupName, i)
+			expr, err := compileRegex(rule.Match.CmdRegex, source)
 			if err != nil {
 				return nil, err
 			}
-			compiled.allowRules = append(compiled.allowRules, compiledAllowRule{
-				group: groupName,
-				index: i,
-				regex: expr,
+			action, err := validateAction(rule.Action, source)
+			if err != nil {
+				return nil, err
+			}
+			compiled.hostRules[groupName] = append(compiled.hostRules[groupName], compiledRule{
+				source:   source,
+				priority: rule.Priority,
+				action:   action,
+				regex:    expr,
 			})
 		}
 	}
 	return compiled, nil
 }
 
-func (c Config) withDefaults() Config {
-	if c.Defaults.Policy == "" {
-		c.Defaults.Policy = ActionAllow
+func (c Config) withMaps() Config {
+	if c.RuleGroups == nil {
+		c.RuleGroups = map[string]RuleGroup{}
 	}
 	if c.HostOverrides == nil {
 		c.HostOverrides = map[string]HostOverride{}
@@ -108,83 +141,278 @@ func (c Config) withDefaults() Config {
 	return c
 }
 
+// UnmarshalYAML decodes policy.yaml while preserving the file order of
+// host_overrides. That order is only a tie-breaker before priority sorting; rule
+// groups remain authoring-only and are not part of engine evaluation.
+func (c *Config) UnmarshalYAML(value *yaml.Node) error {
+	if err := rejectLegacySchemaKeys(value); err != nil {
+		return err
+	}
+	type configYAML struct {
+		Version       int                     `yaml:"version"`
+		Rules         []Rule                  `yaml:"rules"`
+		RuleGroups    map[string]RuleGroup    `yaml:"rule_groups"`
+		HostOverrides map[string]HostOverride `yaml:"host_overrides"`
+		Output        Output                  `yaml:"output"`
+	}
+	var raw configYAML
+	if err := value.Decode(&raw); err != nil {
+		return err
+	}
+	*c = Config{
+		Version:       raw.Version,
+		Rules:         raw.Rules,
+		RuleGroups:    raw.RuleGroups,
+		HostOverrides: raw.HostOverrides,
+		Output:        raw.Output,
+		hostOrder:     hostOverrideOrder(value),
+	}
+	return nil
+}
+
+func (c Config) MarshalYAML() (any, error) {
+	c = c.withMaps()
+	root := &yaml.Node{Kind: yaml.MappingNode}
+	appendNode(root, "version", scalarNode(c.Version))
+	appendNode(root, "rules", mustYAMLNode(c.Rules))
+	appendNode(root, "rule_groups", mustYAMLNode(c.RuleGroups))
+	appendNode(root, "host_overrides", c.hostOverridesNode())
+	appendNode(root, "output", mustYAMLNode(c.Output))
+	return root, nil
+}
+
+func appendNode(mapping *yaml.Node, key string, value *yaml.Node) {
+	mapping.Content = append(mapping.Content, scalarNode(key), value)
+}
+
+func scalarNode(value any) *yaml.Node {
+	var node yaml.Node
+	if err := node.Encode(value); err != nil {
+		panic(err)
+	}
+	return &node
+}
+
+func mustYAMLNode(value any) *yaml.Node {
+	var node yaml.Node
+	if err := node.Encode(value); err != nil {
+		panic(err)
+	}
+	return &node
+}
+
+func (c Config) hostOverridesNode() *yaml.Node {
+	node := &yaml.Node{Kind: yaml.MappingNode}
+	seen := map[string]struct{}{}
+	for _, key := range c.hostOrder {
+		override, ok := c.HostOverrides[key]
+		if !ok {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		appendNode(node, key, mustYAMLNode(override))
+		seen[key] = struct{}{}
+	}
+	var missing []string
+	for key := range c.HostOverrides {
+		if _, ok := seen[key]; !ok {
+			missing = append(missing, key)
+		}
+	}
+	sort.Strings(missing)
+	for _, key := range missing {
+		appendNode(node, key, mustYAMLNode(c.HostOverrides[key]))
+	}
+	return node
+}
+
+func rejectLegacySchemaKeys(value *yaml.Node) error {
+	if value == nil || value.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(value.Content); i += 2 {
+		key := value.Content[i].Value
+		if key == "defaults" || key == "policy" || key == "allow_rules" {
+			return legacySchemaError(key, key)
+		}
+		if key != "host_overrides" {
+			continue
+		}
+		overrides := value.Content[i+1]
+		if overrides == nil || overrides.Kind != yaml.MappingNode {
+			continue
+		}
+		for j := 0; j+1 < len(overrides.Content); j += 2 {
+			overrideName := overrides.Content[j].Value
+			override := overrides.Content[j+1]
+			if override == nil || override.Kind != yaml.MappingNode {
+				continue
+			}
+			for k := 0; k+1 < len(override.Content); k += 2 {
+				overrideKey := override.Content[k].Value
+				if overrideKey == "policy" || overrideKey == "allow_rules" {
+					return legacySchemaError(overrideKey, fmt.Sprintf("host_overrides.%s.%s", overrideName, overrideKey))
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func legacySchemaError(key string, path string) error {
+	return fmt.Errorf("policy.yaml uses removed v0.5.1 key %q at %s; migrate to schema version 1 using top-level rules and host_overrides.<target>.rules with explicit action allow|deny", key, path)
+}
+
+func hostOverrideOrder(value *yaml.Node) []string {
+	if value == nil || value.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(value.Content); i += 2 {
+		if value.Content[i].Value != "host_overrides" {
+			continue
+		}
+		node := value.Content[i+1]
+		if node == nil || node.Kind != yaml.MappingNode {
+			return nil
+		}
+		order := make([]string, 0, len(node.Content)/2)
+		for j := 0; j+1 < len(node.Content); j += 2 {
+			order = append(order, node.Content[j].Value)
+		}
+		return order
+	}
+	return nil
+}
+
 type compiledEngine struct {
-	config     Config
-	inventory  inventory.Inventory
-	rules      []compiledRule
-	allowRules []compiledAllowRule
+	config      Config
+	inventory   inventory.Inventory
+	globalRules []compiledRule
+	hostRules   map[string][]compiledRule
 }
 
 type compiledRule struct {
-	name   string
-	action Action
-	regex  *regexp.Regexp
-}
-
-type compiledAllowRule struct {
-	group string
-	index int
-	regex *regexp.Regexp
+	source   string
+	priority int
+	action   Action
+	regex    *regexp.Regexp
 }
 
 func (e *compiledEngine) Evaluate(host string, command string) (Decision, error) {
-	groups := e.hostGroups(host)
-	var allowlistRule string
-	for _, groupName := range groups {
-		override := e.config.HostOverrides[groupName]
-		if normalizeAction(override.Policy) != ActionDeny {
-			continue
-		}
-		if rule, ok := e.matchAllowRule(groupName, command); ok {
-			if allowlistRule == "" {
-				allowlistRule = rule
-			}
-			continue
-		}
-		return Decision{Action: ActionDeny, Rule: groupName + "/default_deny"}, nil
-	}
-	if allowlistRule != "" {
-		return Decision{Action: ActionAllow, Rule: allowlistRule}, nil
-	}
-
-	for _, rule := range e.rules {
+	for _, rule := range e.hostRulesFor(host) {
 		if rule.regex.MatchString(command) {
-			ruleName := rule.name
-			if ruleName == "" {
-				ruleName = rule.regex.String()
-			}
-			return Decision{Action: rule.action, Rule: "rules:" + ruleName}, nil
+			return Decision{Action: rule.action, Rule: rule.source}, nil
 		}
 	}
 
-	return Decision{Action: normalizeAction(e.config.Defaults.Policy), Rule: "default"}, nil
+	for _, rule := range e.globalRules {
+		if rule.regex.MatchString(command) {
+			return Decision{Action: rule.action, Rule: rule.source}, nil
+		}
+	}
+
+	return Decision{Action: ActionDeny, Rule: "default-deny"}, nil
 }
 
-func (e *compiledEngine) hostGroups(hostName string) []string {
-	host, ok := e.inventory.Hosts[hostName]
-	if !ok {
-		return nil
+func (e *compiledEngine) hostRulesFor(hostName string) []compiledRule {
+	matches := map[string]struct{}{}
+	if _, ok := e.config.HostOverrides[HostRulesKey(hostName)]; ok {
+		matches[HostRulesKey(hostName)] = struct{}{}
 	}
-	var groups []string
-	for groupName, group := range e.inventory.Groups {
-		if hostHasAllTags(host.Tags, group.Tags) {
-			groups = append(groups, groupName)
+	if host, ok := e.inventory.Hosts[hostName]; ok {
+		for groupName, group := range e.inventory.Groups {
+			if _, hasOverride := e.config.HostOverrides[groupName]; hasOverride && hostHasAllTags(host.Tags, group.Tags) {
+				matches[groupName] = struct{}{}
+			}
 		}
 	}
-	sort.Strings(groups)
-	return groups
+
+	keys := e.config.orderedHostOverrideKeys(matches)
+	rules := make([]compiledRule, 0)
+	for _, key := range keys {
+		rules = append(rules, e.hostRules[key]...)
+	}
+	sortRules(rules)
+	return rules
 }
 
-func (e *compiledEngine) matchAllowRule(groupName string, command string) (string, bool) {
-	for _, rule := range e.allowRules {
-		if rule.group != groupName {
+// EffectiveRules returns the host/global rule projection in engine evaluation
+// order. RuleGroups are intentionally ignored; stamped copies are visible only
+// through HostOverrides with Rule.Group provenance.
+func EffectiveRules(config Config, inv inventory.Inventory, hostName string) []EffectiveRule {
+	config = config.withMaps()
+	out := make([]EffectiveRule, 0)
+	if strings.TrimSpace(hostName) != "" {
+		matches := map[string]struct{}{}
+		if _, ok := config.HostOverrides[HostRulesKey(hostName)]; ok {
+			matches[HostRulesKey(hostName)] = struct{}{}
+		}
+		if host, ok := inv.Hosts[hostName]; ok {
+			for groupName, group := range inv.Groups {
+				if _, hasOverride := config.HostOverrides[groupName]; hasOverride && hostHasAllTags(host.Tags, group.Tags) {
+					matches[groupName] = struct{}{}
+				}
+			}
+		}
+		hostRows := make([]EffectiveRule, 0)
+		for _, source := range config.orderedHostOverrideKeys(matches) {
+			override := config.HostOverrides[source]
+			for i, rule := range override.Rules {
+				hostRows = append(hostRows, EffectiveRule{
+					Scope:  "host",
+					Source: source,
+					Index:  i,
+					Rule:   rule,
+				})
+			}
+		}
+		sortEffectiveRules(hostRows)
+		out = append(out, hostRows...)
+	}
+
+	globalRows := make([]EffectiveRule, 0, len(config.Rules))
+	for i, rule := range config.Rules {
+		globalRows = append(globalRows, EffectiveRule{
+			Scope:  "global",
+			Source: "global",
+			Index:  i,
+			Rule:   rule,
+		})
+	}
+	sortEffectiveRules(globalRows)
+	out = append(out, globalRows...)
+	return out
+}
+
+func sortEffectiveRules(rules []EffectiveRule) {
+	sort.SliceStable(rules, func(i, j int) bool {
+		return rules[i].Rule.Priority > rules[j].Rule.Priority
+	})
+}
+
+func (c Config) orderedHostOverrideKeys(filter map[string]struct{}) []string {
+	seen := map[string]struct{}{}
+	keys := make([]string, 0, len(filter))
+	for _, key := range c.hostOrder {
+		if _, ok := filter[key]; !ok {
 			continue
 		}
-		if rule.regex.MatchString(command) {
-			return fmt.Sprintf("%s/allow_rules[%d]", groupName, rule.index), true
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		keys = append(keys, key)
+		seen[key] = struct{}{}
+	}
+	var missing []string
+	for key := range filter {
+		if _, ok := seen[key]; !ok {
+			missing = append(missing, key)
 		}
 	}
-	return "", false
+	sort.Strings(missing)
+	return append(keys, missing...)
 }
 
 func compileRegex(pattern string, source string) (*regexp.Regexp, error) {
@@ -198,11 +426,21 @@ func compileRegex(pattern string, source string) (*regexp.Regexp, error) {
 	return expr, nil
 }
 
-func normalizeAction(action Action) Action {
-	if action == "" {
-		return ActionAllow
+func validateAction(action Action, source string) (Action, error) {
+	switch action {
+	case ActionAllow, ActionDeny:
+		return action, nil
+	case "":
+		return ActionAllow, nil
+	default:
+		return "", fmt.Errorf("policy %s has invalid action %q", source, action)
 	}
-	return action
+}
+
+func sortRules(rules []compiledRule) {
+	sort.SliceStable(rules, func(i, j int) bool {
+		return rules[i].priority > rules[j].priority
+	})
 }
 
 func hostHasAllTags(hostTags []string, groupTags []string) bool {

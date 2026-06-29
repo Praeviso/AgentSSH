@@ -19,49 +19,49 @@ curl -fsSL https://github.com/Praeviso/AgentSSH/releases/download/v0.5.1/agentss
 # 2. Open the console — this is your main entry point:
 agentssh tui
 #   On first run it creates ~/.agentssh/ with a starter inventory.yaml and a
-#   policy.yaml (allow by default, catastrophic commands denied). Nothing to set up.
+#   policy.yaml scaffold. Out of the box every command is denied until you add
+#   allow rules.
 #   In the Hosts tab:
 #     d  discover the SSH hosts you can already reach (from ~/.ssh/config + known_hosts),
 #        select with space, p to probe, enter to import
 #     a  add a host by hand (addr/user, optional identity_file, optional password)
 #     t  test connectivity to the selected host
-#   Switch tabs with 1-4 or tab: Hosts · Audit · Policy · Sessions.
+#   Switch entry tabs with 1/2 or tab: Hosts · Policy.
 
-# 3. Tune the deny rules (a hard, unoverridable boundary; policy is a file for now).
-#    The seeded ~/.agentssh/policy.yaml already contains:
-#      rules:
-#        - name: catastrophic
-#          match: { cmd_regex: '\b(rm\s+-rf|mkfs|dd|shutdown|reboot|init\s+0|userdel)' }
-#          action: deny
-#    Edit that file to add your own rules.
+# 3. Add an explicit allow rule before running anything:
+agentssh policy rule add readonly --cmd-regex '^(systemctl status|journalctl|uptime)\b' --action allow --priority 10
+#    Optional: add higher-priority deny rules for commands that must never run.
+agentssh policy rule add catastrophic --cmd-regex '\b(rm\s+-rf|mkfs|dd|shutdown|reboot|init\s+0|userdel)' --action deny --priority 100
 
 # 4. The agent calls agentssh — every command is policy-checked and audited:
 agentssh hosts                                 # discover targets (no credentials shown)
+export AGENTSSH_SESSION=$(agentssh session new) # one session per task -> grouped in audit
 agentssh run web-1 -- systemctl status nginx   # allowed -> executed over SSH
 agentssh run web-1 -- rm -rf /                 # denied by policy -> exit 6, never runs
 
 # 5. Review everything back in the console:
-agentssh tui            # Audit tab (grouped by session) · Policy tab to test rules
+agentssh tui            # Hosts tab for inventory · Policy tab for global/group rules
 ```
 
 That is the whole loop: you own hosts, policy, and the audit trail through `agentssh tui`; the agent only ever calls `agentssh`.
 
 ## The console (`agentssh tui`)
 
-`agentssh tui` is the primary operator interface — one full-screen app with four tabs (switch with `1`-`4` or `tab`/`shift+tab`, quit with `q`):
+`agentssh tui` is the primary operator interface — one full-screen app with top-level Hosts and Policy tabs (switch with `1`/`2` or `tab`, quit with `q`):
 
 | Tab | What you do |
 | --- | --- |
-| **Hosts** | onboard, inspect, test, and remove hosts; manage credentials |
-| **Audit** | browse the hash-chained audit log, grouped by session |
-| **Policy** | type `host:command` and see allow/deny against your rules |
-| **Sessions** | list sessions; `enter` jumps to that session in Audit |
+| **Hosts** | onboard, inspect, edit, test, and remove hosts; manage credentials |
+| **Policy** | manage the Global rule list and reusable rule groups as cards; open a card to add/edit/remove rules |
 
-**Hosts tab keys** — `j/k move · a add · d discover · t test · r/x remove · tab switch`:
+**Hosts tab keys** — `j/k move · a add · e edit · d discover · t test · r/x remove · tab switch`:
 
 - **`d` Discover** — opens an overlay of hosts you can likely already reach, gathered from `~/.ssh/config` and `~/.ssh/known_hosts`, annotated with key/known-hosts/in-inventory status. `space` selects, `p` probes (a real connection test), `enter`/`i` imports the connectable, not-yet-known ones into your inventory. `esc`/`q` closes.
 - **`a` Add** — a form with `name / addr / user / port / tags / ssh_config_alias / identity_file / password`. `identity_file` points at a private key for that host. `password` is optional and **masked**; it is stored encrypted, never in `inventory.yaml`. Setting a password in the TUI requires `AGENTSSH_MASTER_PASSWORD` to be set (bubbletea owns the terminal, so there is no separate master prompt) — otherwise use `agentssh secret set`.
+- **`e` Edit** — opens the same host form with the selected host prefilled. The host name stays fixed; edit addr/user/port/tags/ssh_config_alias/identity_file.
 - **`t` Test** — runs a real connectivity check against the selected host, updates its detected OS metadata, and shows `OK` or an actionable hint (missing credentials, unknown host key, unreachable, …).
+- **Policy tab** — Global and each reusable rule group render as cards with rule counts. `enter` opens the selected card; `a/e/r` add, edit, and remove rules; `n` creates a group; `d` deletes a group. Rule groups are presets: stamping one onto a host copies its current rules and records the group name as provenance.
+- **Host detail Policy pane** — press `enter`/`i` on a host, then `3` for Policy. The pane shows one unified, borderless rule list with host-tier rows first and global rows below as read-only context. `a` adds a manual host rule (`allow|deny [priority] <regex>`), `p` stamps a rule group, `j/k` selects rows, `r` removes editable host rows, `R` removes all rows stamped from the selected group, and `x` clears that host's rules.
 
 The remote side is always your responsibility — AgentSSH never touches a server's `authorized_keys`; it only connects with the credentials you give it and tells you what to fix when a connection fails.
 
@@ -133,12 +133,27 @@ Example `policy.yaml`:
 
 ```yaml
 version: 1
-defaults:
-  policy: allow
 rules:
+  - name: readonly
+    priority: 10
+    match: { cmd_regex: '^(systemctl status|journalctl|uptime)\b' }
+    action: allow
   - name: catastrophic
+    priority: 100
     match: { cmd_regex: '\b(rm\s+-rf|mkfs|dd|shutdown|reboot|init\s+0|userdel)' }
     action: deny
+host_overrides:
+  host:web-1:
+    rules:
+      - priority: 20
+        match: { cmd_regex: '^systemctl status\b' }
+        action: allow
+rule_groups:
+  readonly:
+    rules:
+      - priority: 10
+        match: { cmd_regex: '^(uptime|whoami)\b' }
+        action: allow
 output:
   max_bytes: 16384
   redact:
@@ -169,10 +184,13 @@ These are the only commands an agent needs. They go through inventory resolution
 ```bash
 agentssh hosts                                   # list targets (name + tags only; no credentials)
 agentssh hosts --json
+export AGENTSSH_SESSION=$(agentssh session new)  # declare one session per task (required by run)
 agentssh run web-1 -- systemctl status nginx
 agentssh run web-1 --json -- uptime
 agentssh status <req_id>
 ```
+
+`run` requires a declared session — `--session <id>` or `$AGENTSSH_SESSION` — so each task maps to one auditable session; without one it exits 2. Mint a fresh id per task with `agentssh session new`.
 
 On a connection failure, `run` prints a credential-free hint and exits 9.
 
@@ -184,6 +202,8 @@ Everything the console does is also scriptable. Manage hosts and credentials:
 agentssh inventory discover [--probe] [--json] [--import]   # find reachable hosts; --probe really connects
 agentssh inventory add web-1 --addr 10.0.0.11 --user deploy --identity-file ~/.ssh/web-1 [--password]
 agentssh inventory add                                       # interactive form (TUI)
+agentssh inventory update web-1 --addr 10.0.0.12 --tags web,prod
+agentssh inventory rm web-1                                  # writes a tamper-evident delete audit record
 agentssh inventory ls
 agentssh inventory test web-1                                # connectivity check + hint
 agentssh secret set|ls|rm <host>
@@ -193,14 +213,34 @@ Inspect and review:
 
 ```bash
 agentssh policy show
+agentssh policy rule ls
+agentssh policy rule add readonly --cmd-regex '^(systemctl status|journalctl|uptime)\b' --action allow --priority 10
+agentssh policy rule add no-reboot --cmd-regex '^(sudo )?reboot\b' --action deny --priority 100
+agentssh policy rule update no-reboot --cmd-regex '^(sudo )?(reboot|shutdown)\b' --priority 100
+agentssh policy rule rm no-reboot
+agentssh policy group ls
+agentssh policy group add readonly
+agentssh policy group rule add readonly --cmd-regex '^(uptime|whoami)\b' --action allow --priority 10
+agentssh policy group rule ls readonly
+agentssh policy group rule rm readonly 0
+agentssh policy group rm readonly
+agentssh policy host ls
+agentssh policy host rule add web-1 --cmd-regex '^systemctl status\b' --action allow --priority 20
+agentssh policy host rule add web-1 --from-group readonly
+agentssh policy host rule ls web-1
+agentssh policy host rule rm web-1 0
+agentssh policy host group rm web-1 readonly
+agentssh policy host rm web-1
 agentssh policy test --host web-1 'rm -rf /'
 agentssh audit ls
 agentssh audit show <req_id>
 agentssh audit verify        # confirm the tamper-evident hash chain is intact
+agentssh audit repair --truncate-broken  # remove a broken audit tail after backing it up
 agentssh session ls
+agentssh session new         # mint a fresh session id for a task
 ```
 
-`inventory edit` / `policy edit` are still placeholders — edit `~/.agentssh/*.yaml` directly for now.
+`inventory edit` / `policy edit` are still placeholders for opening the raw YAML. Use `inventory add/update/rm`, `policy rule ...`, and `policy host ...` for structured CRUD.
 
 ## Transport
 
@@ -212,12 +252,11 @@ Before stdout/stderr return to the agent, AgentSSH applies `policy.output.redact
 
 ## Skills
 
-Example Anthropic Agent Skill-style playbooks live under `skills/`:
+An Anthropic Agent Skill-style operating manual lives under `skills/`:
 
-- `skills/restart-service/SKILL.md` — safe systemd service diagnosis and restart.
-- `skills/investigate-cpu/SKILL.md` — mostly read-only high-CPU investigation.
+- `skills/agentssh-usage/SKILL.md` — best practices and command reference for driving servers through AgentSSH: the trust boundary, one-session-per-task discipline, policy, bounded output, and audit review.
 
-These are procedural knowledge for agents, not RPC tools: they instruct the agent how to call `agentssh run ...` while the CLI enforces policy and audit. AgentSSH does not record or trust playbook names.
+This is procedural knowledge for agents, not an RPC tool: it teaches the agent *how to use `agentssh` well* for whatever the operator asks, while the CLI enforces policy and audit. It is a soft control — it shapes what the agent attempts, but the CLI, not the manual, is the security boundary.
 
 See the project documents for the product and implementation contract:
 

@@ -89,18 +89,32 @@ groups:
 
 ```yaml
 version: 1
-defaults:
-  policy: allow            # 未匹配任何规则的命令默认放行(deny-list 黑名单模型)
-rules:                     # 自上而下,首个命中生效
+rules:                     # 全局规则;priority 越大越先判定,同 priority 按文件顺序
   - name: catastrophic
+    priority: 100
     match: { cmd_regex: '\b(rm\s+-rf|mkfs|dd|shutdown|reboot|init\s+0|userdel|:\(\)\s*\{)' }
     action: deny
+  - name: readonly
+    priority: 0
+    match: { cmd_regex: '^(systemctl status|journalctl|tail|cat|df|ps)\b' }
+    action: allow
 host_overrides:
-  prod:                    # 对 prod 组切 allowlist:默认拒绝,只放行白名单
-    policy: deny
-    allow_rules:
-      - { cmd_regex: '^(systemctl status|journalctl|tail|cat|df|ps)\b' }
-      - { cmd_regex: '^sudo systemctl (status|restart|reload) [a-z0-9-]+$' }
+  prod:                    # 组规则;命中 prod tag 的 host 进入 host tier
+    rules:
+      - priority: 50
+        match: { cmd_regex: '^sudo systemctl (restart|reload) [a-z0-9-]+$' }
+        action: allow
+  host:web-1:              # 单台 host 规则;由 `policy host rule ...` / TUI 管理
+    rules:
+      - priority: 10
+        match: { cmd_regex: '^systemctl status\b' }
+        action: allow
+rule_groups:               # 可复用预设;仅用于编辑/复制,引擎不直接读取
+  readonly:
+    rules:
+      - priority: 10
+        match: { cmd_regex: '^(uptime|whoami)\b' }
+        action: allow
 output:
   max_bytes: 16384
   redact:                  # 命中即替换为 «REDACTED»
@@ -109,15 +123,21 @@ output:
     - '(?i)(password|passwd|secret|token)\s*[=:]\s*\S+'
 ```
 
-判定规则(简化为二元):
-1. 取目标主机所属组的 override;若该组 `policy: deny`(allowlist 模式)→ 命中 `allow_rules` 才放行,否则 `deny`。
-2. 否则按全局 `rules` 顺序匹配:命中 `action: deny` → 拒绝。
-3. 未命中 → `defaults.policy`(MVP = `allow`)。
-4. `deny` 一律拒绝,**不弹任何「是否允许」**(连人都不能临场覆盖,防 Agent 诱导疲劳的人放行)。需放宽只能改 policy。
+`host_overrides` 支持两类 key:`<group>` 按 inventory group/tag 匹配,`host:<name>` 只匹配该 host。`agentssh policy host rule ...` 和 TUI 的 Host detail Policy pane 只写 `host:<name>` host rules,不修改 inventory 的 tags/groups。
 
-> 设计取舍:default=`allow` 是有意识地把灰区交给 harness 交互确认,换取「general run」的灵活与零审批复杂度。**硬安全底线 = deny 黑名单**(全局)+ 可选 allowlist(按组,如 prod)。这套在 headless 下依然成立,而 harness 审批不成立 —— 这正是网关相对「直接给 ssh」的核心价值。
+`rule_groups` 是**编排/编辑层**概念,不是执行层概念。Policy Engine 完全忽略 `rule_groups`,也忽略 `Rule.group` 字段;只有当人类执行 `agentssh policy host rule add <host> --from-group <name>` 或在 TUI Host detail Policy pane 里选择预设时,该组当前的 rules 会被**快照复制**到 `host_overrides["host:<name>"].rules`。复制出的每条 rule 带 `group: <name>` provenance,用于 UI/CLI 展示和 `policy host group rm <host> <name>` 批量移除。之后编辑 rule group 不会自动传播到已经 stamp 到 host 的副本。
+
+判定规则(二层、首个命中生效):
+1. 先取 host tier: `host_overrides["host:<name>"].rules` 加上该 host 按 tag 命中的所有 group 规则,合并后按 `priority` 降序判定;同 priority 按文件顺序。host tier 永远高于 global tier,所以 host 上 `priority: 0` 的 allow 也能覆盖 global 里 `priority: 100` 的 deny。
+2. 再取 global tier:全局 `rules` 按 `priority` 降序判定;同 priority 按文件顺序。
+3. 两层都未命中 → `deny`。这是不可配置的最终兜底,不再有 `defaults.policy`。
+4. `deny` 一律拒绝,**不弹任何「是否允许」**(连人都不能临场覆盖,防 Agent 诱导疲劳的人放行)。需放宽只能添加/修改 allow 规则。
+
+> 设计取舍:default=`deny` 把执行能力变成显式授权:开箱即拒绝所有命令,直到人类写入 allow 规则。硬安全底线不再只是 deny 黑名单,而是「无匹配即拒绝」;host tier 先于 global tier,便于给单台机器或某组机器写更具体的例外。
 >
 > 局限:基于命令字符串的匹配是启发式,不是沙箱;复合命令(`sh -c '…'`、管道)可能绕过模式。缓解见 `docs/plans/mvp.md` R1。
+
+TUI 展示规则与引擎顺序保持一致:Host detail 的 Policy pane 是一张无边框统一列表,先列所有 host-tier 规则(`host:<name>` 与命中的 inventory group override,按 priority 降序),再列 global 规则。列包含 `scope / priority / action / command / group`;global 行在这里只读,用于让人类看到上下文而不在 host 详情里误改全局策略。
 
 ## 4. 命令生命周期(`run`)
 
@@ -160,7 +180,8 @@ run web-1 -- sudo systemctl restart nginx
   "host": "web-1",
   "cmd": "sudo systemctl restart nginx",
   "policy_action": "allow",
-  "policy_rule": "prod/allow_rules[1]",
+  "policy_rule": "prod/rules[0]",
+  "error": "",
   "exit_code": 0,
   "output_sha256": "9f2b…",
   "output_truncated": false,
@@ -171,8 +192,10 @@ run web-1 -- sudo systemctl restart nginx
 ```
 
 - `event` ∈ `started | completed | failed | denied`。`deny` 记一条 `denied`(无 exit_code)。
+- `error` 是可选的人类可读异常说明,主要用于本地管理操作的失败记录;常规 `run` 记录为空。
 - harness 的交互审批不由 AgentSSH 记录(在 harness 自己的日志里);AgentSSH 只记自己看到与执行的事实。
 - hash 链:`hash = SHA256(prev_hash || canonical_json(record_without_hash))`。第 0 条 `prev_hash` 全零。`agentssh audit verify` 从头重算,任一行被改/删/插都会断链。
+- 修复只允许 `agentssh audit repair --truncate-broken`:从第一条断链记录开始截断到文件末尾,并先写 `audit.log.bak`。不支持任意删除单条审计记录。
 
 设计取舍:
 - 记录 `output_sha256` 而非全文,避免审计膨胀并防敏感输出二次落盘;需要时可单独开「完整输出归档」选项。
@@ -184,16 +207,24 @@ run web-1 -- sudo systemctl restart nginx
 
 会话 = `session_id`(+ 可空 `session_label`)。每条 audit 记录都带 `session_id`。
 
-`session_id` 解析顺序(首个非空命中):
-1. `agentssh run --session <id>` 显式指定 —— Agent/手册可自行生成一个 id 贯穿整个任务。
-2. 环境变量 `$AGENTSSH_SESSION` —— harness/人类设一次,子调用继承。
-3. 回退:读 `~/.agentssh/session`(记录「当前会话」id + 最后活动时间)。若距上次活动在空闲窗口内(默认 30m)→ 复用;否则新建 id 并写回。
+**会话由调用方显式声明,系统不猜任务边界。** AgentSSH 无法从命令或时间推断「一个任务从哪里开始、到哪里结束」,所以不做任何基于时间窗口的自动归并——否则同一主机上几分钟内的两个不相干任务会被并进同一个会话,破坏「按任务复盘」。
 
-效果:自觉穿线的 Agent 得到精确分组;不穿线的也能按「时间窗口」自动分组。
+`session_id` 解析顺序(首个非空命中):
+1. `agentssh run --session <id>` 显式指定 —— 单次 run 覆盖,优先级最高。
+2. 环境变量 `$AGENTSSH_SESSION` —— harness/skill 在任务开始时设一次,该任务内所有 `run` 继承。
+3. 两者都没有 → **报错(exit 2)**,提示声明一个会话。绝不新建或复用一个「猜」出来的 id。
+
+约定:**一个任务一个会话**。skill/harness 在每个任务起始 mint 一个新 id 并导出:
+
+```bash
+export AGENTSSH_SESSION=$(agentssh session new)   # 形如 s_1a2b3c4d
+```
+
+`agentssh session new` 只是打印一个新随机 id(`internal/session.NewID`),不落任何状态。下一个任务再 mint 一个新的,天然区分。
 
 `--session-label "fix 502 on web-1"` 可给会话一个人类可读标签(首次出现时记入会话元数据,贯穿后续记录)。
 
-> 局限:回退用的 `~/.agentssh/session` 文件在多 Agent 并发下会串(MVP 假定单操作者交互式,可接受);需要严格隔离时用 `--session` / 环境变量显式指定。
+> 设计取舍:旧版有个「读 `~/.agentssh/session`、30 分钟空闲窗内复用」的回退,已移除——它在多任务/多 Agent 下会把不同任务串成一个会话,且那个指针文件并发下会写串。现在会话纯由调用方声明,无持久化状态,严格隔离是默认行为。
 
 ## 7. 凭据处理
 
@@ -225,11 +256,11 @@ agentssh/
     policy/                # 规则匹配、allow/deny、override、脱敏
     executor/              # SSH shell-out、捕获 stdout/stderr/exit
     audit/                 # JSONL 写入、hash 链、verify
-    session/               # 会话解析(--session / env / 空闲窗口)、聚合
+    session/               # 会话解析(--session / env,必须声明)、id 生成、聚合
     output/                # 脱敏 + 截断
     tui/                   # bubbletea:审计查看器
     approval/              # (预留,MVP 空)未来 out-of-band 同步审批
-  skills/                  # 示例外部操作手册(SKILL.md),供 Agent 参考
+  skills/                  # AgentSSH 使用手册(SKILL.md):最佳实践,供 Agent 参考
   docs/
 ```
 
@@ -245,4 +276,4 @@ agentssh/
 | 敏感输出进模型 | Output Filter | 脱敏 + 截断,审计只存 hash |
 | 事后无法追责/抵赖 | Audit | hash 链 append-only,`verify` 可验完整性 |
 | 越权访问未知主机 | Resolver | 仅允许 inventory 中枚举的主机/分组 |
-| prod 上误操作 | Policy override | `prod` 组切 allowlist(default deny) |
+| prod 上误操作 | Policy override | `prod` 组添加更具体的 allow/deny 规则;未匹配默认拒绝 |

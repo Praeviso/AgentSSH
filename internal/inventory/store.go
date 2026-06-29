@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/Praeviso/AgentSSH/internal/fileutil"
 	"gopkg.in/yaml.v3"
 )
 
@@ -45,32 +46,9 @@ func Save(path string, inv Inventory) error {
 	if err != nil {
 		return fmt.Errorf("marshal inventory: %w", err)
 	}
-	file, err := os.CreateTemp(dir, "inventory-*.yaml")
-	if err != nil {
-		return fmt.Errorf("create temporary inventory file: %w", err)
+	if err := fileutil.WriteFileAtomic(path, data, 0o600, "inventory-*.yaml"); err != nil {
+		return fileutil.LabelAtomicError(err, "inventory")
 	}
-	tempName := file.Name()
-	cleanup := true
-	defer func() {
-		if cleanup {
-			_ = os.Remove(tempName)
-		}
-	}()
-	if err := file.Chmod(0o600); err != nil {
-		_ = file.Close()
-		return fmt.Errorf("chmod temporary inventory file: %w", err)
-	}
-	if _, err := file.Write(data); err != nil {
-		_ = file.Close()
-		return fmt.Errorf("write temporary inventory file: %w", err)
-	}
-	if err := file.Close(); err != nil {
-		return fmt.Errorf("close temporary inventory file: %w", err)
-	}
-	if err := os.Rename(tempName, path); err != nil {
-		return fmt.Errorf("replace inventory file: %w", err)
-	}
-	cleanup = false
 	return nil
 }
 
@@ -101,6 +79,21 @@ func RemoveHost(inv Inventory, name string) (Inventory, error) {
 	next.Hosts = copyHosts(inv.Hosts)
 	next.Groups = copyGroups(inv.Groups)
 	delete(next.Hosts, name)
+	return next, nil
+}
+
+// UpdateHost returns a copy of inv with name replaced by host.
+func UpdateHost(inv Inventory, name string, host Host) (Inventory, error) {
+	if _, ok := inv.Hosts[name]; !ok {
+		return inv, ErrHostNotFound
+	}
+	next := inv
+	next.Hosts = copyHosts(inv.Hosts)
+	next.Groups = copyGroups(inv.Groups)
+	if next.Version == 0 {
+		next.Version = 1
+	}
+	next.Hosts[name] = host
 	return next, nil
 }
 

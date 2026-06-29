@@ -11,10 +11,10 @@
 - **4 个分区**:
   - **Hosts**:列表(operator 全字段)+ 添加(嵌入 `hostform` 表单)+ 删除(确认),写回 `inventory.yaml`。
   - **Audit**:现有审计查看器 model 作为分区(按会话折叠、详情、过滤、校验链)。
-  - **Policy**:展示 `policy.yaml` + 交互式 test 一条命令看 allow/deny + 命中规则。
+- **Policy**:展示 `policy.yaml` + 交互式 test 一条命令看 allow/deny + 命中规则;在 host detail 的 Policy pane 支持 `host:<name>` 绑定 CRUD(默认 allow/deny、allow regex 增删、删除绑定)。
   - **Sessions**:列出会话(id/label/起止/命令数),回车跳到 Audit 分区并按该 session 过滤。
 - `agentssh inventory add/ls`、`agentssh audit/policy/session/hosts` 等 CLI 命令**保持不变**(app 是额外的统一界面,与命令共享底层)。
-- 不做:run 命令(agent 侧操作,不进人类控制台)、多人/权限、policy 编辑(只读 + test)。
+- 不做:run 命令(agent 侧操作,不进人类控制台)、多人/权限、任意 YAML policy 编辑(全局 rule 仍走 CLI;TUI 只管理 host detail 的 `host:<name>` 绑定)。
 
 ## 2. 使能重构(app 的前置)
 
@@ -79,7 +79,7 @@ type Options struct { Paths config.Paths }   // app 自己按 Paths 加载 inven
 
 - **Hosts**(新 `hostsSection`):`inventory.Load(Paths.InventoryFile)` → 列表(name/addr/user/port/alias/tags,排序);按键 `a`=add(切到内嵌 `hostform.New(...)`,`Done()` 后 `AddHost`+`Save`+重载)、`d`/`x`=remove(确认弹窗 → `RemoveHost`+`Save`+重载)、`j/k` 导航。capturing()=表单激活时 true。
 - **Audit**(复用 2c 的审计 model):capturing()=过滤态。
-- **Policy**(新 `policySection`):上半区渲染 `cfg.Policy`(defaults/rules/host_overrides/output);下半区一个 textinput 输 `host:cmd` 或 cmd,回车 `engine.Evaluate` 显示 `allow/deny · rule=…`。engine = `policy.NewEngine(cfg.Policy, cfg.Inventory)`。capturing()=test 输入聚焦时。
+- **Policy**(新 `policySection`):上半区渲染 `cfg.Policy`(defaults/rules/host_overrides/output);下半区一个 textinput 输 `host:cmd` 或 cmd,回车 `engine.Evaluate` 显示 `allow/deny · rule=…`。host detail 模式额外渲染当前 host 的 `host:<name>` 绑定并提供 `s/a/r/x` 管理。engine = `policy.NewEngine(cfg.Policy, cfg.Inventory)`。capturing()=test/input/confirm 聚焦时。
 - **Sessions**(新 `sessionsSection`):`session.Summaries(audit.NewStore(Paths.AuditFile).ReadAll())` 列表;回车 → root 切 Audit + 过滤该 session。capturing()=false。
 
 ## 5. 非 TTY
@@ -96,4 +96,4 @@ type Options struct { Paths config.Paths }   // app 自己按 Paths 加载 inven
 
 ## 7. 不做(未来)
 
-run/exec 进 TUI、policy 编辑、group 管理、多人、主题/配置持久化、鼠标。
+run/exec 进 TUI、任意 YAML policy 编辑、group 管理、多人、主题/配置持久化、鼠标。

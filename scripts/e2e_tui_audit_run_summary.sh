@@ -68,12 +68,15 @@ YAML
 
 cat > "$home/policy.yaml" <<'YAML'
 version: 1
-defaults:
-  policy: allow
 rules:
   - name: catastrophic
+    priority: 100
     match: { cmd_regex: 'rm\s+-rf' }
     action: deny
+  - name: demo-readonly
+    priority: 0
+    match: { cmd_regex: '^(echo|systemctl status|uptime)\b' }
+    action: allow
 output:
   max_bytes: 24
   redact:

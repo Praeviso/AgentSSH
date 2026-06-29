@@ -60,14 +60,31 @@ func (c combinedHelp) FullHelp() [][]key.Binding {
 	return append(c.section.FullHelp(), c.global)
 }
 
-// screen is the top-level navigation state: the host card grid, or the
-// split-pane detail of one selected host.
+// screen is the top-level navigation state: the entry tabs, or the split-pane
+// detail of one selected host.
 type screen int
 
 const (
-	screenGrid screen = iota
+	screenEntry screen = iota
 	screenDetail
 )
+
+const screenGrid = screenEntry
+
+// entryTab is the active top-level tab on the entry screen.
+type entryTab int
+
+const (
+	entryHosts entryTab = iota
+	entryPolicy
+)
+
+func (t entryTab) title() string {
+	if t == entryPolicy {
+		return "Policy"
+	}
+	return "Hosts"
+}
 
 // detailPane is the active sub-view inside a host's detail screen.
 type detailPane int
@@ -123,6 +140,7 @@ type appModel struct {
 	firstRun bool // show the one-time welcome banner until the first keypress
 
 	screen     screen
+	entryTab   entryTab
 	pane       detailPane
 	detailHost string // the host whose detail screen is open
 }
@@ -251,6 +269,12 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case inventoryChangedMsg:
 		m.applyInventoryChange(msg.inventory)
 		return m, nil
+	case policyChangedMsg:
+		m.policy.config = msg.config
+		if msg.text != "" {
+			return m, toastCmd(msg.text)
+		}
+		return m, nil
 	case toastMsg:
 		m.toastID++
 		m.toast = msg.text
@@ -274,16 +298,27 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 		if m.firstRun {
-			// "press any key to begin": consume one keystroke and re-propagate sizes
-			// since the banner (and its line) is now gone.
+			// "press any key to begin": dismiss the one-time banner and re-propagate
+			// sizes (its line is gone). The keystroke isn't wasted — it also performs
+			// its normal action so the first key gets you moving, except q, so a
+			// curious keypress can't quit on the greeting.
 			m.firstRun = false
-			return m.propagateSize()
+			var sizeCmd tea.Cmd
+			m, sizeCmd = m.propagateSize()
+			if msg.String() == "q" {
+				return m, sizeCmd
+			}
+			next, keyCmd := m.updateKey(msg)
+			return next, tea.Batch(sizeCmd, keyCmd)
 		}
 		return m.updateKey(msg)
 	}
 	// Non-key, non-async messages route to the active screen's components.
 	if m.screen == screenDetail {
 		return m.routeDetail(msg)
+	}
+	if m.entryTab == entryPolicy {
+		return m.updatePolicy(msg)
 	}
 	return m.updateHosts(msg)
 }
@@ -293,24 +328,47 @@ func (m appModel) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.screen == screenDetail {
 		return m.updateDetailKey(msg)
 	}
-	return m.updateGridKey(msg)
+	return m.updateEntryKey(msg)
 }
 
-// updateGridKey handles a keypress on the card grid: the shell owns ?/q when the
-// grid isn't capturing (a modal/text mode), everything else goes to the grid.
-func (m appModel) updateGridKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	if !m.hosts.capturing() {
+// updateEntryKey handles a keypress on the entry screen. The shell owns
+// top-level tab navigation unless the active section is capturing text/modal
+// input; section-specific keys are forwarded afterward.
+func (m appModel) updateEntryKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if !m.entryCapturing() {
 		switch msg.String() {
 		case "?":
 			m.help.ShowAll = !m.help.ShowAll
 			return m.propagateSize()
 		case "q":
 			return m, tea.Quit
+		case "tab":
+			m.entryTab = (m.entryTab + 1) % 2
+			if m.entryTab == entryPolicy {
+				m.policy = m.policy.withHost("")
+			}
+			return m.propagateSize()
+		case "shift+tab":
+			m.entryTab = (m.entryTab + 1) % 2
+			if m.entryTab == entryPolicy {
+				m.policy = m.policy.withHost("")
+			}
+			return m.propagateSize()
+		case "1":
+			m.entryTab = entryHosts
+			return m.propagateSize()
+		case "2":
+			m.entryTab = entryPolicy
+			m.policy = m.policy.withHost("")
+			return m.propagateSize()
 		}
+	}
+	if m.entryTab == entryPolicy {
+		return m.updatePolicy(msg)
 	}
 	next, cmd := m.updateHosts(msg)
 	mm := next.(appModel)
-	// The grid signals "open this host" via hosts.open; transition to its detail.
+	// The Hosts tab signals "open this host" via hosts.open; transition to detail.
 	if mm.hosts.open {
 		mm.hosts.open = false
 		return mm.enterDetail(mm.hosts.selectedHost())
@@ -364,7 +422,8 @@ func (m appModel) updateDetailKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// esc pops the active pane's own state first (e.g. a session's command
 		// detail); only when the pane is already at its root does it exit to the grid.
 		if m.paneAtRoot() {
-			m.screen = screenGrid
+			m.screen = screenEntry
+			m.entryTab = entryHosts
 			return m.propagateSize()
 		}
 		return m.routeDetail(msg)
@@ -503,6 +562,8 @@ func (m appModel) welcomeBanner() string {
 }
 
 func (m *appModel) applyInventoryChange(inv inventory.Inventory) {
+	m.hosts.inventory = inv
+	m.hosts.rebuildNames()
 	m.sessions.hosts = hostMetaFromInventory(inv)
 	m.policy.inventory = inv
 	// A successful inventory change means inventory.yaml now parses, so clear a
@@ -511,7 +572,8 @@ func (m *appModel) applyInventoryChange(inv inventory.Inventory) {
 	// If the host whose detail is open was removed, fall back to the grid.
 	if m.screen == screenDetail {
 		if _, ok := inv.Hosts[m.detailHost]; !ok {
-			m.screen = screenGrid
+			m.screen = screenEntry
+			m.entryTab = entryHosts
 		}
 	}
 }
@@ -526,6 +588,11 @@ func (m appModel) View() string {
 	if m.ready {
 		if m.screen == screenDetail {
 			body = m.renderDetail()
+		} else if m.entryTab == entryPolicy {
+			// The pane is already scoped to host "" whenever this tab is active (the
+			// tab-switch handlers call withHost("")). Render it as-is — calling
+			// withHost("") here would wipe the drilled-into card/group on every frame.
+			body = m.policy.View()
 		} else {
 			body = m.hosts.View()
 		}
@@ -575,7 +642,14 @@ func (m appModel) tooSmallView() string {
 func (m appModel) renderStatusBar() string {
 	var bar string
 	if m.screen == screenDetail {
-		crumb := m.styles.crumb.Render("AgentSSH") + m.styles.dim.Render(" › ") + m.styles.header.Render(m.detailHost)
+		crumb := m.styles.crumb.Render("AgentSSH") + m.styles.dim.Render(" › ") + m.detailCrumbHost()
+		// In the Sessions pane, the drilled-into session's id rides on the breadcrumb
+		// (its standalone identity line was removed in favor of this).
+		if m.pane == paneSessions {
+			if id, ok := m.sessions.detailSessionID(); ok && id != "" {
+				crumb += m.styles.dim.Render(" › ") + m.styles.header.Render(id)
+			}
+		}
 		pips := make([]string, 0, 3)
 		for _, p := range []detailPane{paneInfo, paneSessions, panePolicy} {
 			label := fmt.Sprintf("%d %s", int(p)+1, p.title())
@@ -589,8 +663,20 @@ func (m appModel) renderStatusBar() string {
 	} else {
 		n := len(m.hosts.names)
 		crumb := m.styles.crumb.Render("AgentSSH")
+		tabs := make([]string, 0, 2)
+		for _, tab := range []entryTab{entryHosts, entryPolicy} {
+			label := fmt.Sprintf("%d %s", int(tab)+1, tab.title())
+			if tab == m.entryTab {
+				tabs = append(tabs, m.styles.activeTab.Render(label))
+			} else {
+				tabs = append(tabs, m.styles.inactive.Render(label))
+			}
+		}
 		count := m.styles.dim.Render(fmt.Sprintf(" · %d %s", n, plural(n, "host", "hosts")))
-		bar = crumb + count
+		bar = lipgloss.JoinHorizontal(lipgloss.Top, crumb, "  ", lipgloss.JoinHorizontal(lipgloss.Top, tabs...), count)
+		if m.hosts.filterActive() {
+			bar += m.styles.dim.Render(fmt.Sprintf(" · %d shown", m.hosts.visibleCount()))
+		}
 		if chain := m.sessions.chainBadge(); chain != "" {
 			bar += m.styles.dim.Render(" · ") + chain
 		}
@@ -601,6 +687,22 @@ func (m appModel) renderStatusBar() string {
 		style = style.Width(m.w).MaxWidth(m.w)
 	}
 	return style.Render(bar)
+}
+
+// detailCrumbHost renders the breadcrumb's host segment: the host name (bold) plus
+// its user@addr connection as dim context, e.g. "web-staging-1 (deploy@10.0.1.21)".
+// The connection is dropped when the host has no inventory metadata.
+func (m appModel) detailCrumbHost() string {
+	name := m.styles.header.Render(m.detailHost)
+	meta, ok := m.sessions.hosts[m.detailHost]
+	if !ok || (meta.User == "" && meta.Addr == "") {
+		return name
+	}
+	target := meta.Addr
+	if meta.User != "" {
+		target = meta.User + "@" + meta.Addr
+	}
+	return name + m.styles.dim.Render(fmt.Sprintf(" (%s)", target))
 }
 
 // renderFooter is the persistent bottom rail: the active screen's key bindings
@@ -624,10 +726,19 @@ func (m appModel) renderFooter() string {
 	return m.fullWidthLine(helpView + strings.Repeat(" ", pad) + toast)
 }
 
-// activeHelpKeyMap returns the footer bindings for the active screen/pane.
+// activeHelpKeyMap returns the help bindings for the active screen/pane. The
+// footer (ShortHelp) stays terse — a few essential keys plus navigation — while
+// the ? overlay (FullHelp) carries every binding, grouped into columns.
 func (m appModel) activeHelpKeyMap() help.KeyMap {
 	if m.screen != screenDetail {
-		return m.hosts.helpKeyMap()
+		nav := []key.Binding{hk("tab/1-2", "tabs")}
+		var section help.KeyMap
+		if m.entryTab == entryPolicy {
+			section = m.policy.helpKeyMap()
+		} else {
+			section = m.hosts.helpKeyMap()
+		}
+		return mergeHelp(section, nav)
 	}
 	nav := []key.Binding{hk("tab/1-3", "panes"), hk("esc", "back")}
 	var pane help.KeyMap
@@ -637,9 +748,29 @@ func (m appModel) activeHelpKeyMap() help.KeyMap {
 	case panePolicy:
 		pane = m.policy.helpKeyMap()
 	default:
-		pane = helpMap{short: []key.Binding{hk("t", "test")}}
+		pane = helpMap{
+			short: []key.Binding{hk("t", "test")},
+			full:  [][]key.Binding{{hk("t", "test host connection")}},
+		}
 	}
-	return helpMap{short: append(pane.ShortHelp(), nav...)}
+	return mergeHelp(pane, nav)
+}
+
+// mergeHelp appends nav bindings to a section's short help (footer) and adds them
+// as a final column in its full help (?), so the footer stays terse while the
+// overlay lists everything. Slices are copied so callers aren't mutated.
+func mergeHelp(section help.KeyMap, nav []key.Binding) helpMap {
+	short := append(append([]key.Binding{}, section.ShortHelp()...), nav...)
+	full := append([][]key.Binding{}, section.FullHelp()...)
+	full = append(full, nav)
+	return helpMap{short: short, full: full}
+}
+
+func (m appModel) entryCapturing() bool {
+	if m.entryTab == entryPolicy {
+		return m.policy.capturing()
+	}
+	return m.hosts.capturing()
 }
 
 func (m appModel) fullWidthLine(value string) string {

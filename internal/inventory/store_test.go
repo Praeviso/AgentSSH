@@ -69,6 +69,27 @@ func TestRemoveHost(t *testing.T) {
 	}
 }
 
+func TestUpdateHost(t *testing.T) {
+	inv := Inventory{Hosts: map[string]Host{
+		"old": {Addr: "10.0.0.10", User: "deploy", OS: "linux"},
+		"new": {Addr: "10.0.0.11"},
+	}}
+	next, err := UpdateHost(inv, "old", Host{Addr: "10.0.0.12", User: "admin", OS: "linux"})
+	if err != nil {
+		t.Fatalf("UpdateHost: %v", err)
+	}
+	if got := next.Hosts["old"]; got.Addr != "10.0.0.12" || got.User != "admin" || got.OS != "linux" {
+		t.Fatalf("updated host = %#v", got)
+	}
+	if inv.Hosts["old"].Addr != "10.0.0.10" {
+		t.Fatalf("UpdateHost mutated original = %#v", inv)
+	}
+	_, err = UpdateHost(inv, "missing", Host{Addr: "10.0.0.12"})
+	if !errors.Is(err, ErrHostNotFound) {
+		t.Fatalf("missing err = %v, want ErrHostNotFound", err)
+	}
+}
+
 func TestSaveLoadRoundTripAndOmitEmptyFields(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "nested", "inventory.yaml")
 	inv := Inventory{

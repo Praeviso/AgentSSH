@@ -29,7 +29,8 @@ agentssh hosts [--json]
     列出可达主机与分组(仅名字/tag,无凭据)。
 
 agentssh run <host|group> [--session <id>] [--session-label <text>] [--json] -- <cmd…>
-    在目标上执行命令。经 policy 判定:
+    在目标上执行命令。必须声明会话(--session 或 $AGENTSSH_SESSION),
+    否则以 exit 2 拒绝 —— 一个任务一个会话,便于按任务审计。经 policy 判定:
       allow → 立即执行,返回输出与退出码
       deny  → 立即以 exit 6 返回,说明命中的规则
     <cmd…> 在 `--` 之后,原样作为远端单条命令。
@@ -42,11 +43,11 @@ agentssh status <req_id> [--json]
 #### 人类面
 
 ```
-agentssh tui                 打开审计查看器(主入口)
+agentssh tui                 打开终端操作台(Hosts / Policy)
 agentssh inventory ls|edit   查看/编辑主机清单
-agentssh policy show|edit|test <cmd>   查看/编辑/试判某命令(allow|deny + 命中规则)
-agentssh audit ls|show <req>|verify    浏览/查看/校验审计链
-agentssh session ls          列出近期会话(id/label/起止/命令数)
+agentssh policy show|rule|group|host|edit|test <cmd>   查看/管理全局规则/规则组/host 绑定/编辑/试判某命令
+agentssh audit ls|show <req>|verify|repair  浏览/查看/校验审计链/截断损坏尾段
+agentssh session ls|new      列出近期会话 / 为新任务 mint 一个会话 id
 ```
 
 ### A.3 输出格式
@@ -84,7 +85,7 @@ nginx.service - A high performance web server
 
 ```
 ✗ denied by policy · web-1 · 命中规则 "catastrophic"
-  rm -rf 属于不可执行的危险命令;此拦截无法临场放行。
+  rm -rf 命中了 deny 规则或没有命中 allow 规则;此拦截无法临场放行。
   如确需放宽,请人类修改 ~/.agentssh/policy.yaml。
 ```
 
@@ -92,7 +93,7 @@ nginx.service - A high performance web server
 
 ```json
 { "req_id": "f1a0", "host": "web-1", "status": "denied",
-  "policy_action": "deny", "policy_rule": "catastrophic", "exit_code": 6 }
+  "policy_action": "deny", "policy_rule": "rules:catastrophic", "exit_code": 6 }
 ```
 
 > 没有「pending / 等待审批」态。Agent 不会被 AgentSSH 挂起;若 harness 在调用前要人工确认,那是 harness 的交互,AgentSSH 此时尚未被调用。
@@ -126,7 +127,17 @@ nginx.service - A high performance web server
 
 ## B. TUI 设计(人类审计查看器)
 
-> 注:本节是 TUI 的**原始**草案(Audit 为中心)。`agentssh tui` 现已是四 Tab 操作台(Hosts/Audit/Policy/Sessions),并完成了整体 UX 重构——统一 `internal/theme` 配色 + 字形降级、持久外壳 + `bubbles/help` 底栏、实测响应式布局、Hosts 主从面板、错误/确认卡片、Toast、分组加主机表单等。设计依据、各 Tab 原型与**已实现**的分阶段路线图见 [`docs/plans/tui-redesign.md`](plans/tui-redesign.md)(下文若与该文档冲突,以该文档为准)。
+> 注:本节下方保留了 TUI 的**原始**草案(Audit 为中心)。当前 `agentssh tui` 的入口是 `Hosts / Policy` 两个顶层 Tab,Host detail 内有 Info/Sessions/Policy 三个 pane,并完成了整体 UX 重构——统一 `internal/theme` 配色 + 字形降级、持久外壳 + `bubbles/help` 底栏、实测响应式布局、Hosts 主从面板、错误/确认卡片、Toast、分组加主机表单等。设计依据、各 Tab 原型与**已实现**的分阶段路线图见 [`docs/plans/tui-redesign.md`](plans/tui-redesign.md)(下文若与该文档冲突,以该文档为准)。
+
+### 当前已实现的 TUI Policy 结构
+
+`agentssh tui` 的入口页是两张顶层 Tab:`1 Hosts` 与 `2 Policy`,也可用 `tab` 切换。Hosts 仍是主机卡片网格;Policy 是策略卡片网格。
+
+- **Policy 顶层卡片**:`Global` 卡片代表 `Config.Rules`;每个 `rule_groups.<name>` 也渲染为一张卡。卡片显示名称、规则数、allow/deny 计数。`enter` 打开选中卡片进入规则列表。
+- **Global / Group 规则列表**:打开卡片后,用同一套无边框表格列出规则。`a` 新增规则,`e` 编辑选中规则,`r` 删除选中规则,`esc` 回到卡片网格。规则输入格式为 `allow|deny [priority] <cmd_regex>`。
+- **规则组管理**:在 Policy 顶层按 `n` 创建 group;选中 group 卡片按 `d` 删除 group。`Global` 卡片不可删除。
+- **规则组语义**:rule group 是 authoring-only preset,执行引擎不直接读取。把 group 加到 host 时是 snapshot copy,每条复制出来的 host rule 带 `group` provenance;之后编辑 group 不会影响已复制到 host 的规则。
+- **Host detail Policy pane**:进入 host detail 后按 `3`。该 pane 不是卡片堆叠,而是一张统一无边框规则列表:先列 host tier,再列 global tier;列为 `SCOPE / PRIORITY / ACTION / COMMAND / GROUP`。host 行可编辑/删除,global 行只读上下文。`a` 新增手写 host rule,`p` 从 group picker 复制一组规则,`r` 删除选中 host rule,`R` 删除选中 provenance group 的所有 host 规则,`x` 清除该 host 的 `host:<name>` rules。
 
 技术:`bubbletea` + `lipgloss` + `bubbles`。**单一视图:审计流,按会话分组**(无审批界面)。`agentssh tui` 即打开它,等价于交互式的 `agentssh audit`。
 
@@ -137,9 +148,9 @@ nginx.service - A high performance web server
 │  42 条 · 8 会话 · 链 ✓ 完整 (1..42)            / 过滤   v 校验     │  ← 顶部状态条
 ├───────────────────────────────────────────────────────────────────┤
 │ ▾ s_91be0c  "fix 502 on web-1"   claude-code  08:31–08:32  4 cmd  │  ← 会话头(展开)
-│   08:32:11 ✓ web-1  restart-service  sudo systemctl restart nginx │
-│              allow:prod/allow_rules[1] · exit 0 · 412ms           │
-│   08:32:05 ✓ web-1  restart-service  systemctl status nginx       │
+│   08:32:11 ✓ web-1  sudo systemctl restart nginx                  │
+│              allow:prod/rules[0] · exit 0 · 412ms                 │
+│   08:32:05 ✓ web-1  systemctl status nginx                        │
 │              allow · exit 0 · 88ms                                │
 │ ▸ s_77a2d1  "disk cleanup db-1"   claude-code  08:20–08:25  6 cmd │  ← 会话头(折叠)
 │ ▸ s_3c0f9a  (无标签)             claude-code  07:55–07:58  2 cmd  │
@@ -150,7 +161,7 @@ nginx.service - A high performance web server
 
 - 顶层按**会话**倒序;会话头单行显示 `id · label · host(user@ip)`,有篡改时附一段异常提示。
 - 展开后是该会话内的 run,时间倒序;状态图标:`✓` 成功 · `✗` 失败 · `⊘` 拒绝(policy deny)· `●` 执行中。
-- 每行一眼看全:**时间 · 状态 · 主机(prod 加红角标) · 手册 · 真实命令 · policy 判定 · exit/耗时**。
+- 每行一眼看全:**时间 · 状态 · 主机(prod 加红角标) · 真实命令 · policy 判定 · exit/耗时**。
 - 危险/拒绝用红、prod 主机加红色 `prod` 角标、含异常的会话头标红;颜色仅作强调,信息不只靠颜色(同时有文字)。
 
 ### B.2 详情面板
@@ -163,7 +174,7 @@ nginx.service - A high performance web server
 │ Session  s_91be0c "fix 502"    Host   web-1 (deploy@10.0.0.11)    │
 │ Tags     web, prod                                                │
 │ Command  sudo systemctl restart nginx                             │
-│ Policy   allow ← prod/allow_rules[1]                              │
+│ Policy   allow ← prod/rules[0]                                    │
 │ Exit     0 · 412ms · truncated false · redactions 0              │
 │ Output   sha256 9f2b…(原文不入审计)                              │
 │ Chain    prev 00ab…  hash 7d41…                                  │

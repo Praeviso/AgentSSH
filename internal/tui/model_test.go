@@ -46,6 +46,19 @@ func TestWithHostFilterScopesSessions(t *testing.T) {
 	}
 }
 
+func TestBuildGroupsSortsSameEndBySessionID(t *testing.T) {
+	groups := buildGroups([]audit.Record{
+		{Seq: 1, ReqID: "r2", SessionID: "s_b", Host: "web-1", Event: audit.EventCompleted, TS: "2026-06-20T10:00:00Z"},
+		{Seq: 2, ReqID: "r1", SessionID: "s_a", Host: "web-1", Event: audit.EventCompleted, TS: "2026-06-20T10:00:00Z"},
+	}, "", "")
+	if len(groups) != 2 {
+		t.Fatalf("groups = %#v", groups)
+	}
+	if groups[0].id != "s_a" || groups[1].id != "s_b" {
+		t.Fatalf("sort = %#v, want same end sorted by id", groups)
+	}
+}
+
 func TestModelAtRoot(t *testing.T) {
 	r := lipgloss.NewRenderer(os.Stdout)
 	m := newModel(twoHostRecords(), map[string]HostMeta{}, newStyles(r), nil)

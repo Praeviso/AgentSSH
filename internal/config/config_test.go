@@ -5,8 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-
-	"github.com/Praeviso/AgentSSH/internal/policy"
 )
 
 func TestLoadMissingHome(t *testing.T) {
@@ -87,11 +85,8 @@ func TestEnsureHomeCreatesAndSeeds(t *testing.T) {
 	if cfg.Inventory.Transport != "native" {
 		t.Fatalf("seeded transport = %q, want native", cfg.Inventory.Transport)
 	}
-	if cfg.Policy.Defaults.Policy != policy.ActionAllow {
-		t.Fatalf("default policy = %q, want allow", cfg.Policy.Defaults.Policy)
-	}
-	if len(cfg.Policy.Rules) == 0 || cfg.Policy.Rules[0].Action != policy.ActionDeny {
-		t.Fatalf("seeded policy missing catastrophic deny rule: %+v", cfg.Policy.Rules)
+	if len(cfg.Policy.Rules) != 0 || len(cfg.Policy.HostOverrides) != 0 {
+		t.Fatalf("seeded policy should have zero active rules: %+v", cfg.Policy)
 	}
 }
 

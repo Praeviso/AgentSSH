@@ -2,6 +2,7 @@ package audit
 
 import (
 	"bufio"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -37,6 +38,7 @@ type Record struct {
 	Cmd             string `json:"cmd"`
 	PolicyAction    string `json:"policy_action"`
 	PolicyRule      string `json:"policy_rule"`
+	Error           string `json:"error,omitempty"`
 	ExitCode        *int   `json:"exit_code,omitempty"`
 	OutputSHA256    string `json:"output_sha256"`
 	OutputTruncated bool   `json:"output_truncated"`
@@ -56,6 +58,15 @@ type Store struct {
 // NewStore returns a file-backed audit store.
 func NewStore(path string) Store {
 	return Store{Path: path}
+}
+
+// NewReqID returns a short request id for auditable local operations.
+func NewReqID() (string, error) {
+	var bytes [3]byte
+	if _, err := rand.Read(bytes[:]); err != nil {
+		return "", fmt.Errorf("generate request id: %w", err)
+	}
+	return hex.EncodeToString(bytes[:]), nil
 }
 
 // Append adds one record to the hash chain, assigning seq, prev_hash, and hash.
@@ -140,6 +151,61 @@ func readRecords(file *os.File) ([]Record, error) {
 	return records, nil
 }
 
+func writeRecordsAtomic(path string, records []Record) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("create audit directory: %w", err)
+	}
+	file, err := os.CreateTemp(dir, "audit-*.log")
+	if err != nil {
+		return fmt.Errorf("create temporary audit log: %w", err)
+	}
+	tempName := file.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tempName)
+		}
+	}()
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("chmod temporary audit log: %w", err)
+	}
+	for _, record := range records {
+		line, err := json.Marshal(record)
+		if err != nil {
+			_ = file.Close()
+			return fmt.Errorf("marshal audit record: %w", err)
+		}
+		if _, err := file.Write(append(line, '\n')); err != nil {
+			_ = file.Close()
+			return fmt.Errorf("write audit record: %w", err)
+		}
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close temporary audit log: %w", err)
+	}
+	if err := os.Rename(tempName, path); err != nil {
+		return fmt.Errorf("replace audit log: %w", err)
+	}
+	cleanup = false
+	return nil
+}
+
+func copyFileIfExists(src string, dst string) error {
+	data, err := os.ReadFile(src)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read audit backup source: %w", err)
+	}
+	if err := os.WriteFile(dst, data, 0o600); err != nil {
+		return fmt.Errorf("write audit backup: %w", err)
+	}
+	return nil
+}
+
 // Verify recalculates the hash chain from the beginning of the log.
 func (s Store) Verify() (VerifyResult, error) {
 	records, err := s.ReadAll()
@@ -149,13 +215,13 @@ func (s Store) Verify() (VerifyResult, error) {
 	prevHash := ZeroHash
 	for i, record := range records {
 		if record.Seq != uint64(i) {
-			return VerifyResult{OK: false, BrokenSeq: record.Seq, Reason: "seq"}, nil
+			return VerifyResult{OK: false, BrokenSeq: record.Seq, BrokenIndex: i, Reason: "seq"}, nil
 		}
 		if record.PrevHash != prevHash {
-			return VerifyResult{OK: false, BrokenSeq: record.Seq, Reason: "prev_hash"}, nil
+			return VerifyResult{OK: false, BrokenSeq: record.Seq, BrokenIndex: i, Reason: "prev_hash"}, nil
 		}
 		if ComputeHash(record) != record.Hash {
-			return VerifyResult{OK: false, BrokenSeq: record.Seq, Reason: "hash"}, nil
+			return VerifyResult{OK: false, BrokenSeq: record.Seq, BrokenIndex: i, Reason: "hash"}, nil
 		}
 		prevHash = record.Hash
 	}
@@ -164,10 +230,60 @@ func (s Store) Verify() (VerifyResult, error) {
 
 // VerifyResult describes audit chain verification.
 type VerifyResult struct {
-	OK        bool
-	Count     int
-	BrokenSeq uint64
-	Reason    string
+	OK          bool
+	Count       int
+	BrokenSeq   uint64
+	BrokenIndex int
+	Reason      string
+}
+
+// RepairResult describes a destructive audit-log repair.
+type RepairResult struct {
+	Changed     bool
+	Kept        int
+	Removed     int
+	BrokenSeq   uint64
+	BrokenIndex int
+	Reason      string
+	BackupPath  string
+}
+
+// TruncateBroken removes the first broken record and every later record.
+//
+// This is intentionally narrower than arbitrary audit deletion: after a hash
+// chain break, later records no longer have independently verifiable ancestry.
+func (s Store) TruncateBroken() (RepairResult, error) {
+	records, err := s.ReadAll()
+	if err != nil {
+		return RepairResult{}, err
+	}
+	result, err := s.Verify()
+	if err != nil {
+		return RepairResult{}, err
+	}
+	if result.OK {
+		return RepairResult{Changed: false, Kept: len(records)}, nil
+	}
+	cut := result.BrokenIndex
+	if cut < 0 || cut > len(records) {
+		cut = len(records)
+	}
+	backup := s.Path + ".bak"
+	if err := copyFileIfExists(s.Path, backup); err != nil {
+		return RepairResult{}, err
+	}
+	if err := writeRecordsAtomic(s.Path, records[:cut]); err != nil {
+		return RepairResult{}, err
+	}
+	return RepairResult{
+		Changed:     true,
+		Kept:        cut,
+		Removed:     len(records) - cut,
+		BrokenSeq:   result.BrokenSeq,
+		BrokenIndex: result.BrokenIndex,
+		Reason:      result.Reason,
+		BackupPath:  backup,
+	}, nil
 }
 
 // Filters narrows audit list results.
@@ -223,6 +339,7 @@ type canonicalRecord struct {
 	Cmd             string `json:"cmd"`
 	PolicyAction    string `json:"policy_action"`
 	PolicyRule      string `json:"policy_rule"`
+	Error           string `json:"error,omitempty"`
 	ExitCode        *int   `json:"exit_code,omitempty"`
 	OutputSHA256    string `json:"output_sha256"`
 	OutputTruncated bool   `json:"output_truncated"`
@@ -243,6 +360,7 @@ func canonicalJSON(record Record) ([]byte, error) {
 		Cmd:             record.Cmd,
 		PolicyAction:    record.PolicyAction,
 		PolicyRule:      record.PolicyRule,
+		Error:           record.Error,
 		ExitCode:        record.ExitCode,
 		OutputSHA256:    record.OutputSHA256,
 		OutputTruncated: record.OutputTruncated,

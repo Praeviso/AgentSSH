@@ -1,10 +1,9 @@
 package session
 
 import (
+	"errors"
 	"os"
-	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/Praeviso/AgentSSH/internal/audit"
 )
@@ -43,7 +42,9 @@ func TestSummariesBindsSingleHost(t *testing.T) {
 }
 
 func TestResolveOrder(t *testing.T) {
-	resolver := Resolver{Path: filepath.Join(t.TempDir(), "session"), NewID: fixedID("s_new")}
+	var resolver Resolver
+	// Explicit --session wins, even over an ambient env session.
+	t.Setenv(EnvSession, "s_env")
 	ctx, err := resolver.Resolve("web-1", "s_explicit", "label")
 	if err != nil {
 		t.Fatalf("explicit resolve: %v", err)
@@ -52,7 +53,7 @@ func TestResolveOrder(t *testing.T) {
 		t.Fatalf("explicit ctx = %#v", ctx)
 	}
 
-	t.Setenv(EnvSession, "s_env")
+	// With no flag, the env session is used.
 	ctx, err = resolver.Resolve("web-1", "", "")
 	if err != nil {
 		t.Fatalf("env resolve: %v", err)
@@ -62,66 +63,32 @@ func TestResolveOrder(t *testing.T) {
 	}
 }
 
-func TestResolveIdleWindow(t *testing.T) {
-	now := time.Date(2026, 6, 16, 8, 0, 0, 0, time.UTC)
-	path := filepath.Join(t.TempDir(), "session")
-	resolver := Resolver{Path: path, Clock: fixedClock{now: now}, NewID: fixedID("s_new")}
-	if err := resolver.Update("web-1", "s_existing", now.Add(-29*time.Minute)); err != nil {
-		t.Fatalf("seed pointer: %v", err)
-	}
-	ctx, err := resolver.Resolve("web-1", "", "")
-	if err != nil {
-		t.Fatalf("resolve within idle window: %v", err)
-	}
-	if ctx.ID != "s_existing" {
-		t.Fatalf("within idle ctx = %#v", ctx)
-	}
-
-	if err := resolver.Update("web-1", "s_old", now.Add(-31*time.Minute)); err != nil {
-		t.Fatalf("seed old pointer: %v", err)
-	}
-	ctx, err = resolver.Resolve("web-1", "", "")
-	if err != nil {
-		t.Fatalf("resolve beyond idle window: %v", err)
-	}
-	if ctx.ID != "s_new" {
-		t.Fatalf("beyond idle ctx = %#v", ctx)
+// A run that declares no session is a hard error: AgentSSH never invents or resumes
+// an id, so logically distinct tasks can't merge into one audit session.
+func TestResolveErrorsWithoutSession(t *testing.T) {
+	_ = os.Unsetenv(EnvSession)
+	var resolver Resolver
+	_, err := resolver.Resolve("web-1", "", "")
+	if !errors.Is(err, ErrNoSession) {
+		t.Fatalf("resolve without session: err = %v, want ErrNoSession", err)
 	}
 }
 
-// TestResolveBindsPerHost is the core one-session-per-host invariant: a live
-// session for one host is never reused for a different host, even within the
-// idle window — the second host gets its own fresh id.
-func TestResolveBindsPerHost(t *testing.T) {
-	now := time.Date(2026, 6, 16, 8, 0, 0, 0, time.UTC)
-	path := filepath.Join(t.TempDir(), "session")
-	resolver := Resolver{Path: path, Clock: fixedClock{now: now}, NewID: fixedID("s_new")}
-	if err := resolver.Update("web-1", "s_web1", now.Add(-1*time.Minute)); err != nil {
-		t.Fatalf("seed web-1 pointer: %v", err)
-	}
-	// web-1 resumes its own live session.
-	ctx, err := resolver.Resolve("web-1", "", "")
+// NewID mints distinct, well-formed ids so each task can claim a fresh session.
+func TestNewIDIsFreshAndPrefixed(t *testing.T) {
+	a, err := NewID()
 	if err != nil {
-		t.Fatalf("resolve web-1: %v", err)
+		t.Fatalf("NewID: %v", err)
 	}
-	if ctx.ID != "s_web1" {
-		t.Fatalf("web-1 ctx = %#v, want s_web1", ctx)
-	}
-	// web-2 must NOT inherit web-1's session; it gets a new one bound to web-2.
-	ctx, err = resolver.Resolve("web-2", "", "")
+	b, err := NewID()
 	if err != nil {
-		t.Fatalf("resolve web-2: %v", err)
+		t.Fatalf("NewID: %v", err)
 	}
-	if ctx.ID != "s_new" || ctx.Host != "web-2" {
-		t.Fatalf("web-2 ctx = %#v, want fresh s_new bound to web-2", ctx)
+	if a == b {
+		t.Fatalf("NewID returned the same id twice: %q", a)
 	}
-	// web-1's pointer is untouched by the web-2 run.
-	ctx, err = resolver.Resolve("web-1", "", "")
-	if err != nil {
-		t.Fatalf("re-resolve web-1: %v", err)
-	}
-	if ctx.ID != "s_web1" {
-		t.Fatalf("web-1 ctx after web-2 run = %#v, want s_web1 preserved", ctx)
+	if len(a) < 3 || a[:2] != "s_" {
+		t.Fatalf("id = %q, want an s_ prefix", a)
 	}
 }
 
@@ -143,18 +110,17 @@ func TestSummaries(t *testing.T) {
 	}
 }
 
-func fixedID(id string) func() (string, error) {
-	return func() (string, error) {
-		return id, nil
+func TestSummariesSortsSameEndBySessionID(t *testing.T) {
+	summaries := Summaries([]audit.Record{
+		{ReqID: "r2", SessionID: "s_b", TS: "2026-06-20T10:00:00Z"},
+		{ReqID: "r1", SessionID: "s_a", TS: "2026-06-20T10:00:00Z"},
+	})
+	if len(summaries) != 2 {
+		t.Fatalf("summaries = %#v", summaries)
 	}
-}
-
-type fixedClock struct {
-	now time.Time
-}
-
-func (c fixedClock) Now() time.Time {
-	return c.now
+	if summaries[0].ID != "s_a" || summaries[1].ID != "s_b" {
+		t.Fatalf("sort = %#v, want same End sorted by id", summaries)
+	}
 }
 
 func TestMain(m *testing.M) {
