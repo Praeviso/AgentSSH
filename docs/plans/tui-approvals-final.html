@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AgentSSH · Approvals — consequence-first (optimized)</title>
+<style>
+:root{--bg:#0f1117;--term:#0b0e14;--fg:#cdd6e4;--dim:#7c8699;--accent:#7dcfff;--green:#9ece6a;--warn:#e0af68;--danger:#f7768e;--line:#222838}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font-family:-apple-system,Segoe UI,Roboto,sans-serif;line-height:1.5}
+.wrap{max-width:880px;margin:0 auto;padding:26px}
+h1{font-size:18px;margin:0 0 4px;font-weight:650}
+.sub{color:var(--dim);font-size:13px;margin:0 0 18px}
+.termwrap{background:var(--term);border:1px solid var(--line);border-radius:10px;overflow:hidden;box-shadow:0 10px 36px rgba(0,0,0,.4)}
+.bar{display:flex;align-items:center;gap:7px;padding:9px 13px;border-bottom:1px solid #1b2130;background:#0d111a}
+.bar .dot{width:11px;height:11px;border-radius:50%}.bar .r{background:#f7768e}.bar .y{background:#e0af68}.bar .g{background:#9ece6a}
+.bar .t{margin-left:8px;color:var(--dim);font-size:12px;font-family:ui-monospace,Menlo,monospace}
+.term{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"DejaVu Sans Mono",monospace;font-size:14px;line-height:1.7;padding:16px 18px;color:var(--fg)}
+.tabline{color:var(--dim);margin-bottom:10px}
+.tabline .on{color:#0b0e14;background:var(--accent);padding:1px 8px;border-radius:4px;font-weight:700}
+.tabline .meta{float:right;color:var(--dim)}
+.row{display:flex;gap:14px;padding:2px 8px;border-radius:5px;cursor:pointer;white-space:pre}
+.row .cur{width:1ch;color:var(--accent)}
+.row .id{color:var(--dim)}
+.row .host{color:var(--fg);width:6ch}
+.row .cmd{color:var(--fg)}
+.row .mk{color:var(--warn);margin-left:auto}
+.row.sel{background:rgba(125,207,255,.10)}
+.row.sel .cur::before{content:"▌"}
+.row.sel .cmd{color:#fff}
+.sep{border:0;border-top:1px solid #1b2130;margin:12px 0}
+.foot .line1{color:var(--dim);font-size:13.5px}
+.foot .line1 b{color:var(--green);font-weight:600}
+.foot .line1 .id{color:var(--accent)}
+.foot .line1 .off{color:var(--danger)}
+.foot .keys{margin-top:6px;color:var(--dim);font-size:13.5px}
+.foot .keys .k{color:var(--accent);font-weight:700}
+.foot .keys .dis{color:#3a455e;text-decoration:line-through}
+.foot .keys .nav{float:right;color:#566076}
+.hint{color:var(--dim);font-size:12.5px;margin-top:14px}
+.hint b{color:var(--fg)}
+</style></head>
+<body><div class="wrap">
+<h1>AgentSSH · <span style="color:var(--accent)">Approvals</span> — consequence-first (optimized)</h1>
+<p class="sub">One line per request · no per-row key column · the consequence is shown only for the focused row. <b style="color:var(--fg)">↑↓ or click</b> to move the cursor — the footer updates live.</p>
+
+<div class="termwrap">
+  <div class="bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="t">agentssh tui — Approvals</span></div>
+  <div class="term">
+    <div class="tabline">Hosts · Policy · <span class="on">Approvals</span><span class="meta">4 pending · web-1 prod</span></div>
+    <div id="list"></div>
+    <hr class="sep">
+    <div class="foot">
+      <div class="line1" id="f1"></div>
+      <div class="keys" id="f2"></div>
+    </div>
+  </div>
+</div>
+
+<p class="hint">The footer line is where "consequence-first" lives — for the request you are <b>about to decide</b>, it states plainly what <b>[h] host-allow</b> will free. <b>sudo</b> auto-explains "host unavailable"; a <b>pipe</b> explains "exact only, no generalize". Ordinary rows therefore need no markup, so the list stays one line per request.</p>
+</div>
+
+<script>
+const rows = [
+  {id:"ap_7f3a", host:"web-1", cmd:"systemctl status nginx", mk:"",
+   conq:'<span class="id">ap_7f3a</span> · [h] host-allow → frees <b>systemctl status *</b> (won’t ask again)',
+   keys:'<span class="k">[o]</span> once  <span class="k">[s]</span> session  <span class="k">[h]</span> host  <span class="k">[d]</span> deny'},
+  {id:"ap_5c12", host:"web-1", cmd:"sudo systemctl restart nginx", mk:"·sudo",
+   conq:'<span class="id">ap_5c12</span> · <span class="off">[h] unavailable — sudo is privileged, one-off only</span>',
+   keys:'<span class="k">[o]</span> once  <span class="k">[s]</span> session  <span class="dis">[h] host</span>  <span class="k">[d]</span> deny'},
+  {id:"ap_9d04", host:"db-1", cmd:"cat /etc/passwd | grep root", mk:"·pipe",
+   conq:'<span class="id">ap_9d04</span> · [h] host-allow → <b>this exact command only</b> (pipe, no generalize)',
+   keys:'<span class="k">[o]</span> once  <span class="k">[s]</span> session  <span class="k">[h]</span> host  <span class="k">[d]</span> deny'},
+  {id:"ap_a1b2", host:"web-1", cmd:"journalctl -n 100 -u nginx …", mk:"",
+   conq:'<span class="id">ap_a1b2</span> · [h] host-allow → frees <b>journalctl *</b> (won’t ask again)',
+   keys:'<span class="k">[o]</span> once  <span class="k">[s]</span> session  <span class="k">[h]</span> host  <span class="k">[d]</span> deny'},
+];
+let sel = 0;
+const list = document.getElementById('list');
+function pad(s,n){s=String(s);return s + ' '.repeat(Math.max(0,n-s.length));}
+function render(){
+  list.innerHTML = rows.map((r,i)=>
+    `<div class="row${i===sel?' sel':''}" data-i="${i}">`+
+    `<span class="cur"> </span>`+
+    `<span class="id">${r.id}</span>`+
+    `<span class="host">${pad(r.host,6)}</span>`+
+    `<span class="cmd">${r.cmd}</span>`+
+    (r.mk?`<span class="mk">${r.mk}</span>`:'')+
+    `</div>`).join('');
+  document.getElementById('f1').innerHTML = rows[sel].conq;
+  document.getElementById('f2').innerHTML = rows[sel].keys + '<span class="nav">↑↓ move</span>';
+  [...list.children].forEach(el=>el.onclick=()=>{sel=+el.dataset.i;render();});
+}
+render();
+document.addEventListener('keydown',e=>{
+  if(e.key==='ArrowDown'||e.key==='j'){sel=(sel+1)%rows.length;render();e.preventDefault();}
+  else if(e.key==='ArrowUp'||e.key==='k'){sel=(sel-1+rows.length)%rows.length;render();e.preventDefault();}
+});
+</script>
+</body></html>

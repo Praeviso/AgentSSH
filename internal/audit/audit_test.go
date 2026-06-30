@@ -87,6 +87,63 @@ func TestVerifyDetectsChangedDeletedInsertedRecords(t *testing.T) {
 	})
 }
 
+func TestApprovalFieldsAreHashProtectedAndOldRecordsVerify(t *testing.T) {
+	store := NewStore(filepath.Join(t.TempDir(), "audit.log"))
+	old, err := store.Append(Record{ReqID: "old", Event: EventStarted, Host: "web-1"})
+	if err != nil {
+		t.Fatalf("append old: %v", err)
+	}
+	approval, err := store.Append(Record{
+		ReqID:           "r1",
+		Event:           EventApprovalRequested,
+		Host:            "web-1",
+		ApprovalID:      "ap_0123456789abcdef01234567",
+		ApprovalScope:   "session",
+		ApprovalMatcher: `\Aid\z`,
+		ApprovalChannel: "exit",
+	})
+	if err != nil {
+		t.Fatalf("append approval: %v", err)
+	}
+	records := mustRead(t, store)
+	records[0].Hash = ComputeHash(records[0])
+	if records[0].Hash != old.Hash {
+		t.Fatalf("old hash changed after approval fields were added: %s != %s", records[0].Hash, old.Hash)
+	}
+	result, err := store.Verify()
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if !result.OK {
+		t.Fatalf("verify = %#v", result)
+	}
+
+	fields := []struct {
+		name string
+		edit func(*Record)
+	}{
+		{"approval_id", func(r *Record) { r.ApprovalID = "ap_ffffffffffffffffffffffff" }},
+		{"approval_scope", func(r *Record) { r.ApprovalScope = "host" }},
+		{"approval_matcher", func(r *Record) { r.ApprovalMatcher = `\Als\z` }},
+		{"approval_channel", func(r *Record) { r.ApprovalChannel = "cli" }},
+	}
+	for _, tt := range fields {
+		t.Run(tt.name, func(t *testing.T) {
+			tampered := append([]Record(nil), records...)
+			tt.edit(&tampered[1])
+			writeRecords(t, store.Path, tampered)
+			result, err := store.Verify()
+			if err != nil {
+				t.Fatalf("verify tamper: %v", err)
+			}
+			if result.OK || result.BrokenSeq != approval.Seq || result.Reason != "hash" {
+				t.Fatalf("tamper result = %#v", result)
+			}
+			writeRecords(t, store.Path, records)
+		})
+	}
+}
+
 func TestTruncateBrokenRemovesBrokenTailAndBacksUp(t *testing.T) {
 	store := testStoreWithRecords(t)
 	records := mustRead(t, store)

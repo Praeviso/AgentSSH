@@ -21,6 +21,7 @@ var (
 	ErrGroupNotFound = errors.New("policy rule group not found")
 	ErrHostNotFound  = errors.New("policy host rules host not found")
 	ErrNoHostRules   = errors.New("policy host has no rules")
+	ErrReservedGroup = errors.New("policy rule group name is reserved")
 )
 
 // HostRuleSet bundles the policy rules owned by one concrete host. It is stored
@@ -271,6 +272,9 @@ func CreateGroup(bundle Bundle, name string) (Bundle, error) {
 	if name == "" {
 		return bundle, fmt.Errorf("policy rule group name is required")
 	}
+	if isReservedGroupName(name) {
+		return bundle, ErrReservedGroup
+	}
 	if _, ok := bundle.Policy.RuleGroups[name]; ok {
 		return bundle, ErrGroupExists
 	}
@@ -360,6 +364,9 @@ func StampGroupOntoHost(bundle Bundle, host string, groupName string) (Bundle, e
 	if host == "" {
 		return bundle, fmt.Errorf("policy host name is required")
 	}
+	if isReservedGroupName(groupName) {
+		return bundle, ErrReservedGroup
+	}
 	if _, ok := bundle.Inventory.Hosts[host]; !ok {
 		return bundle, ErrHostNotFound
 	}
@@ -434,6 +441,10 @@ func removeRulesFromGroup(rules []Rule, groupName string) []Rule {
 		out = append(out, rule)
 	}
 	return out
+}
+
+func isReservedGroupName(name string) bool {
+	return name == ApprovalGroup || strings.HasPrefix(name, "__agentssh_")
 }
 
 func ruleIndex(rules []Rule, name string) (int, error) {

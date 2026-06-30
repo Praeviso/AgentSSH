@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Praeviso/AgentSSH/internal/approval"
 	"github.com/Praeviso/AgentSSH/internal/audit"
 	"github.com/Praeviso/AgentSSH/internal/config"
 	"github.com/Praeviso/AgentSSH/internal/discovery"
@@ -28,11 +29,12 @@ import (
 )
 
 const (
-	exitOK           = 0
-	exitRemoteFailed = 1
-	exitUsage        = 2
-	exitPolicyDenied = 6
-	exitSSHError     = 9
+	exitOK               = 0
+	exitRemoteFailed     = 1
+	exitUsage            = 2
+	exitPolicyDenied     = 6
+	exitApprovalRequired = 7
+	exitSSHError         = 9
 )
 
 const envMasterPassword = "AGENTSSH_MASTER_PASSWORD"
@@ -55,6 +57,9 @@ var newExecutor = func(cfg *config.Config) executor.Executor {
 }
 
 var readSecretNoEcho = readSecretFromTTY
+var stdinIsTerminal = func() bool {
+	return term.IsTerminal(int(os.Stdin.Fd()))
+}
 
 func main() {
 	os.Exit(execute())
@@ -128,6 +133,7 @@ func newRootCommand() *cobra.Command {
 		newInventoryCommand(),
 		newSecretCommand(),
 		newPolicyCommand(),
+		newApprovalCommand(),
 		newAuditCommand(),
 		newSessionCommand(),
 	)
@@ -730,6 +736,70 @@ func newAuditRepairCommand() *cobra.Command {
 	return cmd
 }
 
+func newApprovalCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "approval",
+		Short: "Inspect and adjudicate async approvals.",
+	}
+	var lsJSON bool
+	lsCmd := &cobra.Command{
+		Use:   "ls [--json]",
+		Short: "List pending approval requests.",
+		Args:  noArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runApprovalLS(cmd, lsJSON)
+		},
+	}
+	lsCmd.Flags().BoolVar(&lsJSON, "json", false, "emit machine-readable JSON")
+
+	var grantOnce, grantSession, grantHost bool
+	grantCmd := &cobra.Command{
+		Use:   "grant <id> --once|--session|--host",
+		Short: "Approve a pending request.",
+		Args:  exactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			scope, err := approvalScopeFromFlags(grantOnce, grantSession, grantHost)
+			if err != nil {
+				return err
+			}
+			return runApprovalGrant(cmd, args[0], scope)
+		},
+	}
+	grantCmd.Flags().BoolVar(&grantOnce, "once", false, "approve one rerun")
+	grantCmd.Flags().BoolVar(&grantSession, "session", false, "approve this session")
+	grantCmd.Flags().BoolVar(&grantHost, "host", false, "persist an approval host rule")
+
+	denyCmd := &cobra.Command{
+		Use:   "deny <id>",
+		Short: "Deny a pending request.",
+		Args:  exactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runApprovalDeny(cmd, args[0])
+		},
+	}
+	statusCmd := &cobra.Command{
+		Use:   "status <id>",
+		Short: "Read one approval result.",
+		Args:  exactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runApprovalStatus(cmd, args[0])
+		},
+	}
+	var waitTimeout string
+	waitCmd := &cobra.Command{
+		Use:   "wait <id> [--timeout <duration>]",
+		Short: "Wait for an approval result.",
+		Args:  exactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runApprovalWait(cmd, args[0], waitTimeout)
+		},
+	}
+	waitCmd.Flags().StringVar(&waitTimeout, "timeout", "", "maximum wait duration, e.g. 10m")
+
+	cmd.AddCommand(lsCmd, grantCmd, denyCmd, statusCmd, waitCmd)
+	return cmd
+}
+
 func newSessionCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "session",
@@ -756,6 +826,14 @@ func newSessionCommand() *cobra.Command {
 			}
 			_, _ = fmt.Fprintln(cmd.OutOrStdout(), id)
 			return nil
+		},
+	})
+	cmd.AddCommand(&cobra.Command{
+		Use:   "end <id>",
+		Short: "Clear approval grants for a session.",
+		Args:  exactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runSessionEnd(cmd, args[0])
 		},
 	})
 	return cmd
@@ -806,18 +884,28 @@ type runFlags struct {
 }
 
 type runResponse struct {
-	ReqID           string `json:"req_id"`
-	SessionID       string `json:"session_id"`
-	Host            string `json:"host"`
-	Status          string `json:"status"`
-	ExitCode        int    `json:"exit_code"`
-	DurationMS      int64  `json:"duration_ms"`
-	Stdout          string `json:"stdout"`
-	Stderr          string `json:"stderr"`
-	OutputTruncated bool   `json:"output_truncated"`
-	Redactions      int    `json:"redactions"`
-	PolicyAction    string `json:"policy_action,omitempty"`
-	PolicyRule      string `json:"policy_rule,omitempty"`
+	ReqID           string   `json:"req_id"`
+	SessionID       string   `json:"session_id"`
+	Host            string   `json:"host"`
+	Status          string   `json:"status"`
+	ExitCode        int      `json:"exit_code"`
+	DurationMS      int64    `json:"duration_ms"`
+	Stdout          string   `json:"stdout"`
+	Stderr          string   `json:"stderr"`
+	OutputTruncated bool     `json:"output_truncated"`
+	Redactions      int      `json:"redactions"`
+	PolicyAction    string   `json:"policy_action,omitempty"`
+	PolicyRule      string   `json:"policy_rule,omitempty"`
+	ApprovalID      string   `json:"approval_id,omitempty"`
+	ApprovalMatcher string   `json:"approval_matcher,omitempty"`
+	ProposedScopes  []string `json:"proposed_scope,omitempty"`
+}
+
+type runPlan struct {
+	Target     inventory.Target
+	ReqID      string
+	SessionCtx session.Context
+	Auth       approval.Authorization
 }
 
 type usageError string
@@ -848,6 +936,7 @@ var _ = []int{
 	exitRemoteFailed,
 	exitUsage,
 	exitPolicyDenied,
+	exitApprovalRequired,
 	exitSSHError,
 }
 
@@ -1320,7 +1409,7 @@ func resolveOperatorMaster() (string, error) {
 	if master := os.Getenv(envMasterPassword); master != "" {
 		return master, nil
 	}
-	if !term.IsTerminal(int(os.Stdin.Fd())) {
+	if !stdinIsTerminal() {
 		return "", newUsageError("%s is required in non-interactive mode", envMasterPassword)
 	}
 	master, err := readSecretNoEcho("Enter AgentSSH master password: ")
@@ -1647,6 +1736,10 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 	if err != nil {
 		return classifyConfigError(err)
 	}
+	runtime, err := approvalRuntime(cfg)
+	if err != nil {
+		return newUsageError("%v", err)
+	}
 
 	resolved, err := inventory.NewResolver(cfg.Inventory).Resolve(targetName)
 	if err != nil {
@@ -1657,62 +1750,71 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 		return newUsageError("%v\n  list hosts and tags with: agentssh hosts", err)
 	}
 
-	engine, err := policy.NewEngine(cfg.Policy, cfg.Inventory)
-	if err != nil {
-		return newUsageError("policy.yaml is invalid: %v\n  fix the rule in ~/.agentssh/policy.yaml, then re-run (check: agentssh policy show)", err)
-	}
 	outputFilter, err := output.NewFilter(cfg.Policy.Output)
 	if err != nil {
 		return newUsageError("invalid output filter in policy.yaml: %v\n  fix the regex under output.redact in ~/.agentssh/policy.yaml", err)
 	}
-	sessionResolver := session.Resolver{}
 	store := audit.NewStore(cfg.Paths.AuditFile)
+	sessionStore := approval.SessionStore{Dir: cfg.Paths.SessionsDir}
+	pendingStore := approval.PendingStore{PendingDir: cfg.Paths.PendingDir, ResponsesDir: cfg.Paths.ResponsesDir}
 	ssh := newExecutor(cfg)
+	plans, err := buildRunPlans(cfg, resolved, remoteCommand, flags, runtime, sessionStore, runtime.Enabled)
+	if err != nil {
+		return err
+	}
+	if runtime.Enabled && anyPlanNeedsApproval(plans) {
+		return handleApprovalPreflightBlock(cmd, pendingStore, store, plans, remoteCommand, flags, resolved)
+	}
+
 	exitCode := exitOK
 	responses := make([]runResponse, 0, len(resolved.Targets))
-	for _, target := range resolved.Targets {
-		reqID, err := newReqID()
+	for _, plan := range plans {
+		target := plan.Target
+		sessionCtx := plan.SessionCtx
+		reqID := plan.ReqID
+		auth, err := approval.Authorize(cfg.Policy, cfg.Inventory, sessionStore, runtime, sessionCtx.ID, target.Name, remoteCommand)
 		if err != nil {
-			return err
+			return newUsageError("policy.yaml is invalid: %v\n  fix the rule in ~/.agentssh/policy.yaml, then re-run (check: agentssh policy show)", err)
 		}
-		// Resolve the declared session id, then derive a host-specific id for
-		// multi-target runs so a session never spans several hosts.
-		sessionCtx, err := sessionResolver.Resolve(target.Name, flags.session, flags.sessionLabel)
-		if err != nil {
-			if errors.Is(err, session.ErrNoSession) {
-				return newUsageError("a session must be declared for run\n" +
-					"  pass --session <id> or set AGENTSSH_SESSION (e.g. AGENTSSH_SESSION=$(agentssh session new))\n" +
-					"  one session per task keeps the audit trail grouped by task")
-			}
-			return fmt.Errorf("resolve session: %w", err)
-		}
-		sessionCtx.ID = sessionIDForTarget(sessionCtx.ID, target.Name, len(resolved.Targets) > 1)
-		decision, err := engine.Evaluate(target.Name, remoteCommand)
-		if err != nil {
-			return fmt.Errorf("evaluate policy for %s: %w", target.Name, err)
-		}
-		if decision.Action == policy.ActionDeny {
-			if _, err := store.Append(baseAuditRecord(reqID, sessionCtx, audit.EventDenied, target.Name, remoteCommand, decision, nil, "", 0)); err != nil {
+		plan.Auth = auth
+		switch auth.Status {
+		case approval.AuthHardDeny:
+			response, err := appendDeniedRun(cmd, store, plan, remoteCommand, flags, exitPolicyDenied)
+			if err != nil {
 				return err
-			}
-			response := runResponse{
-				ReqID:        reqID,
-				SessionID:    sessionCtx.ID,
-				Host:         target.Name,
-				Status:       "denied",
-				ExitCode:     exitPolicyDenied,
-				PolicyAction: string(decision.Action),
-				PolicyRule:   decision.Rule,
 			}
 			if flags.jsonOutput {
 				responses = append(responses, response)
-			} else {
-				printDenyHuman(cmd, target.Name, remoteCommand, decision)
 			}
 			exitCode = mergeExitCode(exitCode, exitPolicyDenied)
 			continue
+		case approval.AuthNeedsApproval:
+			if !runtime.Enabled {
+				response, err := appendDeniedRun(cmd, store, plan, remoteCommand, flags, exitPolicyDenied)
+				if err != nil {
+					return err
+				}
+				if flags.jsonOutput {
+					responses = append(responses, response)
+				}
+				exitCode = mergeExitCode(exitCode, exitPolicyDenied)
+				continue
+			}
+			response, err := appendApprovalPending(cmd, pendingStore, store, plan, remoteCommand, flags)
+			if err != nil {
+				return err
+			}
+			if flags.jsonOutput {
+				responses = append(responses, response)
+			}
+			exitCode = mergeExitCode(exitCode, exitApprovalRequired)
+			continue
+		case approval.AuthAllow, approval.AuthAllowByGrant:
+		default:
+			return fmt.Errorf("unknown approval authorization status %q", auth.Status)
 		}
 
+		decision := auth.Decision
 		if _, err := store.Append(baseAuditRecord(reqID, sessionCtx, audit.EventStarted, target.Name, remoteCommand, decision, nil, "", 0)); err != nil {
 			return err
 		}
@@ -1799,6 +1901,169 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 		return commandExitError{Code: exitCode}
 	}
 	return nil
+}
+
+func approvalRuntime(cfg *config.Config) (approval.RuntimeConfig, error) {
+	if cfg == nil {
+		return approval.RuntimeConfigFromPolicy(policy.Approval{}, os.Getenv(config.EnvApproval))
+	}
+	return approval.RuntimeConfigFromPolicy(cfg.Policy.Approval, os.Getenv(config.EnvApproval))
+}
+
+func buildRunPlans(cfg *config.Config, resolved inventory.ResolvedTarget, remoteCommand string, flags runFlags, runtime approval.RuntimeConfig, sessionStore approval.SessionStore, preflight bool) ([]runPlan, error) {
+	sessionResolver := session.Resolver{}
+	plans := make([]runPlan, 0, len(resolved.Targets))
+	for _, target := range resolved.Targets {
+		reqID, err := newReqID()
+		if err != nil {
+			return nil, err
+		}
+		sessionCtx, err := sessionResolver.Resolve(target.Name, flags.session, flags.sessionLabel)
+		if err != nil {
+			if errors.Is(err, session.ErrNoSession) {
+				return nil, newUsageError("a session must be declared for run\n" +
+					"  pass --session <id> or set AGENTSSH_SESSION (e.g. AGENTSSH_SESSION=$(agentssh session new))\n" +
+					"  one session per task keeps the audit trail grouped by task")
+			}
+			return nil, fmt.Errorf("resolve session: %w", err)
+		}
+		sessionCtx.ID = sessionIDForTarget(sessionCtx.ID, target.Name, len(resolved.Targets) > 1)
+		var auth approval.Authorization
+		if preflight {
+			auth, err = approval.PreflightAuthorize(cfg.Policy, cfg.Inventory, sessionStore, runtime, sessionCtx.ID, target.Name, remoteCommand)
+		} else {
+			auth, err = approval.Authorize(cfg.Policy, cfg.Inventory, sessionStore, runtime, sessionCtx.ID, target.Name, remoteCommand)
+		}
+		if err != nil {
+			return nil, newUsageError("policy.yaml is invalid: %v\n  fix the rule in ~/.agentssh/policy.yaml, then re-run (check: agentssh policy show)", err)
+		}
+		plans = append(plans, runPlan{Target: target, ReqID: reqID, SessionCtx: sessionCtx, Auth: auth})
+	}
+	return plans, nil
+}
+
+func anyPlanNeedsApproval(plans []runPlan) bool {
+	for _, plan := range plans {
+		if plan.Auth.Status == approval.AuthNeedsApproval {
+			return true
+		}
+	}
+	return false
+}
+
+func handleApprovalPreflightBlock(cmd *cobra.Command, pending approval.PendingStore, store audit.Store, plans []runPlan, remoteCommand string, flags runFlags, resolved inventory.ResolvedTarget) error {
+	exitCode := exitOK
+	responses := make([]runResponse, 0, len(plans))
+	for _, plan := range plans {
+		switch plan.Auth.Status {
+		case approval.AuthHardDeny:
+			response, err := appendDeniedRun(cmd, store, plan, remoteCommand, flags, exitPolicyDenied)
+			if err != nil {
+				return err
+			}
+			responses = append(responses, response)
+			exitCode = mergeExitCode(exitCode, exitPolicyDenied)
+		case approval.AuthNeedsApproval:
+			response, err := appendApprovalPending(cmd, pending, store, plan, remoteCommand, flags)
+			if err != nil {
+				return err
+			}
+			responses = append(responses, response)
+			exitCode = mergeExitCode(exitCode, exitApprovalRequired)
+		default:
+			response := runResponse{
+				ReqID:        plan.ReqID,
+				SessionID:    plan.SessionCtx.ID,
+				Host:         plan.Target.Name,
+				Status:       "not_run",
+				ExitCode:     exitApprovalRequired,
+				PolicyAction: string(plan.Auth.Decision.Action),
+				PolicyRule:   plan.Auth.Decision.Rule,
+			}
+			responses = append(responses, response)
+			if !flags.jsonOutput {
+				printNotRunHuman(cmd, plan.Target.Name)
+			}
+			exitCode = mergeExitCode(exitCode, exitApprovalRequired)
+		}
+	}
+	if flags.jsonOutput {
+		if resolved.Kind == inventory.TargetKindHost {
+			if err := writeJSON(cmd, responses[0]); err != nil {
+				return err
+			}
+		} else if err := writeJSON(cmd, responses); err != nil {
+			return err
+		}
+	}
+	if exitCode != exitOK {
+		return commandExitError{Code: exitCode}
+	}
+	return nil
+}
+
+func appendDeniedRun(cmd *cobra.Command, store audit.Store, plan runPlan, remoteCommand string, flags runFlags, exitCode int) (runResponse, error) {
+	if _, err := store.Append(baseAuditRecord(plan.ReqID, plan.SessionCtx, audit.EventDenied, plan.Target.Name, remoteCommand, plan.Auth.Decision, nil, "", 0)); err != nil {
+		return runResponse{}, err
+	}
+	response := runResponse{
+		ReqID:        plan.ReqID,
+		SessionID:    plan.SessionCtx.ID,
+		Host:         plan.Target.Name,
+		Status:       "denied",
+		ExitCode:     exitCode,
+		PolicyAction: string(plan.Auth.Decision.Action),
+		PolicyRule:   plan.Auth.Decision.Rule,
+	}
+	if !flags.jsonOutput {
+		printDenyHuman(cmd, plan.Target.Name, remoteCommand, plan.Auth.Decision)
+	}
+	return response, nil
+}
+
+func appendApprovalPending(cmd *cobra.Command, pending approval.PendingStore, store audit.Store, plan runPlan, remoteCommand string, flags runFlags) (runResponse, error) {
+	req, err := pending.Create(approval.PendingRequest{
+		ReqID:     plan.ReqID,
+		SessionID: plan.SessionCtx.ID,
+		Host:      plan.Target.Name,
+		Cmd:       remoteCommand,
+		Candidate: plan.Auth.ApprovalMatcher,
+	})
+	if err != nil {
+		return runResponse{}, err
+	}
+	exit := exitApprovalRequired
+	record := baseAuditRecord(plan.ReqID, plan.SessionCtx, audit.EventApprovalRequested, plan.Target.Name, remoteCommand, plan.Auth.Decision, &exit, "", 0)
+	record.ApprovalID = req.ID
+	record.ApprovalMatcher = req.Candidate.Regex
+	record.ApprovalChannel = "exit"
+	if _, err := store.Append(record); err != nil {
+		return runResponse{}, err
+	}
+	response := runResponse{
+		ReqID:           plan.ReqID,
+		SessionID:       plan.SessionCtx.ID,
+		Host:            plan.Target.Name,
+		Status:          "approval_pending",
+		ExitCode:        exitApprovalRequired,
+		PolicyAction:    string(plan.Auth.Decision.Action),
+		PolicyRule:      plan.Auth.Decision.Rule,
+		ApprovalID:      req.ID,
+		ApprovalMatcher: req.Candidate.Regex,
+		ProposedScopes:  scopeStrings(req.ProposedScopes),
+	}
+	if !flags.jsonOutput {
+		printApprovalPendingHuman(cmd, plan.Target.Name, req)
+	}
+	return response, nil
+}
+
+func scopeStrings(scopes []approval.Scope) []string {
+	out := make([]string, 0, len(scopes))
+	for _, scope := range scopes {
+		out = append(out, string(scope))
+	}
+	return out
 }
 
 func sessionIDForTarget(baseID string, host string, multiTarget bool) string {
@@ -1905,6 +2170,15 @@ func printDenyHuman(cmd *cobra.Command, host string, command string, decision po
 	_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "  如确需放宽,请人类修改 ~/.agentssh/policy.yaml。")
 }
 
+func printApprovalPendingHuman(cmd *cobra.Command, host string, req approval.PendingRequest) {
+	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "! approval required · %s · %s\n", host, req.ID)
+	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "  已提交审批;等待操作者裁决后重跑原命令。候选 matcher: %s\n", req.Candidate.Regex)
+}
+
+func printNotRunHuman(cmd *cobra.Command, host string) {
+	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "! not run · %s · waiting for approval on another target\n", host)
+}
+
 func statusForResult(result executor.Result) string {
 	if isSSHErrorResult(result) {
 		return "ssh_error"
@@ -1937,9 +2211,12 @@ func isSSHErrorResult(result executor.Result) bool {
 
 func mergeExitCode(current int, next int) int {
 	// Multi-target runs report the most conservative outcome:
-	// deny(6) > ssh_error(9) > remote_failed(1) > success(0).
+	// deny(6) > approval_required(7) > ssh_error(9) > remote_failed(1) > success(0).
 	if current == exitPolicyDenied || next == exitPolicyDenied {
 		return exitPolicyDenied
+	}
+	if current == exitApprovalRequired || next == exitApprovalRequired {
+		return exitApprovalRequired
 	}
 	if current == exitSSHError || next == exitSSHError {
 		return exitSSHError
@@ -2490,6 +2767,8 @@ func policyGroupUsageError(group string, err error) error {
 		return newUsageError("policy group %q not found", strings.TrimSpace(group))
 	case errors.Is(err, policy.ErrGroupExists):
 		return newUsageError("policy group %q already exists", strings.TrimSpace(group))
+	case errors.Is(err, policy.ErrReservedGroup):
+		return newUsageError("policy group %q is reserved for AgentSSH internals", strings.TrimSpace(group))
 	default:
 		return err
 	}
@@ -2544,14 +2823,16 @@ func runPolicyTest(cmd *cobra.Command, host string, command string) error {
 	if err != nil {
 		return classifyConfigError(err)
 	}
-	engine, err := policy.NewEngine(cfg.Policy, cfg.Inventory)
+	runtime, err := approvalRuntime(cfg)
+	if err != nil {
+		return newUsageError("%v", err)
+	}
+	sessionID := os.Getenv(session.EnvSession)
+	auth, err := approval.PreflightAuthorize(cfg.Policy, cfg.Inventory, approval.SessionStore{Dir: cfg.Paths.SessionsDir}, runtime, sessionID, host, command)
 	if err != nil {
 		return newUsageError("policy.yaml is invalid: %v\n  fix the rule in ~/.agentssh/policy.yaml, then re-run (check: agentssh policy show)", err)
 	}
-	decision, err := engine.Evaluate(host, command)
-	if err != nil {
-		return err
-	}
+	decision := auth.Decision
 	if host != "" {
 		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s · rule=%s · host=%s\n", decision.Action, decision.Rule, host)
 		return nil
@@ -2746,6 +3027,201 @@ func runAuditRepair(cmd *cobra.Command) error {
 	return nil
 }
 
+func runApprovalLS(cmd *cobra.Command, jsonOutput bool) error {
+	if err := requireOperatorTTYAndMaster(); err != nil {
+		return err
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		return classifyConfigError(err)
+	}
+	requests, err := approvalStore(cfg.Paths).List()
+	if err != nil {
+		return err
+	}
+	if jsonOutput {
+		return writeJSON(cmd, requests)
+	}
+	out := cmd.OutOrStdout()
+	if len(requests) == 0 {
+		_, _ = fmt.Fprintln(out, "(none)")
+		return nil
+	}
+	for _, req := range requests {
+		_, _ = fmt.Fprintf(out, "%s host=%s session=%s scope=%s cmd=%s matcher=%s\n", req.ID, req.Host, req.SessionID, strings.Join(scopeStrings(req.ProposedScopes), ","), strconv.Quote(req.Cmd), strconv.Quote(req.Candidate.Regex))
+	}
+	return nil
+}
+
+func runApprovalGrant(cmd *cobra.Command, id string, scope approval.Scope) error {
+	if err := requireOperatorTTYAndMaster(); err != nil {
+		return err
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		return classifyConfigError(err)
+	}
+	runtime, err := approvalRuntime(cfg)
+	if err != nil {
+		return newUsageError("%v", err)
+	}
+	_, err = approval.ApplyDecision(approval.ApplyOptions{
+		Pending:    approvalStore(cfg.Paths),
+		Sessions:   approval.SessionStore{Dir: cfg.Paths.SessionsDir},
+		Audit:      audit.NewStore(cfg.Paths.AuditFile),
+		Bundle:     policy.Bundle{Policy: cfg.Policy, Inventory: cfg.Inventory},
+		PolicyPath: cfg.Paths.PolicyFile,
+		SessionTTL: runtime.SessionTTL,
+		Channel:    approval.ChannelCLI,
+		SavePolicy: func(next policy.Config) error {
+			return saveValidatedPolicy(cfg.Paths, next)
+		},
+	}, id, approval.VerdictApproved, scope)
+	if errors.Is(err, approval.ErrPendingNotFound) || errors.Is(err, approval.ErrInvalidID) {
+		return newUsageError("%v", err)
+	}
+	if errors.Is(err, approval.ErrAlreadyResolved) {
+		return newUsageError("approval %s is already resolved", id)
+	}
+	if err != nil {
+		return err
+	}
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "approved %s scope=%s\n", id, scope)
+	return nil
+}
+
+func runApprovalDeny(cmd *cobra.Command, id string) error {
+	if err := requireOperatorTTYAndMaster(); err != nil {
+		return err
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		return classifyConfigError(err)
+	}
+	_, err = approval.ApplyDecision(approval.ApplyOptions{
+		Pending: approvalStore(cfg.Paths),
+		Audit:   audit.NewStore(cfg.Paths.AuditFile),
+		Channel: approval.ChannelCLI,
+	}, id, approval.VerdictDenied, "")
+	if errors.Is(err, approval.ErrPendingNotFound) || errors.Is(err, approval.ErrInvalidID) {
+		return newUsageError("%v", err)
+	}
+	if errors.Is(err, approval.ErrAlreadyResolved) {
+		return newUsageError("approval %s is already resolved", id)
+	}
+	if err != nil {
+		return err
+	}
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "denied %s\n", id)
+	return nil
+}
+
+func runApprovalStatus(cmd *cobra.Command, id string) error {
+	cfg, err := config.Load()
+	if err != nil {
+		return classifyConfigError(err)
+	}
+	status, err := approvalStore(cfg.Paths).Status(id)
+	if errors.Is(err, approval.ErrPendingNotFound) || errors.Is(err, approval.ErrInvalidID) {
+		return newUsageError("%v", err)
+	}
+	if err != nil {
+		return err
+	}
+	if err := writeJSON(cmd, status); err != nil {
+		return err
+	}
+	return approvalStatusExit(status)
+}
+
+func runApprovalWait(cmd *cobra.Command, id string, timeoutValue string) error {
+	cfg, err := config.Load()
+	if err != nil {
+		return classifyConfigError(err)
+	}
+	runtime, err := approvalRuntime(cfg)
+	if err != nil {
+		return newUsageError("%v", err)
+	}
+	timeout := runtime.WaitTimeout
+	if timeoutValue != "" {
+		timeout, err = time.ParseDuration(timeoutValue)
+		if err != nil || timeout < 0 {
+			return newUsageError("invalid --timeout %q", timeoutValue)
+		}
+	}
+	status, err := approvalStore(cfg.Paths).Wait(id, timeout)
+	if errors.Is(err, approval.ErrPendingNotFound) || errors.Is(err, approval.ErrInvalidID) {
+		return newUsageError("%v", err)
+	}
+	if err != nil {
+		return err
+	}
+	if err := writeJSON(cmd, status); err != nil {
+		return err
+	}
+	return approvalStatusExit(status)
+}
+
+func runSessionEnd(cmd *cobra.Command, id string) error {
+	if err := requireOperatorTTYAndMaster(); err != nil {
+		return err
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		return classifyConfigError(err)
+	}
+	if err := (approval.SessionStore{Dir: cfg.Paths.SessionsDir}).End(id); err != nil {
+		return err
+	}
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "ended session %s\n", id)
+	return nil
+}
+
+func approvalStatusExit(status approval.StatusResult) error {
+	switch status.Status {
+	case "approved":
+		return nil
+	case "denied":
+		return commandExitError{Code: exitPolicyDenied}
+	default:
+		return commandExitError{Code: exitApprovalRequired}
+	}
+}
+
+func approvalScopeFromFlags(once, sessionScope, host bool) (approval.Scope, error) {
+	count := 0
+	var scope approval.Scope
+	if once {
+		count++
+		scope = approval.ScopeOnce
+	}
+	if sessionScope {
+		count++
+		scope = approval.ScopeSession
+	}
+	if host {
+		count++
+		scope = approval.ScopeHost
+	}
+	if count != 1 {
+		return "", newUsageError("approval grant requires exactly one of --once, --session, or --host")
+	}
+	return scope, nil
+}
+
+func approvalStore(paths config.Paths) approval.PendingStore {
+	return approval.PendingStore{PendingDir: paths.PendingDir, ResponsesDir: paths.ResponsesDir}
+}
+
+func requireOperatorTTYAndMaster() error {
+	if !stdinIsTerminal() {
+		return newUsageError("operator approval commands require an interactive TTY")
+	}
+	_, err := resolveOperatorMaster()
+	return err
+}
+
 func runSessionLS(cmd *cobra.Command) error {
 	cfg, err := config.Load()
 	if err != nil {
@@ -2795,11 +3271,11 @@ type eventValue audit.Event
 
 func (v *eventValue) Set(value string) error {
 	switch audit.Event(value) {
-	case "", audit.EventStarted, audit.EventCompleted, audit.EventFailed, audit.EventDenied:
+	case "", audit.EventStarted, audit.EventCompleted, audit.EventFailed, audit.EventDenied, audit.EventApprovalRequested, audit.EventApprovalGranted, audit.EventApprovalDenied:
 		*v = eventValue(value)
 		return nil
 	default:
-		return newUsageError("invalid --status %q; expected one of: started, completed, failed, denied", value)
+		return newUsageError("invalid --status %q; expected one of: started, completed, failed, denied, approval_requested, approval_granted, approval_denied", value)
 	}
 }
 
