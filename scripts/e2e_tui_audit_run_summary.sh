@@ -8,18 +8,21 @@ usage() {
   cat <<'EOF'
 Usage: scripts/e2e_tui_audit_run_summary.sh [--no-tui]
 
-Creates an isolated AGENTSSH_HOME with a deterministic audit.log, then opens the
-real AgentSSH TUI so you can inspect the Audit tab's session-first behavior.
+Creates an isolated AGENTSSH_HOME with a deterministic audit.log and a queue of
+pending gray-zone approvals, then opens the real AgentSSH TUI so you can inspect
+both the Approvals tab and the per-host Audit (Sessions) viewer.
 
 Options:
-  --no-tui   Generate data and print audit ls / verify output, but do not open TUI.
+  --no-tui   Generate data and print audit ls / verify plus the seeded pending
+             approvals, but do not open the TUI.
 
 Environment:
   AGENTSSH_E2E_HOME   Use this directory instead of creating /tmp/agentssh-tui-e2e.*.
   AGENTSSH_BIN        Command used to run AgentSSH. Defaults to: go run ./cmd/agentssh
 
-The generated audit data is synthetic. It includes a literal denied command such
-as "rm -rf /" in audit.log, but the command is never executed.
+The generated data is synthetic. audit.log includes a literal denied command
+such as "rm -rf /", and the pending approvals are produced by `run` returning
+exit 7 in the gray zone; no SSH connection is made and no command is executed.
 EOF
 }
 
@@ -68,6 +71,9 @@ YAML
 
 cat > "$home/policy.yaml" <<'YAML'
 version: 1
+approval:
+  enabled: true
+  host_grant_mode: safe-prefix
 rules:
   - name: catastrophic
     priority: 100
@@ -186,6 +192,36 @@ with open(path, "w", encoding="utf-8") as fh:
         fh.write("\n")
 PY
 
+# Seed the Approvals tab. With approval.enabled: true in policy.yaml, gray-zone
+# (default-deny) commands from `run` return exit 7 and write a pending request
+# file under approvals/pending/ — no SSH connection is attempted. The commands
+# below are chosen to exercise every row marker and consequence the tab renders:
+#   - prefix matcher (safe-prefix host-allow would generalize): ls / git / kubectl
+#   - exact matcher (host-allow stays this-command-only): systemctl / journalctl
+#   - privileged, non-promotable (host scope unavailable): sudo ...
+# Each run also appends an approval-requested record to audit.log, so the chain
+# stays intact and the events show up in the host Sessions view too.
+seed_pending() {
+  local sess="$1" host="$2"
+  shift 2
+  AGENTSSH_HOME="$home" AGENTSSH_SESSION="$sess" \
+    bash -lc "$agentssh_cmd run $host -- $*" >/dev/null 2>&1 || true
+}
+
+# Start from a clean queue so re-running against a reused AGENTSSH_E2E_HOME keeps
+# the seeded set at exactly six (fresh session ids each run would otherwise stack).
+rm -rf "$home/approvals"
+
+s_prod="$(AGENTSSH_HOME="$home" bash -lc "$agentssh_cmd session new")"
+s_stg="$(AGENTSSH_HOME="$home" bash -lc "$agentssh_cmd session new")"
+
+seed_pending "$s_prod" web-prod-1 systemctl restart nginx
+seed_pending "$s_prod" web-prod-1 journalctl -u nginx -n 100
+seed_pending "$s_prod" web-prod-1 sudo systemctl restart nginx
+seed_pending "$s_stg" web-staging-1 ls -la /var/log/nginx
+seed_pending "$s_stg" web-staging-1 git status
+seed_pending "$s_stg" web-staging-1 kubectl get pods -n prod
+
 echo "AgentSSH TUI audit-session-first E2E"
 echo "  AGENTSSH_HOME=$home"
 echo "  AgentSSH command: $agentssh_cmd"
@@ -197,16 +233,60 @@ echo "Hash-chain verification:"
 AGENTSSH_HOME="$home" bash -lc "$agentssh_cmd audit verify"
 echo
 
+echo "Seeded pending approvals (adjudicate these in the Approvals tab):"
+# `approval ls` requires an operator TTY, so read the pending files directly here.
+python3 - "$home/approvals/pending" <<'PY'
+import glob
+import json
+import os
+import sys
+
+pending_dir = sys.argv[1]
+rows = []
+for path in sorted(glob.glob(os.path.join(pending_dir, "*.json"))):
+    with open(path, encoding="utf-8") as fh:
+        req = json.load(fh)
+    cand = req["candidate_matcher"]
+    if not cand.get("promotable", False):
+        kind = "priv"       # host scope unavailable
+    elif cand["kind"] == "prefix":
+        kind = "prefix"     # host-allow generalizes to "<prefix> *"
+    else:
+        kind = "exact"      # host-allow stays this-command-only
+    rows.append((req["host"], req["cmd"], kind))
+
+if not rows:
+    print("  (none)")
+else:
+    for host, cmd, kind in rows:
+        print(f"  {host:<14} {kind:<6} {cmd}")
+PY
+echo
+
 cat <<EOF
 Manual TUI checklist:
-  1. TUI opens on Hosts. Press "2" to switch to Audit.
-  2. Audit should show sessions only, sorted by latest update time.
-  3. Session "s_incident" should show 3 commands, not 5 records.
-  4. Press Enter on "s_incident"; the detail should list command results only.
-  5. The denied command should show exit 6 / not executed semantics.
-  6. Raw record evidence such as seq/hash/Event chain should not appear in TUI detail.
-  7. Press "/" then type "status:started" and Enter. Only the live session should remain.
-  8. Press Esc to clear the filter, then press "q" to exit.
+
+Approvals tab (async gray-zone adjudication):
+  1. TUI opens on Hosts. Press "3" to switch to Approvals.
+  2. The queue should list 6 pending requests, one line each: id / host / command
+     / a kind marker (prefix rows have no marker, "exact" or "priv" otherwise).
+  3. Move with j/k. For the focused row, the consequence line below the list
+     states exactly what an [h] host-allow would free:
+       - "ls -la ..." (prefix)       -> host-allow frees "ls *"
+       - "systemctl restart nginx"   -> host-allow stays this exact command
+       - "sudo systemctl restart .."  -> [h] unavailable (privileged)
+  4. Press "s" (session) on one row: it disappears and a toast confirms; a re-run
+     of that exact command in the same session would now be allowed.
+  5. Press "h" (host) on a prefix row (e.g. the git or kubectl one): a generated
+     approval/... rule is written to policy.yaml. Press "2" (Policy) to see it.
+  6. Press "h" on the "sudo ..." row: it is refused (privileged, non-promotable).
+  7. Press "d" to deny a row; press "r" to refresh the queue.
+
+Audit (per-host session viewer):
+  8. Press "1" (Hosts), select a host, press Enter to open its detail.
+  9. Open the Sessions pane: sessions are shown newest-first, one row per command
+     (not per raw record). The denied "rm -rf /" shows exit 6 / not executed.
+ 10. Approval-requested events seeded above appear here too. Press "q" to exit.
 EOF
 
 if [[ "$open_tui" -eq 0 ]]; then

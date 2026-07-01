@@ -26,9 +26,14 @@ type approvalsSection struct {
 	runtime approval.RuntimeConfig
 	pending []approval.PendingRequest
 	cursor  int
-	err     error
-	result  string
-	w, h    int
+	// choosing is the Enter-driven verdict menu: while open the footer swaps to a
+	// selectable once/session/host/deny chooser and this tab owns the keyboard.
+	choosing  bool
+	choiceIdx int
+	choiceID  string // request the open chooser targets, so a poll can't misapply it
+	err       error
+	result    string
+	w, h      int
 }
 
 const approvalsPollInterval = 1500 * time.Millisecond
@@ -46,9 +51,10 @@ func newApprovalsSection(paths config.Paths, st appStyles, runtime approval.Runt
 	return approvalsSection{paths: paths, styles: st, runtime: runtime}
 }
 
-// capturing is always false: this tab has no text input or modal, so the shell
-// keeps ownership of tab/esc/q.
-func (s approvalsSection) capturing() bool { return false }
+// capturing is true only while the Enter-driven verdict chooser is open, so the
+// shell hands this tab the keyboard (esc cancels, enter applies) instead of
+// treating those keys as tab/quit navigation.
+func (s approvalsSection) capturing() bool { return s.choosing }
 
 func (s approvalsSection) Init() tea.Cmd {
 	if !s.runtime.Enabled {
@@ -103,6 +109,7 @@ func (s approvalsSection) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		s.pending = msg.pending
 		s.err = msg.err
 		s.clampCursor()
+		s.resyncChooser()
 		return s, nil
 	case tea.KeyMsg:
 		return s.updateKey(msg)
@@ -111,6 +118,9 @@ func (s approvalsSection) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (s approvalsSection) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if s.choosing {
+		return s.updateChoosing(msg)
+	}
 	switch msg.String() {
 	case "j", "down":
 		s.moveCursor(1)
@@ -122,31 +132,129 @@ func (s approvalsSection) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "G", "end":
 		s.cursor = maxInt(len(s.pending)-1, 0)
 		s.clearStatus()
+	case "enter":
+		return s.openChooser()
 	case "o":
-		if !s.runtime.Enabled {
-			return s, nil
-		}
-		return s.decide(approval.VerdictApproved, approval.ScopeOnce)
+		return s.resolveWith(approval.VerdictApproved, approval.ScopeOnce)
 	case "s":
-		if !s.runtime.Enabled {
-			return s, nil
-		}
-		return s.decide(approval.VerdictApproved, approval.ScopeSession)
+		return s.resolveWith(approval.VerdictApproved, approval.ScopeSession)
 	case "h":
-		if !s.runtime.Enabled {
-			return s, nil
-		}
-		return s.decide(approval.VerdictApproved, approval.ScopeHost)
+		return s.resolveWith(approval.VerdictApproved, approval.ScopeHost)
 	case "d":
-		if !s.runtime.Enabled {
-			return s, nil
-		}
-		return s.decide(approval.VerdictDenied, "")
+		return s.resolveWith(approval.VerdictDenied, "")
 	case "r":
 		s.clearStatus()
 		return s, s.loadCmd()
 	}
 	return s, nil
+}
+
+// updateChoosing drives the Enter verdict menu: arrows/tab move the highlight,
+// enter/space applies it, esc cancels, and the o/s/h/d shortcuts still apply a
+// verdict directly. All other keys are swallowed so the modal keeps focus.
+func (s approvalsSection) updateChoosing(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	choices := s.choices()
+	switch msg.String() {
+	case "left", "shift+tab":
+		s.choiceIdx = maxInt(s.choiceIdx-1, 0)
+	case "right", "tab":
+		s.choiceIdx = minInt(s.choiceIdx+1, len(choices)-1)
+	case "enter", " ":
+		if s.choiceIdx >= 0 && s.choiceIdx < len(choices) {
+			c := choices[s.choiceIdx]
+			return s.resolveWith(c.verdict, c.scope)
+		}
+	case "esc":
+		s.choosing = false
+		s.choiceID = ""
+		s.clearStatus()
+	case "o":
+		return s.resolveWith(approval.VerdictApproved, approval.ScopeOnce)
+	case "s":
+		return s.resolveWith(approval.VerdictApproved, approval.ScopeSession)
+	case "h":
+		return s.resolveWith(approval.VerdictApproved, approval.ScopeHost)
+	case "d":
+		return s.resolveWith(approval.VerdictDenied, "")
+	}
+	return s, nil
+}
+
+// openChooser starts the verdict menu on the focused request. It is a no-op when
+// approval is disabled or the queue is empty.
+func (s approvalsSection) openChooser() (tea.Model, tea.Cmd) {
+	if !s.runtime.Enabled {
+		return s, nil
+	}
+	req, ok := s.selected()
+	if !ok {
+		return s, nil
+	}
+	s.clearStatus()
+	s.choosing = true
+	s.choiceIdx = 0
+	s.choiceID = req.ID
+	return s, nil
+}
+
+// resolveWith closes the chooser (if open) and applies a verdict to the focused
+// request, shared by the direct o/s/h/d shortcuts and the menu.
+func (s approvalsSection) resolveWith(verdict approval.Verdict, scope approval.Scope) (tea.Model, tea.Cmd) {
+	if !s.runtime.Enabled {
+		return s, nil
+	}
+	s.choosing = false
+	s.choiceID = ""
+	return s.decide(verdict, scope)
+}
+
+// resyncChooser keeps the open menu pinned to the request it targeted across a
+// background poll: it re-points the cursor to that request, or closes the menu
+// if the request was resolved elsewhere and is gone.
+func (s *approvalsSection) resyncChooser() {
+	if !s.choosing {
+		return
+	}
+	idx := s.indexOfReq(s.choiceID)
+	if idx < 0 {
+		s.choosing = false
+		s.choiceID = ""
+		return
+	}
+	s.cursor = idx
+	if choices := s.choices(); s.choiceIdx >= len(choices) {
+		s.choiceIdx = maxInt(len(choices)-1, 0)
+	}
+}
+
+func (s approvalsSection) indexOfReq(id string) int {
+	for i, req := range s.pending {
+		if req.ID == id {
+			return i
+		}
+	}
+	return -1
+}
+
+// approvalChoice is one entry in the verdict menu.
+type approvalChoice struct {
+	label   string
+	verdict approval.Verdict
+	scope   approval.Scope
+}
+
+// choices are the verdict options for the focused request. Host is offered only
+// when the request is promotable, so the menu never presents an action that
+// would be refused.
+func (s approvalsSection) choices() []approvalChoice {
+	out := []approvalChoice{
+		{"once", approval.VerdictApproved, approval.ScopeOnce},
+		{"session", approval.VerdictApproved, approval.ScopeSession},
+	}
+	if req, ok := s.selected(); ok && req.Candidate.Promotable {
+		out = append(out, approvalChoice{"host", approval.VerdictApproved, approval.ScopeHost})
+	}
+	return append(out, approvalChoice{"deny", approval.VerdictDenied, ""})
 }
 
 func (s *approvalsSection) moveCursor(delta int) {
@@ -249,10 +357,15 @@ func (s approvalsSection) helpKeyMap() help.KeyMap {
 	if !s.runtime.Enabled || len(s.pending) == 0 {
 		return helpMap{short: []key.Binding{hk("r", "refresh")}}
 	}
+	if s.choosing {
+		return helpMap{
+			short: []key.Binding{hk("←/→", "move"), hk("enter", "apply"), hk("esc", "cancel")},
+		}
+	}
 	return helpMap{
-		short: []key.Binding{hk("o", "once"), hk("s", "session"), hk("h", "host"), hk("d", "deny")},
+		short: []key.Binding{hk("enter", "decide"), hk("j/k", "move"), hk("r", "refresh")},
 		full: [][]key.Binding{
-			{hk("j/k", "move"), hk("g/G", "home/end"), hk("r", "refresh")},
+			{hk("j/k", "move"), hk("g/G", "home/end"), hk("enter", "decide"), hk("r", "refresh")},
 			{hk("o", "once"), hk("s", "session"), hk("h", "host"), hk("d", "deny")},
 		},
 	}
@@ -278,10 +391,15 @@ func (s approvalsSection) View() string {
 	var b strings.Builder
 	visible := s.visibleRows()
 	start, end := scrollWindow(s.cursor, len(s.pending), visible)
+	rows := make([][]string, 0, end-start)
 	for i := start; i < end; i++ {
-		b.WriteString(s.renderRow(s.pending[i], i == s.cursor, inner))
-		b.WriteString("\n")
+		rows = append(rows, approvalRow(s.pending[i]))
 	}
+	// Reuse the shared responsive table (fill=true) so the columns span the
+	// frame instead of clumping at fixed widths: COMMAND takes the slack, HOST
+	// shows in full, KIND is a tidy right column.
+	b.WriteString(renderTable(s.styles, approvalColumns, rows, s.cursor-start, inner, true))
+	b.WriteString("\n")
 	if end < len(s.pending) || start > 0 {
 		b.WriteString(s.styles.dim.Render(fmt.Sprintf("%d-%d of %d", start+1, end, len(s.pending))))
 		b.WriteString("\n")
@@ -291,49 +409,47 @@ func (s approvalsSection) View() string {
 	if req, ok := s.selected(); ok {
 		b.WriteString(truncate(s.consequenceLine(req), inner))
 	}
-	if s.err != nil {
+	switch {
+	case s.choosing:
+		b.WriteString("\n" + truncate(s.chooserLine(), inner))
+	case s.err != nil:
 		b.WriteString("\n" + truncate(s.styles.err.Render(s.err.Error()), inner))
-	} else if s.result != "" {
+	case s.result != "":
 		b.WriteString("\n" + truncate(s.styles.confirm.Render(s.result), inner))
 	}
 	return s.styles.background.MaxWidth(s.w).Render(b.String())
 }
 
-// renderRow draws one pending request on a single line: cursor · id · host ·
-// command · a short kind marker (priv / exact). The focused row is brighter.
-func (s approvalsSection) renderRow(req approval.PendingRequest, selected bool, inner int) string {
-	marker := "  "
-	if selected {
-		marker = s.styles.cursor.Render("▌ ")
-	}
-	id := s.styles.dim.Render(shortApprovalID(req.ID))
-	host := padCell(req.Host, 12)
-	kind := s.rowMarker(req)
-
-	// Reserve columns for id (12), host (12), marker prefix (2), kind (~6) and gaps.
-	cmdWidth := inner - 2 - 12 - 1 - 12 - 1 - 7
-	if cmdWidth < 8 {
-		cmdWidth = 8
-	}
-	cmd := truncate(req.Cmd, cmdWidth)
-	if selected {
-		cmd = s.styles.header.Render(cmd)
-	}
-	line := marker + id + " " + s.styles.dim.Render(host) + " " + cmd
-	if kind != "" {
-		line += "  " + kind
-	}
-	return truncate(line, inner)
+// approvalColumns is the aligned, responsive layout for the pending queue. KIND
+// telegraphs what an [h] host-allow does (prefix generalizes, exact stays
+// this-command-only, priv can't promote); COMMAND carries the most weight so it
+// absorbs the slack on a wide frame.
+var approvalColumns = []tableColumn{
+	{header: "ID", min: 12, max: 14},
+	{header: "HOST", min: 6, max: 20, weight: 1},
+	{header: "COMMAND", min: 12, weight: 4},
+	{header: "KIND", min: 4, max: 6, right: true},
 }
 
-func (s approvalsSection) rowMarker(req approval.PendingRequest) string {
+func approvalRow(req approval.PendingRequest) []string {
+	return []string{
+		shortApprovalID(req.ID),
+		req.Host,
+		req.Cmd,
+		kindLabel(req),
+	}
+}
+
+// kindLabel classifies a request by what host-allow would free — the same split
+// the consequence line spells out for the focused row.
+func kindLabel(req approval.PendingRequest) string {
 	switch {
 	case !req.Candidate.Promotable:
-		return s.styles.confirm.Render("priv")
+		return "priv"
 	case req.Candidate.Kind == approval.MatcherPrefix:
-		return ""
+		return "prefix"
 	default:
-		return s.styles.dim.Render("exact")
+		return "exact"
 	}
 }
 
@@ -355,10 +471,26 @@ func (s approvalsSection) consequenceLine(req approval.PendingRequest) string {
 	}
 }
 
+// chooserLine renders the Enter-driven verdict menu that replaces the footer
+// hints while open: once / session / host / deny with the focused option
+// bracketed and highlighted, mirroring the Info pane's auth-mode chooser.
+func (s approvalsSection) chooserLine() string {
+	choices := s.choices()
+	cells := make([]string, len(choices))
+	for i, c := range choices {
+		if i == s.choiceIdx {
+			cells[i] = s.styles.cursor.Render("[" + c.label + "]")
+		} else {
+			cells[i] = s.styles.dim.Render(" " + c.label + " ")
+		}
+	}
+	return s.styles.dim.Render("decide: ") + strings.Join(cells, " ")
+}
+
 func (s approvalsSection) visibleRows() int {
-	// Body height minus the separator, the consequence line, and a possible
-	// status/overflow line.
-	v := s.h - 3
+	// Body height minus the table header, the separator, the consequence line,
+	// and a possible status/overflow line.
+	v := s.h - 4
 	if v < 1 {
 		v = 1
 	}
@@ -370,11 +502,4 @@ func shortApprovalID(id string) string {
 		return id
 	}
 	return id[:11] + "…"
-}
-
-func padCell(value string, width int) string {
-	if len(value) >= width {
-		return truncate(value, width)
-	}
-	return value + strings.Repeat(" ", width-len(value))
 }

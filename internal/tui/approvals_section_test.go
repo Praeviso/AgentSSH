@@ -183,3 +183,99 @@ func TestApprovalsDecisionLoadErrorAborts(t *testing.T) {
 		t.Fatalf("policy file was clobbered:\n%s", raw)
 	}
 }
+
+func TestApprovalsEnterOpensChooserAndEscCancels(t *testing.T) {
+	m := loadedApprovalsApp(t)
+
+	m = press(t, m, "enter")
+	if !m.approvals.choosing {
+		t.Fatal("enter should open the verdict chooser")
+	}
+	view := m.View()
+	// The footer hints swap to the chooser controls, and the menu renders inline.
+	for _, want := range []string{"decide:", "[once]", "enter apply", "esc cancel"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("chooser view missing %q:\n%s", want, view)
+		}
+	}
+	// While the menu owns the keyboard the shell must not treat keys as tab/quit.
+	if !m.approvals.capturing() {
+		t.Error("open chooser should capture the keyboard")
+	}
+
+	// Navigation clamps at the ends and moves the highlight.
+	m = press(t, m, "right")
+	if m.approvals.choiceIdx != 1 {
+		t.Fatalf("right should move to session (idx 1), got %d", m.approvals.choiceIdx)
+	}
+	m = press(t, m, "left")
+	m = press(t, m, "left")
+	if m.approvals.choiceIdx != 0 {
+		t.Fatalf("left should clamp at once (idx 0), got %d", m.approvals.choiceIdx)
+	}
+
+	m = press(t, m, "esc")
+	if m.approvals.choosing {
+		t.Fatal("esc should cancel the chooser")
+	}
+}
+
+func TestApprovalsChooserOmitsHostOnPrivileged(t *testing.T) {
+	m := loadedApprovalsApp(t)
+	m = press(t, m, "j")     // focus the sudo (non-promotable) request
+	m = press(t, m, "enter") // open the chooser
+
+	got := m.approvals.choices()
+	if len(got) != 3 {
+		t.Fatalf("privileged request should offer 3 options (once/session/deny), got %d: %+v", len(got), got)
+	}
+	for _, c := range got {
+		if c.scope == approval.ScopeHost {
+			t.Errorf("privileged request must not offer host scope: %+v", got)
+		}
+	}
+}
+
+func TestApprovalsChooserApplyResolvesRequest(t *testing.T) {
+	dir := t.TempDir()
+	paths := config.NewPaths(dir)
+	if err := os.WriteFile(paths.InventoryFile, []byte("version: 1\nhosts:\n  web-1: {addr: 10.0.0.11}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.PolicyFile, []byte("version: 1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	req := mkApprovalReq(t, "ap_7f3a1b2c3d4e5f6071829300", "web-1", "s1", "ls /var")
+	store := approval.PendingStore{PendingDir: paths.PendingDir, ResponsesDir: paths.ResponsesDir}
+	if _, err := store.Create(req); err != nil {
+		t.Fatal(err)
+	}
+
+	section := approvalsSection{
+		paths:   paths,
+		styles:  newAppStyles(lipgloss.NewRenderer(os.Stdout)),
+		runtime: approval.RuntimeConfig{Enabled: true},
+		pending: []approval.PendingRequest{req},
+	}
+
+	// Enter opens the menu (once is pre-selected); Enter again applies it.
+	next, _ := section.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	section = next.(approvalsSection)
+	if !section.choosing {
+		t.Fatal("enter did not open the chooser")
+	}
+	next, cmd := section.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	section = next.(approvalsSection)
+	if cmd == nil {
+		t.Fatal("applying a verdict should schedule a reload command")
+	}
+	if section.choosing {
+		t.Error("applying a verdict should close the chooser")
+	}
+	if _, err := os.Stat(filepath.Join(paths.ResponsesDir, req.ID+".json")); err != nil {
+		t.Fatalf("response file not written after apply: %v", err)
+	}
+	if section.pendingCount() != 0 {
+		t.Errorf("applied request should be dropped from the queue, got %d", section.pendingCount())
+	}
+}
