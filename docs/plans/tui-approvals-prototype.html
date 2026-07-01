@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AgentSSH · Approvals TUI 原型 v2(简洁克制版)</title>
+<style>
+:root{--bg:#0f1117;--panel:#161a23;--term:#0b0e14;--fg:#cdd6e4;--dim:#7c8699;--accent:#7dcfff;--accent2:#9ece6a;--warn:#e0af68;--gold:#e0af68;--line:#222838}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font-family:-apple-system,Segoe UI,Roboto,"PingFang SC","Microsoft YaHei",sans-serif;line-height:1.5}
+header{padding:22px 26px 0;max-width:1100px;margin:0 auto}
+h1{font-size:19px;margin:0 0 4px;font-weight:650}
+.sub{color:var(--dim);font-size:13px;margin:0 0 14px}
+.switch{display:flex;flex-wrap:wrap;gap:8px;position:sticky;top:0;background:var(--bg);padding:8px 0;z-index:5;border-bottom:1px solid var(--line)}
+.switch button{cursor:pointer;border:1px solid var(--line);background:var(--panel);color:var(--dim);font:600 13px/1 inherit;padding:9px 13px;border-radius:7px;transition:.12s;position:relative}
+.switch button .k{display:inline-block;width:18px;height:18px;line-height:18px;text-align:center;border-radius:4px;background:#0b0e14;margin-right:7px;color:var(--accent);font-size:11px}
+.switch button:hover{color:var(--fg);border-color:#3a455e}
+.switch button.active{color:#0b0e14;background:var(--accent);border-color:var(--accent)}
+.switch button.active .k{background:rgba(0,0,0,.25);color:#0b0e14}
+.switch button.rec::after{content:"★";color:var(--gold);margin-left:7px;font-size:12px}
+.switch button.active.rec::after{color:#0b0e14}
+main{max-width:1100px;margin:0 auto;padding:18px 26px 60px}
+.screen{display:none}
+.screen.active{display:block;animation:fade .15s ease}
+@keyframes fade{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+.cap{font-size:15px;margin:6px 0 14px}
+.cap .num{display:inline-block;background:var(--accent);color:#0b0e14;font-weight:700;font-size:12px;padding:2px 8px;border-radius:5px;margin-right:9px;vertical-align:1px}
+.cap .rec{display:inline-block;background:var(--gold);color:#0b0e14;font-weight:700;font-size:11px;padding:2px 7px;border-radius:5px;margin-left:9px;vertical-align:1px}
+.cap b{font-weight:700}.cap .one{color:var(--dim);font-size:13px;display:block;margin-top:5px}
+.termwrap{background:var(--term);border:1px solid var(--line);border-radius:9px;overflow:hidden;box-shadow:0 8px 30px rgba(0,0,0,.35)}
+.bar{display:flex;align-items:center;gap:7px;padding:9px 13px;border-bottom:1px solid #1b2130;background:#0d111a}
+.bar .dot{width:11px;height:11px;border-radius:50%}
+.bar .r{background:#f7768e}.bar .y{background:#e0af68}.bar .g{background:#9ece6a}
+.bar .t{margin-left:8px;color:var(--dim);font-size:12px;font-family:ui-monospace,Menlo,Consolas,monospace}
+pre.term{margin:0;padding:18px 18px;color:var(--fg);background:var(--term);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"DejaVu Sans Mono",monospace;font-size:13.5px;line-height:1.55;white-space:pre;overflow-x:auto;tab-size:4;min-height:230px}
+.note{margin-top:14px;background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--accent2);border-radius:8px;padding:11px 14px}
+.note h4{margin:0 0 6px;font-size:12px;letter-spacing:.04em;text-transform:uppercase;color:var(--accent2)}
+.note p{margin:0;font-size:12.5px;color:#aeb8c9;line-height:1.6}
+footer{max-width:1100px;margin:0 auto;padding:0 26px 50px;color:var(--dim);font-size:12.5px}
+kbd{background:#0b0e14;border:1px solid var(--line);border-bottom-width:2px;border-radius:4px;padding:1px 6px;font-family:ui-monospace,monospace;font-size:11px;color:var(--accent)}
+</style></head><body>
+<header>
+  <h1>AgentSSH · <span style="color:var(--accent)">Approvals</span> 裁决屏 — 六种 TUI 方案 <span style="color:var(--dim);font-size:13px">· v2 简洁克制版</span></h1>
+  <p class="sub">已按「简洁·克制·直接·用户友好」全部瘦身(≤18 行、单分隔线、行内短记号)。<span style="color:var(--gold)">★</span> = 推荐。点标签或按 <kbd>1</kbd>–<kbd>6</kbd> / <kbd>←</kbd><kbd>→</kbd> 切换。</p>
+  <nav class="switch"><button data-i="0" class="active "><span class="k">1</span>主从队列</button>
+<button data-i="1" class=""><span class="k">2</span>专注卡片</button>
+<button data-i="2" class="rec"><span class="k">3</span>三联表</button>
+<button data-i="3" class="rec"><span class="k">4</span>后果优先</button>
+<button data-i="4" class=""><span class="k">5</span>会话折叠</button>
+<button data-i="5" class=""><span class="k">6</span>时间流</button></nav>
+</header>
+<main>
+<section class="screen active" id="s0">
+  <div class="cap"><span class="num">方案 1</span><b>Approvals · 主从克制版(单行队列 + 最小详情)</b><span class="one">最适合:面前堆着多条 pending、要按 host/scope 一条接一条快速连续裁决时——一眼看到下一条、直接按键。</span></div>
+  <div class="termwrap">
+    <div class="bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="t">agentssh tui — Approvals</span></div>
+    <pre class="term">Hosts · Policy · [Approvals]                              4 pending
+
+&gt;1 ap_7f3a  web-1  systemctl status nginx         o/s/h  | ap_7f3a  web-1
+ 2 ap_5c12  web-1  sudo systemctl restart … ·sudo o/s(h) | s_1a2b3c4d "fix 502"
+ 3 ap_9d04  db-1   cat /etc/passwd | grep … ·pipe o/s/h  | $ systemctl status nginx
+ 4 ap_a1b2  web-1  journalctl -n 100 -u ng…       o/s/h  | match: prefix
+
+decide &gt;1 ap_7f3a     [o]nce  [s]ession  [h]ost  [d]eny      j/k move</pre>
+  </div>
+  <div class="note"><h4>克制要点</h4><p>相比常规版砍掉了:legend/图例块、每条的双行排版、独立 warnings 段,以及第二条分隔线(只留主从那条竖线)。特例全压成行内短记号——sudo 禁 host = scope 芯片里把 h 灰显成括号 o/s(h) 并配 ·sudo;管道精确 = ·pipe;命令超长用 … 截断,完整命令只在右侧选中详情里给。仍然清楚的原因:每行的 o/s/h 芯片与底部 [o][s][h][d] 键位一一对应,不需文字解释就知道这条能按哪几个键;顶部一句 4 pending、底部一句 decide &gt;1 ap_7f3a,操作者无需扫视即知「现在决定哪条、按什么」。</p></div>
+</section>
+
+<section class="screen" id="s1">
+  <div class="cap"><span class="num">方案 2</span><b>专注卡片(极简版)</b><span class="one">最适合在 deny 硬拦截之后、operator 要对一小批 pending 命令逐条秒级裁决、且需要横向扫一眼范围差异时。</span></div>
+  <div class="termwrap">
+    <div class="bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="t">agentssh tui — Approvals</span></div>
+    <pre class="term"> Hosts · Policy · [Approvals]                                     decide 1/4
+────────────────────────────────────────────────────────────────────────────
+&gt; web-1  s_1a2b3c4d  systemctl status nginx            前缀
+
+  web-1  s_1a2b3c4d  sudo systemctl restart nginx      o   s   (h)  ·sudo
+  db-1   s_99ff0011  cat /etc/passwd | grep root       o   s    h   ·pipe
+  web-1  s_1a2b3c4d  journalctl -n 100 -u nginx …      o   s    h
+
+ [o]nce   [s]ession   [h]ost   [d]eny</pre>
+  </div>
+  <div class="note"><h4>克制要点</h4><p>相比常规版砍掉了:队列预览框、策略/规则来源行、每条的解释三连、底部图例,以及 session 备注 tag(fix 502/backup),全屏只剩一条分隔线、零边框。仍清楚是因为:顶部「decide 1/4」+ ▸ 标记直接说决定哪条,底部四键就是按什么键(键即焦点卡的动作行,不再单列图例);特例不写整句,只用 ·sudo / ·pipe 和灰显 (h) 三个单记号,且 o/s/h 字母按列纵向对齐,4 条可直接横向比对——前缀=无记号、精确=带·、host 禁用=括号灰显。</p></div>
+</section>
+
+<section class="screen" id="s2">
+  <div class="cap"><span class="num">方案 3</span><b>Lean Approvals · 一行一条极简裁决表</b><span class="rec">★ 推荐</span><span class="one">最适合待批积压、操作者已熟手键位、要一眼定位「该决定哪条」再连按 o/s/h/d 快速清栈时。</span></div>
+  <div class="termwrap">
+    <div class="bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="t">agentssh tui — Approvals</span></div>
+    <pre class="term">Hosts · Policy · [Approvals · 4]
+
+▸ ap_7f3a  web-1  systemctl status nginx        prefix      [o][s][h]
+  ap_5c12  web-1  sudo systemctl restart nginx  exact ·sudo [o][s] ·h
+  ap_9d04  db-1   cat /etc/passwd | grep root   exact ·pipe [o][s][h]
+  ap_a1b2  web-1  journalctl -n 100 -u nginx …  prefix      [o][s][h]
+────────────────────────────────────────────────────────────────────
+▸ ap_7f3a → grant [o]nce  [s]ession  [h]ost   ·   [d]eny    ↑↓ next</pre>
+  </div>
+  <div class="note"><h4>克制要点</h4><p>相比常规版砍掉了:会话分组与意图标签列(fix 502/backup)、表头、legend/说明块、每条的多行展开、范围整句解释——整屏只剩一处分隔线。约束信息无损保留:列位即语义(候选 prefix/exact、范围 o/s/h),特例用极短记号——·sudo 配灰显 ·h(host 禁用,无括号即不可按)、·pipe 配 exact(只精确);▸ 行光标 + 底部单条键位让「决定哪条·按什么」一眼即明,空态收敛为一行「无待批 · 全部已处理」。</p></div>
+</section>
+
+<section class="screen" id="s3">
+  <div class="cap"><span class="num">方案 4</span><b>后果优先 · 极简版(每条一行影响面)</b><span class="rec">★ 推荐</span><span class="one">最适合在 prod 网关上逐条快批、又必须一眼看清「批了 host 会顺带放行多大一片」时——把后果压成每条一行,不读正则也能决断。</span></div>
+  <div class="termwrap">
+    <div class="bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="t">agentssh tui — Approvals</span></div>
+    <pre class="term">AgentSSH   Hosts · Policy · [Approvals]                   4 pending · web-1 prod
+────────────────────────────────────────────────────────────────────────────────
+
+▌ ap_7f3a  web-1  systemctl status nginx                [o][s][h][d]
+                  +[h] frees  systemctl status *
+
+  ap_5c12  web-1  sudo systemctl restart nginx          [o][s](h)[d] ·sudo
+                  +[h] off · sudo, no host rule
+
+  ap_9d04  db-1   cat /etc/passwd | grep root           [o][s][h][d] ·pipe
+                  +[h] frees  only this exact line
+
+  ap_a1b2  web-1  journalctl -n 100 -u nginx …          [o][s][h][d]
+                  +[h] frees  journalctl *
+
+o once   s session   h host   d deny          j/k focus · q quit</pre>
+  </div>
+  <div class="note"><h4>克制要点</h4><p>相比常规版砍掉了 blast-radius 说明块、锚定正则原文、FREES/STILL-ASKS 两段枚举、legend 图例和所有装饰边框(只留一根分隔线);每条 host 后果压成一行 +[h] frees …,sudo/管道特例只用 (h) 灰显 + ·sudo / ·pipe 记号,不写整句。仍清楚是因为后果行用统一 +[h] frees 前缀自解释、列对齐可横向比较,焦点 ▌ 与底部单行键位已给足「决定哪条、按什么键」。</p></div>
+</section>
+
+<section class="screen" id="s4">
+  <div class="cap"><span class="num">方案 5</span><b>Approvals · 会话折叠极简裁决屏</b><span class="one">最适合在密集 agent 请求里逐条快速裁决、只想知道「现在轮到哪条、按哪个键」时。</span></div>
+  <div class="termwrap">
+    <div class="bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="t">agentssh tui — Approvals</span></div>
+    <pre class="term"> Hosts   Policy   [ Approvals ]                                     4 待决
+──────────────────────────────────────────────────────────────────────────
+ s_1a2b3c4d · fix 502 · web-1                                       3 待决
+   claude-code · 近期 tail -f /var/log/nginx/error.log
+ ▸ ap_7f3a  systemctl status nginx
+   ap_5c12  sudo systemctl restart nginx                  ·sudo  [h]✗
+   ap_a1b2  journalctl -n 100 -u nginx …
+ s_99ff0011 · backup · db-1                                         1 待决
+   claude-code · 近期 pg_dump app &gt; /backup/app.sql
+   ap_9d04  cat /etc/passwd | grep root                   ·pipe
+ o once · s session · h host · d deny              j/k 选 · q 退</pre>
+  </div>
+  <div class="note"><h4>克制要点</h4><p>砍掉了并排审计面板、单条详情卡、图例/说明块、装饰边框,以及「每条都标 o/s/h/d」的列表噪声。仍清楚:▸ 指出当前该决定的那条,底部单行帮助条是唯一全局键位来源(o/s/h/d 含义在此),正常行因此不必复述;只有特例加最短记号——`·sudo` 后接灰显禁用的 `[h]✗` 表示 sudo 不可放到 host、`·pipe` 表示管道只能精确放行;整屏仅 tab 下一条分隔线,11 行 / 约 74 列,80 列窄终端也不换行。</p></div>
+</section>
+
+<section class="screen" id="s5">
+  <div class="cap"><span class="num">方案 6</span><b>时间流 · 一行一裁（Lean Approvals）</b><span class="one">最适合一屏盯着多条待批、想靠 o/s/h/d 肌肉记忆从上往下逐条秒裁时</span></div>
+  <div class="termwrap">
+    <div class="bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="t">agentssh tui — Approvals</span></div>
+    <pre class="term">Hosts · Policy · ‹Approvals›                                               4 pending
+
+&gt; ap_a1b2 web-1  s_1a2b3c4d          journalctl -n 100 -u nginx …       [o][s][h][d]
+  ap_9d04 db-1   s_99ff0011 backup   cat /etc/passwd | grep root  ·pipe [o][s][h][d]
+  ap_5c12 web-1  s_1a2b3c4d          sudo systemctl restart nginx ·sudo [o][s][-][d]
+  ap_7f3a web-1  s_1a2b3c4d fix 502  systemctl status nginx             [o][s][h][d]
+
+────────────────────────────────────────────────────────────────────────────────────
+[o]nce  [s]ession  [h]ost  [d]eny                                            ↑↓ move</pre>
+  </div>
+  <div class="note"><h4>克制要点</h4><p>砍掉:时间轴竖线/时刻戳、每条之间的分隔与边框、scope 候选的整句说明、底部 legend/图例——全屏只剩一条规则线。仍清楚:chip 永远固定在 o·s·h·d 四个列位右对齐成一竖列,所以被禁的 host 用 [-] 占位即可"自己报名"是哪一档;特例只用 ·sudo / ·pipe 两个短记号替代整句(sudo→host 禁、pipe→只精确),帮助条一行把键位贴回 chip,&gt; 光标指明此刻该裁的那条。</p></div>
+</section></main>
+<footer>同一批 4 条待审批数据。终端区为等宽 ASCII 原型(单色,真实 TUI 会上色)。<code>·sudo</code>=特权不可设 host;<code>·pipe</code>=含管道只能精确;灰显/括号 <code>(h)</code>/<code>[-]</code>=该范围不可选。</footer>
+<script>
+const screens=[...document.querySelectorAll('.screen')];
+const btns=[...document.querySelectorAll('.switch button')];
+function show(i){i=(i+screens.length)%screens.length;
+  screens.forEach((s,k)=>s.classList.toggle('active',k===i));
+  btns.forEach((b,k)=>b.classList.toggle('active',k===i));window.cur=i;}
+btns.forEach((b,i)=>b.addEventListener('click',()=>show(i)));window.cur=0;
+document.addEventListener('keydown',e=>{
+  if(e.key>='1'&&e.key<='6'){show(+e.key-1);}
+  else if(e.key==='ArrowRight'){show(window.cur+1);}
+  else if(e.key==='ArrowLeft'){show(window.cur-1);}});
+</script></body></html>

@@ -57,6 +57,12 @@ func TestLoadValid(t *testing.T) {
 	if cfg.Paths.AuditFile != filepath.Join(dir, "audit.log") {
 		t.Fatalf("audit path = %q", cfg.Paths.AuditFile)
 	}
+	if cfg.Paths.ApprovalsDir != filepath.Join(dir, "approvals") ||
+		cfg.Paths.SessionsDir != filepath.Join(dir, "approvals", "sessions") ||
+		cfg.Paths.PendingDir != filepath.Join(dir, "approvals", "pending") ||
+		cfg.Paths.ResponsesDir != filepath.Join(dir, "approvals", "responses") {
+		t.Fatalf("approval paths = %#v", cfg.Paths)
+	}
 }
 
 func TestEnsureHomeCreatesAndSeeds(t *testing.T) {

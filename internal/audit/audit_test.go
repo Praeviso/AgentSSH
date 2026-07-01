@@ -1,4 +1,4 @@
-package audit
+package audit_test
 
 import (
 	"encoding/json"
@@ -6,19 +6,22 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/Praeviso/AgentSSH/internal/approval"
+	"github.com/Praeviso/AgentSSH/internal/audit"
 )
 
 func TestAppendVerifyAndSeqContinuation(t *testing.T) {
-	store := NewStore(filepath.Join(t.TempDir(), "audit.log"))
-	first, err := store.Append(Record{ReqID: "r1", Event: EventStarted, Host: "web-1"})
+	store := audit.NewStore(filepath.Join(t.TempDir(), "audit.log"))
+	first, err := store.Append(audit.Record{ReqID: "r1", Event: audit.EventStarted, Host: "web-1"})
 	if err != nil {
 		t.Fatalf("append first: %v", err)
 	}
-	second, err := store.Append(Record{ReqID: "r1", Event: EventCompleted, Host: "web-1"})
+	second, err := store.Append(audit.Record{ReqID: "r1", Event: audit.EventCompleted, Host: "web-1"})
 	if err != nil {
 		t.Fatalf("append second: %v", err)
 	}
-	if first.Seq != 0 || first.PrevHash != ZeroHash {
+	if first.Seq != 0 || first.PrevHash != audit.ZeroHash {
 		t.Fatalf("first = %#v", first)
 	}
 	if second.Seq != 1 || second.PrevHash != first.Hash {
@@ -32,8 +35,8 @@ func TestAppendVerifyAndSeqContinuation(t *testing.T) {
 		t.Fatalf("verify result = %#v", result)
 	}
 
-	reopened := NewStore(store.Path)
-	third, err := reopened.Append(Record{ReqID: "r2", Event: EventDenied, Host: "web-2"})
+	reopened := audit.NewStore(store.Path)
+	third, err := reopened.Append(audit.Record{ReqID: "r2", Event: audit.EventDenied, Host: "web-2"})
 	if err != nil {
 		t.Fatalf("append third: %v", err)
 	}
@@ -73,9 +76,9 @@ func TestVerifyDetectsChangedDeletedInsertedRecords(t *testing.T) {
 	t.Run("inserted", func(t *testing.T) {
 		store := testStoreWithRecords(t)
 		records := mustRead(t, store)
-		inserted := Record{Seq: 99, ReqID: "inserted", Event: EventStarted, PrevHash: records[0].Hash}
-		inserted.Hash = ComputeHash(inserted)
-		records = append(records[:1], append([]Record{inserted}, records[1:]...)...)
+		inserted := audit.Record{Seq: 99, ReqID: "inserted", Event: audit.EventStarted, PrevHash: records[0].Hash}
+		inserted.Hash = audit.ComputeHash(inserted)
+		records = append(records[:1], append([]audit.Record{inserted}, records[1:]...)...)
 		writeRecords(t, store.Path, records)
 		result, err := store.Verify()
 		if err != nil {
@@ -85,6 +88,63 @@ func TestVerifyDetectsChangedDeletedInsertedRecords(t *testing.T) {
 			t.Fatalf("inserted result = %#v", result)
 		}
 	})
+}
+
+func TestApprovalFieldsAreHashProtectedAndOldRecordsVerify(t *testing.T) {
+	store := audit.NewStore(filepath.Join(t.TempDir(), "audit.log"))
+	old, err := store.Append(audit.Record{ReqID: "old", Event: audit.EventStarted, Host: "web-1"})
+	if err != nil {
+		t.Fatalf("append old: %v", err)
+	}
+	approvalRecord, err := store.Append(audit.Record{
+		ReqID:           "r1",
+		Event:           audit.EventApprovalRequested,
+		Host:            "web-1",
+		ApprovalID:      "ap_0123456789abcdef01234567",
+		ApprovalScope:   "session",
+		ApprovalMatcher: `\Aid\z`,
+		ApprovalChannel: approval.ChannelExit,
+	})
+	if err != nil {
+		t.Fatalf("append approval: %v", err)
+	}
+	records := mustRead(t, store)
+	records[0].Hash = audit.ComputeHash(records[0])
+	if records[0].Hash != old.Hash {
+		t.Fatalf("old hash changed after approval fields were added: %s != %s", records[0].Hash, old.Hash)
+	}
+	result, err := store.Verify()
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if !result.OK {
+		t.Fatalf("verify = %#v", result)
+	}
+
+	fields := []struct {
+		name string
+		edit func(*audit.Record)
+	}{
+		{"approval_id", func(r *audit.Record) { r.ApprovalID = "ap_ffffffffffffffffffffffff" }},
+		{"approval_scope", func(r *audit.Record) { r.ApprovalScope = "host" }},
+		{"approval_matcher", func(r *audit.Record) { r.ApprovalMatcher = `\Als\z` }},
+		{"approval_channel", func(r *audit.Record) { r.ApprovalChannel = "cli" }},
+	}
+	for _, tt := range fields {
+		t.Run(tt.name, func(t *testing.T) {
+			tampered := append([]audit.Record(nil), records...)
+			tt.edit(&tampered[1])
+			writeRecords(t, store.Path, tampered)
+			result, err := store.Verify()
+			if err != nil {
+				t.Fatalf("verify tamper: %v", err)
+			}
+			if result.OK || result.BrokenSeq != approvalRecord.Seq || result.Reason != "hash" {
+				t.Fatalf("tamper result = %#v", result)
+			}
+			writeRecords(t, store.Path, records)
+		})
+	}
 }
 
 func TestTruncateBrokenRemovesBrokenTailAndBacksUp(t *testing.T) {
@@ -150,13 +210,13 @@ func TestTruncateBrokenNoopsWhenChainOK(t *testing.T) {
 	}
 }
 
-func testStoreWithRecords(t *testing.T) Store {
+func testStoreWithRecords(t *testing.T) audit.Store {
 	t.Helper()
-	store := NewStore(filepath.Join(t.TempDir(), "audit.log"))
-	for _, record := range []Record{
-		{ReqID: "r1", Event: EventStarted, Host: "web-1"},
-		{ReqID: "r1", Event: EventCompleted, Host: "web-1"},
-		{ReqID: "r2", Event: EventDenied, Host: "web-2"},
+	store := audit.NewStore(filepath.Join(t.TempDir(), "audit.log"))
+	for _, record := range []audit.Record{
+		{ReqID: "r1", Event: audit.EventStarted, Host: "web-1"},
+		{ReqID: "r1", Event: audit.EventCompleted, Host: "web-1"},
+		{ReqID: "r2", Event: audit.EventDenied, Host: "web-2"},
 	} {
 		if _, err := store.Append(record); err != nil {
 			t.Fatalf("append: %v", err)
@@ -165,7 +225,7 @@ func testStoreWithRecords(t *testing.T) Store {
 	return store
 }
 
-func mustRead(t *testing.T, store Store) []Record {
+func mustRead(t *testing.T, store audit.Store) []audit.Record {
 	t.Helper()
 	records, err := store.ReadAll()
 	if err != nil {
@@ -174,7 +234,7 @@ func mustRead(t *testing.T, store Store) []Record {
 	return records
 }
 
-func writeRecords(t *testing.T, path string, records []Record) {
+func writeRecords(t *testing.T, path string, records []audit.Record) {
 	t.Helper()
 	var builder strings.Builder
 	for _, record := range records {

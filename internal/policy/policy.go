@@ -18,6 +18,16 @@ const (
 	ActionDeny  Action = "deny"
 )
 
+const (
+	// RuleDefaultDeny is the immutable fallback rule name returned when no rule
+	// matches. Approval code uses this symbol to distinguish gray-area commands
+	// from explicit deny rules.
+	RuleDefaultDeny = "default-deny"
+	// ApprovalGroup is the reserved provenance marker for generated approval
+	// host rules. It is not a user-authorable rule group name.
+	ApprovalGroup = "__agentssh_approval"
+)
+
 // Decision is the result of evaluating a command against policy.
 type Decision struct {
 	Action Action `json:"action"`
@@ -41,7 +51,18 @@ type Config struct {
 	RuleGroups    map[string]RuleGroup    `yaml:"rule_groups" json:"rule_groups"`
 	HostOverrides map[string]HostOverride `yaml:"host_overrides" json:"host_overrides"`
 	Output        Output                  `yaml:"output" json:"output"`
+	Approval      Approval                `yaml:"approval,omitempty" json:"approval,omitempty"`
 	hostOrder     []string
+}
+
+// Approval is the optional async approval policy block. Durations are stored as
+// strings so policy.yaml stays operator-readable ("12h", "10m"); the approval
+// package parses and defaults them at runtime.
+type Approval struct {
+	Enabled       bool   `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	HostGrantMode string `yaml:"host_grant_mode,omitempty" json:"host_grant_mode,omitempty"`
+	SessionTTL    string `yaml:"session_ttl,omitempty" json:"session_ttl,omitempty"`
+	WaitTimeout   string `yaml:"wait_timeout,omitempty" json:"wait_timeout,omitempty"`
 }
 
 // RuleGroup is an authoring-only preset. The engine ignores it; callers stamp a
@@ -154,6 +175,7 @@ func (c *Config) UnmarshalYAML(value *yaml.Node) error {
 		RuleGroups    map[string]RuleGroup    `yaml:"rule_groups"`
 		HostOverrides map[string]HostOverride `yaml:"host_overrides"`
 		Output        Output                  `yaml:"output"`
+		Approval      Approval                `yaml:"approval"`
 	}
 	var raw configYAML
 	if err := value.Decode(&raw); err != nil {
@@ -165,6 +187,7 @@ func (c *Config) UnmarshalYAML(value *yaml.Node) error {
 		RuleGroups:    raw.RuleGroups,
 		HostOverrides: raw.HostOverrides,
 		Output:        raw.Output,
+		Approval:      raw.Approval,
 		hostOrder:     hostOverrideOrder(value),
 	}
 	return nil
@@ -178,7 +201,14 @@ func (c Config) MarshalYAML() (any, error) {
 	appendNode(root, "rule_groups", mustYAMLNode(c.RuleGroups))
 	appendNode(root, "host_overrides", c.hostOverridesNode())
 	appendNode(root, "output", mustYAMLNode(c.Output))
+	if !approvalZero(c.Approval) {
+		appendNode(root, "approval", mustYAMLNode(c.Approval))
+	}
 	return root, nil
+}
+
+func approvalZero(value Approval) bool {
+	return !value.Enabled && value.HostGrantMode == "" && value.SessionTTL == "" && value.WaitTimeout == ""
 }
 
 func appendNode(mapping *yaml.Node, key string, value *yaml.Node) {
@@ -313,7 +343,7 @@ func (e *compiledEngine) Evaluate(host string, command string) (Decision, error)
 		}
 	}
 
-	return Decision{Action: ActionDeny, Rule: "default-deny"}, nil
+	return Decision{Action: ActionDeny, Rule: RuleDefaultDeny}, nil
 }
 
 func (e *compiledEngine) hostRulesFor(hostName string) []compiledRule {

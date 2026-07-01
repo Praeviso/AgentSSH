@@ -312,6 +312,23 @@ func TestRuleGroupCRUD(t *testing.T) {
 	}
 }
 
+func TestRuleGroupRejectsReservedApprovalNames(t *testing.T) {
+	for _, name := range []string{ApprovalGroup, "__agentssh_custom"} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := CreateGroup(Bundle{}, name); !errors.Is(err, ErrReservedGroup) {
+				t.Fatalf("CreateGroup err = %v, want ErrReservedGroup", err)
+			}
+			bundle := Bundle{
+				Policy:    Config{RuleGroups: map[string]RuleGroup{name: {}}},
+				Inventory: inventory.Inventory{Hosts: map[string]inventory.Host{"web-1": {}}},
+			}
+			if _, err := StampGroupOntoHost(bundle, "web-1", name); !errors.Is(err, ErrReservedGroup) {
+				t.Fatalf("StampGroupOntoHost err = %v, want ErrReservedGroup", err)
+			}
+		})
+	}
+}
+
 func TestStampGroupOntoHostCopiesWithProvenance(t *testing.T) {
 	bundle := Bundle{
 		Policy: Config{RuleGroups: map[string]RuleGroup{

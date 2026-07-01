@@ -32,6 +32,13 @@ func withFakeExecutor(t *testing.T, fe fakeExecutor) {
 	t.Cleanup(func() { newExecutor = restore })
 }
 
+func withOperatorTTY(t *testing.T) {
+	t.Helper()
+	restore := stdinIsTerminal
+	stdinIsTerminal = func() bool { return true }
+	t.Cleanup(func() { stdinIsTerminal = restore })
+}
+
 // runExit runs the root command with args and returns the mapped process exit
 // code (via the same exitCodeForError that execute() uses) plus stdout/stderr.
 func runExit(t *testing.T, args ...string) (int, string, string) {

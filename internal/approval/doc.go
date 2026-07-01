@@ -1,6 +1,6 @@
-// Package approval is intentionally empty in the MVP.
+// Package approval implements AgentSSH's optional async approval backend.
 //
-// AgentSSH does not implement synchronous approval, pending queues, or blocking
-// approval UI in M0. The package is reserved for a future optional out-of-band
-// approval mode described in the architecture.
+// It is deliberately out-of-band: run requests that need approval return
+// immediately, operators adjudicate later, and execution happens only when the
+// agent reruns the command through the normal policy path.
 package approval

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Praeviso/AgentSSH/internal/approval"
 	"github.com/Praeviso/AgentSSH/internal/audit"
 	"github.com/Praeviso/AgentSSH/internal/config"
 	"github.com/Praeviso/AgentSSH/internal/inventory"
@@ -77,13 +78,18 @@ type entryTab int
 const (
 	entryHosts entryTab = iota
 	entryPolicy
+	entryApprovals
 )
 
 func (t entryTab) title() string {
-	if t == entryPolicy {
+	switch t {
+	case entryPolicy:
 		return "Policy"
+	case entryApprovals:
+		return "Approvals"
+	default:
+		return "Hosts"
 	}
-	return "Hosts"
 }
 
 // detailPane is the active sub-view inside a host's detail screen.
@@ -126,18 +132,19 @@ func toastCmd(text string) tea.Cmd {
 }
 
 type appModel struct {
-	paths    config.Paths
-	renderer *lipgloss.Renderer
-	styles   appStyles
-	hosts    hostsSection  // host card grid + add/discover/confirm overlays + host CRUD
-	sessions model         // audit/session viewer (filtered to the selected host in detail)
-	policy   policySection // global policy viewer (scoped to the selected host in detail)
-	help     help.Model
-	toast    string
-	toastID  int
-	w, h     int
-	ready    bool
-	firstRun bool // show the one-time welcome banner until the first keypress
+	paths     config.Paths
+	renderer  *lipgloss.Renderer
+	styles    appStyles
+	hosts     hostsSection     // host card grid + add/discover/confirm overlays + host CRUD
+	sessions  model            // audit/session viewer (filtered to the selected host in detail)
+	policy    policySection    // global policy viewer (scoped to the selected host in detail)
+	approvals approvalsSection // gray-zone approval queue (operator adjudication)
+	help      help.Model
+	toast     string
+	toastID   int
+	w, h      int
+	ready     bool
+	firstRun  bool // show the one-time welcome banner until the first keypress
 
 	screen     screen
 	entryTab   entryTab
@@ -207,6 +214,7 @@ func newAppModel(paths config.Paths, renderer *lipgloss.Renderer) appModel {
 	store := audit.NewStore(paths.AuditFile)
 	records, _ := store.ReadAll()
 	hosts := hostMetaFromInventory(inv)
+	runtime, _ := approval.RuntimeConfigFromPolicy(pol.Approval, os.Getenv(config.EnvApproval))
 
 	return appModel{
 		paths:    paths,
@@ -217,7 +225,8 @@ func newAppModel(paths config.Paths, renderer *lipgloss.Renderer) appModel {
 		sessions: newModel(records, hosts, newStyles(renderer), func() (audit.VerifyResult, error) {
 			return store.Verify()
 		}),
-		policy: newPolicySection(paths.PolicyFile, inv, pol, st, firstErr(invErr, polErr)),
+		policy:    newPolicySection(paths.PolicyFile, inv, pol, st, firstErr(invErr, polErr)),
+		approvals: newApprovalsSection(paths, st, runtime),
 	}
 }
 
@@ -257,7 +266,7 @@ func hostMetaFromInventory(inv inventory.Inventory) map[string]HostMeta {
 }
 
 func (m appModel) Init() tea.Cmd {
-	return tea.Batch(m.hosts.Init(), m.sessions.Init(), m.policy.Init())
+	return tea.Batch(m.hosts.Init(), m.sessions.Init(), m.policy.Init(), m.approvals.Init())
 }
 
 func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -293,6 +302,10 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Async Hosts results and the spinner tick must reach the Hosts section
 		// regardless of screen; runID/host guards make stale delivery safe.
 		return m.updateHosts(msg)
+	case approvalsTickMsg, approvalsLoadedMsg:
+		// Poll the approval queue regardless of the active tab so the tab badge
+		// and queue stay live; the section re-arms the tick.
+		return m.updateApprovals(msg)
 	case tea.KeyMsg:
 		if msg.Type == tea.KeyCtrlC {
 			return m, tea.Quit
@@ -343,13 +356,13 @@ func (m appModel) updateEntryKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "q":
 			return m, tea.Quit
 		case "tab":
-			m.entryTab = (m.entryTab + 1) % 2
+			m.entryTab = (m.entryTab + 1) % 3
 			if m.entryTab == entryPolicy {
 				m.policy = m.policy.withHost("")
 			}
 			return m.propagateSize()
 		case "shift+tab":
-			m.entryTab = (m.entryTab + 1) % 2
+			m.entryTab = (m.entryTab + 2) % 3
 			if m.entryTab == entryPolicy {
 				m.policy = m.policy.withHost("")
 			}
@@ -361,7 +374,13 @@ func (m appModel) updateEntryKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.entryTab = entryPolicy
 			m.policy = m.policy.withHost("")
 			return m.propagateSize()
+		case "3":
+			m.entryTab = entryApprovals
+			return m.propagateSize()
 		}
+	}
+	if m.entryTab == entryApprovals {
+		return m.updateApprovals(msg)
 	}
 	if m.entryTab == entryPolicy {
 		return m.updatePolicy(msg)
@@ -564,6 +583,12 @@ func (m appModel) propagateSize() (appModel, tea.Cmd) {
 		m.policy = next
 	}
 	cmds = append(cmds, cmd)
+
+	as, cmd := m.approvals.Update(tea.WindowSizeMsg{Width: m.w, Height: body})
+	if next, ok := as.(approvalsSection); ok {
+		m.approvals = next
+	}
+	cmds = append(cmds, cmd)
 	return m, tea.Batch(cmds...)
 }
 
@@ -616,6 +641,8 @@ func (m appModel) View() string {
 	if m.ready {
 		if m.screen == screenDetail {
 			body = m.renderDetail()
+		} else if m.entryTab == entryApprovals {
+			body = m.approvals.View()
 		} else if m.entryTab == entryPolicy {
 			// The pane is already scoped to host "" whenever this tab is active (the
 			// tab-switch handlers call withHost("")). Render it as-is — calling
@@ -696,8 +723,8 @@ func (m appModel) renderStatusBar() string {
 	} else {
 		n := len(m.hosts.names)
 		crumb := m.styles.crumb.Render("AgentSSH")
-		tabs := make([]string, 0, 2)
-		for _, tab := range []entryTab{entryHosts, entryPolicy} {
+		tabs := make([]string, 0, 3)
+		for _, tab := range []entryTab{entryHosts, entryPolicy, entryApprovals} {
 			label := fmt.Sprintf("%d %s", int(tab)+1, tab.title())
 			if tab == m.entryTab {
 				tabs = append(tabs, m.styles.activeTab.Render(label))
@@ -707,6 +734,9 @@ func (m appModel) renderStatusBar() string {
 		}
 		count := m.styles.dim.Render(fmt.Sprintf(" · %d %s", n, plural(n, "host", "hosts")))
 		bar = lipgloss.JoinHorizontal(lipgloss.Top, crumb, "  ", lipgloss.JoinHorizontal(lipgloss.Top, tabs...), count)
+		if p := m.approvals.pendingCount(); p > 0 {
+			bar += m.styles.confirm.Render(fmt.Sprintf(" · %d pending", p))
+		}
 		if m.hosts.filterActive() {
 			bar += m.styles.dim.Render(fmt.Sprintf(" · %d shown", m.hosts.visibleCount()))
 		}
@@ -764,11 +794,14 @@ func (m appModel) renderFooter() string {
 // the ? overlay (FullHelp) carries every binding, grouped into columns.
 func (m appModel) activeHelpKeyMap() help.KeyMap {
 	if m.screen != screenDetail {
-		nav := []key.Binding{hk("tab/1-2", "tabs")}
+		nav := []key.Binding{hk("tab/1-3", "tabs")}
 		var section help.KeyMap
-		if m.entryTab == entryPolicy {
+		switch m.entryTab {
+		case entryPolicy:
 			section = m.policy.helpKeyMap()
-		} else {
+		case entryApprovals:
+			section = m.approvals.helpKeyMap()
+		default:
 			section = m.hosts.helpKeyMap()
 		}
 		return mergeHelp(section, nav)
@@ -821,10 +854,22 @@ func mergeHelp(section help.KeyMap, nav []key.Binding) helpMap {
 }
 
 func (m appModel) entryCapturing() bool {
-	if m.entryTab == entryPolicy {
+	switch m.entryTab {
+	case entryPolicy:
 		return m.policy.capturing()
+	case entryApprovals:
+		return m.approvals.capturing()
+	default:
+		return m.hosts.capturing()
 	}
-	return m.hosts.capturing()
+}
+
+func (m appModel) updateApprovals(msg tea.Msg) (tea.Model, tea.Cmd) {
+	updated, cmd := m.approvals.Update(msg)
+	if as, ok := updated.(approvalsSection); ok {
+		m.approvals = as
+	}
+	return m, cmd
 }
 
 func (m appModel) fullWidthLine(value string) string {

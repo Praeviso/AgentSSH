@@ -18,10 +18,13 @@ import (
 type Event string
 
 const (
-	EventStarted   Event = "started"
-	EventCompleted Event = "completed"
-	EventFailed    Event = "failed"
-	EventDenied    Event = "denied"
+	EventStarted           Event = "started"
+	EventCompleted         Event = "completed"
+	EventFailed            Event = "failed"
+	EventDenied            Event = "denied"
+	EventApprovalRequested Event = "approval_requested"
+	EventApprovalGranted   Event = "approval_granted"
+	EventApprovalDenied    Event = "approval_denied"
 )
 
 // Record is one append-only JSONL audit entry.
@@ -46,6 +49,10 @@ type Record struct {
 	DurationMS      int64  `json:"duration_ms"`
 	PrevHash        string `json:"prev_hash"`
 	Hash            string `json:"hash"`
+	ApprovalID      string `json:"approval_id,omitempty"`
+	ApprovalScope   string `json:"approval_scope,omitempty"`
+	ApprovalMatcher string `json:"approval_matcher,omitempty"`
+	ApprovalChannel string `json:"approval_channel,omitempty"`
 }
 
 const ZeroHash = "0000000000000000000000000000000000000000000000000000000000000000"
@@ -346,6 +353,10 @@ type canonicalRecord struct {
 	Redactions      int    `json:"redactions"`
 	DurationMS      int64  `json:"duration_ms"`
 	PrevHash        string `json:"prev_hash"`
+	ApprovalID      string `json:"approval_id,omitempty"`
+	ApprovalScope   string `json:"approval_scope,omitempty"`
+	ApprovalMatcher string `json:"approval_matcher,omitempty"`
+	ApprovalChannel string `json:"approval_channel,omitempty"`
 }
 
 func canonicalJSON(record Record) ([]byte, error) {
@@ -367,5 +378,9 @@ func canonicalJSON(record Record) ([]byte, error) {
 		Redactions:      record.Redactions,
 		DurationMS:      record.DurationMS,
 		PrevHash:        record.PrevHash,
+		ApprovalID:      record.ApprovalID,
+		ApprovalScope:   record.ApprovalScope,
+		ApprovalMatcher: record.ApprovalMatcher,
+		ApprovalChannel: record.ApprovalChannel,
 	})
 }

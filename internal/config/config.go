@@ -14,6 +14,8 @@ import (
 const (
 	// EnvHome overrides the default ~/.agentssh configuration directory.
 	EnvHome = "AGENTSSH_HOME"
+	// EnvApproval enables the optional async approval flow when set truthy.
+	EnvApproval = "AGENTSSH_APPROVAL"
 	// DefaultDirName is the configuration directory under the user's home.
 	DefaultDirName = ".agentssh"
 )
@@ -75,6 +77,10 @@ type Paths struct {
 	PolicyFile    string
 	AuditFile     string
 	SecretsFile   string
+	ApprovalsDir  string
+	SessionsDir   string
+	PendingDir    string
+	ResponsesDir  string
 }
 
 // Config is the parsed local configuration set.
@@ -185,12 +191,17 @@ func seedFileIfMissing(path, content string) error {
 
 // NewPaths derives the MVP file layout from a configuration home directory.
 func NewPaths(home string) Paths {
+	approvalsDir := filepath.Join(home, "approvals")
 	return Paths{
 		Home:          home,
 		InventoryFile: filepath.Join(home, "inventory.yaml"),
 		PolicyFile:    filepath.Join(home, "policy.yaml"),
 		AuditFile:     filepath.Join(home, "audit.log"),
 		SecretsFile:   filepath.Join(home, "secrets.enc"),
+		ApprovalsDir:  approvalsDir,
+		SessionsDir:   filepath.Join(approvalsDir, "sessions"),
+		PendingDir:    filepath.Join(approvalsDir, "pending"),
+		ResponsesDir:  filepath.Join(approvalsDir, "responses"),
 	}
 }
 

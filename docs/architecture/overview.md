@@ -2,7 +2,7 @@
 
 > 状态:草案 v1 · 更新于 2026-06-16 · 配套:`docs/prds/agentssh.md`
 >
-> 审批模型(已定):**AgentSSH 不做同步审批**。交互式确认委托给 agent harness;AgentSSH 只保留 `deny` 硬拦截 + 全量审计。详见 §5。
+> 审批模型:硬 `deny` 不可覆盖 + 全量审计始终是底线。在此之上提供**可选(默认关)的异步审批**——灰区(`default-deny`)命令可由 agent 申请,`run` 返回 exit 7 **不阻塞**,操作者在 TUI(或 `agentssh approval` CLI)裁决 once/session/host。**不做同步阻塞审批**。详见 §5 与 `docs/plans/approval-system.md`。
 
 ## 1. 组件总览
 
@@ -45,7 +45,7 @@
 - **Executor**:经 SSH 执行,捕获 stdout/stderr/exit。
 - **Output Filter**:回流给 Agent 前脱敏 + 截断。
 - **Audit**:每次请求落 hash 链日志(allow 与 deny 都记)。
-- **TUI**:人类的**审计查看**界面,不含审批(详见 `docs/DESIGN.md`)。
+- **TUI**:人类的**审计查看 + 灰区审批裁决**界面(详见 `docs/DESIGN.md` 与 `docs/plans/approval-system.md`)。
 
 > 注:同步审批(pending 队列、阻塞 run、人工裁决)**不在本架构内**。它属于 agent harness 的职责;AgentSSH 的安全底线是 resource-side 的 `deny` + 事后审计。理由见 §5。
 
@@ -161,7 +161,7 @@ run web-1 -- sudo systemctl restart nginx
 - **交互式确认**(人盯着 allow/deny):与 agent harness 的权限系统**重复**。harness 已拦截 Bash 调用、看得到完整 `agentssh run … -- <cmd>`。再造一套 TUI 审批 = 双重弹窗。→ **委托给 harness。**
 - **硬边界 `deny`**(谁都不能临场放行):**不可委托**。harness 在 Agent 侧信任边界内,在 headless / 自动批准 / `agentssh run:*` 被加白名单时全部失效;且 harness 只看到命令字符串,不知道目标是 prod、不知道命中了哪条危险规则。→ **留在 CLI,做成不可覆盖的 deny。**
 
-决策前提:**主要交互式、人盯着**(见 PRD)。无人值守下若需要对灰区也强制人工裁决,引入「out-of-band 同步审批」作为**可选模式**(未来):pending 请求落 `~/.agentssh/approvals/`,人在 TUI 裁决,run 阻塞等待。MVP 不实现,但包结构为其预留(§10)。
+决策前提:**主要交互式、人盯着**(见 PRD)。灰区(`default-deny`)的可选人工裁决**已实现为异步、非阻塞模式**(默认关,`approval.enabled` / `AGENTSSH_APPROVAL` 开启):pending 请求落 `~/.agentssh/approvals/`,`run` **立即返回 exit 7 不阻塞**,操作者在 TUI 的 Approvals 标签(或 `agentssh approval` CLI)裁决 once/session/host,模型轮询 `approval status/wait` 或重跑后继续。硬 `deny` 仍不可覆盖,显式 deny 规则结构上进不了审批通道。详见 `docs/plans/approval-system.md`。
 
 ## 6. 审计日志
 
@@ -259,7 +259,7 @@ agentssh/
     session/               # 会话解析(--session / env,必须声明)、id 生成、聚合
     output/                # 脱敏 + 截断
     tui/                   # bubbletea:审计查看器
-    approval/              # (预留,MVP 空)未来 out-of-band 同步审批
+    approval/              # 灰区异步审批:Generalize/Authorize/grant store/裁决(默认关)
   skills/                  # AgentSSH 使用手册(SKILL.md):最佳实践,供 Agent 参考
   docs/
 ```
