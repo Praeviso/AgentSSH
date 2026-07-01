@@ -20,6 +20,8 @@ type PendingStore struct {
 	Now          func() time.Time
 }
 
+const resolvedReapTTL = 24 * time.Hour
+
 type PendingRequest struct {
 	Version        int     `json:"version"`
 	ID             string  `json:"id"`
@@ -54,9 +56,10 @@ type StatusResult struct {
 }
 
 var (
-	ErrInvalidID       = errors.New("invalid approval id")
-	ErrPendingNotFound = errors.New("approval request not found")
-	ErrAlreadyResolved = errors.New("approval request already resolved")
+	ErrInvalidID         = errors.New("invalid approval id")
+	ErrPendingNotFound   = errors.New("approval request not found")
+	ErrAlreadyResolved   = errors.New("approval request already resolved")
+	ErrCorruptResolution = errors.New("corrupt approval resolution")
 )
 
 func NewID() (string, error) {
@@ -68,6 +71,12 @@ func NewID() (string, error) {
 }
 
 func (s PendingStore) Create(req PendingRequest) (PendingRequest, error) {
+	_ = s.reapResolved(resolvedReapTTL)
+	if existing, ok, err := s.findUnresolved(req.SessionID, req.Host, shaHex(req.Cmd)); err != nil {
+		return PendingRequest{}, err
+	} else if ok {
+		return existing, nil
+	}
 	if req.ID == "" {
 		id, err := NewID()
 		if err != nil {
@@ -137,6 +146,7 @@ func (s PendingStore) Get(id string) (PendingRequest, error) {
 }
 
 func (s PendingStore) List() ([]PendingRequest, error) {
+	_ = s.reapResolved(resolvedReapTTL)
 	entries, err := os.ReadDir(s.PendingDir)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
@@ -258,12 +268,75 @@ func (s PendingStore) readResolution(id string) (Resolution, bool, error) {
 	}
 	var resolution Resolution
 	if err := json.Unmarshal(data, &resolution); err != nil {
-		return Resolution{}, true, nil
+		return Resolution{}, false, fmt.Errorf("%w for %s", ErrCorruptResolution, id)
 	}
 	if resolution.ID != id {
-		return Resolution{}, true, nil
+		return Resolution{}, false, fmt.Errorf("%w for %s", ErrCorruptResolution, id)
 	}
 	return resolution, true, nil
+}
+
+func (s PendingStore) findUnresolved(sessionID string, host string, cmdSHA256 string) (PendingRequest, bool, error) {
+	entries, err := os.ReadDir(s.PendingDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return PendingRequest{}, false, nil
+	}
+	if err != nil {
+		return PendingRequest{}, false, fmt.Errorf("list pending approvals: %w", err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		id := strings.TrimSuffix(entry.Name(), ".json")
+		req, err := s.Get(id)
+		if err != nil {
+			continue
+		}
+		if req.SessionID != sessionID || req.Host != host || req.CmdSHA256 != cmdSHA256 {
+			continue
+		}
+		if _, ok, err := s.readResolution(id); err != nil {
+			continue
+		} else if !ok {
+			return req, true, nil
+		}
+	}
+	return PendingRequest{}, false, nil
+}
+
+func (s PendingStore) reapResolved(ttl time.Duration) error {
+	if ttl <= 0 {
+		return nil
+	}
+	entries, err := os.ReadDir(s.PendingDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("list pending approvals: %w", err)
+	}
+	cutoff := s.now().Add(-ttl)
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		id := strings.TrimSuffix(entry.Name(), ".json")
+		if _, ok, err := s.readResolution(id); err != nil || !ok {
+			continue
+		}
+		pendingPath := pendingPath(s.PendingDir, id)
+		info, err := os.Stat(pendingPath)
+		if err != nil {
+			continue
+		}
+		if info.ModTime().After(cutoff) {
+			continue
+		}
+		_ = os.Remove(pendingPath)
+		_ = os.Remove(responsePath(s.ResponsesDir, id))
+	}
+	return nil
 }
 
 func RequestDigest(req PendingRequest, scope Scope) string {

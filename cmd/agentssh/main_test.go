@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Praeviso/AgentSSH/internal/approval"
 	"github.com/Praeviso/AgentSSH/internal/audit"
 	"github.com/Praeviso/AgentSSH/internal/config"
 	"github.com/Praeviso/AgentSSH/internal/discovery"
@@ -727,6 +728,55 @@ output:
 	}
 }
 
+func TestPolicyTestIsStaticAndIgnoresSessionGrant(t *testing.T) {
+	home := t.TempDir()
+	writeTestInventory(t, home)
+	writePolicy(t, home, `
+version: 1
+approval:
+  enabled: true
+output:
+  max_bytes: 1024
+`)
+	t.Setenv("AGENTSSH_HOME", home)
+	t.Setenv("AGENTSSH_SESSION", "s_test")
+	matcher, err := approval.Exact("id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (approval.SessionStore{Dir: filepath.Join(home, "approvals", "sessions")}).Grant("s_test", "web-1", approval.ScopeSession, matcher, "ap_0123456789abcdef01234567", "r1", time.Hour, approval.ChannelCLI); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout, stderr, err := runCommandForTest(t, "policy", "test", "--host", "web-1", "id")
+	if err != nil {
+		t.Fatalf("policy test err=%v stdout=%s stderr=%s", err, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "needs-approval") || strings.Contains(stdout, "approval/session") {
+		t.Fatalf("policy test should be static gray, got %q", stdout)
+	}
+
+	cfg := readPolicyFile(t, home)
+	cfg.HostOverrides = map[string]policy.HostOverride{
+		policy.HostRulesKey("web-1"): {Rules: []policy.Rule{{
+			Name:   "approval/host",
+			Match:  policy.Match{CmdRegex: `\Aid\z`},
+			Action: policy.ActionAllow,
+			Group:  policy.ApprovalGroup,
+		}}},
+	}
+	if err := policy.Save(filepath.Join(home, "policy.yaml"), cfg); err != nil {
+		t.Fatal(err)
+	}
+	stdout, stderr, err = runCommandForTest(t, "policy", "test", "--host", "web-1", "id")
+	if err != nil {
+		t.Fatalf("policy test persisted host grant err=%v stdout=%s stderr=%s", err, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "allow") || !strings.Contains(stdout, "host:web-1/rules[0]") {
+		t.Fatalf("policy test should include persisted host grants, got %q", stdout)
+	}
+}
+
 func TestApprovalSessionGrantE2E(t *testing.T) {
 	home := t.TempDir()
 	writeTestInventory(t, home)
@@ -758,6 +808,9 @@ output:
 	}
 	if pending.Status != "approval_pending" || pending.ApprovalID == "" || !strings.Contains(pending.ApprovalMatcher, `\Asystemctl`) {
 		t.Fatalf("pending response = %#v", pending)
+	}
+	if pending.Cmd != "systemctl restart nginx" {
+		t.Fatalf("pending cmd = %q", pending.Cmd)
 	}
 
 	code, statusOut, _ := runExit(t, "approval", "status", pending.ApprovalID)
@@ -836,6 +889,55 @@ output:
 	}
 }
 
+func TestApprovalPendingHumanOutputIsEnglish(t *testing.T) {
+	home := t.TempDir()
+	writeTestInventory(t, home)
+	writePolicy(t, home, `
+version: 1
+approval:
+  enabled: true
+output:
+  max_bytes: 1024
+`)
+	t.Setenv("AGENTSSH_HOME", home)
+	t.Setenv("AGENTSSH_SESSION", "s_test")
+	withFakeExecutor(t, fakeExecutor{})
+
+	code, _, stderr := runExit(t, "run", "web-1", "--", "id")
+	if code != exitApprovalRequired {
+		t.Fatalf("exit=%d want 7 stderr=%s", code, stderr)
+	}
+	for _, want := range []string{"submitted for approval", "operator's decision", "candidate matcher"} {
+		if !strings.Contains(stderr, want) {
+			t.Fatalf("approval stderr missing %q:\n%s", want, stderr)
+		}
+	}
+	for _, r := range stderr {
+		if r >= 0x4e00 && r <= 0x9fff {
+			t.Fatalf("approval stderr contains CJK rune %q:\n%s", r, stderr)
+		}
+	}
+}
+
+func TestDeniedHumanOutputIsEnglish(t *testing.T) {
+	setupHome(t)
+	withFakeExecutor(t, fakeExecutor{})
+	code, _, stderr := runExit(t, "run", "web-1", "--", "rm", "-rf", "/")
+	if code != exitPolicyDenied {
+		t.Fatalf("exit=%d want 6 stderr=%s", code, stderr)
+	}
+	for _, want := range []string{"matched rule", "cannot be approved inline", "ask an operator"} {
+		if !strings.Contains(stderr, want) {
+			t.Fatalf("deny stderr missing %q:\n%s", want, stderr)
+		}
+	}
+	for _, r := range stderr {
+		if r >= 0x4e00 && r <= 0x9fff {
+			t.Fatalf("deny stderr contains CJK rune %q:\n%s", r, stderr)
+		}
+	}
+}
+
 func TestApprovalGroupPreflightDoesNotHalfExecute(t *testing.T) {
 	home := t.TempDir()
 	writeTestInventory(t, home)
@@ -877,8 +979,18 @@ output:
 		t.Fatalf("statusByHost = %#v responses=%#v", statusByHost, responses)
 	}
 	records := mustReadAudit(t, home)
-	if len(records) != 1 || records[0].Event != audit.EventApprovalRequested || records[0].Host != "web-2" {
-		t.Fatalf("audit records = %#v", records)
+	if len(records) != 2 {
+		t.Fatalf("audit records = %#v, want not_run + approval_requested", records)
+	}
+	byHost := map[string]audit.Record{}
+	for _, record := range records {
+		byHost[record.Host] = record
+	}
+	if byHost["web-1"].Event != audit.EventDenied || byHost["web-1"].ExitCode == nil || *byHost["web-1"].ExitCode != exitApprovalRequired {
+		t.Fatalf("web-1 not_run audit = %#v", byHost["web-1"])
+	}
+	if byHost["web-2"].Event != audit.EventApprovalRequested {
+		t.Fatalf("web-2 approval audit = %#v", byHost["web-2"])
 	}
 }
 
@@ -911,6 +1023,98 @@ output:
 	code, statusOut, _ := runExit(t, "approval", "status", pending.ApprovalID)
 	if code != exitPolicyDenied || !strings.Contains(statusOut, `"status": "denied"`) {
 		t.Fatalf("denied status code=%d out=%s", code, statusOut)
+	}
+}
+
+func TestApprovalPendingDedupesDeniedCommand(t *testing.T) {
+	home := t.TempDir()
+	writeTestInventory(t, home)
+	writePolicy(t, home, `
+version: 1
+approval:
+  enabled: true
+output:
+  max_bytes: 1024
+`)
+	t.Setenv("AGENTSSH_HOME", home)
+	t.Setenv("AGENTSSH_SESSION", "s_test")
+	withFakeExecutor(t, fakeExecutor{})
+
+	code, stdout, _ := runExit(t, "run", "web-1", "--json", "--", "id")
+	if code != exitApprovalRequired {
+		t.Fatalf("first run exit=%d stdout=%s", code, stdout)
+	}
+	var first runResponse
+	if err := json.Unmarshal([]byte(stdout), &first); err != nil {
+		t.Fatal(err)
+	}
+	code, stdout, _ = runExit(t, "run", "web-1", "--json", "--", "id")
+	if code != exitApprovalRequired {
+		t.Fatalf("second run exit=%d stdout=%s", code, stdout)
+	}
+	var second runResponse
+	if err := json.Unmarshal([]byte(stdout), &second); err != nil {
+		t.Fatal(err)
+	}
+	if second.ApprovalID != first.ApprovalID {
+		t.Fatalf("approval id = %s, want reused %s", second.ApprovalID, first.ApprovalID)
+	}
+	entries, err := os.ReadDir(filepath.Join(home, "approvals", "pending"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("pending files = %d, want 1", len(entries))
+	}
+}
+
+func TestInvalidApprovalConfigDisablesApprovalButAllowsExplicitAllow(t *testing.T) {
+	home := t.TempDir()
+	writeTestInventory(t, home)
+	writePolicy(t, home, `
+version: 1
+approval:
+  enabled: true
+  session_ttl: 12hours
+rules:
+  - name: allow-id
+    match: { cmd_regex: '\Aid\z' }
+    action: allow
+output:
+  max_bytes: 1024
+`)
+	t.Setenv("AGENTSSH_HOME", home)
+	t.Setenv("AGENTSSH_SESSION", "s_test")
+	var calls int32
+	withFakeExecutor(t, fakeExecutor{calls: &calls})
+
+	code, stdout, stderr := runExit(t, "run", "web-1", "--json", "--", "id")
+	if code != exitOK {
+		t.Fatalf("allowed run exit=%d stdout=%s stderr=%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stderr, "WARNING: invalid approval configuration") {
+		t.Fatalf("missing approval warning stderr=%q", stderr)
+	}
+	if atomic.LoadInt32(&calls) != 1 {
+		t.Fatalf("executor calls=%d want 1", calls)
+	}
+	var response runResponse
+	if err := json.Unmarshal([]byte(stdout), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Status != "completed" || response.Cmd != "id" {
+		t.Fatalf("response = %#v", response)
+	}
+
+	code, stdout, stderr = runExit(t, "run", "web-1", "--json", "--", "whoami")
+	if code != exitPolicyDenied {
+		t.Fatalf("gray run exit=%d want 6 stdout=%s stderr=%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stderr, "WARNING: invalid approval configuration") {
+		t.Fatalf("missing second approval warning stderr=%q", stderr)
+	}
+	if entries, err := os.ReadDir(filepath.Join(home, "approvals", "pending")); err == nil && len(entries) > 0 {
+		t.Fatalf("pending approvals created while invalid config disabled approval: %#v", entries)
 	}
 }
 

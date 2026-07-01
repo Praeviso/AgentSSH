@@ -17,6 +17,9 @@ func TestGeneralizeSafePrefixTable(t *testing.T) {
 		{"systemctl status nginx", HostGrantSafePrefix, MatcherPrefix, []string{"systemctl", "status"}, true},
 		{"systemctl restart nginx", HostGrantSafePrefix, MatcherExact, nil, true},
 		{"ls -la /var", HostGrantSafePrefix, MatcherPrefix, []string{"ls"}, true},
+		{"git diff HEAD", HostGrantSafePrefix, MatcherPrefix, []string{"git", "diff", "HEAD"}, true},
+		{"kubectl get pods", HostGrantSafePrefix, MatcherPrefix, []string{"kubectl", "get", "pods"}, true},
+		{"journalctl -u nginx", HostGrantSafePrefix, MatcherExact, nil, true},
 		{"cat /etc/passwd", HostGrantSafePrefix, MatcherExact, nil, true},
 		{"sudo systemctl restart nginx", HostGrantSafePrefix, MatcherExact, nil, false},
 		{"rm -rf /var/tmp/cache", HostGrantSafePrefix, MatcherExact, nil, true},
@@ -37,6 +40,59 @@ func TestGeneralizeSafePrefixTable(t *testing.T) {
 			assertMatcherInvariant(t, got.Regex)
 			if matched, err := got.Match(tt.command); err != nil || !matched {
 				t.Fatalf("matcher should match source command: matched=%v err=%v regex=%s", matched, err, got.Regex)
+			}
+		})
+	}
+}
+
+func TestGeneralizeSafePrefixConfirmedEscalationsDoNotMatch(t *testing.T) {
+	tests := []struct {
+		name    string
+		benign  string
+		exploit string
+	}{
+		{
+			name:    "journalctl destructive flag",
+			benign:  "journalctl -u nginx",
+			exploit: "journalctl --vacuum-time=1s",
+		},
+		{
+			name:    "git output overwrite",
+			benign:  "git diff HEAD",
+			exploit: "git diff --output=/etc/cron.d/x HEAD",
+		},
+		{
+			name:    "kubectl impersonated secret read",
+			benign:  "kubectl get pods",
+			exploit: "kubectl get secret --as=system:masters -o yaml",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			benign, err := Generalize(tt.benign, HostGrantSafePrefix)
+			if err != nil {
+				t.Fatalf("Generalize benign: %v", err)
+			}
+			assertMatcherInvariant(t, benign.Regex)
+			matched, err := benign.Match(tt.exploit)
+			if err != nil {
+				t.Fatalf("Match exploit with benign matcher: %v", err)
+			}
+			if matched {
+				t.Fatalf("benign matcher %s matched exploit %q", benign.Regex, tt.exploit)
+			}
+
+			exploit, err := Generalize(tt.exploit, HostGrantSafePrefix)
+			if err != nil {
+				t.Fatalf("Generalize exploit: %v", err)
+			}
+			if exploit.Kind != MatcherExact {
+				t.Fatalf("exploit matcher kind = %s, want exact: %#v", exploit.Kind, exploit)
+			}
+			assertMatcherInvariant(t, exploit.Regex)
+			matched, err = exploit.Match(tt.exploit)
+			if err != nil || !matched {
+				t.Fatalf("exploit exact matcher should match source: matched=%v err=%v regex=%s", matched, err, exploit.Regex)
 			}
 		})
 	}

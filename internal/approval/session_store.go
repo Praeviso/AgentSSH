@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -36,12 +37,10 @@ type Grant struct {
 type sessionFile struct {
 	Version   int     `json:"version"`
 	SessionID string  `json:"session_id"`
-	Host      string  `json:"host"`
+	Host      string  `json:"host,omitempty"`
 	Updated   string  `json:"updated"`
 	Grants    []Grant `json:"grants"`
 }
-
-var ErrSessionHostMismatch = errors.New("approval session is bound to a different host")
 
 func (s SessionStore) Grant(sessionID string, host string, scope Scope, matcher Matcher, approvalID string, reqID string, ttl time.Duration, channel string) (Grant, error) {
 	if scope != ScopeOnce && scope != ScopeSession {
@@ -73,12 +72,6 @@ func (s SessionStore) Grant(sessionID string, host string, scope Scope, matcher 
 		}
 		if doc.SessionID != sessionID {
 			return fmt.Errorf("session store file mismatch: %q != %q", doc.SessionID, sessionID)
-		}
-		if doc.Host == "" {
-			doc.Host = host
-		}
-		if doc.Host != host {
-			return ErrSessionHostMismatch
 		}
 		doc.Grants = filterLiveGrants(doc.Grants, now)
 		out := doc.Grants[:0]
@@ -116,9 +109,6 @@ func (s SessionStore) match(sessionID string, host string, command string, consu
 		}
 		if doc.SessionID != sessionID {
 			return fmt.Errorf("session store file mismatch: %q != %q", doc.SessionID, sessionID)
-		}
-		if doc.Host != "" && doc.Host != host {
-			return nil
 		}
 		live := filterLiveGrants(doc.Grants, now)
 		changed := len(live) != len(doc.Grants)
@@ -165,7 +155,39 @@ func (s SessionStore) End(sessionID string) error {
 	if err := os.MkdirAll(s.Dir, 0o700); err != nil {
 		return fmt.Errorf("create approval session directory: %w", err)
 	}
-	path := sessionPath(s.Dir, sessionID)
+	if err := removeSessionFile(sessionPath(s.Dir, sessionID)); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(s.Dir)
+	if err != nil {
+		return fmt.Errorf("list approval sessions: %w", err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		path := filepath.Join(s.Dir, entry.Name())
+		lock, err := lockSessionPath(path)
+		if err != nil {
+			return err
+		}
+		doc, err := readSessionFile(path)
+		if err != nil {
+			unlockAndClose(lock)
+			return err
+		}
+		if doc.SessionID == sessionID || strings.HasPrefix(doc.SessionID, sessionID+"@") {
+			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				unlockAndClose(lock)
+				return fmt.Errorf("remove approval session: %w", err)
+			}
+		}
+		unlockAndClose(lock)
+	}
+	return nil
+}
+
+func removeSessionFile(path string) error {
 	lock, err := lockSessionPath(path)
 	if err != nil {
 		return err

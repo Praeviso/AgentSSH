@@ -1,10 +1,15 @@
 package tui
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/Praeviso/AgentSSH/internal/approval"
+	"github.com/Praeviso/AgentSSH/internal/config"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 func mkApprovalReq(t *testing.T, id, host, session, cmd string) approval.PendingRequest {
@@ -107,5 +112,74 @@ func TestApprovalsDisabledShowsOffNote(t *testing.T) {
 	view := m.View()
 	if !strings.Contains(view, "Approvals are off") {
 		t.Errorf("disabled approvals should show the off note:\n%s", view)
+	}
+}
+
+func TestApprovalsDisabledDoesNotPollBadgeOrDecide(t *testing.T) {
+	req := sampleApprovalQueue(t)[:1]
+	m := buildAppWith(t, "version: 1\nhosts: {}\n", "version: 1\n")
+	m = sized(t, m, 92, 20)
+	m.approvals.pending = req
+	m = press(t, m, "3")
+	if got := m.approvals.pendingCount(); got != 0 {
+		t.Fatalf("disabled pendingCount = %d, want 0", got)
+	}
+	if strings.Contains(m.renderStatusBar(), "pending") {
+		t.Fatalf("disabled status bar shows pending badge:\n%s", m.renderStatusBar())
+	}
+	next, cmd := m.approvals.Update(approvalsTickMsg{})
+	if cmd != nil {
+		t.Fatal("disabled tick should not poll or re-arm")
+	}
+	section := next.(approvalsSection)
+	before := section.pendingCount()
+	next, cmd = section.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("d")})
+	if cmd != nil {
+		t.Fatal("disabled verdict key should be a no-op command")
+	}
+	section = next.(approvalsSection)
+	if got := section.pendingCount(); got != before {
+		t.Fatalf("disabled verdict key changed pending count from %d to %d", before, got)
+	}
+}
+
+func TestApprovalsDecisionLoadErrorAborts(t *testing.T) {
+	dir := t.TempDir()
+	paths := config.NewPaths(dir)
+	if err := os.WriteFile(paths.InventoryFile, []byte("version: 1\nhosts:\n  web-1: {addr: 10.0.0.11}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.PolicyFile, []byte("version: 1\nhost_overrides: [bad\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	req := mkApprovalReq(t, "ap_7f3a1b2c3d4e5f6071829300", "web-1", "s1", "ls /var")
+	store := approval.PendingStore{PendingDir: paths.PendingDir, ResponsesDir: paths.ResponsesDir}
+	if _, err := store.Create(req); err != nil {
+		t.Fatal(err)
+	}
+
+	section := approvalsSection{
+		paths:   paths,
+		styles:  newAppStyles(lipgloss.NewRenderer(os.Stdout)),
+		runtime: approval.RuntimeConfig{Enabled: true},
+		pending: []approval.PendingRequest{req},
+	}
+	next, cmd := section.decide(approval.VerdictApproved, approval.ScopeHost)
+	if cmd != nil {
+		t.Fatal("load failure should not trigger reload command")
+	}
+	section = next.(approvalsSection)
+	if section.err == nil {
+		t.Fatal("decision error = nil, want policy load error")
+	}
+	if _, err := os.Stat(filepath.Join(paths.ResponsesDir, req.ID+".json")); !os.IsNotExist(err) {
+		t.Fatalf("response file exists after load failure: %v", err)
+	}
+	raw, err := os.ReadFile(paths.PolicyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != "version: 1\nhost_overrides: [bad\n" {
+		t.Fatalf("policy file was clobbered:\n%s", raw)
 	}
 }

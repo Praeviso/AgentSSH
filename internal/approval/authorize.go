@@ -35,6 +35,24 @@ func PreflightAuthorize(cfg policy.Config, inv inventory.Inventory, sessionStore
 }
 
 func authorize(cfg policy.Config, inv inventory.Inventory, sessionStore SessionStore, runtime RuntimeConfig, sessionID string, host string, command string, consumeOnce bool) (Authorization, error) {
+	if !runtime.Enabled {
+		engine, err := policy.NewEngine(cfg, inv)
+		if err != nil {
+			return Authorization{}, err
+		}
+		decision, err := engine.Evaluate(host, command)
+		if err != nil {
+			return Authorization{}, err
+		}
+		if decision.Action == policy.ActionAllow {
+			return Authorization{Status: AuthAllow, Decision: decision}, nil
+		}
+		if decision.Rule != policy.RuleDefaultDeny {
+			return Authorization{Status: AuthHardDeny, Decision: decision}, nil
+		}
+		return Authorization{Status: AuthNeedsApproval, Decision: decision}, nil
+	}
+
 	clean, hostMatchers := splitPolicy(cfg, host)
 	engine, err := policy.NewEngine(clean, inv)
 	if err != nil {
@@ -49,9 +67,6 @@ func authorize(cfg policy.Config, inv inventory.Inventory, sessionStore SessionS
 	}
 	if decision.Rule != policy.RuleDefaultDeny {
 		return Authorization{Status: AuthHardDeny, Decision: decision}, nil
-	}
-	if !runtime.Enabled {
-		return Authorization{Status: AuthNeedsApproval, Decision: decision}, nil
 	}
 	var grant Grant
 	var ok bool

@@ -67,3 +67,54 @@ func TestSessionStoreOnceConcurrentConsumesOnce(t *testing.T) {
 		t.Fatalf("once grant matched %d times, want 1", got)
 	}
 }
+
+func TestSessionStoreAllowsSameSessionAcrossHosts(t *testing.T) {
+	store := SessionStore{Dir: t.TempDir()}
+	webMatcher, err := Exact("systemctl restart web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbMatcher, err := Exact("systemctl restart db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Grant("s_shared", "web-1", ScopeSession, webMatcher, "ap_0123456789abcdef01234567", "r1", time.Hour, ChannelCLI); err != nil {
+		t.Fatalf("Grant web: %v", err)
+	}
+	if _, err := store.Grant("s_shared", "db-1", ScopeSession, dbMatcher, "ap_0123456789abcdef01234568", "r2", time.Hour, ChannelCLI); err != nil {
+		t.Fatalf("Grant db: %v", err)
+	}
+	if grant, ok, err := store.Match("s_shared", "web-1", "systemctl restart web"); err != nil || !ok || grant.Host != "web-1" {
+		t.Fatalf("web match grant=%#v ok=%v err=%v", grant, ok, err)
+	}
+	if grant, ok, err := store.Match("s_shared", "db-1", "systemctl restart db"); err != nil || !ok || grant.Host != "db-1" {
+		t.Fatalf("db match grant=%#v ok=%v err=%v", grant, ok, err)
+	}
+	if _, ok, err := store.Match("s_shared", "db-1", "systemctl restart web"); err != nil || ok {
+		t.Fatalf("cross-host command match ok=%v err=%v", ok, err)
+	}
+}
+
+func TestSessionStoreEndRemovesDerivedSessions(t *testing.T) {
+	store := SessionStore{Dir: t.TempDir()}
+	matcher, err := Exact("id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, sessionID := range []string{"s_batch", "s_batch@web-1", "s_batch@web-2", "s_batch_other@web-3"} {
+		if _, err := store.Grant(sessionID, "web-1", ScopeSession, matcher, "ap_0123456789abcdef01234567", "r1", time.Hour, ChannelCLI); err != nil {
+			t.Fatalf("Grant %s: %v", sessionID, err)
+		}
+	}
+	if err := store.End("s_batch"); err != nil {
+		t.Fatalf("End: %v", err)
+	}
+	for _, sessionID := range []string{"s_batch", "s_batch@web-1", "s_batch@web-2"} {
+		if _, ok, err := store.Match(sessionID, "web-1", "id"); err != nil || ok {
+			t.Fatalf("ended session %s match ok=%v err=%v", sessionID, ok, err)
+		}
+	}
+	if _, ok, err := store.Match("s_batch_other@web-3", "web-1", "id"); err != nil || !ok {
+		t.Fatalf("unrelated derived session match ok=%v err=%v", ok, err)
+	}
+}

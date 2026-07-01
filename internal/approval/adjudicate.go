@@ -40,15 +40,36 @@ func ApplyDecision(opts ApplyOptions, id string, verdict Verdict, scope Scope) (
 	} else if exists {
 		return ApplyResult{}, ErrAlreadyResolved
 	}
-	if existing, err := opts.Pending.Status(id); err == nil && existing.Status != "pending" {
-		return ApplyResult{}, ErrAlreadyResolved
-	}
 	result := ApplyResult{Request: req}
 	switch verdict {
 	case VerdictApproved:
 		if scope != ScopeOnce && scope != ScopeSession && scope != ScopeHost {
 			return ApplyResult{}, fmt.Errorf("approval grant scope is required")
 		}
+		if scope == ScopeHost {
+			if !req.Candidate.Promotable {
+				return ApplyResult{}, fmt.Errorf("approval %s cannot be promoted to host scope", req.ID)
+			}
+			if err := validateMatcherInvariant(req.Candidate.Regex); err != nil {
+				return ApplyResult{}, err
+			}
+		} else if _, err := Exact(req.Cmd); err != nil {
+			return ApplyResult{}, err
+		}
+	case VerdictDenied:
+		scope = ""
+	default:
+		return ApplyResult{}, fmt.Errorf("invalid approval verdict %q", verdict)
+	}
+
+	resolution, err := opts.Pending.Resolve(req, verdict, scope)
+	if err != nil {
+		return ApplyResult{}, err
+	}
+	result.Resolution = resolution
+
+	switch verdict {
+	case VerdictApproved:
 		if scope == ScopeHost {
 			ruleName, err := applyHostGrant(opts, req)
 			if err != nil {
@@ -63,19 +84,11 @@ func ApplyDecision(opts ApplyOptions, id string, verdict Verdict, scope Scope) (
 			result.Grant = &grant
 		}
 	case VerdictDenied:
-		scope = ""
-	default:
-		return ApplyResult{}, fmt.Errorf("invalid approval verdict %q", verdict)
 	}
 
 	if err := appendApprovalAudit(opts, req, verdict, scope); err != nil {
 		return ApplyResult{}, err
 	}
-	resolution, err := opts.Pending.Resolve(req, verdict, scope)
-	if err != nil {
-		return ApplyResult{}, err
-	}
-	result.Resolution = resolution
 	return result, nil
 }
 

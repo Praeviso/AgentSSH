@@ -25,7 +25,7 @@ func TestAuthorizeApprovalGrantCannotShadowExplicitDeny(t *testing.T) {
 			}}},
 		},
 	}
-	auth, err := Authorize(cfg, inventory.Inventory{Hosts: map[string]inventory.Host{"web-1": {}}}, SessionStore{Dir: t.TempDir()}, RuntimeConfig{HostGrantMode: HostGrantSafePrefix}, "s", "web-1", "systemctl restart prod-db")
+	auth, err := Authorize(cfg, inventory.Inventory{Hosts: map[string]inventory.Host{"web-1": {}}}, SessionStore{Dir: t.TempDir()}, RuntimeConfig{Enabled: true, HostGrantMode: HostGrantSafePrefix}, "s", "web-1", "systemctl restart prod-db")
 	if err != nil {
 		t.Fatalf("Authorize: %v", err)
 	}
@@ -84,5 +84,32 @@ func TestAuthorizeNewDenyInvalidatesExistingGrant(t *testing.T) {
 	}
 	if auth.Status != AuthHardDeny {
 		t.Fatalf("auth = %#v, want hard deny", auth)
+	}
+}
+
+func TestAuthorizeDisabledApprovalUsesPersistedHostRules(t *testing.T) {
+	inv := inventory.Inventory{Hosts: map[string]inventory.Host{"web-1": {}}}
+	cfg := policy.Config{HostOverrides: map[string]policy.HostOverride{
+		policy.HostRulesKey("web-1"): {Rules: []policy.Rule{{
+			Name:   "approval/host",
+			Match:  policy.Match{CmdRegex: `\Als(?:[ \t]+[A-Za-z0-9@%+=:,./_-]+)*[ \t]*\z`},
+			Action: policy.ActionAllow,
+			Group:  policy.ApprovalGroup,
+		}}},
+	}}
+	auth, err := Authorize(cfg, inv, SessionStore{Dir: t.TempDir()}, RuntimeConfig{Enabled: false, HostGrantMode: HostGrantSafePrefix}, "s", "web-1", "ls /var")
+	if err != nil {
+		t.Fatalf("Authorize persisted host rule while disabled: %v", err)
+	}
+	if auth.Status != AuthAllow || auth.Decision.Action != policy.ActionAllow {
+		t.Fatalf("auth = %#v, want raw allow while disabled", auth)
+	}
+
+	auth, err = Authorize(cfg, inv, SessionStore{Dir: t.TempDir()}, RuntimeConfig{Enabled: false, HostGrantMode: HostGrantSafePrefix}, "s", "web-1", "id")
+	if err != nil {
+		t.Fatalf("Authorize gray while disabled: %v", err)
+	}
+	if auth.Status != AuthNeedsApproval || auth.Decision.Rule != policy.RuleDefaultDeny {
+		t.Fatalf("gray auth = %#v, want default-deny needs approval sentinel", auth)
 	}
 }

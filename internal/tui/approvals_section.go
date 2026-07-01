@@ -51,10 +51,16 @@ func newApprovalsSection(paths config.Paths, st appStyles, runtime approval.Runt
 func (s approvalsSection) capturing() bool { return false }
 
 func (s approvalsSection) Init() tea.Cmd {
+	if !s.runtime.Enabled {
+		return nil
+	}
 	return tea.Batch(s.loadCmd(), approvalsTickCmd())
 }
 
-func approvalsTickCmd() tea.Cmd {
+func approvalsTickCmd(enabled ...bool) tea.Cmd {
+	if len(enabled) > 0 && !enabled[0] {
+		return nil
+	}
 	return tea.Tick(approvalsPollInterval, func(time.Time) tea.Msg { return approvalsTickMsg{} })
 }
 
@@ -63,6 +69,9 @@ func (s approvalsSection) pendingStore() approval.PendingStore {
 }
 
 func (s approvalsSection) loadCmd() tea.Cmd {
+	if !s.runtime.Enabled {
+		return nil
+	}
 	store := s.pendingStore()
 	return func() tea.Msg {
 		reqs, err := store.List()
@@ -71,7 +80,12 @@ func (s approvalsSection) loadCmd() tea.Cmd {
 }
 
 // pendingCount is read by the shell to badge the tab from any screen.
-func (s approvalsSection) pendingCount() int { return len(s.pending) }
+func (s approvalsSection) pendingCount() int {
+	if !s.runtime.Enabled {
+		return 0
+	}
+	return len(s.pending)
+}
 
 func (s approvalsSection) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
@@ -79,9 +93,12 @@ func (s approvalsSection) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		s.w, s.h = msg.Width, msg.Height
 		return s, nil
 	case approvalsTickMsg:
+		if !s.runtime.Enabled {
+			return s, nil
+		}
 		// Keep polling regardless of the active tab so the queue and the tab badge
 		// stay live; re-arm the tick.
-		return s, tea.Batch(s.loadCmd(), approvalsTickCmd())
+		return s, tea.Batch(s.loadCmd(), approvalsTickCmd(s.runtime.Enabled))
 	case approvalsLoadedMsg:
 		s.pending = msg.pending
 		s.err = msg.err
@@ -106,12 +123,24 @@ func (s approvalsSection) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		s.cursor = maxInt(len(s.pending)-1, 0)
 		s.clearStatus()
 	case "o":
+		if !s.runtime.Enabled {
+			return s, nil
+		}
 		return s.decide(approval.VerdictApproved, approval.ScopeOnce)
 	case "s":
+		if !s.runtime.Enabled {
+			return s, nil
+		}
 		return s.decide(approval.VerdictApproved, approval.ScopeSession)
 	case "h":
+		if !s.runtime.Enabled {
+			return s, nil
+		}
 		return s.decide(approval.VerdictApproved, approval.ScopeHost)
 	case "d":
+		if !s.runtime.Enabled {
+			return s, nil
+		}
 		return s.decide(approval.VerdictDenied, "")
 	case "r":
 		s.clearStatus()
@@ -171,9 +200,19 @@ func (s approvalsSection) decide(verdict approval.Verdict, scope approval.Scope)
 		s.result = "host scope unavailable — privileged command; use once or session"
 		return s, nil
 	}
-	inv, _ := inventory.Load(s.paths.InventoryFile)
-	pol, _ := policy.Load(s.paths.PolicyFile)
-	_, err := approval.ApplyDecision(approval.ApplyOptions{
+	inv, err := inventory.Load(s.paths.InventoryFile)
+	if err != nil {
+		s.err = err
+		s.result = ""
+		return s, nil
+	}
+	pol, err := policy.Load(s.paths.PolicyFile)
+	if err != nil {
+		s.err = err
+		s.result = ""
+		return s, nil
+	}
+	_, err = approval.ApplyDecision(approval.ApplyOptions{
 		Pending:    s.pendingStore(),
 		Sessions:   approval.SessionStore{Dir: s.paths.SessionsDir},
 		Audit:      audit.NewStore(s.paths.AuditFile),

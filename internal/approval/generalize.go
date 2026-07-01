@@ -79,7 +79,8 @@ func Generalize(command string, mode HostGrantMode) (Matcher, error) {
 	}
 
 	prefix := prefixForMode(tokens, head, mode)
-	if len(prefix) == 0 || !tailTokensSafe(tokens[len(prefix):]) {
+	tail := tokens[len(prefix):]
+	if len(prefix) == 0 || !tailTokensSafe(tail) || (mode == HostGrantSafePrefix && !safePrefixTailTokensSafe(head, tail)) {
 		return exactMatcher(command, promotable), nil
 	}
 	return prefixMatcher(command, prefix, promotable), nil
@@ -209,11 +210,15 @@ func prefixForMode(tokens []string, head string, mode HostGrantMode) []string {
 		}
 		if subcommands, ok := safeReadonlySubcommands[head]; ok && len(tokens) >= 2 {
 			if _, ok := subcommands[strings.ToLower(tokens[1])]; ok {
-				return []string{tokens[0], tokens[1]}
+				prefix := []string{tokens[0], tokens[1]}
+				// Multi-tool read-only subcommands still have semantic positionals
+				// (for example, kubectl resource names). Pin a leading positional
+				// when present so a host grant does not silently widen across them.
+				if (head == "git" || head == "kubectl") && len(tokens) >= 3 && !strings.HasPrefix(tokens[2], "-") {
+					prefix = append(prefix, tokens[2])
+				}
+				return prefix
 			}
-		}
-		if head == "journalctl" {
-			return []string{tokens[0]}
 		}
 		return nil
 	case HostGrantPrefix:
@@ -238,6 +243,47 @@ func tailTokensSafe(tokens []string) bool {
 		}
 	}
 	return true
+}
+
+func safePrefixTailTokensSafe(head string, tokens []string) bool {
+	for _, token := range tokens {
+		if strings.HasPrefix(token, "-") && strings.Contains(token, "=") {
+			return false
+		}
+		if dangerousSafePrefixOption(head, token) {
+			return false
+		}
+	}
+	return true
+}
+
+func dangerousSafePrefixOption(head string, token string) bool {
+	for _, opt := range dangerousSafePrefixOptions(head) {
+		if token == opt || strings.HasPrefix(token, opt+"=") {
+			return true
+		}
+	}
+	return false
+}
+
+func dangerousSafePrefixOptions(head string) []string {
+	opts := []string{
+		"--output",
+		"--as",
+		"--as-group",
+		"--token",
+		"--kubeconfig",
+		"--server",
+		"--vacuum-time",
+		"--vacuum-size",
+		"--vacuum-files",
+		"--rotate",
+		"--flush",
+	}
+	if head == "git" {
+		opts = append(opts, "-o")
+	}
+	return opts
 }
 
 func isTailByte(b byte) bool {

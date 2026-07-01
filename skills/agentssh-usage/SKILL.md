@@ -87,7 +87,7 @@ agentssh status <req_id> [--json]                    # look up a past run's resu
 agentssh approval status <approval_id>               # read approval result: 0 approved, 6 denied, 7 pending
 agentssh approval wait <approval_id> [--timeout 10m]  # wait for approval result, never grants approval
 agentssh audit ls [--session <id>] | show <req_id> | verify   # browse / inspect / verify the hash chain
-agentssh policy test --host <host> '<cmd>'           # check how a command would be judged, without running it
+agentssh policy test --host <host> '<cmd>'           # static policy check, without running it or consulting session grants
 agentssh tui                                         # interactive audit + policy viewer
 ```
 

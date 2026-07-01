@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -31,8 +32,9 @@ const (
 )
 
 const (
-	ChannelCLI = "cli"
-	ChannelTUI = "tui"
+	ChannelCLI  = "cli"
+	ChannelTUI  = "tui"
+	ChannelExit = "exit"
 )
 
 // Matcher is the reusable command matcher that can be stored in session grants
@@ -57,7 +59,7 @@ func (m Matcher) Match(command string) (bool, error) {
 }
 
 func (m Matcher) SHA256() string {
-	sum := sha256.Sum256([]byte(string(m.Kind) + "\x00" + m.Regex + "\x00" + strings.Join(m.Prefix, "\x00") + "\x00" + m.SourceCmd))
+	sum := sha256.Sum256([]byte(string(m.Kind) + "\x00" + m.Regex + "\x00" + strings.Join(m.Prefix, "\x00") + "\x00" + m.SourceCmd + "\x00" + strconv.FormatBool(m.Promotable)))
 	return hex.EncodeToString(sum[:])
 }
 

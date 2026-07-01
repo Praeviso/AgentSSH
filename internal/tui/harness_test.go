@@ -104,6 +104,10 @@ func buildAppWith(t *testing.T, inv, pol string) appModel {
 		PolicyFile:    filepath.Join(dir, "policy.yaml"),
 		AuditFile:     filepath.Join(dir, "audit.log"),
 		SecretsFile:   filepath.Join(dir, "secrets.enc"),
+		ApprovalsDir:  filepath.Join(dir, "approvals"),
+		SessionsDir:   filepath.Join(dir, "approvals", "sessions"),
+		PendingDir:    filepath.Join(dir, "approvals", "pending"),
+		ResponsesDir:  filepath.Join(dir, "approvals", "responses"),
 	}
 	return newAppModel(paths, lipgloss.NewRenderer(os.Stdout))
 }
