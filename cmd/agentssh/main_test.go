@@ -111,8 +111,12 @@ func TestTransportSelection(t *testing.T) {
 	}
 	cfg.Inventory.Transport = executor.TransportShell
 	shellExec := newExecutor(cfg)
-	if _, ok := shellExec.(executor.SSHExecutor); !ok {
+	shellSSH, ok := shellExec.(executor.SSHExecutor)
+	if !ok {
 		t.Fatalf("inventory shell transport = %T, want shell-out SSHExecutor", shellExec)
+	}
+	if shellSSH.Options.DisableMultiplexing {
+		t.Fatal("default shell executor disabled multiplexing")
 	}
 	t.Setenv("AGENTSSH_TRANSPORT", executor.TransportShell)
 	cfg.Inventory.Transport = executor.TransportNative
@@ -121,6 +125,38 @@ func TestTransportSelection(t *testing.T) {
 		t.Fatalf("env shell transport = %T, want SSHExecutor override", envExec)
 	}
 	t.Logf("transport default=%T inventory_shell=%T env_shell_overrides=%T", defaultExec, shellExec, envExec)
+}
+
+func TestNewExecutorSSHReuseConfig(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Inventory.SSH.Multiplexing = "off"
+	cfg.Inventory.SSH.ControlPersist = "2m"
+	cfg.Inventory.SSH.KeepAliveInterval = "15s"
+
+	nativeExec := newExecutor(cfg)
+	nativeSSH, ok := nativeExec.(executor.NativeExecutor)
+	if !ok {
+		t.Fatalf("native executor = %T", nativeExec)
+	}
+	if !nativeSSH.Options.DisableConnectionReuse {
+		t.Fatal("native DisableConnectionReuse = false, want true")
+	}
+	if nativeSSH.Options.KeepAliveInterval != 15*time.Second {
+		t.Fatalf("native keepalive = %s, want 15s", nativeSSH.Options.KeepAliveInterval)
+	}
+
+	cfg.Inventory.Transport = executor.TransportShell
+	shellExec := newExecutor(cfg)
+	shellSSH, ok := shellExec.(executor.SSHExecutor)
+	if !ok {
+		t.Fatalf("shell executor = %T", shellExec)
+	}
+	if !shellSSH.Options.DisableMultiplexing {
+		t.Fatal("shell DisableMultiplexing = false, want true")
+	}
+	if shellSSH.Options.ControlPersist != 2*time.Minute || shellSSH.Options.KeepAliveInterval != 15*time.Second {
+		t.Fatalf("shell options = %#v", shellSSH.Options)
+	}
 }
 
 func TestPrintSSHExit255MappingDemo(t *testing.T) {
@@ -2135,6 +2171,8 @@ func (e fakeExecutor) Run(_ context.Context, request executor.Request) executor.
 	}
 }
 
+func (e fakeExecutor) Close() error { return nil }
+
 var _ executor.Executor = fakeExecutor{}
 
 func (e fakeExecutor) RunStreaming(_ context.Context, request executor.Request, stdout io.Writer, stderr io.Writer) executor.Result {
@@ -2169,6 +2207,8 @@ func (e osDetectingExecutor) Run(_ context.Context, request executor.Request) ex
 		OS:       e.osName,
 	}
 }
+
+func (e osDetectingExecutor) Close() error { return nil }
 
 var _ executor.Executor = osDetectingExecutor{}
 
@@ -2207,6 +2247,8 @@ func (e bufferedOnlyExecutor) Run(_ context.Context, request executor.Request) e
 		Argv:     []string{"ssh", request.Target.Name, request.Command},
 	}
 }
+
+func (e bufferedOnlyExecutor) Close() error { return nil }
 
 var _ executor.Executor = bufferedOnlyExecutor{}
 

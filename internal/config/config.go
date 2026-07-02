@@ -28,6 +28,10 @@ const seedInventoryYAML = `# AgentSSH inventory — manage via 'agentssh tui' (H
 version: 1
 transport: native           # built-in Go SSH client; set "ssh" to shell out to system ssh
 host_key_policy: strict     # or "accept-new" for trust-on-first-use
+ssh:
+  multiplexing: on          # set "off" to disable connection reuse
+  control_persist: 60s      # shell transport ControlPersist lifetime
+  keepalive_interval: 30s   # pooled/native heartbeat and shell ServerAliveInterval
 hosts: {}
 `
 

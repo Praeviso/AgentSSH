@@ -176,6 +176,142 @@ func TestSSHExecutorMultiplexesCommandAndProbe(t *testing.T) {
 	}
 }
 
+func TestSSHExecutorCachesOSPerMuxKey(t *testing.T) {
+	controlDir := t.TempDir()
+	var probes int
+	runner := RunnerFunc(func(_ context.Context, argv []string) RunResult {
+		if argv[len(argv)-1] == OSProbeCommand {
+			probes++
+			return RunResult{Stdout: "Linux\n", ExitCode: 0}
+		}
+		return RunResult{Stdout: "ok\n", ExitCode: 0}
+	})
+	exec := NewSSHExecutorWithOptions(runner, SSHOptions{ControlDir: controlDir})
+	defer func() { _ = exec.Close() }()
+	target := inventory.Target{Name: "web-1", Host: inventory.Host{Addr: "10.0.0.11", User: "deploy"}}
+
+	for i := 0; i < 2; i++ {
+		result := exec.Run(context.Background(), Request{Target: target, Command: "echo ok"})
+		if result.Err != nil || result.OS != "linux" {
+			t.Fatalf("run %d result = %#v", i, result)
+		}
+	}
+	if probes != 1 {
+		t.Fatalf("OS probes = %d, want 1 cached probe", probes)
+	}
+}
+
+func TestSSHExecutorLeavesAliasMuxOptionsToSSHConfig(t *testing.T) {
+	controlDir := t.TempDir()
+	var call []string
+	runner := RunnerFunc(func(_ context.Context, argv []string) RunResult {
+		call = append([]string{}, argv...)
+		return RunResult{ExitCode: 255, Err: errors.New("connect failed")}
+	})
+	exec := NewSSHExecutorWithOptions(runner, SSHOptions{ControlDir: controlDir})
+	defer func() { _ = exec.Close() }()
+
+	_ = exec.Run(context.Background(), Request{
+		Target:  inventory.Target{Name: "prod", Host: inventory.Host{SSHConfigAlias: "prod-web", Addr: "ignored", User: "ignored", Port: 2222}},
+		Command: "uptime",
+	})
+
+	if got := sshOptionValue(t, call, "ControlPath"); got != "" {
+		t.Fatalf("alias ControlPath = %q, want no injected mux options in %#v", got, call)
+	}
+	want := []string{"ssh", "prod-web", "uptime"}
+	if !reflect.DeepEqual(call, want) {
+		t.Fatalf("alias argv = %#v, want %#v", call, want)
+	}
+}
+
+func TestBuildSSHArgvWithOptionsDoesNotOverrideAliasMuxConfig(t *testing.T) {
+	target := inventory.Target{Name: "prod", Host: inventory.Host{SSHConfigAlias: "prod-web"}}
+	got := BuildSSHArgvWithOptions(target, "uptime", SSHArgvOptions{
+		ControlPath:    filepath.Join(t.TempDir(), "cm-prod"),
+		ControlPersist: time.Minute,
+	})
+	want := []string{"ssh", "prod-web", "uptime"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("argv = %#v, want %#v", got, want)
+	}
+}
+
+func TestSSHExecutorStableControlDirSurvivesClose(t *testing.T) {
+	cacheRoot, err := os.MkdirTemp("/tmp", "agentssh-cache-*")
+	if err != nil {
+		t.Fatalf("create short cache dir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(cacheRoot) })
+	t.Setenv("XDG_CACHE_HOME", cacheRoot)
+	var controlPath string
+	runner := RunnerFunc(func(_ context.Context, argv []string) RunResult {
+		if controlPath == "" {
+			controlPath = sshOptionValue(t, argv, "ControlPath")
+			if err := os.WriteFile(controlPath, []byte("socket placeholder"), 0o600); err != nil {
+				t.Fatalf("write control path placeholder: %v", err)
+			}
+		}
+		return RunResult{ExitCode: 255, Err: errors.New("connect failed")}
+	})
+	exec := NewSSHExecutor(runner)
+
+	_ = exec.Run(context.Background(), Request{
+		Target:  inventory.Target{Name: "web-1", Host: inventory.Host{Addr: "10.0.0.11", User: "deploy"}},
+		Command: "uptime",
+	})
+	if controlPath == "" {
+		t.Fatal("runner did not receive a ControlPath")
+	}
+	controlDir := filepath.Dir(controlPath)
+	wantDir := filepath.Join(cacheRoot, "agentssh", "ssh-mux")
+	if controlDir != wantDir {
+		t.Fatalf("control dir = %q, want %q", controlDir, wantDir)
+	}
+	if err := exec.Close(); err != nil {
+		t.Fatalf("close executor: %v", err)
+	}
+	if _, err := os.Stat(controlPath); err != nil {
+		t.Fatalf("control path after close: %v", err)
+	}
+}
+
+func TestSSHExecutorFallsBackWhenControlPathTooLong(t *testing.T) {
+	controlDir := filepath.Join(t.TempDir(), strings.Repeat("long-segment-", 12))
+	var call []string
+	runner := RunnerFunc(func(_ context.Context, argv []string) RunResult {
+		call = append([]string{}, argv...)
+		return RunResult{ExitCode: 255, Err: errors.New("connect failed")}
+	})
+	exec := NewSSHExecutorWithOptions(runner, SSHOptions{ControlDir: controlDir})
+	defer func() { _ = exec.Close() }()
+
+	_ = exec.Run(context.Background(), Request{
+		Target:  inventory.Target{Name: "web-1", Host: inventory.Host{Addr: "10.0.0.11", User: "deploy"}},
+		Command: "uptime",
+	})
+
+	if got := sshOptionValue(t, call, "ControlPath"); got != "" {
+		t.Fatalf("long ControlPath still injected as %q in %#v", got, call)
+	}
+	want := []string{"ssh", "deploy@10.0.0.11", "uptime"}
+	if !reflect.DeepEqual(call, want) {
+		t.Fatalf("fallback argv = %#v, want %#v", call, want)
+	}
+}
+
+func TestSSHExecutorInjectsServerAliveIntervalWhenConfigured(t *testing.T) {
+	target := inventory.Target{Name: "web-1", Host: inventory.Host{Addr: "10.0.0.11", User: "deploy"}}
+	got := BuildSSHArgvWithOptions(target, "uptime", SSHArgvOptions{
+		ControlPath:       filepath.Join(t.TempDir(), "cm-web-1"),
+		ControlPersist:    time.Minute,
+		KeepAliveInterval: 7 * time.Second,
+	})
+	if value := sshOptionValue(t, got, "ServerAliveInterval"); value != "7" {
+		t.Fatalf("ServerAliveInterval = %q, want 7 in %#v", value, got)
+	}
+}
+
 func TestSSHExecutorMultiplexingCanBeDisabled(t *testing.T) {
 	var calls [][]string
 	runner := RunnerFunc(func(_ context.Context, argv []string) RunResult {
@@ -198,8 +334,13 @@ func TestSSHExecutorMultiplexingCanBeDisabled(t *testing.T) {
 	}
 }
 
-func TestSSHExecutorCloseCleansOwnedControlDir(t *testing.T) {
+func TestSSHExecutorCloseLeavesConfiguredControlPath(t *testing.T) {
 	var controlPath string
+	controlDir, err := os.MkdirTemp("/tmp", "agentssh-mux-*")
+	if err != nil {
+		t.Fatalf("create short control dir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(controlDir) })
 	runner := RunnerFunc(func(_ context.Context, argv []string) RunResult {
 		if controlPath == "" {
 			controlPath = sshOptionValue(t, argv, "ControlPath")
@@ -209,7 +350,7 @@ func TestSSHExecutorCloseCleansOwnedControlDir(t *testing.T) {
 		}
 		return RunResult{ExitCode: 255, Err: errors.New("connect failed")}
 	})
-	exec := NewSSHExecutor(runner)
+	exec := NewSSHExecutorWithOptions(runner, SSHOptions{ControlDir: controlDir})
 
 	result := exec.Run(context.Background(), Request{
 		Target:  inventory.Target{Name: "web-1", Host: inventory.Host{Addr: "10.0.0.11", User: "deploy"}},
@@ -221,15 +362,17 @@ func TestSSHExecutorCloseCleansOwnedControlDir(t *testing.T) {
 	if controlPath == "" {
 		t.Fatal("runner did not receive a ControlPath")
 	}
-	controlDir := filepath.Dir(controlPath)
 	if _, err := os.Stat(controlPath); err != nil {
 		t.Fatalf("control path placeholder before close: %v", err)
 	}
 	if err := exec.Close(); err != nil {
 		t.Fatalf("close executor: %v", err)
 	}
-	if _, err := os.Stat(controlDir); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("control dir after close err=%v, want not exist", err)
+	if _, err := os.Stat(controlPath); err != nil {
+		t.Fatalf("control path after close: %v", err)
+	}
+	if _, err := os.Stat(controlDir); err != nil {
+		t.Fatalf("control dir after close: %v", err)
 	}
 }
 

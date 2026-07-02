@@ -39,6 +39,7 @@ type Result struct {
 // Executor runs commands against remote hosts.
 type Executor interface {
 	Run(ctx context.Context, request Request) Result
+	Close() error
 }
 
 // StreamingExecutor optionally streams stdout/stderr into supplied writers.
@@ -82,7 +83,10 @@ type SSHOptions struct {
 	DisableMultiplexing bool
 	ControlPersist      time.Duration
 	ControlDir          string
+	KeepAliveInterval   time.Duration
 }
+
+const maxControlPathLen = 90
 
 // NewSSHExecutor returns an executor backed by the system ssh binary.
 func NewSSHExecutor(runner Runner) SSHExecutor {
@@ -105,9 +109,10 @@ func NewSSHExecutorWithOptions(runner Runner, options SSHOptions) SSHExecutor {
 	return exec
 }
 
-// Close removes the per-run ControlPath directory used by shell transport
-// multiplexing. Any OpenSSH master process left by ControlPersist exits on its
-// own bounded timer, but the socket path is no longer exposed to future runs.
+// Close drops this process's in-memory mux cache. It intentionally leaves
+// ControlPath sockets on disk: OpenSSH masters remove them when their
+// ControlPersist lifetime ends, and keeping the stable path available is what
+// lets later AgentSSH invocations reuse the master.
 func (e SSHExecutor) Close() error {
 	if e.mux == nil {
 		return nil
@@ -130,6 +135,7 @@ func (e SSHExecutor) Run(ctx context.Context, request Request) Result {
 	if sshResultConnected(result) {
 		if request.Command == OSProbeCommand {
 			result.OS = NormalizeOS(result.Stdout)
+			e.cacheOS(request.Target, result.OS)
 		} else {
 			result.OS = e.detectOS(ctx, request.Target)
 		}
@@ -160,17 +166,25 @@ func sshResultConnected(result Result) bool {
 }
 
 func (e SSHExecutor) detectOS(ctx context.Context, target inventory.Target) string {
+	if osName := e.cachedOS(target); osName != "" {
+		return osName
+	}
 	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	result := e.Runner.Run(probeCtx, e.buildArgv(target, OSProbeCommand))
 	if result.Err != nil || result.ExitCode != 0 {
 		return ""
 	}
-	return NormalizeOS(result.Stdout)
+	osName := NormalizeOS(result.Stdout)
+	e.cacheOS(target, osName)
+	return osName
 }
 
 func (e SSHExecutor) buildArgv(target inventory.Target, command string) []string {
 	if e.mux == nil || e.Options.DisableMultiplexing {
+		return BuildSSHArgv(target, command)
+	}
+	if target.Host.SSHConfigAlias != "" {
 		return BuildSSHArgv(target, command)
 	}
 	controlPath := e.mux.controlPath(target)
@@ -178,9 +192,24 @@ func (e SSHExecutor) buildArgv(target inventory.Target, command string) []string
 		return BuildSSHArgv(target, command)
 	}
 	return BuildSSHArgvWithOptions(target, command, SSHArgvOptions{
-		ControlPath:    controlPath,
-		ControlPersist: e.Options.ControlPersist,
+		ControlPath:       controlPath,
+		ControlPersist:    e.Options.ControlPersist,
+		KeepAliveInterval: e.Options.KeepAliveInterval,
 	})
+}
+
+func (e SSHExecutor) cachedOS(target inventory.Target) string {
+	if e.mux == nil || e.Options.DisableMultiplexing {
+		return ""
+	}
+	return e.mux.cachedOS(sshControlKey(target))
+}
+
+func (e SSHExecutor) cacheOS(target inventory.Target, osName string) {
+	if e.mux == nil || e.Options.DisableMultiplexing || osName == "" {
+		return
+	}
+	e.mux.setOS(sshControlKey(target), osName)
 }
 
 // OSProbeCommand is the remote command AgentSSH uses for internal host metadata
@@ -217,8 +246,9 @@ func BuildSSHArgv(target inventory.Target, command string) []string {
 
 // SSHArgvOptions carries local ssh(1) process options that AgentSSH owns.
 type SSHArgvOptions struct {
-	ControlPath    string
-	ControlPersist time.Duration
+	ControlPath       string
+	ControlPersist    time.Duration
+	KeepAliveInterval time.Duration
 }
 
 // BuildSSHArgvWithOptions constructs the local ssh(1) argv with optional
@@ -238,7 +268,7 @@ func BuildSSHArgvWithOptions(target inventory.Target, command string, options SS
 	if host.Port != 0 && host.Port != 22 && host.SSHConfigAlias == "" {
 		argv = append(argv, "-p", strconv.Itoa(host.Port))
 	}
-	if options.ControlPath != "" {
+	if options.ControlPath != "" && host.SSHConfigAlias == "" {
 		persist := options.ControlPersist
 		if persist <= 0 {
 			persist = 60 * time.Second
@@ -248,37 +278,68 @@ func BuildSSHArgvWithOptions(target inventory.Target, command string, options SS
 			"-o", "ControlPersist="+formatControlPersist(persist),
 			"-o", "ControlPath="+options.ControlPath,
 		)
+		if options.KeepAliveInterval > 0 {
+			argv = append(argv, "-o", "ServerAliveInterval="+formatSeconds(options.KeepAliveInterval))
+		}
 	}
 	return append(argv, hostSpec, command)
 }
 
 func formatControlPersist(duration time.Duration) string {
+	return formatControlSeconds(duration)
+}
+
+func formatControlSeconds(duration time.Duration) string {
+	return formatSeconds(duration) + "s"
+}
+
+func formatSeconds(duration time.Duration) string {
 	seconds := int(duration.Round(time.Second) / time.Second)
 	if seconds < 1 {
 		seconds = 1
 	}
-	return strconv.Itoa(seconds) + "s"
+	return strconv.Itoa(seconds)
 }
 
 type sshMultiplexer struct {
 	mu         sync.Mutex
 	dir        string
 	configured string
-	owned      bool
 	paths      map[string]struct{}
+	disabled   map[string]struct{}
+	osByKey    map[string]string
 }
 
 func newSSHMultiplexer(controlDir string) *sshMultiplexer {
-	return &sshMultiplexer{configured: controlDir, paths: map[string]struct{}{}}
+	return &sshMultiplexer{
+		configured: controlDir,
+		paths:      map[string]struct{}{},
+		disabled:   map[string]struct{}{},
+		osByKey:    map[string]string{},
+	}
 }
 
 func (m *sshMultiplexer) controlPath(target inventory.Target) string {
+	key := sshControlKey(target)
+	m.mu.Lock()
+	if _, ok := m.disabled[key]; ok {
+		m.mu.Unlock()
+		return ""
+	}
+	m.mu.Unlock()
+
 	dir := m.dirPath()
 	if dir == "" {
 		return ""
 	}
-	sum := sha256.Sum256([]byte(sshControlKey(target)))
+	sum := sha256.Sum256([]byte(key))
 	path := filepath.Join(dir, "cm-"+hex.EncodeToString(sum[:])[:24])
+	if len(path) > maxControlPathLen {
+		m.mu.Lock()
+		m.disabled[key] = struct{}{}
+		m.mu.Unlock()
+		return ""
+	}
 
 	m.mu.Lock()
 	m.paths[path] = struct{}{}
@@ -301,41 +362,54 @@ func (m *sshMultiplexer) dirPath() string {
 		m.dir = dir
 		return m.dir
 	}
+	if dir, err := defaultControlDir(); err == nil {
+		m.dir = dir
+		return m.dir
+	}
 	dir, err := os.MkdirTemp("", "agentssh-ssh-*")
 	if err != nil {
 		return ""
 	}
 	m.dir = dir
-	m.owned = true
 	return m.dir
 }
 
 func (m *sshMultiplexer) Close() error {
 	m.mu.Lock()
-	dir := m.dir
-	owned := m.owned
-	paths := make([]string, 0, len(m.paths))
-	for path := range m.paths {
-		paths = append(paths, path)
-	}
 	m.dir = ""
-	m.owned = false
 	m.paths = map[string]struct{}{}
+	m.disabled = map[string]struct{}{}
+	m.osByKey = map[string]string{}
 	m.mu.Unlock()
 
-	if dir == "" {
-		return nil
+	return nil
+}
+
+func (m *sshMultiplexer) cachedOS(key string) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.osByKey[key]
+}
+
+func (m *sshMultiplexer) setOS(key string, osName string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.osByKey[key] = osName
+}
+
+func defaultControlDir() (string, error) {
+	cacheDir, err := os.UserCacheDir()
+	if err != nil {
+		return "", err
 	}
-	if owned {
-		return os.RemoveAll(dir)
+	dir := filepath.Join(cacheDir, "agentssh", "ssh-mux")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
 	}
-	var err error
-	for _, path := range paths {
-		if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) && err == nil {
-			err = removeErr
-		}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return "", err
 	}
-	return err
+	return dir, nil
 }
 
 func sshControlKey(target inventory.Target) string {
