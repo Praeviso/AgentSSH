@@ -10,6 +10,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -18,6 +19,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Praeviso/AgentSSH/internal/inventory"
 	"golang.org/x/crypto/ssh"
@@ -36,6 +38,7 @@ func TestNativeExecutorExecSuccessAndRemoteNonZero(t *testing.T) {
 		KnownHostsPath: filepath.Join(home, ".ssh", "known_hosts"),
 		ConfigPath:     filepath.Join(home, ".ssh", "config"),
 	})
+	defer func() { _ = exec.Close() }()
 	target := inventory.Target{Name: "test", Host: inventory.Host{Addr: server.Host(), Port: server.Port(), User: "test"}}
 
 	result := exec.Run(context.Background(), Request{Target: target, Command: "ok"})
@@ -69,6 +72,7 @@ func TestNativeExecutorRunStreaming(t *testing.T) {
 		KnownHostsPath: filepath.Join(home, ".ssh", "known_hosts"),
 		ConfigPath:     filepath.Join(home, ".ssh", "config"),
 	})
+	defer func() { _ = exec.Close() }()
 	target := inventory.Target{Name: "test", Host: inventory.Host{Addr: server.Host(), Port: server.Port(), User: "test"}}
 
 	var stdout bytes.Buffer
@@ -84,6 +88,386 @@ func TestNativeExecutorRunStreaming(t *testing.T) {
 		t.Fatalf("stdout=%q stderr=%q", stdout.String(), stderr.String())
 	}
 	t.Logf("native streaming stdout=%q stderr=%q exit_code=%d", stdout.String(), stderr.String(), result.ExitCode)
+}
+
+func TestNativeExecutorReusesPooledConnection(t *testing.T) {
+	home := t.TempDir()
+	clientSigner := writeClientKey(t, home)
+	server := newTestSSHServer(t, clientSigner.PublicKey())
+	defer server.Close()
+
+	writeKnownHosts(t, home, server.Addr(), server.HostSigner.PublicKey())
+
+	exec := NewNativeExecutor(NativeOptions{
+		KnownHostsPath:    filepath.Join(home, ".ssh", "known_hosts"),
+		ConfigPath:        filepath.Join(home, ".ssh", "config"),
+		KeepAliveInterval: -1,
+	})
+	defer func() { _ = exec.Close() }()
+	target := inventory.Target{Name: "test", Host: inventory.Host{Addr: server.Host(), Port: server.Port(), User: "test"}}
+
+	for _, command := range []string{"ok", "exit7"} {
+		result := exec.Run(context.Background(), Request{Target: target, Command: command})
+		if result.Err != nil {
+			t.Fatalf("%s result err = %v", command, result.Err)
+		}
+	}
+	if got := atomic.LoadInt32(&server.accepted); got != 1 {
+		t.Fatalf("accepted connections = %d, want 1 pooled connection", got)
+	}
+}
+
+func TestNativeExecutorCachesOSPerPooledConnection(t *testing.T) {
+	home := t.TempDir()
+	clientSigner := writeClientKey(t, home)
+	server := newTestSSHServer(t, clientSigner.PublicKey())
+	defer server.Close()
+
+	writeKnownHosts(t, home, server.Addr(), server.HostSigner.PublicKey())
+
+	exec := NewNativeExecutor(NativeOptions{
+		KnownHostsPath:    filepath.Join(home, ".ssh", "known_hosts"),
+		ConfigPath:        filepath.Join(home, ".ssh", "config"),
+		KeepAliveInterval: -1,
+	})
+	defer func() { _ = exec.Close() }()
+	target := inventory.Target{Name: "test", Host: inventory.Host{Addr: server.Host(), Port: server.Port(), User: "test"}}
+
+	for i := 0; i < 2; i++ {
+		result := exec.Run(context.Background(), Request{Target: target, Command: "ok"})
+		if result.Err != nil || result.OS != "linux" {
+			t.Fatalf("run %d result = %#v err=%v", i, result, result.Err)
+		}
+	}
+	if got := atomic.LoadInt32(&server.osProbes); got != 1 {
+		t.Fatalf("OS probes = %d, want 1 cached probe", got)
+	}
+}
+
+func TestNativeExecutorPoolSingleFlightsConcurrentDial(t *testing.T) {
+	home := t.TempDir()
+	clientSigner := writeClientKey(t, home)
+	server := newTestSSHServer(t, clientSigner.PublicKey())
+	defer server.Close()
+
+	writeKnownHosts(t, home, server.Addr(), server.HostSigner.PublicKey())
+
+	exec := NewNativeExecutor(NativeOptions{
+		KnownHostsPath:    filepath.Join(home, ".ssh", "known_hosts"),
+		ConfigPath:        filepath.Join(home, ".ssh", "config"),
+		KeepAliveInterval: -1,
+	})
+	defer func() { _ = exec.Close() }()
+	target := inventory.Target{Name: "test", Host: inventory.Host{Addr: server.Host(), Port: server.Port(), User: "test"}}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 8)
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			result := exec.Run(context.Background(), Request{Target: target, Command: "ok"})
+			if result.Err != nil || result.ExitCode != 0 || result.Stdout != "ok\n" {
+				errs <- fmt.Errorf("result = %#v err=%v", result, result.Err)
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	if got := atomic.LoadInt32(&server.accepted); got != 1 {
+		t.Fatalf("accepted connections = %d, want 1 pooled connection", got)
+	}
+}
+
+func TestNativeClientPoolBroadcastsDialErrorToWaiters(t *testing.T) {
+	pool := newNativeClientPool(-1)
+	wantErr := errors.New("dial failed")
+	dialEntered := make(chan struct{})
+	releaseDial := make(chan struct{})
+	var dials int32
+	dial := func(context.Context) (*nativeClient, error) {
+		if atomic.AddInt32(&dials, 1) == 1 {
+			close(dialEntered)
+		}
+		<-releaseDial
+		return nil, wantErr
+	}
+
+	errs := make(chan error, 6)
+	go func() {
+		_, _, err := pool.get(context.Background(), "web-1", dial)
+		errs <- err
+	}()
+	<-dialEntered
+	for i := 0; i < 5; i++ {
+		go func() {
+			_, _, err := pool.get(context.Background(), "web-1", dial)
+			errs <- err
+		}()
+	}
+	time.Sleep(20 * time.Millisecond)
+	close(releaseDial)
+
+	for i := 0; i < 6; i++ {
+		if err := <-errs; !errors.Is(err, wantErr) {
+			t.Fatalf("waiter %d err = %v, want %v", i, err, wantErr)
+		}
+	}
+	if got := atomic.LoadInt32(&dials); got != 1 {
+		t.Fatalf("dials = %d, want one broadcast failed dial", got)
+	}
+}
+
+func TestNativeClientPoolDepoolDefersCloseUntilInFlightDrains(t *testing.T) {
+	pool := newNativeClientPool(-1)
+	var closes int32
+	entry := &nativePoolEntry{
+		client: &nativeClient{closers: []io.Closer{
+			closerFunc(func() error {
+				atomic.AddInt32(&closes, 1)
+				return nil
+			}),
+		}},
+		stop:     make(chan struct{}),
+		inFlight: 2,
+	}
+	pool.entries["web-1"] = entry
+
+	pool.depoolWhenIdle("web-1", entry, entry.client)
+	if _, ok := pool.entries["web-1"]; ok {
+		t.Fatal("entry still pooled after suspicious run error")
+	}
+	if got := atomic.LoadInt32(&closes); got != 0 {
+		t.Fatalf("close count after depool = %d, want 0 while sessions are in flight", got)
+	}
+	pool.release(entry)
+	if got := atomic.LoadInt32(&closes); got != 0 {
+		t.Fatalf("close count after first release = %d, want 0", got)
+	}
+	pool.release(entry)
+	if got := atomic.LoadInt32(&closes); got != 1 {
+		t.Fatalf("close count after final release = %d, want 1", got)
+	}
+}
+
+func TestNativeExecutorReconnectsWhenPooledClientDies(t *testing.T) {
+	home := t.TempDir()
+	clientSigner := writeClientKey(t, home)
+	server := newTestSSHServer(t, clientSigner.PublicKey())
+	defer server.Close()
+
+	writeKnownHosts(t, home, server.Addr(), server.HostSigner.PublicKey())
+
+	exec := NewNativeExecutor(NativeOptions{
+		KnownHostsPath:    filepath.Join(home, ".ssh", "known_hosts"),
+		ConfigPath:        filepath.Join(home, ".ssh", "config"),
+		KeepAliveInterval: -1,
+	})
+	defer func() { _ = exec.Close() }()
+	target := inventory.Target{Name: "test", Host: inventory.Host{Addr: server.Host(), Port: server.Port(), User: "test"}}
+
+	result := exec.Run(context.Background(), Request{Target: target, Command: "close-connection"})
+	if result.Err != nil || result.ExitCode != 0 {
+		t.Fatalf("close-connection result = %#v err=%v", result, result.Err)
+	}
+	waitForAtomic(t, &server.closed, 1)
+
+	result = exec.Run(context.Background(), Request{Target: target, Command: "ok"})
+	if result.Err != nil || result.ExitCode != 0 || result.Stdout != "ok\n" {
+		t.Fatalf("reconnected result = %#v err=%v", result, result.Err)
+	}
+	if got := atomic.LoadInt32(&server.accepted); got != 2 {
+		t.Fatalf("accepted connections = %d, want reconnect to dial once", got)
+	}
+}
+
+func TestNativeExecutorFallsBackToUnpooledWhenMaxSessionsRejects(t *testing.T) {
+	home := t.TempDir()
+	clientSigner := writeClientKey(t, home)
+	server := newTestSSHServer(t, clientSigner.PublicKey())
+	server.maxSessions = 1
+	server.blockCh = make(chan struct{})
+	defer server.Close()
+
+	writeKnownHosts(t, home, server.Addr(), server.HostSigner.PublicKey())
+
+	exec := NewNativeExecutor(NativeOptions{
+		KnownHostsPath:    filepath.Join(home, ".ssh", "known_hosts"),
+		ConfigPath:        filepath.Join(home, ".ssh", "config"),
+		KeepAliveInterval: -1,
+	})
+	defer func() { _ = exec.Close() }()
+	target := inventory.Target{Name: "test", Host: inventory.Host{Addr: server.Host(), Port: server.Port(), User: "test"}}
+
+	firstDone := make(chan Result, 1)
+	go func() {
+		firstDone <- exec.Run(context.Background(), Request{Target: target, Command: "block"})
+	}()
+	waitForAtomic(t, &server.activeSessions, 1)
+
+	second := exec.Run(context.Background(), Request{Target: target, Command: "ok"})
+	if second.Err != nil || second.ExitCode != 0 || second.Stdout != "ok\n" {
+		t.Fatalf("fallback result = %#v err=%v", second, second.Err)
+	}
+	if got := atomic.LoadInt32(&server.sessionRejects); got == 0 {
+		t.Fatal("pooled channel-open was not rejected by the session cap")
+	}
+
+	close(server.blockCh)
+	first := <-firstDone
+	if first.Err != nil || first.ExitCode != 0 {
+		t.Fatalf("first pooled result = %#v err=%v", first, first.Err)
+	}
+	third := exec.Run(context.Background(), Request{Target: target, Command: "ok"})
+	if third.Err != nil || third.ExitCode != 0 {
+		t.Fatalf("third pooled result = %#v err=%v", third, third.Err)
+	}
+	if got := atomic.LoadInt32(&server.accepted); got != 2 {
+		t.Fatalf("accepted connections = %d, want pooled connection plus one unpooled fallback", got)
+	}
+}
+
+func TestNativeExecutorNewSessionTimesOutAndClosesPooledClient(t *testing.T) {
+	home := t.TempDir()
+	clientSigner := writeClientKey(t, home)
+	server := newTestSSHServer(t, clientSigner.PublicKey())
+	server.hangChannels = make(chan struct{})
+	defer server.Close()
+
+	writeKnownHosts(t, home, server.Addr(), server.HostSigner.PublicKey())
+
+	exec := NewNativeExecutor(NativeOptions{
+		KnownHostsPath:    filepath.Join(home, ".ssh", "known_hosts"),
+		ConfigPath:        filepath.Join(home, ".ssh", "config"),
+		ConnectTimeout:    30 * time.Millisecond,
+		KeepAliveInterval: -1,
+	})
+	defer func() { _ = exec.Close() }()
+	target := inventory.Target{Name: "test", Host: inventory.Host{Addr: server.Host(), Port: server.Port(), User: "test"}}
+
+	start := time.Now()
+	result := exec.Run(context.Background(), Request{Target: target, Command: "ok"})
+	close(server.hangChannels)
+	if !errors.Is(result.Err, context.DeadlineExceeded) {
+		t.Fatalf("result err = %v, want context deadline exceeded", result.Err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("NewSession timeout took %s", elapsed)
+	}
+	waitForAtomic(t, &server.closed, 1)
+}
+
+func TestNativeExecutorRunHonorsContextWithoutRunTimeout(t *testing.T) {
+	home := t.TempDir()
+	clientSigner := writeClientKey(t, home)
+	server := newTestSSHServer(t, clientSigner.PublicKey())
+	server.blockCh = make(chan struct{})
+	defer server.Close()
+
+	writeKnownHosts(t, home, server.Addr(), server.HostSigner.PublicKey())
+
+	exec := NewNativeExecutor(NativeOptions{
+		KnownHostsPath:    filepath.Join(home, ".ssh", "known_hosts"),
+		ConfigPath:        filepath.Join(home, ".ssh", "config"),
+		KeepAliveInterval: -1,
+	})
+	defer func() { _ = exec.Close() }()
+	target := inventory.Target{Name: "test", Host: inventory.Host{Addr: server.Host(), Port: server.Port(), User: "test"}}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+
+	result := exec.Run(ctx, Request{Target: target, Command: "block"})
+	close(server.blockCh)
+	if !errors.Is(result.Err, context.DeadlineExceeded) {
+		t.Fatalf("result err = %v, want context deadline exceeded", result.Err)
+	}
+	waitForAtomic(t, &server.closed, 1)
+}
+
+func TestNativeExecutorKeepAliveAndClose(t *testing.T) {
+	home := t.TempDir()
+	clientSigner := writeClientKey(t, home)
+	server := newTestSSHServer(t, clientSigner.PublicKey())
+	defer server.Close()
+
+	writeKnownHosts(t, home, server.Addr(), server.HostSigner.PublicKey())
+
+	exec := NewNativeExecutor(NativeOptions{
+		KnownHostsPath:    filepath.Join(home, ".ssh", "known_hosts"),
+		ConfigPath:        filepath.Join(home, ".ssh", "config"),
+		KeepAliveInterval: 5 * time.Millisecond,
+	})
+	target := inventory.Target{Name: "test", Host: inventory.Host{Addr: server.Host(), Port: server.Port(), User: "test"}}
+
+	result := exec.Run(context.Background(), Request{Target: target, Command: "ok"})
+	if result.Err != nil || result.ExitCode != 0 {
+		t.Fatalf("run result = %#v err=%v", result, result.Err)
+	}
+	waitForAtomic(t, &server.globalRequests, 1)
+
+	if err := exec.Close(); err != nil {
+		t.Fatalf("close executor: %v", err)
+	}
+	waitForAtomic(t, &server.closed, 1)
+}
+
+func TestNativeExecutorKeepAliveTimeoutEvictsAndCloses(t *testing.T) {
+	home := t.TempDir()
+	clientSigner := writeClientKey(t, home)
+	server := newTestSSHServer(t, clientSigner.PublicKey())
+	server.hangGlobalRequests = make(chan struct{})
+	defer server.Close()
+
+	writeKnownHosts(t, home, server.Addr(), server.HostSigner.PublicKey())
+
+	oldTimeout := nativeKeepAliveTimeout
+	nativeKeepAliveTimeout = 20 * time.Millisecond
+	defer func() { nativeKeepAliveTimeout = oldTimeout }()
+
+	exec := NewNativeExecutor(NativeOptions{
+		KnownHostsPath:    filepath.Join(home, ".ssh", "known_hosts"),
+		ConfigPath:        filepath.Join(home, ".ssh", "config"),
+		KeepAliveInterval: 10 * time.Millisecond,
+	})
+	defer func() { _ = exec.Close() }()
+	target := inventory.Target{Name: "test", Host: inventory.Host{Addr: server.Host(), Port: server.Port(), User: "test"}}
+
+	result := exec.Run(context.Background(), Request{Target: target, Command: "ok"})
+	if result.Err != nil || result.ExitCode != 0 {
+		t.Fatalf("run result = %#v err=%v", result, result.Err)
+	}
+	waitForAtomic(t, &server.globalRequests, 1)
+	waitForAtomic(t, &server.closed, 1)
+	close(server.hangGlobalRequests)
+}
+
+func TestNativeClientPoolCloseClosesCloserChain(t *testing.T) {
+	pool := newNativeClientPool(-1)
+	var first int32
+	var second int32
+	pool.entries["web-1"] = &nativePoolEntry{
+		client: &nativeClient{closers: []io.Closer{
+			closerFunc(func() error {
+				atomic.AddInt32(&first, 1)
+				return nil
+			}),
+			closerFunc(func() error {
+				atomic.AddInt32(&second, 1)
+				return nil
+			}),
+		}},
+		stop: make(chan struct{}),
+	}
+
+	if err := pool.Close(); err != nil {
+		t.Fatalf("pool close: %v", err)
+	}
+	if atomic.LoadInt32(&first) != 1 || atomic.LoadInt32(&second) != 1 {
+		t.Fatalf("closer counts first=%d second=%d", first, second)
+	}
 }
 
 func TestNativeExecutorHostKeyRejected(t *testing.T) {
@@ -106,6 +490,7 @@ func TestNativeExecutorHostKeyRejected(t *testing.T) {
 		KnownHostsPath: filepath.Join(home, ".ssh", "known_hosts"),
 		ConfigPath:     filepath.Join(home, ".ssh", "config"),
 	})
+	defer func() { _ = exec.Close() }()
 	target := inventory.Target{Name: "test", Host: inventory.Host{Addr: server.Host(), Port: server.Port(), User: "test"}}
 	result := exec.Run(context.Background(), Request{Target: target, Command: "ok"})
 	if result.Err == nil || result.ExitCode != -1 {
@@ -126,6 +511,7 @@ func TestNativeExecutorAcceptNewTrustsUnknownHost(t *testing.T) {
 		ConfigPath:     filepath.Join(home, ".ssh", "config"),
 		HostKeyPolicy:  "accept-new",
 	})
+	defer func() { _ = exec.Close() }()
 	target := inventory.Target{Name: "test", Host: inventory.Host{Addr: server.Host(), Port: server.Port(), User: "test"}}
 	result := exec.Run(context.Background(), Request{Target: target, Command: "ok"})
 	if result.Err != nil || result.ExitCode != 0 {
@@ -144,6 +530,7 @@ func TestNativeExecutorAcceptNewTrustsUnknownHost(t *testing.T) {
 		KnownHostsPath: knownHostsPath,
 		ConfigPath:     filepath.Join(home, ".ssh", "config"),
 	})
+	defer func() { _ = strictExec.Close() }()
 	result = strictExec.Run(context.Background(), Request{Target: target, Command: "ok"})
 	if result.Err != nil || result.ExitCode != 0 {
 		t.Fatalf("strict result after accept-new = %#v err=%v", result, result.Err)
@@ -208,6 +595,7 @@ func TestNativeExecutorUsesPerHostIdentityBeforeDefault(t *testing.T) {
 		KnownHostsPath: filepath.Join(home, ".ssh", "known_hosts"),
 		ConfigPath:     filepath.Join(home, ".ssh", "config"),
 	})
+	defer func() { _ = exec.Close() }()
 	target := inventory.Target{Name: "test", Host: inventory.Host{Addr: server.Host(), Port: server.Port(), User: "test", IdentityFile: "~/keys/web-1"}}
 	result := exec.Run(context.Background(), Request{Target: target, Command: "ok"})
 	if result.Err != nil || result.ExitCode != 0 {
@@ -282,6 +670,7 @@ func TestNativeExecutorPasswordAuthEndToEnd(t *testing.T) {
 			return "secretpw", true
 		},
 	})
+	defer func() { _ = exec.Close() }()
 	target := inventory.Target{Name: "web-1", Host: inventory.Host{Addr: server.Host(), Port: server.Port(), User: "test"}}
 	result := exec.Run(context.Background(), Request{Target: target, Command: "ok"})
 	if result.Err != nil || result.ExitCode != 0 || result.Stdout != "ok\n" {
@@ -304,6 +693,7 @@ func TestNativeExecutorPrefersKeyAuthBeforePassword(t *testing.T) {
 		ConfigPath:     filepath.Join(home, ".ssh", "config"),
 		PasswordSource: func(string) (string, bool) { return "secretpw", true },
 	})
+	defer func() { _ = exec.Close() }()
 	target := inventory.Target{Name: "web-1", Host: inventory.Host{Addr: server.Host(), Port: server.Port(), User: "test"}}
 	result := exec.Run(context.Background(), Request{Target: target, Command: "ok"})
 	if result.Err != nil || result.ExitCode != 0 {
@@ -339,10 +729,26 @@ func TestConnectHintMapping(t *testing.T) {
 }
 
 type testSSHServer struct {
-	Listener   net.Listener
-	HostSigner ssh.Signer
-	wg         sync.WaitGroup
-	allowedKey ssh.PublicKey
+	Listener           net.Listener
+	HostSigner         ssh.Signer
+	wg                 sync.WaitGroup
+	allowedKey         ssh.PublicKey
+	accepted           int32
+	closed             int32
+	globalRequests     int32
+	osProbes           int32
+	activeSessions     int32
+	sessionRejects     int32
+	maxSessions        int32
+	blockCh            chan struct{}
+	hangChannels       chan struct{}
+	hangGlobalRequests chan struct{}
+}
+
+type closerFunc func() error
+
+func (fn closerFunc) Close() error {
+	return fn()
 }
 
 type passwordTestSSHServer struct {
@@ -441,7 +847,7 @@ func (s *passwordTestSSHServer) handle(conn net.Conn) {
 		if err != nil {
 			continue
 		}
-		go handleSession(channel, requests)
+		go handleSession(sshConn, channel, requests, nil)
 	}
 }
 
@@ -498,6 +904,7 @@ func (s *testSSHServer) accept() {
 
 func (s *testSSHServer) handle(conn net.Conn) {
 	defer s.wg.Done()
+	atomic.AddInt32(&s.accepted, 1)
 	cfg := &ssh.ServerConfig{
 		PublicKeyCallback: func(_ ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
 			if string(key.Marshal()) == string(s.allowedKey.Marshal()) {
@@ -512,22 +919,66 @@ func (s *testSSHServer) handle(conn net.Conn) {
 		_ = conn.Close()
 		return
 	}
-	defer func() { _ = sshConn.Close() }()
-	go ssh.DiscardRequests(reqs)
+	defer func() {
+		atomic.AddInt32(&s.closed, 1)
+		_ = sshConn.Close()
+	}()
+	go s.handleGlobalRequests(reqs)
+	var connectionSessions int32
 	for ch := range chans {
+		if s.hangChannels != nil {
+			<-s.hangChannels
+		}
 		if ch.ChannelType() != "session" {
 			_ = ch.Reject(ssh.UnknownChannelType, "session only")
+			continue
+		}
+		if maxSessions := atomic.LoadInt32(&s.maxSessions); maxSessions > 0 && atomic.LoadInt32(&connectionSessions) >= maxSessions {
+			atomic.AddInt32(&s.sessionRejects, 1)
+			_ = ch.Reject(ssh.Prohibited, "session limit reached")
 			continue
 		}
 		channel, requests, err := ch.Accept()
 		if err != nil {
 			continue
 		}
-		go handleSession(channel, requests)
+		atomic.AddInt32(&connectionSessions, 1)
+		atomic.AddInt32(&s.activeSessions, 1)
+		go func() {
+			defer func() {
+				atomic.AddInt32(&connectionSessions, -1)
+				atomic.AddInt32(&s.activeSessions, -1)
+			}()
+			handleSession(sshConn, channel, requests, s)
+		}()
 	}
 }
 
-func handleSession(channel ssh.Channel, requests <-chan *ssh.Request) {
+func (s *testSSHServer) handleGlobalRequests(requests <-chan *ssh.Request) {
+	for req := range requests {
+		atomic.AddInt32(&s.globalRequests, 1)
+		if s.hangGlobalRequests != nil {
+			<-s.hangGlobalRequests
+		}
+		if req.WantReply {
+			_ = req.Reply(true, nil)
+		}
+	}
+}
+
+func waitForAtomic(t *testing.T, value *int32, want int32) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if got := atomic.LoadInt32(value); got >= want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("atomic value = %d, want at least %d", atomic.LoadInt32(value), want)
+}
+
+func handleSession(conn *ssh.ServerConn, channel ssh.Channel, requests <-chan *ssh.Request, server *testSSHServer) {
 	defer func() { _ = channel.Close() }()
 	for req := range requests {
 		if req.Type != "exec" {
@@ -539,12 +990,27 @@ func handleSession(channel ssh.Channel, requests <-chan *ssh.Request) {
 		_ = req.Reply(true, nil)
 		code := uint32(0)
 		if payload.Command == OSProbeCommand {
+			if server != nil {
+				atomic.AddInt32(&server.osProbes, 1)
+			}
 			_, _ = channel.Write([]byte("Linux\n"))
+		} else if strings.Contains(payload.Command, "block") {
+			if server != nil && server.blockCh != nil {
+				<-server.blockCh
+			}
+			_, _ = channel.Write([]byte("ok\n"))
 		} else if strings.Contains(payload.Command, "stream-secret") {
 			_, _ = channel.Write([]byte("line1\n"))
 			_, _ = channel.Write([]byte("password="))
 			_, _ = channel.Write([]byte("secret123\nline3\n"))
 			_, _ = channel.Stderr().Write([]byte("warn=secret\n"))
+		} else if strings.Contains(payload.Command, "close-connection") {
+			_, _ = channel.Write([]byte("ok\n"))
+			_, _ = channel.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{Status: code}))
+			if conn != nil {
+				go func() { _ = conn.Close() }()
+			}
+			return
 		} else if strings.Contains(payload.Command, "exit7") {
 			code = 7
 			_, _ = channel.Stderr().Write([]byte("failed\n"))

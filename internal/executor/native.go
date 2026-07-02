@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -30,6 +31,10 @@ const (
 	nativeArgv0     = "native-ssh"
 )
 
+const defaultNativeKeepAliveInterval = 30 * time.Second
+
+var nativeKeepAliveTimeout = 5 * time.Second
+
 // ProbeTimeout bounds connectivity probes (inventory test, discover --probe, the
 // TUI t/probe actions). It matches the default Run connect budget so a probe
 // fails only when a real run would: a shorter cap produced false "cannot reach
@@ -42,13 +47,19 @@ type NativeOptions struct {
 	ConfigPath     string
 	KnownHostsPath string
 	ConnectTimeout time.Duration
-	HostKeyPolicy  string // strict | accept-new
-	PasswordSource func(host string) (string, bool)
+	// DisableConnectionReuse preserves the old one-dial-per-command behavior.
+	DisableConnectionReuse bool
+	// KeepAliveInterval controls pooled-connection heartbeats. Zero uses the
+	// default; a negative value disables keepalives for tests and diagnostics.
+	KeepAliveInterval time.Duration
+	HostKeyPolicy     string // strict | accept-new
+	PasswordSource    func(host string) (string, bool)
 }
 
 // NativeExecutor executes commands using golang.org/x/crypto/ssh.
 type NativeExecutor struct {
 	Options NativeOptions
+	pool    *nativeClientPool
 }
 
 // NewNativeExecutor returns a native SSH executor.
@@ -59,23 +70,39 @@ func NewNativeExecutor(options NativeOptions) NativeExecutor {
 	if options.HostKeyPolicy == "" {
 		options.HostKeyPolicy = "strict"
 	}
-	return NativeExecutor{Options: options}
+	var pool *nativeClientPool
+	if !options.DisableConnectionReuse {
+		pool = newNativeClientPool(options.KeepAliveInterval)
+	}
+	return NativeExecutor{
+		Options: options,
+		pool:    pool,
+	}
+}
+
+// Close releases every pooled SSH connection held by this executor, including
+// ProxyJump tunnel and jump-client closers owned by each connection.
+func (e NativeExecutor) Close() error {
+	if e.pool == nil {
+		return nil
+	}
+	return e.pool.Close()
 }
 
 func (e NativeExecutor) Run(ctx context.Context, request Request) Result {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	result := e.runSession(ctx, request, &stdout, &stderr)
+	result := e.runSession(ctx, request, &stdout, &stderr, true)
 	result.Stdout = stdout.String()
 	result.Stderr = stderr.String()
 	return result
 }
 
 func (e NativeExecutor) RunStreaming(ctx context.Context, request Request, stdout io.Writer, stderr io.Writer) Result {
-	return e.runSession(ctx, request, stdout, stderr)
+	return e.runSession(ctx, request, stdout, stderr, true)
 }
 
-func (e NativeExecutor) runSession(ctx context.Context, request Request, stdout io.Writer, stderr io.Writer) Result {
+func (e NativeExecutor) runSession(ctx context.Context, request Request, stdout io.Writer, stderr io.Writer, usePool bool) Result {
 	start := time.Now()
 	target, err := e.resolveTarget(request.Target)
 	targetDisplay := target.display()
@@ -87,15 +114,62 @@ func (e NativeExecutor) runSession(ctx context.Context, request Request, stdout 
 		return Result{ExitCode: -1, Duration: time.Since(start), Err: err, Argv: argv}
 	}
 
-	client, err := e.dial(ctx, target)
+	client, poolKey, poolEntry, pooled, err := e.client(ctx, target, usePool)
 	if err != nil {
 		return Result{ExitCode: -1, Duration: time.Since(start), Err: err, Argv: argv}
 	}
+	closeClient := !pooled
+	poolReleased := false
+	releasePool := func() {
+		if pooled && poolEntry != nil && !poolReleased {
+			e.pool.release(poolEntry)
+			poolReleased = true
+		}
+	}
 	defer func() {
-		_ = client.Close()
+		releasePool()
+		if closeClient && client != nil {
+			_ = client.Close()
+		}
 	}()
 
-	session, err := client.NewSession()
+	closeCurrentClient := func() {
+		if pooled && poolEntry != nil {
+			e.pool.evictNow(poolKey, poolEntry, client)
+			return
+		}
+		_ = client.Close()
+	}
+	session, err := e.newSession(ctx, client, e.connectTimeout(), closeCurrentClient)
+	if err != nil && pooled && isSessionCapacityError(err) {
+		releasePool()
+		client, _, _, pooled, err = e.client(ctx, target, false)
+		closeClient = true
+		poolEntry = nil
+		poolKey = ""
+		poolReleased = false
+		closeCurrentClient = func() { _ = client.Close() }
+		if err == nil {
+			session, err = e.newSession(ctx, client, e.connectTimeout(), closeCurrentClient)
+		}
+	}
+	if err != nil && pooled && e.shouldReconnect(poolKey, poolEntry, client, err) {
+		e.pool.evictNow(poolKey, poolEntry, client)
+		releasePool()
+		client, poolKey, poolEntry, pooled, err = e.client(ctx, target, usePool)
+		closeClient = !pooled
+		poolReleased = false
+		closeCurrentClient = func() {
+			if pooled && poolEntry != nil {
+				e.pool.evictNow(poolKey, poolEntry, client)
+				return
+			}
+			_ = client.Close()
+		}
+		if err == nil {
+			session, err = e.newSession(ctx, client, e.connectTimeout(), closeCurrentClient)
+		}
+	}
 	if err != nil {
 		return Result{ExitCode: -1, Duration: time.Since(start), Err: err, Argv: argv}
 	}
@@ -106,9 +180,12 @@ func (e NativeExecutor) runSession(ctx context.Context, request Request, stdout 
 	session.Stdout = stdout
 	session.Stderr = stderr
 
-	runErr := session.Run(request.Command)
+	runErr := runSSHSession(ctx, session, request.Command, closeCurrentClient)
 	exitCode, err := nativeExitCode(runErr)
 	if err != nil {
+		if pooled && isBrokenSSHClientError(err) {
+			e.pool.depoolWhenIdle(poolKey, poolEntry, client)
+		}
 		return Result{ExitCode: -1, Duration: time.Since(start), Err: err, Argv: argv}
 	}
 	osName := ""
@@ -118,15 +195,42 @@ func (e NativeExecutor) runSession(ctx context.Context, request Request, stdout 
 		}
 	}
 	if osName == "" {
-		osName = e.detectOS(ctx, client)
+		if pooled {
+			osName = e.pool.cachedOS(poolEntry)
+		}
+		if osName == "" {
+			osName = e.detectOS(ctx, client, closeCurrentClient)
+		}
+	}
+	if pooled && osName != "" {
+		e.pool.setOS(poolEntry, osName)
 	}
 	return Result{ExitCode: exitCode, Duration: time.Since(start), Argv: argv, OS: osName}
 }
 
-func (e NativeExecutor) detectOS(ctx context.Context, client *nativeClient) string {
+func (e NativeExecutor) client(ctx context.Context, target nativeTarget, usePool bool) (*nativeClient, string, *nativePoolEntry, bool, error) {
+	if e.pool == nil || !usePool {
+		client, err := e.dial(ctx, target)
+		return client, "", nil, false, err
+	}
+	key := target.poolKey()
+	client, entry, err := e.pool.get(ctx, key, func(context.Context) (*nativeClient, error) {
+		return e.dial(ctx, target)
+	})
+	return client, key, entry, true, err
+}
+
+func (e NativeExecutor) shouldReconnect(key string, entry *nativePoolEntry, client *nativeClient, err error) bool {
+	if e.pool == nil {
+		return false
+	}
+	return e.pool.isDead(key, entry, client) || isBrokenSSHClientError(err)
+}
+
+func (e NativeExecutor) detectOS(ctx context.Context, client *nativeClient, closeClient func()) string {
 	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	session, err := client.NewSession()
+	session, err := e.newSession(probeCtx, client, 5*time.Second, closeClient)
 	if err != nil {
 		return ""
 	}
@@ -135,20 +239,76 @@ func (e NativeExecutor) detectOS(ctx context.Context, client *nativeClient) stri
 	}()
 	var stdout bytes.Buffer
 	session.Stdout = &stdout
-	done := make(chan error, 1)
-	go func() {
-		done <- session.Run(OSProbeCommand)
-	}()
-	select {
-	case err := <-done:
-		if err != nil {
-			return ""
+	if err := runSSHSession(probeCtx, session, OSProbeCommand, func() {
+		if closeClient != nil {
+			closeClient()
 		}
-	case <-probeCtx.Done():
 		_ = session.Close()
+	}); err != nil {
 		return ""
 	}
 	return NormalizeOS(stdout.String())
+}
+
+func (e NativeExecutor) connectTimeout() time.Duration {
+	if e.Options.ConnectTimeout != 0 {
+		return e.Options.ConnectTimeout
+	}
+	return 10 * time.Second
+}
+
+func (e NativeExecutor) newSession(ctx context.Context, client *nativeClient, timeout time.Duration, closeClient func()) (*ssh.Session, error) {
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+	sessionCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	type sessionResult struct {
+		session *ssh.Session
+		err     error
+	}
+	done := make(chan sessionResult)
+	go func() {
+		session, err := client.NewSession()
+		select {
+		case done <- sessionResult{session: session, err: err}:
+		case <-sessionCtx.Done():
+			if session != nil {
+				_ = session.Close()
+			}
+		}
+	}()
+	select {
+	case result := <-done:
+		return result.session, result.err
+	case <-sessionCtx.Done():
+		if closeClient != nil {
+			closeClient()
+		}
+		return nil, sessionCtx.Err()
+	}
+}
+
+func runSSHSession(ctx context.Context, session *ssh.Session, command string, closeClient func()) error {
+	done := make(chan error, 1)
+	go func() {
+		done <- session.Run(command)
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		if closeClient != nil {
+			closeClient()
+		} else {
+			_ = session.Close()
+		}
+		// Closing the transport unblocks session.Run, and Run does not return
+		// until its stdout/stderr copies finish. Wait for it so the caller can
+		// read the output buffers without racing those copies.
+		<-done
+		return ctx.Err()
+	}
 }
 
 type nativeTarget struct {
@@ -179,6 +339,17 @@ func (t nativeTarget) display() string {
 		return t.address()
 	}
 	return t.User + "@" + t.address()
+}
+
+func (t nativeTarget) poolKey() string {
+	parts := []string{
+		strings.ToLower(t.HostName),
+		strconv.Itoa(t.Port),
+		t.User,
+		strings.TrimSpace(t.ProxyJump),
+	}
+	parts = append(parts, t.IdentityFiles...)
+	return strings.Join(parts, "\x00")
 }
 
 func (e NativeExecutor) resolveTarget(target inventory.Target) (nativeTarget, error) {
@@ -342,6 +513,316 @@ func (c *nativeClient) Close() error {
 	return err
 }
 
+type nativeClientPool struct {
+	mu                sync.Mutex
+	entries           map[string]*nativePoolEntry
+	keepAliveInterval time.Duration
+	closed            bool
+}
+
+type nativePoolEntry struct {
+	client        *nativeClient
+	dialing       bool
+	ready         chan struct{}
+	readyOnce     sync.Once
+	stop          chan struct{}
+	stopOnce      sync.Once
+	dialErr       error
+	inFlight      int
+	removed       bool
+	closeWhenIdle bool
+	forceClosed   bool
+	osName        string
+}
+
+func (e *nativePoolEntry) closeReady() {
+	e.readyOnce.Do(func() {
+		if e.ready != nil {
+			close(e.ready)
+		}
+	})
+}
+
+func (e *nativePoolEntry) closeStop() {
+	e.stopOnce.Do(func() {
+		if e.stop != nil {
+			close(e.stop)
+		}
+	})
+}
+
+func newNativeClientPool(keepAliveInterval time.Duration) *nativeClientPool {
+	if keepAliveInterval == 0 {
+		keepAliveInterval = defaultNativeKeepAliveInterval
+	}
+	return &nativeClientPool{
+		entries:           map[string]*nativePoolEntry{},
+		keepAliveInterval: keepAliveInterval,
+	}
+}
+
+func (p *nativeClientPool) get(ctx context.Context, key string, dial func(context.Context) (*nativeClient, error)) (*nativeClient, *nativePoolEntry, error) {
+	for {
+		p.mu.Lock()
+		if p.closed {
+			p.mu.Unlock()
+			return nil, nil, errors.New("native SSH executor is closed")
+		}
+		entry := p.entries[key]
+		if entry == nil {
+			entry = &nativePoolEntry{dialing: true, ready: make(chan struct{})}
+			p.entries[key] = entry
+			p.mu.Unlock()
+			return p.dialEntry(ctx, key, entry, dial)
+		}
+		if entry.client != nil {
+			client := entry.client
+			entry.inFlight++
+			p.mu.Unlock()
+			return client, entry, nil
+		}
+		if entry.dialing {
+			ready := entry.ready
+			p.mu.Unlock()
+			select {
+			case <-ready:
+				p.mu.Lock()
+				dialErr := entry.dialErr
+				p.mu.Unlock()
+				if dialErr != nil {
+					return nil, nil, dialErr
+				}
+				continue
+			case <-ctx.Done():
+				return nil, nil, ctx.Err()
+			}
+		}
+		p.mu.Unlock()
+	}
+}
+
+func (p *nativeClientPool) dialEntry(ctx context.Context, key string, entry *nativePoolEntry, dial func(context.Context) (*nativeClient, error)) (*nativeClient, *nativePoolEntry, error) {
+	client, err := dial(ctx)
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	current := p.entries[key]
+	if current != entry {
+		if client != nil {
+			_ = client.Close()
+		}
+		if err != nil {
+			return nil, nil, err
+		}
+		return nil, nil, errors.New("native SSH pooled connection was replaced while dialing")
+	}
+	entry.dialing = false
+	if err != nil {
+		entry.dialErr = err
+		delete(p.entries, key)
+		entry.closeReady()
+		return nil, nil, err
+	}
+	if p.closed {
+		delete(p.entries, key)
+		entry.closeReady()
+		_ = client.Close()
+		return nil, nil, errors.New("native SSH executor is closed")
+	}
+	entry.client = client
+	entry.inFlight = 1
+	entry.stop = make(chan struct{})
+	entry.closeReady()
+	p.startKeepAliveLocked(key, entry)
+	return client, entry, nil
+}
+
+func (p *nativeClientPool) startKeepAliveLocked(key string, entry *nativePoolEntry) {
+	if p.keepAliveInterval < 0 || entry.client == nil || entry.stop == nil {
+		return
+	}
+	client := entry.client
+	stop := entry.stop
+	interval := p.keepAliveInterval
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if err := sendKeepAlive(client, nativeKeepAliveTimeout); err != nil {
+					p.evictNow(key, entry, client)
+					return
+				}
+			case <-stop:
+				return
+			}
+		}
+	}()
+}
+
+func (p *nativeClientPool) isDead(key string, entry *nativePoolEntry, client *nativeClient) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	current := p.entries[key]
+	return current != entry || entry == nil || entry.client != client || entry.forceClosed
+}
+
+func (p *nativeClientPool) release(entry *nativePoolEntry) {
+	var closeClient *nativeClient
+	var closeStop *nativePoolEntry
+
+	p.mu.Lock()
+	if entry != nil && entry.inFlight > 0 {
+		entry.inFlight--
+		if entry.inFlight == 0 && entry.closeWhenIdle && !entry.forceClosed {
+			closeClient = entry.client
+			closeStop = entry
+			entry.forceClosed = true
+		}
+	}
+	p.mu.Unlock()
+
+	if closeStop != nil {
+		closeStop.closeStop()
+	}
+	if closeClient != nil {
+		_ = closeClient.Close()
+	}
+}
+
+func (p *nativeClientPool) cachedOS(entry *nativePoolEntry) string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if entry == nil || entry.forceClosed {
+		return ""
+	}
+	return entry.osName
+}
+
+func (p *nativeClientPool) setOS(entry *nativePoolEntry, osName string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if entry != nil && !entry.forceClosed {
+		entry.osName = osName
+	}
+}
+
+func (p *nativeClientPool) depoolWhenIdle(key string, entry *nativePoolEntry, client *nativeClient) {
+	var closeClient *nativeClient
+	var closeStop *nativePoolEntry
+
+	p.mu.Lock()
+	if entry != nil && entry.client == client && !entry.forceClosed {
+		if p.entries[key] == entry {
+			delete(p.entries, key)
+		}
+		entry.removed = true
+		entry.closeWhenIdle = true
+		if entry.inFlight == 0 {
+			closeClient = entry.client
+			closeStop = entry
+			entry.forceClosed = true
+		}
+	}
+	p.mu.Unlock()
+
+	if closeStop != nil {
+		closeStop.closeStop()
+	}
+	if closeClient != nil {
+		_ = closeClient.Close()
+	}
+}
+
+func (p *nativeClientPool) evictNow(key string, entry *nativePoolEntry, client *nativeClient) {
+	var closeClient *nativeClient
+	var closeStop *nativePoolEntry
+
+	p.mu.Lock()
+	if entry != nil && entry.client == client && !entry.forceClosed {
+		if p.entries[key] == entry {
+			delete(p.entries, key)
+		}
+		entry.removed = true
+		entry.closeWhenIdle = true
+		entry.forceClosed = true
+		closeClient = entry.client
+		closeStop = entry
+	}
+	p.mu.Unlock()
+
+	if closeStop != nil {
+		closeStop.closeStop()
+	}
+	if closeClient != nil {
+		_ = closeClient.Close()
+	}
+}
+
+func sendKeepAlive(client *nativeClient, timeout time.Duration) error {
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := client.SendRequest("keepalive@openssh.com", true, nil)
+		done <- err
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-timer.C:
+		return context.DeadlineExceeded
+	}
+}
+
+func (p *nativeClientPool) Close() error {
+	if p == nil {
+		return nil
+	}
+
+	var clients []*nativeClient
+	var stops []*nativePoolEntry
+	var ready []*nativePoolEntry
+
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return nil
+	}
+	p.closed = true
+	for key, entry := range p.entries {
+		delete(p.entries, key)
+		if entry.stop != nil {
+			stops = append(stops, entry)
+		}
+		if entry.dialing && entry.ready != nil {
+			ready = append(ready, entry)
+		}
+		if entry.client != nil {
+			clients = append(clients, entry.client)
+		}
+	}
+	p.mu.Unlock()
+
+	for _, entry := range stops {
+		entry.closeStop()
+	}
+	for _, entry := range ready {
+		entry.closeReady()
+	}
+	var err error
+	for _, client := range clients {
+		if closeErr := client.Close(); closeErr != nil && err == nil {
+			err = closeErr
+		}
+	}
+	return err
+}
+
 func (e NativeExecutor) dialTCP(ctx context.Context, addr string) (net.Conn, error) {
 	timeout := e.Options.ConnectTimeout
 	if timeout == 0 {
@@ -410,7 +891,12 @@ func (e NativeExecutor) clientConfig(target nativeTarget) (*ssh.ClientConfig, io
 // Probe opens a native SSH session and runs a no-op command. It is intended for
 // explicit operator diagnostics; callers must gate it behind a user action.
 func (e NativeExecutor) Probe(ctx context.Context, target inventory.Target) Result {
-	return e.Run(ctx, Request{Target: target, Command: OSProbeCommand})
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	result := e.runSession(ctx, Request{Target: target, Command: OSProbeCommand}, &stdout, &stderr, false)
+	result.Stdout = stdout.String()
+	result.Stderr = stderr.String()
+	return result
 }
 
 // ProbeStatusForError maps a transport error into the probe status vocabulary.
@@ -468,6 +954,30 @@ func isConnectionRefused(err error) bool {
 		}
 	}
 	return errors.Is(err, syscall.ECONNREFUSED) || strings.Contains(strings.ToLower(err.Error()), "connection refused")
+}
+
+func isBrokenSSHClientError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNABORTED) {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "use of closed network connection") ||
+		strings.Contains(message, "broken pipe") ||
+		strings.Contains(message, "connection reset") ||
+		strings.Contains(message, "connection closed") ||
+		strings.Contains(message, "unexpected packet in response to channel open: <nil>")
+}
+
+func isSessionCapacityError(err error) bool {
+	var openErr *ssh.OpenChannelError
+	if errors.As(err, &openErr) {
+		return openErr.Reason == ssh.Prohibited || openErr.Reason == ssh.ResourceShortage
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "administratively prohibited") || strings.Contains(message, "resource shortage")
 }
 
 func (e NativeExecutor) authMethods(target nativeTarget) ([]ssh.AuthMethod, io.Closer, error) {

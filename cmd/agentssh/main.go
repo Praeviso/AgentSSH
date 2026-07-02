@@ -49,10 +49,16 @@ var newExecutor = func(cfg *config.Config) executor.Executor {
 		if cfg != nil {
 			options.HostKeyPolicy = cfg.Inventory.HostKeyPolicy
 			options.PasswordSource = passwordSourceForRun(cfg.Paths)
+			options.DisableConnectionReuse = !sshMultiplexingEnabled(cfg)
+			options.KeepAliveInterval = sshKeepAliveInterval(cfg)
 		}
 		return executor.NewNativeExecutor(options)
 	default:
-		return executor.NewSSHExecutor(nil)
+		return executor.NewSSHExecutorWithOptions(nil, executor.SSHOptions{
+			DisableMultiplexing: !sshMultiplexingEnabled(cfg),
+			ControlPersist:      sshControlPersist(cfg),
+			KeepAliveInterval:   sshKeepAliveInterval(cfg),
+		})
 	}
 }
 
@@ -976,6 +982,46 @@ func selectedTransport(cfg *config.Config) string {
 	}
 }
 
+func sshMultiplexingEnabled(cfg *config.Config) bool {
+	if cfg == nil {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(cfg.Inventory.SSH.Multiplexing)) {
+	case "", "on", "true", "yes", "1", "auto":
+		return true
+	case "off", "false", "no", "0", "disabled":
+		return false
+	default:
+		return true
+	}
+}
+
+func sshControlPersist(cfg *config.Config) time.Duration {
+	if cfg == nil {
+		return 0
+	}
+	return sshDuration(cfg.Inventory.SSH.ControlPersist)
+}
+
+func sshKeepAliveInterval(cfg *config.Config) time.Duration {
+	if cfg == nil {
+		return 0
+	}
+	return sshDuration(cfg.Inventory.SSH.KeepAliveInterval)
+}
+
+func sshDuration(value string) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	duration, err := time.ParseDuration(value)
+	if err != nil {
+		return 0
+	}
+	return duration
+}
+
 type inventoryAddOptions struct {
 	Name         string
 	Addr         string
@@ -1549,6 +1595,7 @@ func runInventoryDiscover(cmd *cobra.Command, opts inventoryDiscoverOptions) err
 			// will run (env-only master; no prompting across many candidates).
 			PasswordSource: passwordSourceForRun(cfg.Paths),
 		})
+		defer func() { _ = exec.Close() }()
 		result.Candidates = discovery.Probe(context.Background(), result.Candidates, discovery.ProbeOptions{
 			Executor:    exec,
 			Timeout:     executor.ProbeTimeout,
@@ -1667,6 +1714,7 @@ func runInventoryTest(cmd *cobra.Command, name string) error {
 		// (env-only master).
 		PasswordSource: passwordSourceForRun(cfg.Paths),
 	})
+	defer func() { _ = exec.Close() }()
 	result := exec.Probe(context.Background(), resolved.Targets[0])
 	if result.Err == nil && result.ExitCode == 0 {
 		refreshInventoryHostOS(cfg.Paths, name, result.OS)
@@ -1756,6 +1804,7 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 	sessionStore := approval.SessionStore{Dir: cfg.Paths.SessionsDir}
 	pendingStore := approval.PendingStore{PendingDir: cfg.Paths.PendingDir, ResponsesDir: cfg.Paths.ResponsesDir}
 	ssh := newExecutor(cfg)
+	defer func() { _ = ssh.Close() }()
 	plans, err := buildRunPlans(cfg, resolved, remoteCommand, flags, runtime, sessionStore, runtime.Enabled)
 	if err != nil {
 		return err

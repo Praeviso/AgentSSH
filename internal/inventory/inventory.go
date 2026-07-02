@@ -12,8 +12,27 @@ type Inventory struct {
 	Version       int              `yaml:"version,omitempty" json:"version"`
 	Transport     string           `yaml:"transport,omitempty" json:"transport"`
 	HostKeyPolicy string           `yaml:"host_key_policy,omitempty" json:"host_key_policy"`
+	SSH           SSHConfig        `yaml:"ssh,omitempty" json:"ssh,omitempty"`
 	Hosts         map[string]Host  `yaml:"hosts,omitempty" json:"hosts"`
 	Groups        map[string]Group `yaml:"groups,omitempty" json:"groups"`
+}
+
+// SSHConfig contains local SSH transport tuning. It never stores credentials;
+// the fields only decide how AgentSSH reuses already-authenticated connections.
+type SSHConfig struct {
+	// Multiplexing is "on" (default) or "off". For shell transport it controls
+	// OpenSSH ControlMaster injection; for native transport it controls pooled
+	// client reuse.
+	Multiplexing      string `yaml:"multiplexing,omitempty" json:"multiplexing,omitempty"`
+	ControlPersist    string `yaml:"control_persist,omitempty" json:"control_persist,omitempty"`
+	KeepAliveInterval string `yaml:"keepalive_interval,omitempty" json:"keepalive_interval,omitempty"`
+}
+
+// IsZero lets yaml/json omit the ssh section when every value is defaulted.
+func (c SSHConfig) IsZero() bool {
+	return strings.TrimSpace(c.Multiplexing) == "" &&
+		strings.TrimSpace(c.ControlPersist) == "" &&
+		strings.TrimSpace(c.KeepAliveInterval) == ""
 }
 
 // Host describes a named SSH target without storing private keys or passwords.

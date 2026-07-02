@@ -91,6 +91,9 @@ func TestEnsureHomeCreatesAndSeeds(t *testing.T) {
 	if cfg.Inventory.Transport != "native" {
 		t.Fatalf("seeded transport = %q, want native", cfg.Inventory.Transport)
 	}
+	if cfg.Inventory.SSH.Multiplexing != "on" || cfg.Inventory.SSH.ControlPersist != "60s" || cfg.Inventory.SSH.KeepAliveInterval != "30s" {
+		t.Fatalf("seeded ssh config = %#v", cfg.Inventory.SSH)
+	}
 	if len(cfg.Policy.Rules) != 0 || len(cfg.Policy.HostOverrides) != 0 {
 		t.Fatalf("seeded policy should have zero active rules: %+v", cfg.Policy)
 	}
