@@ -5,8 +5,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/Praeviso/AgentSSH/internal/inventory"
 )
@@ -24,6 +28,39 @@ func TestBuildSSHArgvKeepsRemoteCommandAsSingleArg(t *testing.T) {
 
 	got := BuildSSHArgv(target, command)
 	want := []string{"ssh", "-p", "2222", "deploy@10.0.0.11", command}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("argv = %#v, want %#v", got, want)
+	}
+	if got[len(got)-1] != command {
+		t.Fatalf("remote command was changed: %q", got[len(got)-1])
+	}
+}
+
+func TestBuildSSHArgvWithControlMasterOptions(t *testing.T) {
+	target := inventory.Target{
+		Name: "web-1",
+		Host: inventory.Host{
+			Addr: "10.0.0.11",
+			User: "deploy",
+			Port: 2222,
+		},
+	}
+	command := `printf 'a|b;$(whoami)' | sed 's/a/x/'`
+	controlPath := filepath.Join(t.TempDir(), "cm-web-1")
+
+	got := BuildSSHArgvWithOptions(target, command, SSHArgvOptions{
+		ControlPath:    controlPath,
+		ControlPersist: 90 * time.Second,
+	})
+	want := []string{
+		"ssh",
+		"-p", "2222",
+		"-o", "ControlMaster=auto",
+		"-o", "ControlPersist=90s",
+		"-o", "ControlPath=" + controlPath,
+		"deploy@10.0.0.11",
+		command,
+	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("argv = %#v, want %#v", got, want)
 	}
@@ -59,7 +96,7 @@ func TestSSHExecutorUsesInjectedRunner(t *testing.T) {
 		}
 		return RunResult{Stdout: "ok\n", ExitCode: 0}
 	})
-	exec := NewSSHExecutor(runner)
+	exec := NewSSHExecutorWithOptions(runner, SSHOptions{DisableMultiplexing: true})
 
 	result := exec.Run(context.Background(), Request{
 		Target: inventory.Target{
@@ -91,6 +128,111 @@ func TestSSHExecutorUsesInjectedRunner(t *testing.T) {
 	}
 }
 
+func TestSSHExecutorMultiplexesCommandAndProbe(t *testing.T) {
+	controlDir := t.TempDir()
+	var calls [][]string
+	runner := RunnerFunc(func(_ context.Context, argv []string) RunResult {
+		calls = append(calls, append([]string{}, argv...))
+		if argv[len(argv)-1] == OSProbeCommand {
+			return RunResult{Stdout: "Linux\n", ExitCode: 0}
+		}
+		return RunResult{Stdout: "ok\n", ExitCode: 0}
+	})
+	exec := NewSSHExecutorWithOptions(runner, SSHOptions{ControlDir: controlDir, ControlPersist: 42 * time.Second})
+	defer func() { _ = exec.Close() }()
+
+	result := exec.Run(context.Background(), Request{
+		Target: inventory.Target{
+			Name: "web-1",
+			Host: inventory.Host{Addr: "10.0.0.11", User: "deploy"},
+		},
+		Command: "echo ok",
+	})
+
+	if len(calls) != 2 {
+		t.Fatalf("runner calls = %#v, want command + OS probe", calls)
+	}
+	commandPath := sshOptionValue(t, calls[0], "ControlPath")
+	probePath := sshOptionValue(t, calls[1], "ControlPath")
+	if commandPath == "" || probePath == "" || commandPath != probePath {
+		t.Fatalf("control paths command=%q probe=%q", commandPath, probePath)
+	}
+	if !strings.HasPrefix(commandPath, controlDir+string(os.PathSeparator)) {
+		t.Fatalf("control path %q is not under %q", commandPath, controlDir)
+	}
+	for _, argv := range calls {
+		if got := sshOptionValue(t, argv, "ControlMaster"); got != "auto" {
+			t.Fatalf("ControlMaster = %q, want auto in %#v", got, argv)
+		}
+		if got := sshOptionValue(t, argv, "ControlPersist"); got != "42s" {
+			t.Fatalf("ControlPersist = %q, want 42s in %#v", got, argv)
+		}
+	}
+	if result.Stdout != "ok\n" || result.ExitCode != 0 || result.Err != nil || result.OS != "linux" {
+		t.Fatalf("result = %#v", result)
+	}
+	if !reflect.DeepEqual(result.Argv, calls[0]) {
+		t.Fatalf("result argv = %#v, want first runner argv %#v", result.Argv, calls[0])
+	}
+}
+
+func TestSSHExecutorMultiplexingCanBeDisabled(t *testing.T) {
+	var calls [][]string
+	runner := RunnerFunc(func(_ context.Context, argv []string) RunResult {
+		calls = append(calls, append([]string{}, argv...))
+		return RunResult{ExitCode: 255, Err: errors.New("connect failed")}
+	})
+	exec := NewSSHExecutorWithOptions(runner, SSHOptions{DisableMultiplexing: true})
+
+	result := exec.Run(context.Background(), Request{
+		Target:  inventory.Target{Name: "web-1", Host: inventory.Host{Addr: "10.0.0.11", User: "deploy"}},
+		Command: "uptime",
+	})
+
+	want := []string{"ssh", "deploy@10.0.0.11", "uptime"}
+	if result.Err == nil {
+		t.Fatal("result err = nil")
+	}
+	if len(calls) != 1 || !reflect.DeepEqual(calls[0], want) || !reflect.DeepEqual(result.Argv, want) {
+		t.Fatalf("calls=%#v result argv=%#v, want %#v", calls, result.Argv, want)
+	}
+}
+
+func TestSSHExecutorCloseCleansOwnedControlDir(t *testing.T) {
+	var controlPath string
+	runner := RunnerFunc(func(_ context.Context, argv []string) RunResult {
+		if controlPath == "" {
+			controlPath = sshOptionValue(t, argv, "ControlPath")
+			if err := os.WriteFile(controlPath, []byte("socket placeholder"), 0o600); err != nil {
+				t.Fatalf("write control path placeholder: %v", err)
+			}
+		}
+		return RunResult{ExitCode: 255, Err: errors.New("connect failed")}
+	})
+	exec := NewSSHExecutor(runner)
+
+	result := exec.Run(context.Background(), Request{
+		Target:  inventory.Target{Name: "web-1", Host: inventory.Host{Addr: "10.0.0.11", User: "deploy"}},
+		Command: "uptime",
+	})
+	if result.Err == nil {
+		t.Fatal("result err = nil")
+	}
+	if controlPath == "" {
+		t.Fatal("runner did not receive a ControlPath")
+	}
+	controlDir := filepath.Dir(controlPath)
+	if _, err := os.Stat(controlPath); err != nil {
+		t.Fatalf("control path placeholder before close: %v", err)
+	}
+	if err := exec.Close(); err != nil {
+		t.Fatalf("close executor: %v", err)
+	}
+	if _, err := os.Stat(controlDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("control dir after close err=%v, want not exist", err)
+	}
+}
+
 func TestSSHExecutorDoesNotParseUserStdoutAsOS(t *testing.T) {
 	var probeCalled bool
 	runner := RunnerFunc(func(_ context.Context, argv []string) RunResult {
@@ -100,7 +242,7 @@ func TestSSHExecutorDoesNotParseUserStdoutAsOS(t *testing.T) {
 		}
 		return RunResult{Stdout: "Linux\n", ExitCode: 0}
 	})
-	exec := NewSSHExecutor(runner)
+	exec := NewSSHExecutorWithOptions(runner, SSHOptions{DisableMultiplexing: true})
 	result := exec.Run(context.Background(), Request{
 		Target:  inventory.Target{Name: "web-1", Host: inventory.Host{Addr: "10.0.0.11", User: "deploy"}},
 		Command: "echo Linux",
@@ -189,7 +331,7 @@ func TestPrintArgvDemo(t *testing.T) {
 		fmt.Printf("argv=%#v\n", argv)
 		return RunResult{ExitCode: 0}
 	})
-	exec := NewSSHExecutor(runner)
+	exec := NewSSHExecutorWithOptions(runner, SSHOptions{DisableMultiplexing: true})
 	result := exec.Run(context.Background(), Request{
 		Target: inventory.Target{
 			Name: "web-1",
@@ -200,4 +342,18 @@ func TestPrintArgvDemo(t *testing.T) {
 	if result.ExitCode != 0 {
 		t.Fatalf("demo result = %#v", result)
 	}
+}
+
+func sshOptionValue(t *testing.T, argv []string, name string) string {
+	t.Helper()
+	prefix := name + "="
+	for i := 0; i+1 < len(argv); i++ {
+		if argv[i] != "-o" {
+			continue
+		}
+		if strings.HasPrefix(argv[i+1], prefix) {
+			return strings.TrimPrefix(argv[i+1], prefix)
+		}
+	}
+	return ""
 }

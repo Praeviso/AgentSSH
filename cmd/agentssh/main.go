@@ -1549,6 +1549,7 @@ func runInventoryDiscover(cmd *cobra.Command, opts inventoryDiscoverOptions) err
 			// will run (env-only master; no prompting across many candidates).
 			PasswordSource: passwordSourceForRun(cfg.Paths),
 		})
+		defer func() { _ = exec.Close() }()
 		result.Candidates = discovery.Probe(context.Background(), result.Candidates, discovery.ProbeOptions{
 			Executor:    exec,
 			Timeout:     executor.ProbeTimeout,
@@ -1667,6 +1668,7 @@ func runInventoryTest(cmd *cobra.Command, name string) error {
 		// (env-only master).
 		PasswordSource: passwordSourceForRun(cfg.Paths),
 	})
+	defer func() { _ = exec.Close() }()
 	result := exec.Probe(context.Background(), resolved.Targets[0])
 	if result.Err == nil && result.ExitCode == 0 {
 		refreshInventoryHostOS(cfg.Paths, name, result.OS)
@@ -1756,6 +1758,9 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 	sessionStore := approval.SessionStore{Dir: cfg.Paths.SessionsDir}
 	pendingStore := approval.PendingStore{PendingDir: cfg.Paths.PendingDir, ResponsesDir: cfg.Paths.ResponsesDir}
 	ssh := newExecutor(cfg)
+	if closer, ok := ssh.(interface{ Close() error }); ok {
+		defer func() { _ = closer.Close() }()
+	}
 	plans, err := buildRunPlans(cfg, resolved, remoteCommand, flags, runtime, sessionStore, runtime.Enabled)
 	if err != nil {
 		return err
