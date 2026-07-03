@@ -20,11 +20,19 @@ AgentSSH is the only way you touch managed hosts. You call `agentssh`; the CLI r
    agentssh hosts
    ```
 
-2. **Open one session for the task.** A `run` requires a declared session, and one task = one session keeps the audit trail reviewable as a unit. Mint one and reuse it for every command in this task:
+2. **Open one session for the task.** A `run` requires a declared session, and one task = one session keeps the audit trail reviewable as a unit. Mint one id at the start of the task:
 
    ```bash
-   export AGENTSSH_SESSION=$(agentssh session new)   # e.g. s_1a2b3c4d
+   agentssh session new                              # prints an id, e.g. s_1a2b3c4d
    ```
+
+   Remember the id and pass it explicitly on every run in the task:
+
+   ```bash
+   agentssh run web-1 --session s_1a2b3c4d --json -- <cmd...>
+   ```
+
+   Do **not** mint a new id per command — that fragments the task's audit trail. If your shell persists environment variables between commands, `export AGENTSSH_SESSION=$(agentssh session new)` also works; most agent harnesses run each command in a fresh shell, so the explicit `--session` flag is the reliable form.
 
    Optionally label the task on its first run: `--session-label "fix 502 on web-1"`.
 
@@ -32,33 +40,39 @@ AgentSSH is the only way you touch managed hosts. You call `agentssh`; the CLI r
 
 4. **Act only after summarizing.** Before a state-changing command (restart, reload, write, delete), state what you found, the risk, and the exact command. Rely on the harness/operator confirmation flow for the go-ahead.
 
-5. **Review via audit.** Hand back the session id and key request ids so the operator can replay the task:
+5. **Review via audit.** Hand back the session id and key request ids so the operator can replay the task. A run's `req_id` appears in its `--json` response and in `audit ls`; the human-readable run output omits it.
 
    ```bash
-   agentssh audit ls --session "$AGENTSSH_SESSION"
+   agentssh audit ls --session s_1a2b3c4d
    agentssh audit show <req_id>
-   agentssh tui                       # audit grouped by session
    ```
+
+   Group runs record one derived session per host (`s_1a2b3c4d@web-1`); filtering by the base id matches all of them. The operator can also browse the same data with `agentssh tui`.
 
 ## Practices that matter
 
 - **Policy is the safety boundary, not a suggestion.** Exit `6` is final — do not retry the same command, reword it, or look for a syntax that slips past. It means a hard deny or disabled gray-area approval path blocked the command.
 - **Never self-approve.** You may read `approval status` / `approval wait`, but you must never run `approval grant`, `approval deny`, edit policy, write approval files, or otherwise approve your own command. If a run returns exit `7`, surface the approval id and exact command to the operator, wait for the operator's decision, then rerun the same command only after approval.
-- **One session per task.** Don't reuse a previous task's `AGENTSSH_SESSION`, and don't share one session across unrelated tasks — that merges them in the audit trail. Start a new task → mint a new id.
+- **One session per task.** Don't reuse a previous task's session id, and don't share one session across unrelated tasks — that merges them in the audit trail. Start a new task → mint a new id.
 - **Bounded, relevant output.** Prefer targeted commands (`systemctl status`, `journalctl -n`, `ps --sort`) over broad recursive scans. Output filtering may redact secrets and truncate length before results reach you; treat `«REDACTED»` and truncation as expected.
+- **Prefer `--json` on `run`.** The structured response carries `req_id`, `approval_id`, `redactions`, and `output_truncated`, none of which appear in the human-readable output. Parse it instead of scraping text.
+- **`policy test` reports its verdict on stdout, not via exit code.** It prints `allow`, `deny`, or `needs-approval` and exits `0` in all three cases — never chain it as `policy test ... && run ...`.
 - **No destructive exploration.** Never run recursive deletes, mass `kill`, or cleanup as part of diagnosis. If the task needs them, propose them explicitly and let policy + the operator gate it.
 - **Read exit codes, don't fight them.** `0` ok · `1` remote command failed · `2` usage (e.g. no session declared, missing `--`) · `6` policy denied/final · `7` approval required or still pending · `9` connection failed. A `9` means fix connectivity/inventory, not retry blindly.
 
 ## Async approval flow
 
-When optional approval is enabled, a gray-area command that hits `default-deny` returns immediately with exit `7` and a JSON body like:
+When optional approval is enabled, a gray-area command that hits `default-deny` returns immediately with exit `7`. Without `--json`, the approval id and candidate matcher are printed on stderr; with `--json` (preferred) the body looks like:
 
 ```json
 {
-  "status": "approval_pending",
-  "approval_id": "ap_0123456789abcdef01234567",
+  "req_id": "a1b2c3",
+  "session_id": "s_1a2b3c4d",
   "host": "web-1",
-  "cmd": "systemctl status nginx"
+  "cmd": "systemctl status nginx",
+  "status": "approval_pending",
+  "exit_code": 7,
+  "approval_id": "ap_0123456789abcdef01234567"
 }
 ```
 
@@ -87,8 +101,8 @@ agentssh status <req_id> [--json]                    # look up a past run's resu
 agentssh approval status <approval_id>               # read approval result: 0 approved, 6 denied, 7 pending
 agentssh approval wait <approval_id> [--timeout 10m]  # wait for approval result, never grants approval
 agentssh audit ls [--session <id>] | show <req_id> | verify   # browse / inspect / verify the hash chain
-agentssh policy test --host <host> '<cmd>'           # static policy check, without running it or consulting session grants
-agentssh tui                                         # interactive audit + policy viewer
+agentssh policy test --host <host> '<cmd>'           # static check; verdict on stdout (allow/deny/needs-approval), exits 0 either way
+agentssh tui                                         # interactive audit + policy viewer (operator-facing)
 ```
 
-The command after `--` is sent verbatim as one remote command. Bind every run in a task to the same session (via `$AGENTSSH_SESSION` or `--session`) so audit groups them by task.
+The command after `--` is sent verbatim as one remote command. Bind every run in a task to the same session (via `--session <id>`, or `$AGENTSSH_SESSION` in a persistent shell) so audit groups them by task.
