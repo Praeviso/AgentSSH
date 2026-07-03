@@ -872,8 +872,9 @@ func newSessionCommand() *cobra.Command {
 	cmd.AddCommand(&cobra.Command{
 		Use:   "new",
 		Short: "Mint a fresh session id for a task.",
-		Long: "Print a fresh session id. Bind a task's runs to it so audit groups them:\n" +
-			"  AGENTSSH_SESSION=$(agentssh session new)",
+		Long: "Print a fresh session id. Bind every run in the task to it so audit groups them:\n" +
+			"  agentssh run <host> --session <id> -- <cmd...>\n" +
+			"In a persistent shell, AGENTSSH_SESSION=$(agentssh session new) works too.",
 		Args: noArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			id, err := session.NewID()
@@ -2250,8 +2251,9 @@ func buildRunPlans(cfg *config.Config, resolved inventory.ResolvedTarget, remote
 		if err != nil {
 			if errors.Is(err, session.ErrNoSession) {
 				return nil, newUsageError("a session must be declared for run\n" +
-					"  pass --session <id> or set AGENTSSH_SESSION (e.g. AGENTSSH_SESSION=$(agentssh session new))\n" +
-					"  one session per task keeps the audit trail grouped by task")
+					"  mint one id per task: agentssh session new\n" +
+					"  then pass --session <id> on every run in the task (or export AGENTSSH_SESSION in a persistent shell)\n" +
+					"  do not mint a new id per command — one session per task keeps the audit trail grouped by task")
 			}
 			return nil, fmt.Errorf("resolve session: %w", err)
 		}
