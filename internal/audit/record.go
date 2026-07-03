@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -307,7 +308,7 @@ func FilterRecords(records []Record, filters Filters) []Record {
 		if filters.Host != "" && record.Host != filters.Host {
 			continue
 		}
-		if filters.SessionID != "" && record.SessionID != filters.SessionID {
+		if filters.SessionID != "" && !sessionIDMatches(record.SessionID, filters.SessionID) {
 			continue
 		}
 		if filters.Event != "" && record.Event != filters.Event {
@@ -316,6 +317,12 @@ func FilterRecords(records []Record, filters Filters) []Record {
 		result = append(result, record)
 	}
 	return result
+}
+
+// sessionIDMatches accepts an exact session id or, for group runs that derive
+// per-host ids ("s_x@web-1"), the base id shared by all targets.
+func sessionIDMatches(recordID string, filter string) bool {
+	return recordID == filter || strings.HasPrefix(recordID, filter+"@")
 }
 
 // ComputeOutputSHA256 returns the sha256 of stdout+stderr bytes captured in M2.

@@ -249,3 +249,24 @@ func writeRecords(t *testing.T, path string, records []audit.Record) {
 		t.Fatalf("write: %v", err)
 	}
 }
+
+// A base session filter must match both single-host records and the per-host
+// derived ids ("s_x@web-1") that group runs record, while an exact derived id
+// still selects only its own host.
+func TestFilterRecordsMatchesDerivedGroupSessionIDs(t *testing.T) {
+	records := []audit.Record{
+		{ReqID: "r1", SessionID: "s_x"},
+		{ReqID: "r2", SessionID: "s_x@web-1"},
+		{ReqID: "r3", SessionID: "s_x@web-2"},
+		{ReqID: "r4", SessionID: "s_xy"},
+		{ReqID: "r5", SessionID: "s_other@web-1"},
+	}
+	base := audit.FilterRecords(records, audit.Filters{SessionID: "s_x"})
+	if len(base) != 3 || base[0].ReqID != "r1" || base[1].ReqID != "r2" || base[2].ReqID != "r3" {
+		t.Fatalf("base filter = %#v", base)
+	}
+	exact := audit.FilterRecords(records, audit.Filters{SessionID: "s_x@web-1"})
+	if len(exact) != 1 || exact[0].ReqID != "r2" {
+		t.Fatalf("exact filter = %#v", exact)
+	}
+}
