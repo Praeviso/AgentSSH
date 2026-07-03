@@ -179,6 +179,7 @@ func TestMergeExitCode(t *testing.T) {
 func TestInventoryAddFlagPathCreatesInventoryAndList(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("AGENTSSH_HOME", home)
+	withOperatorAuth(t, home)
 
 	stdout, stderr, err := runCommandForTest(t, "inventory", "add", "web-1", "--addr", "10.0.0.11", "--user", "deploy", "--tags", "web,prod")
 	if err != nil {
@@ -223,6 +224,7 @@ func TestInventoryAddFlagPathCreatesInventoryAndList(t *testing.T) {
 func TestInventoryAddIdentityFileFlagAndHostsDoNotLeakIt(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("AGENTSSH_HOME", home)
+	withOperatorAuth(t, home)
 
 	stdout, stderr, err := runCommandForTest(t, "inventory", "add", "web-1", "--addr", "10.0.0.11", "--identity-file", "~/.ssh/web-1")
 	if err != nil {
@@ -253,17 +255,18 @@ func TestInventoryAddIdentityFileFlagAndHostsDoNotLeakIt(t *testing.T) {
 func TestSecretSetListRemoveRoundTripDoesNotPrintValues(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("AGENTSSH_HOME", home)
-	t.Setenv(envMasterPassword, "master")
-	restorePrompt := readSecretNoEcho
-	readSecretNoEcho = func(prompt string) (string, error) {
-		if !strings.Contains(prompt, "web-1") {
+	initOperatorVerifierForTest(t, home, "master")
+	withOperatorPrompt(t, func(prompt string) (string, error) {
+		switch {
+		case strings.Contains(prompt, "AgentSSH master password"):
+			return "master", nil
+		case strings.Contains(prompt, "web-1"):
+			return "ssh-password-value", nil
+		default:
 			t.Fatalf("prompt = %q", prompt)
+			return "", nil
 		}
-		return "ssh-password-value", nil
-	}
-	defer func() {
-		readSecretNoEcho = restorePrompt
-	}()
+	})
 
 	stdout, stderr, err := runCommandForTest(t, "secret", "set", "web-1")
 	if err != nil {
@@ -311,12 +314,13 @@ func TestSecretSetListRemoveRoundTripDoesNotPrintValues(t *testing.T) {
 func TestInventoryAddPasswordStoresSecretNotInventory(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("AGENTSSH_HOME", home)
-	t.Setenv(envMasterPassword, "master")
-	restorePrompt := readSecretNoEcho
-	readSecretNoEcho = func(string) (string, error) { return "ssh-password-value", nil }
-	defer func() {
-		readSecretNoEcho = restorePrompt
-	}()
+	initOperatorVerifierForTest(t, home, "master")
+	withOperatorPrompt(t, func(prompt string) (string, error) {
+		if strings.Contains(prompt, "AgentSSH master password") {
+			return "master", nil
+		}
+		return "ssh-password-value", nil
+	})
 
 	stdout, stderr, err := runCommandForTest(t, "inventory", "add", "web-1", "--addr", "10.0.0.11", "--user", "deploy", "--password")
 	if err != nil {
@@ -349,6 +353,7 @@ groups:
     tags: [prod]
 `)
 	t.Setenv("AGENTSSH_HOME", home)
+	withOperatorAuth(t, home)
 
 	_, stderr, err := runCommandForTest(t, "inventory", "add", "new", "--addr", "10.0.0.11")
 	if err != nil {
@@ -369,6 +374,7 @@ func TestInventoryAddCreatesMissingHomeDirectory(t *testing.T) {
 	root := t.TempDir()
 	home := filepath.Join(root, "missing", "agentssh")
 	t.Setenv("AGENTSSH_HOME", home)
+	withOperatorAuth(t, home)
 
 	_, stderr, err := runCommandForTest(t, "inventory", "add", "web-1", "--addr", "10.0.0.11")
 	if err != nil {
@@ -382,6 +388,7 @@ func TestInventoryAddCreatesMissingHomeDirectory(t *testing.T) {
 func TestInventoryAddNonInteractiveRequiresFields(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("AGENTSSH_HOME", home)
+	withOperatorAuth(t, home)
 	_, _, err := runCommandForTest(t, "inventory", "add", "--addr", "10.0.0.11")
 	if err == nil || !isUsageError(err) {
 		t.Fatalf("missing name err = %T %[1]v, want usageError", err)
@@ -406,6 +413,7 @@ hosts:
     tags: [web, prod]
 `)
 	t.Setenv("AGENTSSH_HOME", home)
+	withOperatorAuth(t, home)
 
 	stdout, stderr, err := runCommandForTest(t, "inventory", "update", "web-1", "--addr", "10.0.0.12", "--port", "2222", "--tags", "api,prod")
 	if err != nil {
@@ -432,6 +440,7 @@ hosts:
     addr: 10.0.0.11
 `)
 	t.Setenv("AGENTSSH_HOME", home)
+	withOperatorAuth(t, home)
 
 	_, _, err := runCommandForTest(t, "inventory", "update", "web-1")
 	if err == nil || !isUsageError(err) {
@@ -454,6 +463,7 @@ hosts:
     addr: 10.0.0.12
 `)
 	t.Setenv("AGENTSSH_HOME", home)
+	withOperatorAuth(t, home)
 
 	stdout, stderr, err := runCommandForTest(t, "inventory", "rm", "web-1")
 	if err != nil {
@@ -518,6 +528,7 @@ rule_groups:
         action: allow
 `)
 	t.Setenv("AGENTSSH_HOME", home)
+	withOperatorAuth(t, home)
 
 	stdout, stderr, err := runCommandForTest(t, "inventory", "rm", "web-1")
 	if err != nil {
@@ -561,6 +572,7 @@ rules:
     action: deny
 `)
 	t.Setenv("AGENTSSH_HOME", home)
+	withOperatorAuth(t, home)
 
 	_, _, err := runCommandForTest(t, "inventory", "rm", "web-1")
 	if err == nil {
@@ -585,6 +597,7 @@ hosts:
     addr: 10.0.0.11
 `)
 	t.Setenv("AGENTSSH_HOME", home)
+	withOperatorAuth(t, home)
 
 	_, _, err := runCommandForTest(t, "inventory", "rm", "missing")
 	if err == nil || !isUsageError(err) {
@@ -619,6 +632,7 @@ output:
   max_bytes: 1024
 `)
 	t.Setenv("AGENTSSH_HOME", home)
+	withOperatorAuth(t, home)
 
 	stdout, stderr, err := runCommandForTest(t, "policy", "rule", "add", "danger", "--cmd-regex", "rm -rf", "--action", "deny", "--priority", "50")
 	if err != nil {
@@ -667,6 +681,135 @@ output:
 	}
 }
 
+func TestOperatorGateRejectsPolicyMutationWithoutVerifier(t *testing.T) {
+	home := t.TempDir()
+	writePolicy(t, home, "version: 1\n")
+	t.Setenv("AGENTSSH_HOME", home)
+	withOperatorPrompt(t, func(prompt string) (string, error) {
+		if strings.Contains(prompt, "AgentSSH master password") {
+			return "master", nil
+		}
+		t.Fatalf("unexpected prompt %q", prompt)
+		return "", nil
+	})
+
+	_, _, err := runCommandForTest(t, "policy", "rule", "add", "self-allow", "--cmd-regex", ".*", "--action", "allow")
+	if err == nil || !isUsageError(err) || !strings.Contains(err.Error(), "operator password verifier is not initialized") {
+		t.Fatalf("policy mutation err = %T %[1]v, want uninitialized verifier usage error", err)
+	}
+	raw := readFileString(t, filepath.Join(home, "policy.yaml"))
+	if strings.Contains(raw, "self-allow") {
+		t.Fatalf("policy mutated despite missing operator verifier:\n%s", raw)
+	}
+}
+
+func TestOperatorGateRejectsWrongMaster(t *testing.T) {
+	home := t.TempDir()
+	writePolicy(t, home, "version: 1\n")
+	t.Setenv("AGENTSSH_HOME", home)
+	initOperatorVerifierForTest(t, home, "master")
+	withOperatorPrompt(t, func(prompt string) (string, error) {
+		if strings.Contains(prompt, "AgentSSH master password") {
+			return "wrong", nil
+		}
+		t.Fatalf("unexpected prompt %q", prompt)
+		return "", nil
+	})
+
+	_, _, err := runCommandForTest(t, "policy", "rule", "add", "self-allow", "--cmd-regex", ".*", "--action", "allow")
+	if err == nil || !isUsageError(err) || !strings.Contains(err.Error(), "wrong password") {
+		t.Fatalf("policy mutation err = %T %[1]v, want wrong master usage error", err)
+	}
+}
+
+func TestOperatorGateIgnoresEnvMasterPassword(t *testing.T) {
+	home := t.TempDir()
+	writePolicy(t, home, "version: 1\n")
+	t.Setenv("AGENTSSH_HOME", home)
+	t.Setenv(envMasterPassword, "master")
+	store, err := secrets.Open(filepath.Join(home, "secrets.enc"), "master")
+	if err != nil {
+		t.Fatalf("open secrets: %v", err)
+	}
+	if err := store.Save("master"); err != nil {
+		t.Fatalf("save secrets: %v", err)
+	}
+	withOperatorPrompt(t, func(prompt string) (string, error) {
+		if strings.Contains(prompt, "AgentSSH master password") {
+			return "wrong", nil
+		}
+		t.Fatalf("unexpected prompt %q", prompt)
+		return "", nil
+	})
+
+	_, _, err = runCommandForTest(t, "policy", "rule", "add", "self-allow", "--cmd-regex", ".*", "--action", "allow")
+	if err == nil || !isUsageError(err) || !strings.Contains(err.Error(), "wrong master password") {
+		t.Fatalf("policy mutation err = %T %[1]v, want prompted wrong master to be rejected", err)
+	}
+	raw := readFileString(t, filepath.Join(home, "policy.yaml"))
+	if strings.Contains(raw, "self-allow") {
+		t.Fatalf("policy mutated using %s:\n%s", envMasterPassword, raw)
+	}
+}
+
+func TestOperatorGateCommandWiring(t *testing.T) {
+	root := newRootCommand()
+	gated := []string{
+		"inventory add",
+		"inventory update",
+		"inventory rm",
+		"inventory discover",
+		"inventory test",
+		"secret set",
+		"secret rm",
+		"secret ls",
+		"policy rule add",
+		"policy rule update",
+		"policy rule rm",
+		"policy group add",
+		"policy group rm",
+		"policy group rule add",
+		"policy group rule rm",
+		"policy host rm",
+		"policy host rule add",
+		"policy host rule rm",
+		"policy host group rm",
+		"approval ls",
+		"approval grant",
+		"approval deny",
+		"session end",
+		"audit repair",
+	}
+	for _, path := range gated {
+		cmd := findCommandForTest(t, root, path)
+		if !hasOperatorGate(cmd) {
+			t.Fatalf("%s is not operator-gated", path)
+		}
+	}
+
+	ungated := []string{
+		"approval status",
+		"approval wait",
+		"run",
+		"status",
+		"policy test",
+		"policy show",
+		"audit ls",
+		"audit show",
+		"audit verify",
+		"inventory ls",
+		"hosts",
+		"session ls",
+		"session new",
+	}
+	for _, path := range ungated {
+		cmd := findCommandForTest(t, root, path)
+		if hasOperatorGate(cmd) {
+			t.Fatalf("%s unexpectedly has an operator gate", path)
+		}
+	}
+}
+
 func TestPolicyHostCRUDCommands(t *testing.T) {
 	home := t.TempDir()
 	writeInventory(t, home, `
@@ -687,6 +830,7 @@ output:
   max_bytes: 1024
 `)
 	t.Setenv("AGENTSSH_HOME", home)
+	withOperatorAuth(t, home)
 
 	stdout, stderr, err := runCommandForTest(t, "policy", "host", "rule", "add", "web-1", "--cmd-regex", "^cat\\b", "--action", "deny", "--priority", "20")
 	if err != nil {
@@ -858,8 +1002,7 @@ output:
 		t.Fatalf("pending wait code=%d out=%s", code, waitOut)
 	}
 
-	withOperatorTTY(t)
-	t.Setenv(envMasterPassword, "master")
+	withOperatorAuth(t, home)
 	stdout, stderr, err := runCommandForTest(t, "approval", "grant", pending.ApprovalID, "--session")
 	if err != nil {
 		t.Fatalf("approval grant err=%v stdout=%s stderr=%s", err, stdout, stderr)
@@ -1051,8 +1194,7 @@ output:
 	if err := json.Unmarshal([]byte(stdout), &pending); err != nil {
 		t.Fatal(err)
 	}
-	withOperatorTTY(t)
-	t.Setenv(envMasterPassword, "master")
+	withOperatorAuth(t, home)
 	if _, _, err := runCommandForTest(t, "approval", "deny", pending.ApprovalID); err != nil {
 		t.Fatalf("deny err: %v", err)
 	}
@@ -1168,6 +1310,7 @@ output:
   max_bytes: 1024
 `)
 	t.Setenv("AGENTSSH_HOME", home)
+	withOperatorAuth(t, home)
 
 	stdout, stderr, err := runCommandForTest(t, "policy", "group", "add", "readonly")
 	if err != nil {
@@ -1269,6 +1412,7 @@ func TestAuditRepairTruncatesBrokenTail(t *testing.T) {
 	writeTestInventory(t, home)
 	writeTestPolicy(t, home)
 	t.Setenv("AGENTSSH_HOME", home)
+	withOperatorAuth(t, home)
 
 	store := audit.NewStore(filepath.Join(home, "audit.log"))
 	for _, record := range []audit.Record{
@@ -1312,6 +1456,7 @@ func TestInventoryAddDoesNotOverwriteMalformedInventory(t *testing.T) {
 		t.Fatalf("write bad inventory: %v", err)
 	}
 	t.Setenv("AGENTSSH_HOME", home)
+	withOperatorAuth(t, home)
 
 	_, _, err := runCommandForTest(t, "inventory", "add", "web-1", "--addr", "10.0.0.11")
 	if err == nil {
@@ -1846,6 +1991,7 @@ hosts:
 `, server.Host(), server.Port()))
 	writeTestPolicy(t, home)
 	t.Setenv("AGENTSSH_HOME", home)
+	withOperatorAuth(t, home)
 
 	stdout, stderr, err := runCommandForTest(t, "inventory", "test", "web-1")
 	if err != nil {
@@ -1875,6 +2021,7 @@ Host web-1
 	writeInventory(t, home, "version: 1\n")
 	writeTestPolicy(t, home)
 	t.Setenv("AGENTSSH_HOME", home)
+	withOperatorAuth(t, home)
 
 	stdout, stderr, err := runCommandForTest(t, "inventory", "discover", "--probe", "--import")
 	if err != nil {
@@ -2001,6 +2148,27 @@ func runCommandForTest(t *testing.T, args ...string) (string, string, error) {
 	root.SetArgs(args)
 	err := root.Execute()
 	return stdout.String(), stderr.String(), err
+}
+
+func findCommandForTest(t *testing.T, root *cobra.Command, path string) *cobra.Command {
+	t.Helper()
+	cmd, _, err := root.Find(strings.Fields(path))
+	if err != nil {
+		t.Fatalf("find command %q: %v", path, err)
+	}
+	if cmd == nil {
+		t.Fatalf("find command %q: nil", path)
+	}
+	return cmd
+}
+
+func hasOperatorGate(cmd *cobra.Command) bool {
+	for current := cmd; current != nil; current = current.Parent() {
+		if current.PersistentPreRunE != nil {
+			return true
+		}
+	}
+	return false
 }
 
 func writeTestInventory(t *testing.T, home string) {
@@ -2595,6 +2763,7 @@ hosts:
 		t.Fatalf("save secrets: %v", err)
 	}
 	t.Setenv("AGENTSSH_HOME", home)
+	withOperatorAuth(t, home)
 	t.Setenv(envMasterPassword, "master")
 	t.Setenv("SSH_AUTH_SOCK", "")
 

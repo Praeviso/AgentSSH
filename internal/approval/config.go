@@ -54,7 +54,9 @@ func RuntimeConfigFromPolicy(cfg policy.Approval, envValue string) (RuntimeConfi
 		if err != nil {
 			return out, err
 		}
-		out.Enabled = enabled
+		if enabled {
+			out.Enabled = true
+		}
 	}
 	return out, nil
 }

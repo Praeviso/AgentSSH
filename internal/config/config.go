@@ -14,7 +14,8 @@ import (
 const (
 	// EnvHome overrides the default ~/.agentssh configuration directory.
 	EnvHome = "AGENTSSH_HOME"
-	// EnvApproval enables the optional async approval flow when set truthy.
+	// EnvApproval can enable the optional async approval flow when set truthy;
+	// false values do not disable policy-file approval.
 	EnvApproval = "AGENTSSH_APPROVAL"
 	// DefaultDirName is the configuration directory under the user's home.
 	DefaultDirName = ".agentssh"

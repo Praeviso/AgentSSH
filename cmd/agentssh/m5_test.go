@@ -39,6 +39,33 @@ func withOperatorTTY(t *testing.T) {
 	t.Cleanup(func() { stdinIsTerminal = restore })
 }
 
+func initOperatorVerifierForTest(t *testing.T, home string, master string) {
+	t.Helper()
+	if err := saveOperatorVerifier(operatorVerifierPath(config.NewPaths(home)), master); err != nil {
+		t.Fatalf("save operator verifier: %v", err)
+	}
+}
+
+func withOperatorPrompt(t *testing.T, prompt func(string) (string, error)) {
+	t.Helper()
+	withOperatorTTY(t)
+	restore := readSecretNoEcho
+	readSecretNoEcho = prompt
+	t.Cleanup(func() { readSecretNoEcho = restore })
+}
+
+func withOperatorAuth(t *testing.T, home string) {
+	t.Helper()
+	initOperatorVerifierForTest(t, home, "master")
+	withOperatorPrompt(t, func(prompt string) (string, error) {
+		if strings.Contains(prompt, "AgentSSH master password") {
+			return "master", nil
+		}
+		t.Fatalf("unexpected secret prompt %q", prompt)
+		return "", nil
+	})
+}
+
 // runExit runs the root command with args and returns the mapped process exit
 // code (via the same exitCodeForError that execute() uses) plus stdout/stderr.
 func runExit(t *testing.T, args ...string) (int, string, string) {

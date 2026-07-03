@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -12,11 +14,13 @@ import (
 	"strings"
 	"time"
 
+	"filippo.io/age"
 	"github.com/Praeviso/AgentSSH/internal/approval"
 	"github.com/Praeviso/AgentSSH/internal/audit"
 	"github.com/Praeviso/AgentSSH/internal/config"
 	"github.com/Praeviso/AgentSSH/internal/discovery"
 	"github.com/Praeviso/AgentSSH/internal/executor"
+	"github.com/Praeviso/AgentSSH/internal/fileutil"
 	"github.com/Praeviso/AgentSSH/internal/hostform"
 	"github.com/Praeviso/AgentSSH/internal/inventory"
 	"github.com/Praeviso/AgentSSH/internal/output"
@@ -38,6 +42,12 @@ const (
 )
 
 const envMasterPassword = "AGENTSSH_MASTER_PASSWORD"
+
+const (
+	operatorVerifierFile    = "operator.verifier"
+	operatorVerifierVersion = 1
+	operatorVerifierPurpose = "agentssh operator verifier"
+)
 
 // version is overridden at build time via -ldflags "-X main.version=<tag>".
 var version = "dev"
@@ -136,6 +146,7 @@ func newRootCommand() *cobra.Command {
 		newRunCommand(),
 		newStatusCommand(),
 		newTUICommand(),
+		newOperatorCommand(),
 		newInventoryCommand(),
 		newSecretCommand(),
 		newPolicyCommand(),
@@ -255,6 +266,22 @@ func runTUI(cmd *cobra.Command) error {
 	return err
 }
 
+func newOperatorCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "operator",
+		Short: "Manage local operator authentication.",
+	}
+	cmd.AddCommand(&cobra.Command{
+		Use:   "init",
+		Short: "Initialize the local operator password verifier.",
+		Args:  noArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runOperatorInit(cmd)
+		},
+	})
+	return cmd
+}
+
 func newInventoryCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "inventory",
@@ -273,14 +300,15 @@ func newInventoryCommand() *cobra.Command {
 
 	var add inventoryAddOptions
 	addCmd := &cobra.Command{
-		Use:   "add [name] [--addr <addr>] [--user <user>] [--port <port>] [--alias <ssh_config_alias>] [--identity-file <path>] [--tags <a,b>]",
-		Short: "Add a host to inventory.yaml.",
-		Args:  cobra.MaximumNArgs(1),
+		Use:               "add [name] [--addr <addr>] [--user <user>] [--port <port>] [--alias <ssh_config_alias>] [--identity-file <path>] [--tags <a,b>]",
+		Short:             "Add a host to inventory.yaml.",
+		Args:              cobra.MaximumNArgs(1),
+		PersistentPreRunE: requireOperator,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if len(args) > 0 {
 				add.Name = args[0]
 			}
-			return runInventoryAdd(add)
+			return runInventoryAdd(cmd, add)
 		},
 	}
 	addCmd.Flags().StringVar(&add.Addr, "addr", "", "host address")
@@ -293,9 +321,10 @@ func newInventoryCommand() *cobra.Command {
 
 	var update inventoryUpdateOptions
 	updateCmd := &cobra.Command{
-		Use:   "update <name> [--addr <addr>] [--user <user>] [--port <port>] [--alias <ssh_config_alias>] [--identity-file <path>] [--tags <a,b>]",
-		Short: "Update an existing host in inventory.yaml.",
-		Args:  exactArgs(1),
+		Use:               "update <name> [--addr <addr>] [--user <user>] [--port <port>] [--alias <ssh_config_alias>] [--identity-file <path>] [--tags <a,b>]",
+		Short:             "Update an existing host in inventory.yaml.",
+		Args:              exactArgs(1),
+		PersistentPreRunE: requireOperator,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			update.Name = args[0]
 			flags := cmd.Flags()
@@ -316,10 +345,11 @@ func newInventoryCommand() *cobra.Command {
 	updateCmd.Flags().StringVar(&update.Tags, "tags", "", "comma-separated tags; empty clears tags")
 
 	rmCmd := &cobra.Command{
-		Use:     "rm <name>",
-		Aliases: []string{"remove", "delete"},
-		Short:   "Remove a host from inventory.yaml.",
-		Args:    exactArgs(1),
+		Use:               "rm <name>",
+		Aliases:           []string{"remove", "delete"},
+		Short:             "Remove a host from inventory.yaml.",
+		Args:              exactArgs(1),
+		PersistentPreRunE: requireOperator,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runInventoryRM(cmd, args[0])
 		},
@@ -327,9 +357,10 @@ func newInventoryCommand() *cobra.Command {
 
 	var discover inventoryDiscoverOptions
 	discoverCmd := &cobra.Command{
-		Use:   "discover [--probe] [--json] [--import]",
-		Short: "Discover SSH hosts from local SSH config and known_hosts.",
-		Args:  noArgs,
+		Use:               "discover [--probe] [--json] [--import]",
+		Short:             "Discover SSH hosts from local SSH config and known_hosts.",
+		Args:              noArgs,
+		PersistentPreRunE: requireOperator,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runInventoryDiscover(cmd, discover)
 		},
@@ -339,9 +370,10 @@ func newInventoryCommand() *cobra.Command {
 	discoverCmd.Flags().BoolVar(&discover.Import, "import", false, "import connectable hosts not already in inventory")
 
 	testCmd := &cobra.Command{
-		Use:   "test <name>",
-		Short: "Test native SSH connectivity for an inventory host.",
-		Args:  exactArgs(1),
+		Use:               "test <name>",
+		Short:             "Test native SSH connectivity for an inventory host.",
+		Args:              exactArgs(1),
+		PersistentPreRunE: requireOperator,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runInventoryTest(cmd, args[0])
 		},
@@ -366,18 +398,20 @@ func newSecretCommand() *cobra.Command {
 	}
 	cmd.AddCommand(
 		&cobra.Command{
-			Use:   "set <host>",
-			Short: "Prompt for and store an encrypted SSH password.",
-			Args:  exactArgs(1),
+			Use:               "set <host>",
+			Short:             "Prompt for and store an encrypted SSH password.",
+			Args:              exactArgs(1),
+			PersistentPreRunE: requireOperator,
 			RunE: func(cmd *cobra.Command, args []string) error {
 				return runSecretSet(cmd, args[0])
 			},
 		},
 		newSecretLSCommand(),
 		&cobra.Command{
-			Use:   "rm <host>",
-			Short: "Remove a stored SSH password.",
-			Args:  exactArgs(1),
+			Use:               "rm <host>",
+			Short:             "Remove a stored SSH password.",
+			Args:              exactArgs(1),
+			PersistentPreRunE: requireOperator,
 			RunE: func(cmd *cobra.Command, args []string) error {
 				return runSecretRM(cmd, args[0])
 			},
@@ -389,9 +423,10 @@ func newSecretCommand() *cobra.Command {
 func newSecretLSCommand() *cobra.Command {
 	var jsonOutput bool
 	cmd := &cobra.Command{
-		Use:   "ls [--json]",
-		Short: "List hosts with stored SSH passwords.",
-		Args:  noArgs,
+		Use:               "ls [--json]",
+		Short:             "List hosts with stored SSH passwords.",
+		Args:              noArgs,
+		PersistentPreRunE: requireOperator,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runSecretLS(cmd, jsonOutput)
 		},
@@ -449,10 +484,11 @@ func newPolicyHostCommand() *cobra.Command {
 	groupCmd := newPolicyHostGroupCommand()
 
 	rmCmd := &cobra.Command{
-		Use:     "rm <host>",
-		Aliases: []string{"remove", "delete"},
-		Short:   "Clear per-host policy rules.",
-		Args:    exactArgs(1),
+		Use:               "rm <host>",
+		Aliases:           []string{"remove", "delete"},
+		Short:             "Clear per-host policy rules.",
+		Args:              exactArgs(1),
+		PersistentPreRunE: requireOperator,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runPolicyHostRM(cmd, args[0])
 		},
@@ -468,9 +504,10 @@ func newPolicyHostRuleCommand() *cobra.Command {
 	}
 	var add policyHostRuleOptions
 	addCmd := &cobra.Command{
-		Use:   "add <host> (--cmd-regex <regex> --action allow|deny [--priority <int>] | --from-group <name>)",
-		Short: "Append a manual rule or stamp a rule group onto host rules.",
-		Args:  exactArgs(1),
+		Use:               "add <host> (--cmd-regex <regex> --action allow|deny [--priority <int>] | --from-group <name>)",
+		Short:             "Append a manual rule or stamp a rule group onto host rules.",
+		Args:              exactArgs(1),
+		PersistentPreRunE: requireOperator,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			add.Host = args[0]
 			cmdRegexSet := cmd.Flags().Changed("cmd-regex")
@@ -505,10 +542,11 @@ func newPolicyHostRuleCommand() *cobra.Command {
 	}
 
 	rmCmd := &cobra.Command{
-		Use:     "rm <host> <index>",
-		Aliases: []string{"remove", "delete"},
-		Short:   "Remove a host-specific policy rule by index.",
-		Args:    exactArgs(2),
+		Use:               "rm <host> <index>",
+		Aliases:           []string{"remove", "delete"},
+		Short:             "Remove a host-specific policy rule by index.",
+		Args:              exactArgs(2),
+		PersistentPreRunE: requireOperator,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			index, err := strconv.Atoi(args[1])
 			if err != nil {
@@ -528,10 +566,11 @@ func newPolicyHostGroupCommand() *cobra.Command {
 		Short: "Manage rule-group snapshots stamped onto hosts.",
 	}
 	rmCmd := &cobra.Command{
-		Use:     "rm <host> <name>",
-		Aliases: []string{"remove", "delete"},
-		Short:   "Remove all host rules stamped from a group.",
-		Args:    exactArgs(2),
+		Use:               "rm <host> <name>",
+		Aliases:           []string{"remove", "delete"},
+		Short:             "Remove all host rules stamped from a group.",
+		Args:              exactArgs(2),
+		PersistentPreRunE: requireOperator,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runPolicyHostGroupRM(cmd, args[0], args[1])
 		},
@@ -554,18 +593,20 @@ func newPolicyGroupCommand() *cobra.Command {
 		},
 	}
 	addCmd := &cobra.Command{
-		Use:   "add <name>",
-		Short: "Create a reusable policy rule group.",
-		Args:  exactArgs(1),
+		Use:               "add <name>",
+		Short:             "Create a reusable policy rule group.",
+		Args:              exactArgs(1),
+		PersistentPreRunE: requireOperator,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runPolicyGroupAdd(cmd, args[0])
 		},
 	}
 	rmCmd := &cobra.Command{
-		Use:     "rm <name>",
-		Aliases: []string{"remove", "delete"},
-		Short:   "Delete a reusable policy rule group.",
-		Args:    exactArgs(1),
+		Use:               "rm <name>",
+		Aliases:           []string{"remove", "delete"},
+		Short:             "Delete a reusable policy rule group.",
+		Args:              exactArgs(1),
+		PersistentPreRunE: requireOperator,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runPolicyGroupRM(cmd, args[0])
 		},
@@ -582,9 +623,10 @@ func newPolicyGroupRuleCommand() *cobra.Command {
 	}
 	var add policyGroupRuleOptions
 	addCmd := &cobra.Command{
-		Use:   "add <group> --cmd-regex <regex> --action allow|deny [--priority <int>]",
-		Short: "Append a rule to a policy rule group.",
-		Args:  exactArgs(1),
+		Use:               "add <group> --cmd-regex <regex> --action allow|deny [--priority <int>]",
+		Short:             "Append a rule to a policy rule group.",
+		Args:              exactArgs(1),
+		PersistentPreRunE: requireOperator,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			add.Group = args[0]
 			if !cmd.Flags().Changed("action") {
@@ -606,10 +648,11 @@ func newPolicyGroupRuleCommand() *cobra.Command {
 		},
 	}
 	rmCmd := &cobra.Command{
-		Use:     "rm <group> <index>",
-		Aliases: []string{"remove", "delete"},
-		Short:   "Remove a rule from a policy rule group by index.",
-		Args:    exactArgs(2),
+		Use:               "rm <group> <index>",
+		Aliases:           []string{"remove", "delete"},
+		Short:             "Remove a rule from a policy rule group by index.",
+		Args:              exactArgs(2),
+		PersistentPreRunE: requireOperator,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			index, err := strconv.Atoi(args[1])
 			if err != nil {
@@ -637,9 +680,10 @@ func newPolicyRuleCommand() *cobra.Command {
 	}
 	var add policyRuleOptions
 	addCmd := &cobra.Command{
-		Use:   "add <name> --cmd-regex <regex> --action allow|deny [--priority <int>]",
-		Short: "Add a global policy rule.",
-		Args:  exactArgs(1),
+		Use:               "add <name> --cmd-regex <regex> --action allow|deny [--priority <int>]",
+		Short:             "Add a global policy rule.",
+		Args:              exactArgs(1),
+		PersistentPreRunE: requireOperator,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			add.Name = args[0]
 			if !cmd.Flags().Changed("action") {
@@ -654,9 +698,10 @@ func newPolicyRuleCommand() *cobra.Command {
 
 	var update policyRuleOptions
 	updateCmd := &cobra.Command{
-		Use:   "update <name> [--name <new-name>] [--cmd-regex <regex>] [--action allow|deny] [--priority <int>]",
-		Short: "Update a global policy rule.",
-		Args:  exactArgs(1),
+		Use:               "update <name> [--name <new-name>] [--cmd-regex <regex>] [--action allow|deny] [--priority <int>]",
+		Short:             "Update a global policy rule.",
+		Args:              exactArgs(1),
+		PersistentPreRunE: requireOperator,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			update.Name = args[0]
 			flags := cmd.Flags()
@@ -673,10 +718,11 @@ func newPolicyRuleCommand() *cobra.Command {
 	updateCmd.Flags().IntVar(&update.Priority, "priority", 0, "rule priority; higher values evaluate first")
 
 	rmCmd := &cobra.Command{
-		Use:     "rm <name>",
-		Aliases: []string{"remove", "delete"},
-		Short:   "Remove a global policy rule.",
-		Args:    exactArgs(1),
+		Use:               "rm <name>",
+		Aliases:           []string{"remove", "delete"},
+		Short:             "Remove a global policy rule.",
+		Args:              exactArgs(1),
+		PersistentPreRunE: requireOperator,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runPolicyRuleRM(cmd, args[0])
 		},
@@ -728,9 +774,10 @@ func newAuditCommand() *cobra.Command {
 func newAuditRepairCommand() *cobra.Command {
 	var truncateBroken bool
 	cmd := &cobra.Command{
-		Use:   "repair --truncate-broken",
-		Short: "Repair a broken audit log by truncating the unverifiable tail.",
-		Args:  noArgs,
+		Use:               "repair --truncate-broken",
+		Short:             "Repair a broken audit log by truncating the unverifiable tail.",
+		Args:              noArgs,
+		PersistentPreRunE: requireOperator,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if !truncateBroken {
 				return newUsageError("audit repair requires --truncate-broken")
@@ -749,9 +796,10 @@ func newApprovalCommand() *cobra.Command {
 	}
 	var lsJSON bool
 	lsCmd := &cobra.Command{
-		Use:   "ls [--json]",
-		Short: "List pending approval requests.",
-		Args:  noArgs,
+		Use:               "ls [--json]",
+		Short:             "List pending approval requests.",
+		Args:              noArgs,
+		PersistentPreRunE: requireOperator,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runApprovalLS(cmd, lsJSON)
 		},
@@ -760,9 +808,10 @@ func newApprovalCommand() *cobra.Command {
 
 	var grantOnce, grantSession, grantHost bool
 	grantCmd := &cobra.Command{
-		Use:   "grant <id> --once|--session|--host",
-		Short: "Approve a pending request.",
-		Args:  exactArgs(1),
+		Use:               "grant <id> --once|--session|--host",
+		Short:             "Approve a pending request.",
+		Args:              exactArgs(1),
+		PersistentPreRunE: requireOperator,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			scope, err := approvalScopeFromFlags(grantOnce, grantSession, grantHost)
 			if err != nil {
@@ -776,9 +825,10 @@ func newApprovalCommand() *cobra.Command {
 	grantCmd.Flags().BoolVar(&grantHost, "host", false, "persist an approval host rule")
 
 	denyCmd := &cobra.Command{
-		Use:   "deny <id>",
-		Short: "Deny a pending request.",
-		Args:  exactArgs(1),
+		Use:               "deny <id>",
+		Short:             "Deny a pending request.",
+		Args:              exactArgs(1),
+		PersistentPreRunE: requireOperator,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runApprovalDeny(cmd, args[0])
 		},
@@ -835,9 +885,10 @@ func newSessionCommand() *cobra.Command {
 		},
 	})
 	cmd.AddCommand(&cobra.Command{
-		Use:   "end <id>",
-		Short: "Clear approval grants for a session.",
-		Args:  exactArgs(1),
+		Use:               "end <id>",
+		Short:             "Clear approval grants for a session.",
+		Args:              exactArgs(1),
+		PersistentPreRunE: requireOperator,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runSessionEnd(cmd, args[0])
 		},
@@ -1082,7 +1133,7 @@ type policyGroupRuleOptions struct {
 	Priority int
 }
 
-func runInventoryAdd(opts inventoryAddOptions) error {
+func runInventoryAdd(cmd *cobra.Command, opts inventoryAddOptions) error {
 	home, err := config.ResolveHome()
 	if err != nil {
 		return err
@@ -1121,7 +1172,7 @@ func runInventoryAdd(opts inventoryAddOptions) error {
 	// so a failed prompt / missing-or-wrong master / corrupt store never leaves a
 	// half-added host. Then add the host and persist the secret, rolling back the
 	// inventory entry if the secret write fails, so the two stores stay consistent.
-	store, master, err := openSecretsForOperator(paths.SecretsFile)
+	store, master, err := openSecretsForOperator(cmd, paths.SecretsFile)
 	if err != nil {
 		return err
 	}
@@ -1372,7 +1423,7 @@ func runSecretSet(cmd *cobra.Command, host string) error {
 	if err != nil {
 		return err
 	}
-	if err := setHostPassword(paths.SecretsFile, host); err != nil {
+	if err := setHostPassword(cmd, paths.SecretsFile, host); err != nil {
 		return err
 	}
 	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "stored password for %s\n", host)
@@ -1384,7 +1435,7 @@ func runSecretLS(cmd *cobra.Command, jsonOutput bool) error {
 	if err != nil {
 		return err
 	}
-	store, _, err := openSecretsForOperator(paths.SecretsFile)
+	store, _, err := openSecretsForOperator(cmd, paths.SecretsFile)
 	if err != nil {
 		return err
 	}
@@ -1404,7 +1455,7 @@ func runSecretRM(cmd *cobra.Command, host string) error {
 	if err != nil {
 		return err
 	}
-	store, master, err := openSecretsForOperator(paths.SecretsFile)
+	store, master, err := openSecretsForOperator(cmd, paths.SecretsFile)
 	if err != nil {
 		return err
 	}
@@ -1416,8 +1467,8 @@ func runSecretRM(cmd *cobra.Command, host string) error {
 	return nil
 }
 
-func setHostPassword(path string, host string) error {
-	store, master, err := openSecretsForOperator(path)
+func setHostPassword(cmd *cobra.Command, path string, host string) error {
+	store, master, err := openSecretsForOperator(cmd, path)
 	if err != nil {
 		return err
 	}
@@ -1429,19 +1480,87 @@ func setHostPassword(path string, host string) error {
 	return store.Save(master)
 }
 
-func openSecretsForOperator(path string) (*secrets.Store, string, error) {
-	master, err := resolveOperatorMaster()
+func runOperatorInit(cmd *cobra.Command) error {
+	if !stdinIsTerminal() {
+		return newUsageError("operator init requires an interactive TTY")
+	}
+	home, err := config.ResolveHome()
 	if err != nil {
-		return nil, "", err
+		return err
 	}
-	store, err := secrets.Open(path, master)
-	if errors.Is(err, secrets.ErrWrongMaster) {
-		return nil, "", newUsageError("cannot open secrets: wrong master password or corrupt secrets file")
+	created, err := config.EnsureHome(home)
+	if err != nil {
+		return classifyConfigError(err)
 	}
+	paths := config.NewPaths(home)
+	if os.Getenv(config.EnvHome) != "" {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "WARNING: %s is set; operator verifier will be initialized under %s.\n", config.EnvHome, paths.Home)
+	}
+	exists, err := fileExists(operatorVerifierPath(paths))
+	if err != nil {
+		return err
+	}
+	if exists {
+		return newUsageError("operator password verifier already exists at %s", operatorVerifierPath(paths))
+	}
+	master, err := promptOperatorMaster()
+	if err != nil {
+		return err
+	}
+	secretsExist, err := fileExists(paths.SecretsFile)
+	if err != nil {
+		return err
+	}
+	if secretsExist {
+		if _, err := openSecretsWithMaster(paths.SecretsFile, master); err != nil {
+			return err
+		}
+	} else {
+		confirm, err := readSecretNoEcho("Confirm AgentSSH master password: ")
+		if err != nil {
+			return err
+		}
+		if confirm != master {
+			return newUsageError("operator master password confirmation did not match")
+		}
+	}
+	if err := saveOperatorVerifier(operatorVerifierPath(paths), master); err != nil {
+		return err
+	}
+	if created {
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "initialized %s with starter inventory.yaml and policy.yaml\n", home)
+	}
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "initialized operator password verifier at %s\n", operatorVerifierPath(paths))
+	return nil
+}
+
+type operatorMasterContextKey struct{}
+
+// openSecretsForOperator opens the encrypted secrets store using the master
+// password that requireOperator verified and cached on the command context.
+// Every caller is behind the operator gate, so a missing cached master is an
+// internal wiring bug rather than a runtime condition: fail closed.
+func openSecretsForOperator(cmd *cobra.Command, path string) (*secrets.Store, string, error) {
+	master, ok := operatorMasterFromCommand(cmd)
+	if !ok {
+		return nil, "", fmt.Errorf("operator master password was not verified by the command gate")
+	}
+	store, err := openSecretsWithMaster(path, master)
 	if err != nil {
 		return nil, "", err
 	}
 	return store, master, nil
+}
+
+func openSecretsWithMaster(path string, master string) (*secrets.Store, error) {
+	store, err := secrets.Open(path, master)
+	if errors.Is(err, secrets.ErrWrongMaster) {
+		return nil, newUsageError("cannot open secrets: wrong master password or corrupt secrets file")
+	}
+	if err != nil {
+		return nil, err
+	}
+	return store, nil
 }
 
 func resolvePathsForWrite() (config.Paths, error) {
@@ -1452,21 +1571,168 @@ func resolvePathsForWrite() (config.Paths, error) {
 	return config.NewPaths(home), nil
 }
 
-func resolveOperatorMaster() (string, error) {
-	if master := os.Getenv(envMasterPassword); master != "" {
-		return master, nil
-	}
+func requireOperator(cmd *cobra.Command, _ []string) error {
 	if !stdinIsTerminal() {
-		return "", newUsageError("%s is required in non-interactive mode", envMasterPassword)
+		return newUsageError("operator commands require an interactive TTY")
 	}
+	home, err := config.ResolveHome()
+	if err != nil {
+		return err
+	}
+	paths := config.NewPaths(home)
+	warnEnvHomeForOperatorCommand(cmd, paths.Home)
+	master, err := promptOperatorMaster()
+	if err != nil {
+		return err
+	}
+	if err := verifyOperatorMaster(paths, master); err != nil {
+		return err
+	}
+	cmd.SetContext(context.WithValue(cmd.Context(), operatorMasterContextKey{}, master))
+	return nil
+}
+
+func warnEnvHomeForOperatorCommand(cmd *cobra.Command, home string) {
+	if os.Getenv(config.EnvHome) == "" {
+		return
+	}
+	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "WARNING: %s is set; operator-gated command will use config directory %s. Ensure this was selected by the human operator.\n", config.EnvHome, home)
+}
+
+func verifyOperatorMaster(paths config.Paths, master string) error {
+	if master == "" {
+		return newUsageError("operator master password is required")
+	}
+	exists, err := fileExists(paths.SecretsFile)
+	if err != nil {
+		return err
+	}
+	if exists {
+		_, err := openSecretsWithMaster(paths.SecretsFile, master)
+		return err
+	}
+	if err := verifyOperatorVerifier(operatorVerifierPath(paths), master); err != nil {
+		return operatorVerifierUsageError(err)
+	}
+	return nil
+}
+
+func operatorVerifierUsageError(err error) error {
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return newUsageError("operator password verifier is not initialized; run 'agentssh operator init' from an interactive terminal")
+	case errors.Is(err, secrets.ErrWrongMaster):
+		return newUsageError("cannot verify operator master password: wrong password or corrupt operator verifier")
+	default:
+		return err
+	}
+}
+
+func promptOperatorMaster() (string, error) {
 	master, err := readSecretNoEcho("Enter AgentSSH master password: ")
 	if err != nil {
 		return "", err
 	}
 	if master == "" {
-		return "", newUsageError("%s is required or enter a master password from an interactive TTY", envMasterPassword)
+		return "", newUsageError("operator master password is required")
 	}
 	return master, nil
+}
+
+func operatorMasterFromCommand(cmd *cobra.Command) (string, bool) {
+	if cmd == nil {
+		return "", false
+	}
+	master, ok := cmd.Context().Value(operatorMasterContextKey{}).(string)
+	if !ok || master == "" {
+		return "", false
+	}
+	return master, true
+}
+
+func operatorVerifierPath(paths config.Paths) string {
+	return operatorVerifierPathForHome(paths.Home)
+}
+
+func operatorVerifierPathForHome(home string) string {
+	return filepath.Join(home, operatorVerifierFile)
+}
+
+type operatorVerifierPayload struct {
+	Version int    `json:"version"`
+	Purpose string `json:"purpose"`
+}
+
+func saveOperatorVerifier(path string, master string) error {
+	recipient, err := age.NewScryptRecipient(master)
+	if err != nil {
+		return secrets.ErrWrongMaster
+	}
+	payload := operatorVerifierPayload{
+		Version: operatorVerifierVersion,
+		Purpose: operatorVerifierPurpose,
+	}
+	plaintext, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal operator verifier: %w", err)
+	}
+	var ciphertext bytes.Buffer
+	writer, err := age.Encrypt(&ciphertext, recipient)
+	if err != nil {
+		return fmt.Errorf("create operator verifier encryptor: %w", err)
+	}
+	if _, err := writer.Write(plaintext); err != nil {
+		_ = writer.Close()
+		return fmt.Errorf("encrypt operator verifier: %w", err)
+	}
+	if err := writer.Close(); err != nil {
+		return fmt.Errorf("finalize operator verifier: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("create operator verifier directory: %w", err)
+	}
+	if err := fileutil.WriteFileAtomic(path, ciphertext.Bytes(), 0o600, "operator-verifier-*.age"); err != nil {
+		return fileutil.LabelAtomicError(err, "operator verifier")
+	}
+	return nil
+}
+
+func verifyOperatorVerifier(path string, master string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	identity, err := age.NewScryptIdentity(master)
+	if err != nil {
+		return secrets.ErrWrongMaster
+	}
+	reader, err := age.Decrypt(bytes.NewReader(data), identity)
+	if err != nil {
+		return secrets.ErrWrongMaster
+	}
+	plaintext, err := io.ReadAll(reader)
+	if err != nil {
+		return secrets.ErrWrongMaster
+	}
+	var payload operatorVerifierPayload
+	if err := json.Unmarshal(plaintext, &payload); err != nil {
+		return secrets.ErrWrongMaster
+	}
+	if payload.Version != operatorVerifierVersion || payload.Purpose != operatorVerifierPurpose {
+		return secrets.ErrWrongMaster
+	}
+	return nil
+}
+
+func fileExists(path string) (bool, error) {
+	_, err := os.Stat(path)
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	return false, err
 }
 
 func passwordSourceForRun(paths config.Paths) func(string) (string, bool) {
@@ -3103,9 +3369,6 @@ func runAuditRepair(cmd *cobra.Command) error {
 }
 
 func runApprovalLS(cmd *cobra.Command, jsonOutput bool) error {
-	if err := requireOperatorTTYAndMaster(); err != nil {
-		return err
-	}
 	cfg, err := config.Load()
 	if err != nil {
 		return classifyConfigError(err)
@@ -3129,9 +3392,6 @@ func runApprovalLS(cmd *cobra.Command, jsonOutput bool) error {
 }
 
 func runApprovalGrant(cmd *cobra.Command, id string, scope approval.Scope) error {
-	if err := requireOperatorTTYAndMaster(); err != nil {
-		return err
-	}
 	cfg, err := config.Load()
 	if err != nil {
 		return classifyConfigError(err)
@@ -3166,9 +3426,6 @@ func runApprovalGrant(cmd *cobra.Command, id string, scope approval.Scope) error
 }
 
 func runApprovalDeny(cmd *cobra.Command, id string) error {
-	if err := requireOperatorTTYAndMaster(); err != nil {
-		return err
-	}
 	cfg, err := config.Load()
 	if err != nil {
 		return classifyConfigError(err)
@@ -3239,9 +3496,6 @@ func runApprovalWait(cmd *cobra.Command, id string, timeoutValue string) error {
 }
 
 func runSessionEnd(cmd *cobra.Command, id string) error {
-	if err := requireOperatorTTYAndMaster(); err != nil {
-		return err
-	}
 	cfg, err := config.Load()
 	if err != nil {
 		return classifyConfigError(err)
@@ -3287,14 +3541,6 @@ func approvalScopeFromFlags(once, sessionScope, host bool) (approval.Scope, erro
 
 func approvalStore(paths config.Paths) approval.PendingStore {
 	return approval.PendingStore{PendingDir: paths.PendingDir, ResponsesDir: paths.ResponsesDir}
-}
-
-func requireOperatorTTYAndMaster() error {
-	if !stdinIsTerminal() {
-		return newUsageError("operator approval commands require an interactive TTY")
-	}
-	_, err := resolveOperatorMaster()
-	return err
 }
 
 func runSessionLS(cmd *cobra.Command) error {
