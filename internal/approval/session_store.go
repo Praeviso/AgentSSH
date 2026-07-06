@@ -32,6 +32,17 @@ type Grant struct {
 	ApprovalID string      `json:"approval_id"`
 	ReqID      string      `json:"req_id"`
 	Channel    string      `json:"channel"`
+	// StdinSHA256 binds the grant to one exact stdin payload. Empty means the
+	// approved command had no stdin; a grant never matches a run whose stdin
+	// hash differs from the one the operator approved.
+	StdinSHA256 string `json:"stdin_sha256,omitempty"`
+	// ClaimReqID/ClaimTS implement two-phase once-grant consumption: Claim marks
+	// the grant as reserved by one run request; Commit deletes it once the command
+	// reached the remote; Release restores it when the command never executed.
+	// A claim never expires by wall clock: a crash between claim and settle leaves
+	// the grant unusable (fail-closed), same as a consumed grant.
+	ClaimReqID string `json:"claim_req_id,omitempty"`
+	ClaimTS    string `json:"claim_ts,omitempty"`
 }
 
 type sessionFile struct {
@@ -42,7 +53,7 @@ type sessionFile struct {
 	Grants    []Grant `json:"grants"`
 }
 
-func (s SessionStore) Grant(sessionID string, host string, scope Scope, matcher Matcher, approvalID string, reqID string, ttl time.Duration, channel string) (Grant, error) {
+func (s SessionStore) Grant(sessionID string, host string, scope Scope, matcher Matcher, stdinSHA256 string, approvalID string, reqID string, ttl time.Duration, channel string) (Grant, error) {
 	if scope != ScopeOnce && scope != ScopeSession {
 		return Grant{}, fmt.Errorf("session store cannot grant scope %q", scope)
 	}
@@ -51,17 +62,18 @@ func (s SessionStore) Grant(sessionID string, host string, scope Scope, matcher 
 	}
 	now := s.now()
 	grant := Grant{
-		Scope:      scope,
-		Kind:       matcher.Kind,
-		Regex:      matcher.Regex,
-		Prefix:     append([]string(nil), matcher.Prefix...),
-		SourceCmd:  matcher.SourceCmd,
-		Host:       host,
-		GrantedTS:  now.UTC().Format(time.RFC3339),
-		ExpiresTS:  now.Add(ttl).UTC().Format(time.RFC3339),
-		ApprovalID: approvalID,
-		ReqID:      reqID,
-		Channel:    channel,
+		Scope:       scope,
+		Kind:        matcher.Kind,
+		Regex:       matcher.Regex,
+		Prefix:      append([]string(nil), matcher.Prefix...),
+		SourceCmd:   matcher.SourceCmd,
+		Host:        host,
+		GrantedTS:   now.UTC().Format(time.RFC3339),
+		ExpiresTS:   now.Add(ttl).UTC().Format(time.RFC3339),
+		ApprovalID:  approvalID,
+		ReqID:       reqID,
+		Channel:     channel,
+		StdinSHA256: stdinSHA256,
 	}
 	err := s.withLockedSession(sessionID, func(doc *sessionFile) error {
 		if doc.Version == 0 {
@@ -76,7 +88,7 @@ func (s SessionStore) Grant(sessionID string, host string, scope Scope, matcher 
 		doc.Grants = filterLiveGrants(doc.Grants, now)
 		out := doc.Grants[:0]
 		for _, existing := range doc.Grants {
-			if existing.Host == host && existing.Scope == scope && existing.Regex == grant.Regex {
+			if existing.Host == host && existing.Scope == scope && existing.Regex == grant.Regex && existing.StdinSHA256 == grant.StdinSHA256 {
 				continue
 			}
 			out = append(out, existing)
@@ -88,15 +100,75 @@ func (s SessionStore) Grant(sessionID string, host string, scope Scope, matcher 
 	return grant, err
 }
 
-func (s SessionStore) Match(sessionID string, host string, command string) (Grant, bool, error) {
-	return s.match(sessionID, host, command, true)
+// Peek reports whether a grant would authorize the command without reserving
+// or consuming anything. Once grants already claimed by an in-flight run are
+// invisible: they can no longer authorize a different request.
+func (s SessionStore) Peek(sessionID string, host string, command string, stdinSHA256 string) (Grant, bool, error) {
+	return s.match(sessionID, host, command, stdinSHA256, "")
 }
 
-func (s SessionStore) Peek(sessionID string, host string, command string) (Grant, bool, error) {
-	return s.match(sessionID, host, command, false)
+// Claim matches a grant for one run request. A matching once grant is marked
+// as claimed by reqID (in the same lock, so two concurrent runs can never
+// claim the same once grant); session grants match without side effects.
+// The caller must settle every once claim with Commit or Release.
+func (s SessionStore) Claim(sessionID string, host string, command string, stdinSHA256 string, reqID string) (Grant, bool, error) {
+	if reqID == "" {
+		return Grant{}, false, fmt.Errorf("once-grant claim requires a request id")
+	}
+	return s.match(sessionID, host, command, stdinSHA256, reqID)
 }
 
-func (s SessionStore) match(sessionID string, host string, command string, consumeOnce bool) (Grant, bool, error) {
+// Commit consumes every once grant claimed by reqID. Call it as soon as the
+// command has been handed to the remote: from that point re-running requires a
+// fresh approval.
+func (s SessionStore) Commit(sessionID string, reqID string) error {
+	return s.settleClaims(sessionID, reqID, true)
+}
+
+// Release restores every once grant claimed by reqID. Call it only when the
+// command verifiably never executed (local cancel, transport failure before
+// the remote ran it, audit append failure before execution).
+func (s SessionStore) Release(sessionID string, reqID string) error {
+	return s.settleClaims(sessionID, reqID, false)
+}
+
+func (s SessionStore) settleClaims(sessionID string, reqID string, consume bool) error {
+	if sessionID == "" || reqID == "" {
+		return nil
+	}
+	now := s.now()
+	return s.withLockedSession(sessionID, func(doc *sessionFile) error {
+		if doc.SessionID == "" {
+			return nil
+		}
+		if doc.SessionID != sessionID {
+			return fmt.Errorf("session store file mismatch: %q != %q", doc.SessionID, sessionID)
+		}
+		changed := false
+		remaining := doc.Grants[:0]
+		for _, grant := range doc.Grants {
+			if grant.Scope != ScopeOnce || grant.ClaimReqID != reqID {
+				remaining = append(remaining, grant)
+				continue
+			}
+			changed = true
+			if consume {
+				continue
+			}
+			grant.ClaimReqID = ""
+			grant.ClaimTS = ""
+			remaining = append(remaining, grant)
+		}
+		if changed {
+			doc.Grants = remaining
+			doc.Updated = now.UTC().Format(time.RFC3339)
+		}
+		return nil
+	})
+}
+
+// match implements Peek (claimReqID == "") and Claim (claimReqID != "").
+func (s SessionStore) match(sessionID string, host string, command string, stdinSHA256 string, claimReqID string) (Grant, bool, error) {
 	if sessionID == "" {
 		return Grant{}, false, nil
 	}
@@ -122,6 +194,16 @@ func (s SessionStore) match(sessionID string, host string, command string, consu
 				remaining = append(remaining, grant)
 				continue
 			}
+			// A grant only covers the exact stdin payload it was approved with.
+			if grant.StdinSHA256 != stdinSHA256 {
+				remaining = append(remaining, grant)
+				continue
+			}
+			// A once grant claimed by another in-flight request is spoken for.
+			if grant.Scope == ScopeOnce && grant.ClaimReqID != "" && grant.ClaimReqID != claimReqID {
+				remaining = append(remaining, grant)
+				continue
+			}
 			matcher := grant.matcher()
 			matches, err := matcher.Match(command)
 			if err != nil {
@@ -131,12 +213,13 @@ func (s SessionStore) match(sessionID string, host string, command string, consu
 				remaining = append(remaining, grant)
 				continue
 			}
+			if grant.Scope == ScopeOnce && claimReqID != "" && grant.ClaimReqID != claimReqID {
+				grant.ClaimReqID = claimReqID
+				grant.ClaimTS = now.UTC().Format(time.RFC3339)
+				changed = true
+			}
 			matched = grant
 			ok = true
-			if grant.Scope == ScopeOnce && consumeOnce {
-				changed = true
-				continue
-			}
 			remaining = append(remaining, grant)
 		}
 		if changed {

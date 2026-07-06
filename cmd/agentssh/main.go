@@ -3,16 +3,22 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"filippo.io/age"
 	"github.com/Praeviso/AgentSSH/internal/approval"
@@ -151,6 +157,7 @@ func newRootCommand() *cobra.Command {
 		newSecretCommand(),
 		newPolicyCommand(),
 		newApprovalCommand(),
+		newPlanCommand(),
 		newAuditCommand(),
 		newSessionCommand(),
 	)
@@ -179,7 +186,7 @@ func newHostsCommand() *cobra.Command {
 func newRunCommand() *cobra.Command {
 	var flags runFlags
 	cmd := &cobra.Command{
-		Use:   "run <host|group> [--session <id>] [--session-label <text>] [--json] -- <cmd...>",
+		Use:   "run <host|group> [--session <id>] [--session-label <text>] [--stdin-file <path>] [--json] -- <cmd...>",
 		Short: "Run a policy-checked command on a configured host or group.",
 		Args: func(cmd *cobra.Command, args []string) error {
 			if cmd.ArgsLenAtDash() != 1 {
@@ -193,12 +200,20 @@ func newRunCommand() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			target := args[0]
 			remoteCommand := strings.Join(args[1:], " ")
+			if _, err := parseRunFields(flags.fields); err != nil {
+				return err
+			}
+			if flags.fields != "" {
+				flags.jsonOutput = true
+			}
 			return runDirect(cmd, target, remoteCommand, flags)
 		},
 	}
 	cmd.Flags().StringVar(&flags.session, "session", "", "associate the run with a session id")
 	cmd.Flags().StringVar(&flags.sessionLabel, "session-label", "", "attach a human-readable label to the session")
 	cmd.Flags().BoolVar(&flags.jsonOutput, "json", false, "emit machine-readable JSON")
+	cmd.Flags().StringVar(&flags.fields, "fields", "", "comma-separated JSON fields to emit (implies --json), e.g. req_id,status,exit_code,stdout")
+	cmd.Flags().StringVar(&flags.stdinFile, "stdin-file", "", "local file streamed to the remote command's stdin (audited by sha256+size; approvals bind to the exact content)")
 	return cmd
 }
 
@@ -939,6 +954,66 @@ type runFlags struct {
 	session      string
 	sessionLabel string
 	jsonOutput   bool
+	fields       string
+	stdinFile    string
+}
+
+// maxStdinBytes caps --stdin-file payloads. Stdin exists for configuration
+// files and small artifacts, not bulk transfer; the cap protects memory and
+// keeps a single approval reviewable.
+const maxStdinBytes = 32 << 20
+
+// stdinSpec is the loaded stdin payload plus the identity (hash + size) that
+// flows into policy grants, the audit log, and run responses.
+type stdinSpec struct {
+	data   []byte
+	sha256 string
+	bytes  int64
+}
+
+func loadStdinSpec(path string) (stdinSpec, error) {
+	if strings.TrimSpace(path) == "" {
+		return stdinSpec{}, nil
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return stdinSpec{}, newUsageError("cannot read --stdin-file: %v", err)
+	}
+	// Require a regular file. A device (/dev/zero), FIFO, or socket reports size
+	// 0 from Stat yet streams unbounded bytes, so reading it whole would hang or
+	// exhaust memory before any size check — reject it up front.
+	if !info.Mode().IsRegular() {
+		return stdinSpec{}, newUsageError("--stdin-file %s is not a regular file", path)
+	}
+	if info.Size() > maxStdinBytes {
+		return stdinSpec{}, newUsageError("--stdin-file %s is %d bytes; the limit is %d bytes (32 MiB)", path, info.Size(), int64(maxStdinBytes))
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return stdinSpec{}, newUsageError("cannot read --stdin-file: %v", err)
+	}
+	defer func() { _ = file.Close() }()
+	// Enforce the cap during the read (LimitReader to cap+1) so a file that grew
+	// between Stat and Open, or a lying size, still cannot exceed the limit.
+	data, err := io.ReadAll(io.LimitReader(file, maxStdinBytes+1))
+	if err != nil {
+		return stdinSpec{}, newUsageError("cannot read --stdin-file: %v", err)
+	}
+	if len(data) > maxStdinBytes {
+		return stdinSpec{}, newUsageError("--stdin-file %s exceeds the limit of %d bytes (32 MiB)", path, int64(maxStdinBytes))
+	}
+	sum := sha256.Sum256(data)
+	return stdinSpec{
+		data:   data,
+		sha256: hex.EncodeToString(sum[:]),
+		bytes:  int64(len(data)),
+	}, nil
+}
+
+func stampStdin(record audit.Record, stdin stdinSpec) audit.Record {
+	record.StdinSHA256 = stdin.sha256
+	record.StdinBytes = stdin.bytes
+	return record
 }
 
 type runResponse struct {
@@ -946,6 +1021,10 @@ type runResponse struct {
 	SessionID       string   `json:"session_id"`
 	Host            string   `json:"host"`
 	Cmd             string   `json:"cmd,omitempty"`
+	CmdSHA256       string   `json:"cmd_sha256,omitempty"`
+	CmdTruncated    bool     `json:"cmd_truncated,omitempty"`
+	StdinSHA256     string   `json:"stdin_sha256,omitempty"`
+	StdinBytes      int64    `json:"stdin_bytes,omitempty"`
 	Status          string   `json:"status"`
 	ExitCode        int      `json:"exit_code"`
 	DurationMS      int64    `json:"duration_ms"`
@@ -958,6 +1037,125 @@ type runResponse struct {
 	ApprovalID      string   `json:"approval_id,omitempty"`
 	ApprovalMatcher string   `json:"approval_matcher,omitempty"`
 	ProposedScopes  []string `json:"proposed_scope,omitempty"`
+}
+
+// cmdEchoMaxBytes caps the command echoed back in run JSON responses. The full
+// command stays in the audit log; callers that need to correlate use cmd_sha256.
+const cmdEchoMaxBytes = 2048
+
+// finalizeRunResponses stamps cmd_sha256 (of the full command), truncates
+// oversized cmd echoes so a large command payload is not mirrored back to the
+// caller verbatim, and stamps the stdin identity on every response so all
+// status branches carry the same fields.
+func finalizeRunResponses(responses []runResponse, stdin stdinSpec) {
+	for i := range responses {
+		responses[i].StdinSHA256 = stdin.sha256
+		responses[i].StdinBytes = stdin.bytes
+		if responses[i].Cmd == "" {
+			continue
+		}
+		sum := sha256.Sum256([]byte(responses[i].Cmd))
+		responses[i].CmdSHA256 = hex.EncodeToString(sum[:])
+		if len(responses[i].Cmd) > cmdEchoMaxBytes {
+			cut := cmdEchoMaxBytes
+			for cut > 0 && !utf8.RuneStart(responses[i].Cmd[cut]) {
+				cut--
+			}
+			responses[i].Cmd = responses[i].Cmd[:cut]
+			responses[i].CmdTruncated = true
+		}
+	}
+}
+
+func runResponseFieldNames() map[string]struct{} {
+	names := map[string]struct{}{}
+	t := reflect.TypeOf(runResponse{})
+	for i := 0; i < t.NumField(); i++ {
+		tag := strings.Split(t.Field(i).Tag.Get("json"), ",")[0]
+		if tag != "" && tag != "-" {
+			names[tag] = struct{}{}
+		}
+	}
+	return names
+}
+
+func parseRunFields(spec string) ([]string, error) {
+	if strings.TrimSpace(spec) == "" {
+		return nil, nil
+	}
+	known := runResponseFieldNames()
+	var fields []string
+	for _, raw := range strings.Split(spec, ",") {
+		name := strings.TrimSpace(raw)
+		if name == "" {
+			continue
+		}
+		if _, ok := known[name]; !ok {
+			options := make([]string, 0, len(known))
+			for key := range known {
+				options = append(options, key)
+			}
+			sort.Strings(options)
+			return nil, newUsageError("unknown --fields name %q; known fields: %s", name, strings.Join(options, ", "))
+		}
+		fields = append(fields, name)
+	}
+	if len(fields) == 0 {
+		return nil, newUsageError("--fields requires at least one field name")
+	}
+	return fields, nil
+}
+
+// selectRunFields projects a response onto the requested JSON keys. Fields that
+// are omitempty and empty simply stay absent.
+func selectRunFields(response runResponse, fields []string) (map[string]any, error) {
+	raw, err := json.Marshal(response)
+	if err != nil {
+		return nil, err
+	}
+	var full map[string]any
+	if err := json.Unmarshal(raw, &full); err != nil {
+		return nil, err
+	}
+	out := make(map[string]any, len(fields))
+	for _, name := range fields {
+		if value, ok := full[name]; ok {
+			out[name] = value
+		}
+	}
+	return out, nil
+}
+
+// writeRunResponses is the single JSON output path for run: it finalizes the
+// cmd echo and applies the optional --fields projection.
+func writeRunResponses(cmd *cobra.Command, resolved inventory.ResolvedTarget, responses []runResponse, flags runFlags, stdin stdinSpec) error {
+	finalizeRunResponses(responses, stdin)
+	fields, err := parseRunFields(flags.fields)
+	if err != nil {
+		return err
+	}
+	if fields == nil {
+		if resolved.Kind == inventory.TargetKindHost {
+			return writeJSON(cmd, responses[0])
+		}
+		return writeJSON(cmd, responses)
+	}
+	if resolved.Kind == inventory.TargetKindHost {
+		selected, err := selectRunFields(responses[0], fields)
+		if err != nil {
+			return err
+		}
+		return writeJSON(cmd, selected)
+	}
+	selected := make([]map[string]any, 0, len(responses))
+	for _, response := range responses {
+		row, err := selectRunFields(response, fields)
+		if err != nil {
+			return err
+		}
+		selected = append(selected, row)
+	}
+	return writeJSON(cmd, selected)
 }
 
 type runPlan struct {
@@ -2069,16 +2267,30 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 	}
 	store := audit.NewStore(cfg.Paths.AuditFile)
 	sessionStore := approval.SessionStore{Dir: cfg.Paths.SessionsDir}
-	pendingStore := approval.PendingStore{PendingDir: cfg.Paths.PendingDir, ResponsesDir: cfg.Paths.ResponsesDir}
+	pendingStore := approvalStore(cfg.Paths)
+	stdin, err := loadStdinSpec(flags.stdinFile)
+	if err != nil {
+		return err
+	}
 	ssh := newExecutor(cfg)
 	defer func() { _ = ssh.Close() }()
-	plans, err := buildRunPlans(cfg, resolved, remoteCommand, flags, runtime, sessionStore, runtime.Enabled)
+	plans, err := buildRunPlans(cfg, resolved, remoteCommand, flags, runtime, sessionStore, runtime.Enabled, stdin)
 	if err != nil {
 		return err
 	}
 	if runtime.Enabled && anyPlanNeedsApproval(plans) {
-		return handleApprovalPreflightBlock(cmd, pendingStore, store, plans, remoteCommand, flags, resolved)
+		return handleApprovalPreflightBlock(cmd, pendingStore, store, plans, remoteCommand, flags, resolved, stdin)
 	}
+
+	// Intercept SIGINT/SIGTERM so a locally cancelled run can settle its
+	// once-grant claim (release, not consume) and audit the failed attempt.
+	// A second signal restores default delivery and kills the process.
+	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+	go func() {
+		<-ctx.Done()
+		stopSignals()
+	}()
 
 	exitCode := exitOK
 	responses := make([]runResponse, 0, len(resolved.Targets))
@@ -2086,14 +2298,14 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 		target := plan.Target
 		sessionCtx := plan.SessionCtx
 		reqID := plan.ReqID
-		auth, err := approval.Authorize(cfg.Policy, cfg.Inventory, sessionStore, runtime, sessionCtx.ID, target.Name, remoteCommand)
+		auth, err := approval.Authorize(cfg.Policy, cfg.Inventory, sessionStore, runtime, sessionCtx.ID, target.Name, remoteCommand, stdin.sha256, reqID)
 		if err != nil {
 			return newUsageError("policy.yaml is invalid: %v\n  fix the rule in ~/.agentssh/policy.yaml, then re-run (check: agentssh policy show)", err)
 		}
 		plan.Auth = auth
 		switch auth.Status {
 		case approval.AuthHardDeny:
-			response, err := appendDeniedRun(cmd, store, plan, remoteCommand, flags, exitPolicyDenied)
+			response, err := appendDeniedRun(cmd, store, plan, remoteCommand, flags, exitPolicyDenied, stdin)
 			if err != nil {
 				return err
 			}
@@ -2104,7 +2316,7 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 			continue
 		case approval.AuthNeedsApproval:
 			if !runtime.Enabled {
-				response, err := appendDeniedRun(cmd, store, plan, remoteCommand, flags, exitPolicyDenied)
+				response, err := appendDeniedRun(cmd, store, plan, remoteCommand, flags, exitPolicyDenied, stdin)
 				if err != nil {
 					return err
 				}
@@ -2114,7 +2326,7 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 				exitCode = mergeExitCode(exitCode, exitPolicyDenied)
 				continue
 			}
-			response, err := appendApprovalPending(cmd, pendingStore, store, plan, remoteCommand, flags)
+			response, err := appendApprovalPending(cmd, pendingStore, store, plan, remoteCommand, flags, stdin)
 			if err != nil {
 				return err
 			}
@@ -2129,13 +2341,17 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 		}
 
 		decision := auth.Decision
-		if _, err := store.Append(baseAuditRecord(reqID, sessionCtx, audit.EventStarted, target.Name, remoteCommand, decision, nil, "", 0)); err != nil {
+		if _, err := store.Append(stampStdin(baseAuditRecord(reqID, sessionCtx, audit.EventStarted, target.Name, remoteCommand, decision, nil, "", 0), stdin)); err != nil {
+			// The command never executed: hand the claimed once grant back.
+			if auth.Status == approval.AuthAllowByGrant && auth.GrantScope == approval.ScopeOnce {
+				_ = sessionStore.Release(sessionCtx.ID, reqID)
+			}
 			return err
 		}
 		streamExec, canStream := ssh.(executor.StreamingExecutor)
 		streamFilter, canStreamFilter := outputFilter.(output.StreamFilter)
 		if canStream && canStreamFilter && shouldStreamRun(flags, resolved) {
-			streamed := runStreaming(cmd, streamExec, target, remoteCommand, streamFilter)
+			streamed := runStreaming(ctx, cmd, streamExec, target, remoteCommand, stdin.data, streamFilter)
 			result := streamed.Result
 			status := statusForResult(result)
 			event := audit.EventCompleted
@@ -2147,19 +2363,24 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 				OutputTruncated: streamed.OutputTruncated,
 				Redactions:      streamed.Redactions,
 			}
-			if _, err := store.Append(baseAuditRecord(reqID, sessionCtx, event, target.Name, remoteCommand, decision, &result.ExitCode, outputHash, result.Duration.Milliseconds(), filtered)); err != nil {
+			if _, err := store.Append(stampStdin(baseAuditRecord(reqID, sessionCtx, event, target.Name, remoteCommand, decision, &result.ExitCode, outputHash, result.Duration.Milliseconds(), filtered), stdin)); err != nil {
 				return err
 			}
+			settleOnceClaimWithWarning(cmd, sessionStore, sessionCtx.ID, reqID, auth, result)
 			if !isSSHErrorResult(result) {
 				refreshInventoryHostOS(cfg.Paths, target.Name, result.OS)
 			}
 			printRunStreamFooter(cmd, target.Name, result, streamed.Stdout)
 			exitCode = mergeExitCode(exitCode, exitCodeForResult(result))
+			if ctx.Err() != nil {
+				break
+			}
 			continue
 		}
-		result := ssh.Run(context.Background(), executor.Request{
+		result := ssh.Run(ctx, executor.Request{
 			Target:  target,
 			Command: remoteCommand,
+			Stdin:   stdin.data,
 		})
 		status := statusForResult(result)
 		event := audit.EventCompleted
@@ -2170,9 +2391,10 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 		// The audit hash records the bytes that crossed the trust boundary and
 		// were returned to the agent after output filtering.
 		outputHash := audit.ComputeOutputSHA256(filtered.Stdout, filtered.Stderr)
-		if _, err := store.Append(baseAuditRecord(reqID, sessionCtx, event, target.Name, remoteCommand, decision, &result.ExitCode, outputHash, result.Duration.Milliseconds(), filtered)); err != nil {
+		if _, err := store.Append(stampStdin(baseAuditRecord(reqID, sessionCtx, event, target.Name, remoteCommand, decision, &result.ExitCode, outputHash, result.Duration.Milliseconds(), filtered), stdin)); err != nil {
 			return err
 		}
+		settleOnceClaimWithWarning(cmd, sessionStore, sessionCtx.ID, reqID, auth, result)
 		if !isSSHErrorResult(result) {
 			refreshInventoryHostOS(cfg.Paths, target.Name, result.OS)
 		}
@@ -2200,14 +2422,13 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 		}
 
 		exitCode = mergeExitCode(exitCode, exitCodeForResult(result))
+		if ctx.Err() != nil {
+			break
+		}
 	}
 
 	if flags.jsonOutput {
-		if resolved.Kind == inventory.TargetKindHost {
-			if err := writeJSON(cmd, responses[0]); err != nil {
-				return err
-			}
-		} else if err := writeJSON(cmd, responses); err != nil {
+		if err := writeRunResponses(cmd, resolved, responses, flags, stdin); err != nil {
 			return err
 		}
 	}
@@ -2239,7 +2460,7 @@ func approvalRuntimeWithWarning(cmd *cobra.Command, cfg *config.Config) approval
 	}
 }
 
-func buildRunPlans(cfg *config.Config, resolved inventory.ResolvedTarget, remoteCommand string, flags runFlags, runtime approval.RuntimeConfig, sessionStore approval.SessionStore, preflight bool) ([]runPlan, error) {
+func buildRunPlans(cfg *config.Config, resolved inventory.ResolvedTarget, remoteCommand string, flags runFlags, runtime approval.RuntimeConfig, sessionStore approval.SessionStore, preflight bool, stdin stdinSpec) ([]runPlan, error) {
 	sessionResolver := session.Resolver{}
 	plans := make([]runPlan, 0, len(resolved.Targets))
 	for _, target := range resolved.Targets {
@@ -2260,9 +2481,9 @@ func buildRunPlans(cfg *config.Config, resolved inventory.ResolvedTarget, remote
 		sessionCtx.ID = sessionIDForTarget(sessionCtx.ID, target.Name, len(resolved.Targets) > 1)
 		var auth approval.Authorization
 		if preflight {
-			auth, err = approval.PreflightAuthorize(cfg.Policy, cfg.Inventory, sessionStore, runtime, sessionCtx.ID, target.Name, remoteCommand)
+			auth, err = approval.PreflightAuthorize(cfg.Policy, cfg.Inventory, sessionStore, runtime, sessionCtx.ID, target.Name, remoteCommand, stdin.sha256)
 		} else {
-			auth, err = approval.Authorize(cfg.Policy, cfg.Inventory, sessionStore, runtime, sessionCtx.ID, target.Name, remoteCommand)
+			auth, err = approval.Authorize(cfg.Policy, cfg.Inventory, sessionStore, runtime, sessionCtx.ID, target.Name, remoteCommand, stdin.sha256, reqID)
 		}
 		if err != nil {
 			return nil, newUsageError("policy.yaml is invalid: %v\n  fix the rule in ~/.agentssh/policy.yaml, then re-run (check: agentssh policy show)", err)
@@ -2281,20 +2502,20 @@ func anyPlanNeedsApproval(plans []runPlan) bool {
 	return false
 }
 
-func handleApprovalPreflightBlock(cmd *cobra.Command, pending approval.PendingStore, store audit.Store, plans []runPlan, remoteCommand string, flags runFlags, resolved inventory.ResolvedTarget) error {
+func handleApprovalPreflightBlock(cmd *cobra.Command, pending approval.PendingStore, store audit.Store, plans []runPlan, remoteCommand string, flags runFlags, resolved inventory.ResolvedTarget, stdin stdinSpec) error {
 	exitCode := exitOK
 	responses := make([]runResponse, 0, len(plans))
 	for _, plan := range plans {
 		switch plan.Auth.Status {
 		case approval.AuthHardDeny:
-			response, err := appendDeniedRun(cmd, store, plan, remoteCommand, flags, exitPolicyDenied)
+			response, err := appendDeniedRun(cmd, store, plan, remoteCommand, flags, exitPolicyDenied, stdin)
 			if err != nil {
 				return err
 			}
 			responses = append(responses, response)
 			exitCode = mergeExitCode(exitCode, exitPolicyDenied)
 		case approval.AuthNeedsApproval:
-			response, err := appendApprovalPending(cmd, pending, store, plan, remoteCommand, flags)
+			response, err := appendApprovalPending(cmd, pending, store, plan, remoteCommand, flags, stdin)
 			if err != nil {
 				return err
 			}
@@ -2302,7 +2523,7 @@ func handleApprovalPreflightBlock(cmd *cobra.Command, pending approval.PendingSt
 			exitCode = mergeExitCode(exitCode, exitApprovalRequired)
 		default:
 			exit := exitApprovalRequired
-			if _, err := store.Append(baseAuditRecord(plan.ReqID, plan.SessionCtx, audit.EventDenied, plan.Target.Name, remoteCommand, plan.Auth.Decision, &exit, "", 0)); err != nil {
+			if _, err := store.Append(stampStdin(baseAuditRecord(plan.ReqID, plan.SessionCtx, audit.EventDenied, plan.Target.Name, remoteCommand, plan.Auth.Decision, &exit, "", 0), stdin)); err != nil {
 				return err
 			}
 			response := runResponse{
@@ -2323,11 +2544,7 @@ func handleApprovalPreflightBlock(cmd *cobra.Command, pending approval.PendingSt
 		}
 	}
 	if flags.jsonOutput {
-		if resolved.Kind == inventory.TargetKindHost {
-			if err := writeJSON(cmd, responses[0]); err != nil {
-				return err
-			}
-		} else if err := writeJSON(cmd, responses); err != nil {
+		if err := writeRunResponses(cmd, resolved, responses, flags, stdin); err != nil {
 			return err
 		}
 	}
@@ -2337,8 +2554,8 @@ func handleApprovalPreflightBlock(cmd *cobra.Command, pending approval.PendingSt
 	return nil
 }
 
-func appendDeniedRun(cmd *cobra.Command, store audit.Store, plan runPlan, remoteCommand string, flags runFlags, exitCode int) (runResponse, error) {
-	if _, err := store.Append(baseAuditRecord(plan.ReqID, plan.SessionCtx, audit.EventDenied, plan.Target.Name, remoteCommand, plan.Auth.Decision, nil, "", 0)); err != nil {
+func appendDeniedRun(cmd *cobra.Command, store audit.Store, plan runPlan, remoteCommand string, flags runFlags, exitCode int, stdin stdinSpec) (runResponse, error) {
+	if _, err := store.Append(stampStdin(baseAuditRecord(plan.ReqID, plan.SessionCtx, audit.EventDenied, plan.Target.Name, remoteCommand, plan.Auth.Decision, nil, "", 0), stdin)); err != nil {
 		return runResponse{}, err
 	}
 	response := runResponse{
@@ -2357,19 +2574,21 @@ func appendDeniedRun(cmd *cobra.Command, store audit.Store, plan runPlan, remote
 	return response, nil
 }
 
-func appendApprovalPending(cmd *cobra.Command, pending approval.PendingStore, store audit.Store, plan runPlan, remoteCommand string, flags runFlags) (runResponse, error) {
+func appendApprovalPending(cmd *cobra.Command, pending approval.PendingStore, store audit.Store, plan runPlan, remoteCommand string, flags runFlags, stdin stdinSpec) (runResponse, error) {
 	req, err := pending.Create(approval.PendingRequest{
-		ReqID:     plan.ReqID,
-		SessionID: plan.SessionCtx.ID,
-		Host:      plan.Target.Name,
-		Cmd:       remoteCommand,
-		Candidate: plan.Auth.ApprovalMatcher,
+		ReqID:       plan.ReqID,
+		SessionID:   plan.SessionCtx.ID,
+		Host:        plan.Target.Name,
+		Cmd:         remoteCommand,
+		Candidate:   plan.Auth.ApprovalMatcher,
+		StdinSHA256: stdin.sha256,
+		StdinBytes:  stdin.bytes,
 	})
 	if err != nil {
 		return runResponse{}, err
 	}
 	exit := exitApprovalRequired
-	record := baseAuditRecord(plan.ReqID, plan.SessionCtx, audit.EventApprovalRequested, plan.Target.Name, remoteCommand, plan.Auth.Decision, &exit, "", 0)
+	record := stampStdin(baseAuditRecord(plan.ReqID, plan.SessionCtx, audit.EventApprovalRequested, plan.Target.Name, remoteCommand, plan.Auth.Decision, &exit, "", 0), stdin)
 	record.ApprovalID = req.ID
 	record.ApprovalMatcher = req.Candidate.Regex
 	record.ApprovalChannel = approval.ChannelExit
@@ -2450,12 +2669,45 @@ func shouldStreamRun(flags runFlags, resolved inventory.ResolvedTarget) bool {
 	return !flags.jsonOutput && len(resolved.Targets) == 1
 }
 
-func runStreaming(cmd *cobra.Command, streamExec executor.StreamingExecutor, target inventory.Target, remoteCommand string, streamFilter output.StreamFilter) streamingRunResult {
+// settleOnceClaim closes the two-phase consumption of a once grant after the
+// execution outcome is known. A remote exit (success or failure) consumes the
+// grant. A transport-level failure (dial failure, local cancel, dropped
+// connection) restores it so the approval survives for a clean re-run.
+//
+// Deliberate trade-off: SSH cannot prove that a transport failure happened
+// before the remote started the command. A connection dropped (or Ctrl-C
+// pressed) mid-execution therefore restores a grant whose command may already
+// have run, and the re-run executes it a second time. The restored grant is
+// still pinned to the exact command, session, and stdin hash, and both
+// attempts are in the audit log; treat once approvals for non-idempotent
+// commands accordingly.
+func settleOnceClaim(sessionStore approval.SessionStore, sessionID string, reqID string, auth approval.Authorization, result executor.Result) error {
+	if auth.Status != approval.AuthAllowByGrant || auth.GrantScope != approval.ScopeOnce {
+		return nil
+	}
+	if isSSHErrorResult(result) {
+		return sessionStore.Release(sessionID, reqID)
+	}
+	return sessionStore.Commit(sessionID, reqID)
+}
+
+// settleOnceClaimWithWarning runs after the completion audit record is safely
+// appended; a settle failure must not suppress the run's result or audit
+// trail. An unsettled claim fails closed (the grant stays reserved), so a
+// warning is the right severity.
+func settleOnceClaimWithWarning(cmd *cobra.Command, sessionStore approval.SessionStore, sessionID string, reqID string, auth approval.Authorization, result executor.Result) {
+	if err := settleOnceClaim(sessionStore, sessionID, reqID, auth, result); err != nil {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "WARNING: failed to settle once-approval grant: %v\n", err)
+	}
+}
+
+func runStreaming(ctx context.Context, cmd *cobra.Command, streamExec executor.StreamingExecutor, target inventory.Target, remoteCommand string, stdin []byte, streamFilter output.StreamFilter) streamingRunResult {
 	stdout := streamFilter.NewStreamWriter(cmd.OutOrStdout())
 	stderr := streamFilter.NewStreamWriter(cmd.ErrOrStderr())
-	result := streamExec.RunStreaming(context.Background(), executor.Request{
+	result := streamExec.RunStreaming(ctx, executor.Request{
 		Target:  target,
 		Command: remoteCommand,
+		Stdin:   stdin,
 	}, stdout, stderr)
 	stdout.Flush()
 	stderr.Flush()
@@ -3477,12 +3729,9 @@ func runApprovalWait(cmd *cobra.Command, id string, timeoutValue string) error {
 	if err != nil {
 		return newUsageError("%v", err)
 	}
-	timeout := runtime.WaitTimeout
-	if timeoutValue != "" {
-		timeout, err = time.ParseDuration(timeoutValue)
-		if err != nil || timeout < 0 {
-			return newUsageError("invalid --timeout %q", timeoutValue)
-		}
+	timeout, err := resolveWaitTimeout(runtime.WaitTimeout, timeoutValue)
+	if err != nil {
+		return err
 	}
 	status, err := approvalStore(cfg.Paths).Wait(id, timeout)
 	if errors.Is(err, approval.ErrPendingNotFound) || errors.Is(err, approval.ErrInvalidID) {
@@ -3507,6 +3756,19 @@ func runSessionEnd(cmd *cobra.Command, id string) error {
 	}
 	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "ended session %s\n", id)
 	return nil
+}
+
+// resolveWaitTimeout applies the runtime default unless the caller passed an
+// explicit --timeout; approval wait and plan wait share this contract.
+func resolveWaitTimeout(defaultTimeout time.Duration, value string) (time.Duration, error) {
+	if value == "" {
+		return defaultTimeout, nil
+	}
+	timeout, err := time.ParseDuration(value)
+	if err != nil || timeout < 0 {
+		return 0, newUsageError("invalid --timeout %q", value)
+	}
+	return timeout, nil
 }
 
 func approvalStatusExit(status approval.StatusResult) error {
@@ -3542,7 +3804,7 @@ func approvalScopeFromFlags(once, sessionScope, host bool) (approval.Scope, erro
 }
 
 func approvalStore(paths config.Paths) approval.PendingStore {
-	return approval.PendingStore{PendingDir: paths.PendingDir, ResponsesDir: paths.ResponsesDir}
+	return approval.PendingStore{PendingDir: paths.PendingDir, ResponsesDir: paths.ResponsesDir, PlansDir: paths.PlansDir}
 }
 
 func runSessionLS(cmd *cobra.Command) error {

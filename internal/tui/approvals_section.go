@@ -31,9 +31,12 @@ type approvalsSection struct {
 	choosing  bool
 	choiceIdx int
 	choiceID  string // request the open chooser targets, so a poll can't misapply it
-	err       error
-	result    string
-	w, h      int
+	// planMode scopes the open chooser to the focused request's whole plan:
+	// the verdict applies to every still-pending member in one keystroke.
+	planMode bool
+	err      error
+	result   string
+	w, h     int
 }
 
 const approvalsPollInterval = 1500 * time.Millisecond
@@ -71,7 +74,7 @@ func approvalsTickCmd(enabled ...bool) tea.Cmd {
 }
 
 func (s approvalsSection) pendingStore() approval.PendingStore {
-	return approval.PendingStore{PendingDir: s.paths.PendingDir, ResponsesDir: s.paths.ResponsesDir}
+	return approval.PendingStore{PendingDir: s.paths.PendingDir, ResponsesDir: s.paths.ResponsesDir, PlansDir: s.paths.PlansDir}
 }
 
 func (s approvalsSection) loadCmd() tea.Cmd {
@@ -142,6 +145,8 @@ func (s approvalsSection) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return s.resolveWith(approval.VerdictApproved, approval.ScopeHost)
 	case "d":
 		return s.resolveWith(approval.VerdictDenied, "")
+	case "p":
+		return s.openPlanChooser()
 	case "r":
 		s.clearStatus()
 		return s, s.loadCmd()
@@ -173,6 +178,9 @@ func (s approvalsSection) updateChoosing(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "s":
 		return s.resolveWith(approval.VerdictApproved, approval.ScopeSession)
 	case "h":
+		if s.planMode {
+			return s, nil
+		}
 		return s.resolveWith(approval.VerdictApproved, approval.ScopeHost)
 	case "d":
 		return s.resolveWith(approval.VerdictDenied, "")
@@ -192,6 +200,25 @@ func (s approvalsSection) openChooser() (tea.Model, tea.Cmd) {
 	}
 	s.clearStatus()
 	s.choosing = true
+	s.planMode = false
+	s.choiceIdx = 0
+	s.choiceID = req.ID
+	return s, nil
+}
+
+// openPlanChooser starts the whole-plan verdict menu when the focused request
+// belongs to a plan; a no-op otherwise.
+func (s approvalsSection) openPlanChooser() (tea.Model, tea.Cmd) {
+	if !s.runtime.Enabled {
+		return s, nil
+	}
+	req, ok := s.selected()
+	if !ok || req.PlanID == "" {
+		return s, nil
+	}
+	s.clearStatus()
+	s.choosing = true
+	s.planMode = true
 	s.choiceIdx = 0
 	s.choiceID = req.ID
 	return s, nil
@@ -203,8 +230,13 @@ func (s approvalsSection) resolveWith(verdict approval.Verdict, scope approval.S
 	if !s.runtime.Enabled {
 		return s, nil
 	}
+	planMode := s.planMode
 	s.choosing = false
+	s.planMode = false
 	s.choiceID = ""
+	if planMode {
+		return s.decidePlan(verdict, scope)
+	}
 	return s.decide(verdict, scope)
 }
 
@@ -218,6 +250,7 @@ func (s *approvalsSection) resyncChooser() {
 	idx := s.indexOfReq(s.choiceID)
 	if idx < 0 {
 		s.choosing = false
+		s.planMode = false
 		s.choiceID = ""
 		return
 	}
@@ -251,7 +284,9 @@ func (s approvalsSection) choices() []approvalChoice {
 		{"once", approval.VerdictApproved, approval.ScopeOnce},
 		{"session", approval.VerdictApproved, approval.ScopeSession},
 	}
-	if req, ok := s.selected(); ok && req.Candidate.Promotable {
+	// Whole-plan decisions never offer host scope: persistent widening stays a
+	// deliberate per-command call.
+	if req, ok := s.selected(); ok && !s.planMode && req.Candidate.Promotable {
 		out = append(out, approvalChoice{"host", approval.VerdictApproved, approval.ScopeHost})
 	}
 	return append(out, approvalChoice{"deny", approval.VerdictDenied, ""})
@@ -345,6 +380,58 @@ func (s approvalsSection) decide(verdict approval.Verdict, scope approval.Scope)
 	return s, tea.Batch(s.loadCmd(), toastCmd(decisionToast(req, verdict, scope)))
 }
 
+// decidePlan applies one verdict to every still-pending member of the focused
+// request's plan, mirroring the CLI `plan grant/deny` wiring.
+func (s approvalsSection) decidePlan(verdict approval.Verdict, scope approval.Scope) (tea.Model, tea.Cmd) {
+	req, ok := s.selected()
+	if !ok || req.PlanID == "" {
+		return s, nil
+	}
+	inv, err := inventory.Load(s.paths.InventoryFile)
+	if err != nil {
+		s.err = err
+		s.result = ""
+		return s, nil
+	}
+	pol, err := policy.Load(s.paths.PolicyFile)
+	if err != nil {
+		s.err = err
+		s.result = ""
+		return s, nil
+	}
+	results, err := approval.ApplyPlanDecision(approval.ApplyOptions{
+		Pending:    s.pendingStore(),
+		Sessions:   approval.SessionStore{Dir: s.paths.SessionsDir},
+		Audit:      audit.NewStore(s.paths.AuditFile),
+		Bundle:     policy.Bundle{Policy: pol, Inventory: inv},
+		PolicyPath: s.paths.PolicyFile,
+		SessionTTL: s.runtime.SessionTTL,
+		Channel:    approval.ChannelTUI,
+		SavePolicy: func(next policy.Config) error {
+			return policy.Save(s.paths.PolicyFile, next)
+		},
+	}, req.PlanID, verdict, scope)
+	if err != nil {
+		s.err = err
+		s.result = ""
+		return s, s.loadCmd()
+	}
+	s.err = nil
+	s.result = ""
+	toast := fmt.Sprintf("plan %s · denied %d command(s)", shortPlanID(req.PlanID), len(results))
+	if verdict == approval.VerdictApproved {
+		toast = fmt.Sprintf("plan %s · approved %d command(s) · %s", shortPlanID(req.PlanID), len(results), scope)
+	}
+	return s, tea.Batch(s.loadCmd(), toastCmd(toast))
+}
+
+func shortPlanID(id string) string {
+	if len(id) > 11 {
+		return id[:11]
+	}
+	return id
+}
+
 func decisionToast(req approval.PendingRequest, verdict approval.Verdict, scope approval.Scope) string {
 	short := shortApprovalID(req.ID)
 	if verdict == approval.VerdictDenied {
@@ -366,7 +453,7 @@ func (s approvalsSection) helpKeyMap() help.KeyMap {
 		short: []key.Binding{hk("enter", "decide"), hk("j/k", "move"), hk("r", "refresh")},
 		full: [][]key.Binding{
 			{hk("j/k", "move"), hk("g/G", "home/end"), hk("enter", "decide"), hk("r", "refresh")},
-			{hk("o", "once"), hk("s", "session"), hk("h", "host"), hk("d", "deny")},
+			{hk("o", "once"), hk("s", "session"), hk("h", "host"), hk("d", "deny"), hk("p", "plan")},
 		},
 	}
 }
@@ -444,6 +531,8 @@ func approvalRow(req approval.PendingRequest) []string {
 // the consequence line spells out for the focused row.
 func kindLabel(req approval.PendingRequest) string {
 	switch {
+	case req.StdinBytes > 0:
+		return "stdin"
 	case !req.Candidate.Promotable:
 		return "priv"
 	case req.Candidate.Kind == approval.MatcherPrefix:
@@ -458,7 +547,19 @@ func kindLabel(req approval.PendingRequest) string {
 func (s approvalsSection) consequenceLine(req approval.PendingRequest) string {
 	id := s.styles.cursor.Render(shortApprovalID(req.ID))
 	sep := s.styles.dim.Render(" · ")
+	if req.PlanID != "" {
+		id += sep + s.styles.header.Render(fmt.Sprintf("plan %d/%d", req.PlanSeq, req.PlanTotal)) +
+			s.styles.dim.Render(" [p] decide whole plan")
+	}
 	c := req.Candidate
+	if req.StdinBytes > 0 {
+		sha := req.StdinSHA256
+		if len(sha) > 12 {
+			sha = sha[:12]
+		}
+		return id + sep + s.styles.header.Render(fmt.Sprintf("stdin %d B sha256=%s…", req.StdinBytes, sha)) +
+			s.styles.dim.Render(" — exact content only; no host-allow")
+	}
 	switch {
 	case !c.Promotable:
 		return id + sep + s.styles.deny.Render("[h]") + s.styles.dim.Render(" unavailable — privileged command; use once or session")
@@ -484,7 +585,13 @@ func (s approvalsSection) chooserLine() string {
 			cells[i] = s.styles.dim.Render(" " + c.label + " ")
 		}
 	}
-	return s.styles.dim.Render("decide: ") + strings.Join(cells, " ")
+	label := "decide: "
+	if s.planMode {
+		if req, ok := s.selected(); ok {
+			label = fmt.Sprintf("decide plan %s (all pending lines): ", shortPlanID(req.PlanID))
+		}
+	}
+	return s.styles.dim.Render(label) + strings.Join(cells, " ")
 }
 
 func (s approvalsSection) visibleRows() int {

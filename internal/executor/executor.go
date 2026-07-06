@@ -23,6 +23,9 @@ import (
 type Request struct {
 	Target  inventory.Target
 	Command string
+	// Stdin, when non-nil, is fed to the remote command's standard input.
+	// A nil Stdin preserves the historical behavior (/dev/null).
+	Stdin []byte
 }
 
 // Result captures the outcome of a remote command execution.
@@ -51,15 +54,16 @@ type StreamingExecutor interface {
 }
 
 // Runner executes an argv vector. Tests can inject a runner to avoid real SSH.
+// stdin is nil for commands without an input stream.
 type Runner interface {
-	Run(ctx context.Context, argv []string) RunResult
+	Run(ctx context.Context, argv []string, stdin []byte) RunResult
 }
 
 // RunnerFunc adapts a function into a Runner.
-type RunnerFunc func(ctx context.Context, argv []string) RunResult
+type RunnerFunc func(ctx context.Context, argv []string, stdin []byte) RunResult
 
-func (fn RunnerFunc) Run(ctx context.Context, argv []string) RunResult {
-	return fn(ctx, argv)
+func (fn RunnerFunc) Run(ctx context.Context, argv []string, stdin []byte) RunResult {
+	return fn(ctx, argv, stdin)
 }
 
 // RunResult is the low-level process result from a Runner.
@@ -123,7 +127,7 @@ func (e SSHExecutor) Close() error {
 func (e SSHExecutor) Run(ctx context.Context, request Request) Result {
 	start := time.Now()
 	argv := e.buildArgv(request.Target, request.Command)
-	runResult := e.Runner.Run(ctx, argv)
+	runResult := e.Runner.Run(ctx, argv, request.Stdin)
 	result := Result{
 		Stdout:   runResult.Stdout,
 		Stderr:   runResult.Stderr,
@@ -146,7 +150,7 @@ func (e SSHExecutor) Run(ctx context.Context, request Request) Result {
 func (e SSHExecutor) RunStreaming(ctx context.Context, request Request, stdout io.Writer, stderr io.Writer) Result {
 	start := time.Now()
 	argv := e.buildArgv(request.Target, request.Command)
-	runResult := runStreamingProcess(ctx, argv, stdout, stderr)
+	runResult := runStreamingProcess(ctx, argv, request.Stdin, stdout, stderr)
 	result := Result{
 		ExitCode: runResult.ExitCode,
 		Duration: time.Since(start),
@@ -171,7 +175,7 @@ func (e SSHExecutor) detectOS(ctx context.Context, target inventory.Target) stri
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	result := e.Runner.Run(probeCtx, e.buildArgv(target, OSProbeCommand))
+	result := e.Runner.Run(probeCtx, e.buildArgv(target, OSProbeCommand), nil)
 	if result.Err != nil || result.ExitCode != 0 {
 		return ""
 	}
@@ -432,13 +436,16 @@ func sshControlKey(target inventory.Target) string {
 // ExecRunner executes argv directly with os/exec.
 type ExecRunner struct{}
 
-func (ExecRunner) Run(ctx context.Context, argv []string) RunResult {
+func (ExecRunner) Run(ctx context.Context, argv []string, stdin []byte) RunResult {
 	if len(argv) == 0 {
 		return RunResult{ExitCode: -1, Err: errors.New("empty argv")}
 	}
 
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Env = scrubbedEnv()
+	if stdin != nil {
+		cmd.Stdin = bytes.NewReader(stdin)
+	}
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -462,13 +469,16 @@ func (ExecRunner) Run(ctx context.Context, argv []string) RunResult {
 	}
 }
 
-func runStreamingProcess(ctx context.Context, argv []string, stdout io.Writer, stderr io.Writer) RunResult {
+func runStreamingProcess(ctx context.Context, argv []string, stdin []byte, stdout io.Writer, stderr io.Writer) RunResult {
 	if len(argv) == 0 {
 		return RunResult{ExitCode: -1, Err: errors.New("empty argv")}
 	}
 
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Env = scrubbedEnv()
+	if stdin != nil {
+		cmd.Stdin = bytes.NewReader(stdin)
+	}
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 

@@ -89,7 +89,7 @@ func TestBuildSSHArgvUsesSSHConfigAlias(t *testing.T) {
 
 func TestSSHExecutorUsesInjectedRunner(t *testing.T) {
 	var calls [][]string
-	runner := RunnerFunc(func(_ context.Context, argv []string) RunResult {
+	runner := RunnerFunc(func(_ context.Context, argv []string, _ []byte) RunResult {
 		calls = append(calls, append([]string{}, argv...))
 		if argv[len(argv)-1] == OSProbeCommand {
 			return RunResult{Stdout: "Linux\n", ExitCode: 0}
@@ -131,7 +131,7 @@ func TestSSHExecutorUsesInjectedRunner(t *testing.T) {
 func TestSSHExecutorMultiplexesCommandAndProbe(t *testing.T) {
 	controlDir := t.TempDir()
 	var calls [][]string
-	runner := RunnerFunc(func(_ context.Context, argv []string) RunResult {
+	runner := RunnerFunc(func(_ context.Context, argv []string, _ []byte) RunResult {
 		calls = append(calls, append([]string{}, argv...))
 		if argv[len(argv)-1] == OSProbeCommand {
 			return RunResult{Stdout: "Linux\n", ExitCode: 0}
@@ -179,7 +179,7 @@ func TestSSHExecutorMultiplexesCommandAndProbe(t *testing.T) {
 func TestSSHExecutorCachesOSPerMuxKey(t *testing.T) {
 	controlDir := t.TempDir()
 	var probes int
-	runner := RunnerFunc(func(_ context.Context, argv []string) RunResult {
+	runner := RunnerFunc(func(_ context.Context, argv []string, _ []byte) RunResult {
 		if argv[len(argv)-1] == OSProbeCommand {
 			probes++
 			return RunResult{Stdout: "Linux\n", ExitCode: 0}
@@ -204,7 +204,7 @@ func TestSSHExecutorCachesOSPerMuxKey(t *testing.T) {
 func TestSSHExecutorLeavesAliasMuxOptionsToSSHConfig(t *testing.T) {
 	controlDir := t.TempDir()
 	var call []string
-	runner := RunnerFunc(func(_ context.Context, argv []string) RunResult {
+	runner := RunnerFunc(func(_ context.Context, argv []string, _ []byte) RunResult {
 		call = append([]string{}, argv...)
 		return RunResult{ExitCode: 255, Err: errors.New("connect failed")}
 	})
@@ -245,7 +245,7 @@ func TestSSHExecutorStableControlDirSurvivesClose(t *testing.T) {
 	t.Cleanup(func() { _ = os.RemoveAll(cacheRoot) })
 	t.Setenv("XDG_CACHE_HOME", cacheRoot)
 	var controlPath string
-	runner := RunnerFunc(func(_ context.Context, argv []string) RunResult {
+	runner := RunnerFunc(func(_ context.Context, argv []string, _ []byte) RunResult {
 		if controlPath == "" {
 			controlPath = sshOptionValue(t, argv, "ControlPath")
 			if err := os.WriteFile(controlPath, []byte("socket placeholder"), 0o600); err != nil {
@@ -279,7 +279,7 @@ func TestSSHExecutorStableControlDirSurvivesClose(t *testing.T) {
 func TestSSHExecutorFallsBackWhenControlPathTooLong(t *testing.T) {
 	controlDir := filepath.Join(t.TempDir(), strings.Repeat("long-segment-", 12))
 	var call []string
-	runner := RunnerFunc(func(_ context.Context, argv []string) RunResult {
+	runner := RunnerFunc(func(_ context.Context, argv []string, _ []byte) RunResult {
 		call = append([]string{}, argv...)
 		return RunResult{ExitCode: 255, Err: errors.New("connect failed")}
 	})
@@ -314,7 +314,7 @@ func TestSSHExecutorInjectsServerAliveIntervalWhenConfigured(t *testing.T) {
 
 func TestSSHExecutorMultiplexingCanBeDisabled(t *testing.T) {
 	var calls [][]string
-	runner := RunnerFunc(func(_ context.Context, argv []string) RunResult {
+	runner := RunnerFunc(func(_ context.Context, argv []string, _ []byte) RunResult {
 		calls = append(calls, append([]string{}, argv...))
 		return RunResult{ExitCode: 255, Err: errors.New("connect failed")}
 	})
@@ -341,7 +341,7 @@ func TestSSHExecutorCloseLeavesConfiguredControlPath(t *testing.T) {
 		t.Fatalf("create short control dir: %v", err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(controlDir) })
-	runner := RunnerFunc(func(_ context.Context, argv []string) RunResult {
+	runner := RunnerFunc(func(_ context.Context, argv []string, _ []byte) RunResult {
 		if controlPath == "" {
 			controlPath = sshOptionValue(t, argv, "ControlPath")
 			if err := os.WriteFile(controlPath, []byte("socket placeholder"), 0o600); err != nil {
@@ -378,7 +378,7 @@ func TestSSHExecutorCloseLeavesConfiguredControlPath(t *testing.T) {
 
 func TestSSHExecutorDoesNotParseUserStdoutAsOS(t *testing.T) {
 	var probeCalled bool
-	runner := RunnerFunc(func(_ context.Context, argv []string) RunResult {
+	runner := RunnerFunc(func(_ context.Context, argv []string, _ []byte) RunResult {
 		if argv[len(argv)-1] == OSProbeCommand {
 			probeCalled = true
 			return RunResult{Stdout: "Darwin\n", ExitCode: 0}
@@ -416,7 +416,7 @@ func TestNormalizeOS(t *testing.T) {
 func TestRunStreamingProcessWritesToProvidedWriters(t *testing.T) {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	result := runStreamingProcess(context.Background(), []string{"sh", "-c", "printf out; printf err >&2; exit 7"}, &stdout, &stderr)
+	result := runStreamingProcess(context.Background(), []string{"sh", "-c", "printf out; printf err >&2; exit 7"}, nil, &stdout, &stderr)
 
 	if result.ExitCode != 7 || result.Err == nil {
 		t.Fatalf("result = %#v", result)
@@ -470,7 +470,7 @@ func TestPrintArgvDemo(t *testing.T) {
 		t.Skip("demo skipped in short mode")
 	}
 
-	runner := RunnerFunc(func(_ context.Context, argv []string) RunResult {
+	runner := RunnerFunc(func(_ context.Context, argv []string, _ []byte) RunResult {
 		fmt.Printf("argv=%#v\n", argv)
 		return RunResult{ExitCode: 0}
 	})

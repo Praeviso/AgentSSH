@@ -17,6 +17,7 @@ import (
 type PendingStore struct {
 	PendingDir   string
 	ResponsesDir string
+	PlansDir     string
 	Now          func() time.Time
 }
 
@@ -36,6 +37,18 @@ type PendingRequest struct {
 	Promotable     bool    `json:"promotable"`
 	TS             string  `json:"ts"`
 	ProposedScopes []Scope `json:"proposed_scope"`
+	// StdinSHA256/StdinBytes describe the stdin payload the run would feed the
+	// command. The content itself never enters the approval store; the operator
+	// adjudicates on hash + size, and the resulting grant is pinned to the hash.
+	StdinSHA256 string `json:"stdin_sha256,omitempty"`
+	StdinBytes  int64  `json:"stdin_bytes,omitempty"`
+	// PlanID/PlanSeq/PlanTotal tag requests minted by one `plan submit` so the
+	// operator can review and adjudicate the batch as a unit. Authoritative plan
+	// membership lives in the plan manifest (plans/<id>.json); these fields are
+	// display metadata on the requests this submit created.
+	PlanID    string `json:"plan_id,omitempty"`
+	PlanSeq   int    `json:"plan_seq,omitempty"`
+	PlanTotal int    `json:"plan_total,omitempty"`
 }
 
 type Resolution struct {
@@ -63,16 +76,22 @@ var (
 )
 
 func NewID() (string, error) {
+	return newPrefixedID("ap_")
+}
+
+// newPrefixedID mints a <prefix> + 96-bit random hex identifier; approval and
+// plan IDs share this so entropy/format changes apply to both.
+func newPrefixedID(prefix string) (string, error) {
 	var bytes [12]byte
 	if _, err := rand.Read(bytes[:]); err != nil {
-		return "", fmt.Errorf("generate approval id: %w", err)
+		return "", fmt.Errorf("generate %sid: %w", prefix, err)
 	}
-	return "ap_" + hex.EncodeToString(bytes[:]), nil
+	return prefix + hex.EncodeToString(bytes[:]), nil
 }
 
 func (s PendingStore) Create(req PendingRequest) (PendingRequest, error) {
 	_ = s.reapResolved(resolvedReapTTL)
-	if existing, ok, err := s.findUnresolved(req.SessionID, req.Host, shaHex(req.Cmd)); err != nil {
+	if existing, ok, err := s.findUnresolved(req.SessionID, req.Host, shaHex(req.Cmd), req.StdinSHA256); err != nil {
 		return PendingRequest{}, err
 	} else if ok {
 		return existing, nil
@@ -276,7 +295,7 @@ func (s PendingStore) readResolution(id string) (Resolution, bool, error) {
 	return resolution, true, nil
 }
 
-func (s PendingStore) findUnresolved(sessionID string, host string, cmdSHA256 string) (PendingRequest, bool, error) {
+func (s PendingStore) findUnresolved(sessionID string, host string, cmdSHA256 string, stdinSHA256 string) (PendingRequest, bool, error) {
 	entries, err := os.ReadDir(s.PendingDir)
 	if errors.Is(err, os.ErrNotExist) {
 		return PendingRequest{}, false, nil
@@ -293,7 +312,7 @@ func (s PendingStore) findUnresolved(sessionID string, host string, cmdSHA256 st
 		if err != nil {
 			continue
 		}
-		if req.SessionID != sessionID || req.Host != host || req.CmdSHA256 != cmdSHA256 {
+		if req.SessionID != sessionID || req.Host != host || req.CmdSHA256 != cmdSHA256 || req.StdinSHA256 != stdinSHA256 {
 			continue
 		}
 		if _, ok, err := s.readResolution(id); err != nil {
@@ -341,6 +360,11 @@ func (s PendingStore) reapResolved(ttl time.Duration) error {
 
 func RequestDigest(req PendingRequest, scope Scope) string {
 	parts := []string{req.ID, req.ReqID, req.SessionID, req.Host, req.CmdSHA256, req.MatcherSHA256, string(scope)}
+	// Appended only when present so digests of pre-stdin requests are unchanged
+	// across an upgrade.
+	if req.StdinSHA256 != "" {
+		parts = append(parts, req.StdinSHA256)
+	}
 	sum := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
 	return hex.EncodeToString(sum[:])
 }
@@ -354,10 +378,14 @@ func proposedScopes(matcher Matcher) []Scope {
 }
 
 func validApprovalID(id string) bool {
-	if !strings.HasPrefix(id, "ap_") || len(id) < len("ap_")+24 {
+	return validPrefixedID(id, "ap_")
+}
+
+func validPrefixedID(id string, prefix string) bool {
+	if !strings.HasPrefix(id, prefix) || len(id) < len(prefix)+24 {
 		return false
 	}
-	for _, r := range id[len("ap_"):] {
+	for _, r := range id[len(prefix):] {
 		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
 			return false
 		}
