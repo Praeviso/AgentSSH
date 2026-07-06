@@ -979,18 +979,28 @@ func loadStdinSpec(path string) (stdinSpec, error) {
 	if err != nil {
 		return stdinSpec{}, newUsageError("cannot read --stdin-file: %v", err)
 	}
-	if info.IsDir() {
-		return stdinSpec{}, newUsageError("--stdin-file %s is a directory", path)
+	// Require a regular file. A device (/dev/zero), FIFO, or socket reports size
+	// 0 from Stat yet streams unbounded bytes, so reading it whole would hang or
+	// exhaust memory before any size check — reject it up front.
+	if !info.Mode().IsRegular() {
+		return stdinSpec{}, newUsageError("--stdin-file %s is not a regular file", path)
 	}
 	if info.Size() > maxStdinBytes {
 		return stdinSpec{}, newUsageError("--stdin-file %s is %d bytes; the limit is %d bytes (32 MiB)", path, info.Size(), int64(maxStdinBytes))
 	}
-	data, err := os.ReadFile(path)
+	file, err := os.Open(path)
+	if err != nil {
+		return stdinSpec{}, newUsageError("cannot read --stdin-file: %v", err)
+	}
+	defer func() { _ = file.Close() }()
+	// Enforce the cap during the read (LimitReader to cap+1) so a file that grew
+	// between Stat and Open, or a lying size, still cannot exceed the limit.
+	data, err := io.ReadAll(io.LimitReader(file, maxStdinBytes+1))
 	if err != nil {
 		return stdinSpec{}, newUsageError("cannot read --stdin-file: %v", err)
 	}
 	if len(data) > maxStdinBytes {
-		return stdinSpec{}, newUsageError("--stdin-file %s is %d bytes; the limit is %d bytes (32 MiB)", path, len(data), int64(maxStdinBytes))
+		return stdinSpec{}, newUsageError("--stdin-file %s exceeds the limit of %d bytes (32 MiB)", path, int64(maxStdinBytes))
 	}
 	sum := sha256.Sum256(data)
 	return stdinSpec{

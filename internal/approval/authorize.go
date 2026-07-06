@@ -48,7 +48,16 @@ func PreflightAuthorize(cfg policy.Config, inv inventory.Inventory, sessionStore
 
 func authorize(cfg policy.Config, inv inventory.Inventory, sessionStore SessionStore, runtime RuntimeConfig, sessionID string, host string, command string, stdinSHA256 string, claimReqID string) (Authorization, error) {
 	if !runtime.Enabled {
-		engine, err := policy.NewEngine(cfg, inv)
+		// A generated approval host rule matches command text only and can never
+		// vouch for an arbitrary stdin payload. It must not authorize a stdin run
+		// even when the async approval channel is disabled, so evaluate stdin
+		// runs against a base engine with those rules stripped. Operator-authored
+		// allow/deny rules are untouched.
+		baseCfg := cfg
+		if stdinSHA256 != "" {
+			baseCfg, _ = splitPolicy(cfg, host)
+		}
+		engine, err := policy.NewEngine(baseCfg, inv)
 		if err != nil {
 			return Authorization{}, err
 		}

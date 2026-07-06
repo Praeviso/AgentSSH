@@ -68,6 +68,17 @@ func ApplyDecision(opts ApplyOptions, id string, verdict Verdict, scope Scope) (
 	}
 	result.Resolution = resolution
 
+	// Commit the approval audit record BEFORE any durable grant. Authorization is
+	// derived at run time from the grant store (the resolution file is only a
+	// notification), so ordering audit → grant guarantees a usable grant can
+	// never exist without its approval_granted record. If the audit append fails
+	// no grant is written; if a grant write later fails the resolution is stuck
+	// approved-without-grant, which fails closed (the agent must re-submit) — the
+	// safe direction versus a silent grant with no audit trail.
+	if err := appendApprovalAudit(opts, req, verdict, scope); err != nil {
+		return ApplyResult{}, err
+	}
+
 	switch verdict {
 	case VerdictApproved:
 		if scope == ScopeHost {
@@ -86,9 +97,6 @@ func ApplyDecision(opts ApplyOptions, id string, verdict Verdict, scope Scope) (
 	case VerdictDenied:
 	}
 
-	if err := appendApprovalAudit(opts, req, verdict, scope); err != nil {
-		return ApplyResult{}, err
-	}
 	return result, nil
 }
 
