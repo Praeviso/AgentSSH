@@ -25,7 +25,7 @@ func TestAuthorizeApprovalGrantCannotShadowExplicitDeny(t *testing.T) {
 			}}},
 		},
 	}
-	auth, err := Authorize(cfg, inventory.Inventory{Hosts: map[string]inventory.Host{"web-1": {}}}, SessionStore{Dir: t.TempDir()}, RuntimeConfig{Enabled: true, HostGrantMode: HostGrantSafePrefix}, "s", "web-1", "systemctl restart prod-db")
+	auth, err := Authorize(cfg, inventory.Inventory{Hosts: map[string]inventory.Host{"web-1": {}}}, SessionStore{Dir: t.TempDir()}, RuntimeConfig{Enabled: true, HostGrantMode: HostGrantSafePrefix}, "s", "web-1", "systemctl restart prod-db", "", "req-test")
 	if err != nil {
 		t.Fatalf("Authorize: %v", err)
 	}
@@ -38,10 +38,10 @@ func TestAuthorizeSessionAndHostGrantOnlyAfterDefaultDeny(t *testing.T) {
 	inv := inventory.Inventory{Hosts: map[string]inventory.Host{"web-1": {}}}
 	store := SessionStore{Dir: t.TempDir()}
 	matcher, _ := Exact("systemctl restart nginx")
-	if _, err := store.Grant("s", "web-1", ScopeSession, matcher, "ap_0123456789abcdef01234567", "r1", time.Hour, ChannelCLI); err != nil {
+	if _, err := store.Grant("s", "web-1", ScopeSession, matcher, "", "ap_0123456789abcdef01234567", "r1", time.Hour, ChannelCLI); err != nil {
 		t.Fatal(err)
 	}
-	auth, err := Authorize(policy.Config{}, inv, store, RuntimeConfig{Enabled: true, HostGrantMode: HostGrantSafePrefix}, "s", "web-1", "systemctl restart nginx")
+	auth, err := Authorize(policy.Config{}, inv, store, RuntimeConfig{Enabled: true, HostGrantMode: HostGrantSafePrefix}, "s", "web-1", "systemctl restart nginx", "", "req-test")
 	if err != nil {
 		t.Fatalf("Authorize session: %v", err)
 	}
@@ -57,7 +57,7 @@ func TestAuthorizeSessionAndHostGrantOnlyAfterDefaultDeny(t *testing.T) {
 			Group:  policy.ApprovalGroup,
 		}}},
 	}}
-	auth, err = Authorize(cfg, inv, SessionStore{Dir: t.TempDir()}, RuntimeConfig{Enabled: true, HostGrantMode: HostGrantSafePrefix}, "s2", "web-1", "ls /var")
+	auth, err = Authorize(cfg, inv, SessionStore{Dir: t.TempDir()}, RuntimeConfig{Enabled: true, HostGrantMode: HostGrantSafePrefix}, "s2", "web-1", "ls /var", "", "req-test")
 	if err != nil {
 		t.Fatalf("Authorize host: %v", err)
 	}
@@ -70,7 +70,7 @@ func TestAuthorizeNewDenyInvalidatesExistingGrant(t *testing.T) {
 	inv := inventory.Inventory{Hosts: map[string]inventory.Host{"web-1": {}}}
 	store := SessionStore{Dir: t.TempDir()}
 	matcher, _ := Exact("id")
-	if _, err := store.Grant("s", "web-1", ScopeSession, matcher, "ap_0123456789abcdef01234567", "r1", time.Hour, ChannelCLI); err != nil {
+	if _, err := store.Grant("s", "web-1", ScopeSession, matcher, "", "ap_0123456789abcdef01234567", "r1", time.Hour, ChannelCLI); err != nil {
 		t.Fatal(err)
 	}
 	cfg := policy.Config{Rules: []policy.Rule{{
@@ -78,7 +78,7 @@ func TestAuthorizeNewDenyInvalidatesExistingGrant(t *testing.T) {
 		Match:  policy.Match{CmdRegex: `\Aid\z`},
 		Action: policy.ActionDeny,
 	}}}
-	auth, err := Authorize(cfg, inv, store, RuntimeConfig{Enabled: true, HostGrantMode: HostGrantSafePrefix}, "s", "web-1", "id")
+	auth, err := Authorize(cfg, inv, store, RuntimeConfig{Enabled: true, HostGrantMode: HostGrantSafePrefix}, "s", "web-1", "id", "", "req-test")
 	if err != nil {
 		t.Fatalf("Authorize: %v", err)
 	}
@@ -97,7 +97,7 @@ func TestAuthorizeDisabledApprovalUsesPersistedHostRules(t *testing.T) {
 			Group:  policy.ApprovalGroup,
 		}}},
 	}}
-	auth, err := Authorize(cfg, inv, SessionStore{Dir: t.TempDir()}, RuntimeConfig{Enabled: false, HostGrantMode: HostGrantSafePrefix}, "s", "web-1", "ls /var")
+	auth, err := Authorize(cfg, inv, SessionStore{Dir: t.TempDir()}, RuntimeConfig{Enabled: false, HostGrantMode: HostGrantSafePrefix}, "s", "web-1", "ls /var", "", "req-test")
 	if err != nil {
 		t.Fatalf("Authorize persisted host rule while disabled: %v", err)
 	}
@@ -105,7 +105,7 @@ func TestAuthorizeDisabledApprovalUsesPersistedHostRules(t *testing.T) {
 		t.Fatalf("auth = %#v, want raw allow while disabled", auth)
 	}
 
-	auth, err = Authorize(cfg, inv, SessionStore{Dir: t.TempDir()}, RuntimeConfig{Enabled: false, HostGrantMode: HostGrantSafePrefix}, "s", "web-1", "id")
+	auth, err = Authorize(cfg, inv, SessionStore{Dir: t.TempDir()}, RuntimeConfig{Enabled: false, HostGrantMode: HostGrantSafePrefix}, "s", "web-1", "id", "", "req-test")
 	if err != nil {
 		t.Fatalf("Authorize gray while disabled: %v", err)
 	}

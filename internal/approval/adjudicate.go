@@ -101,7 +101,7 @@ func applySessionGrant(opts ApplyOptions, req PendingRequest, scope Scope) (Gran
 	if ttl <= 0 {
 		ttl = DefaultSessionTTL
 	}
-	return opts.Sessions.Grant(req.SessionID, req.Host, scope, matcher, req.ID, req.ReqID, ttl, opts.Channel)
+	return opts.Sessions.Grant(req.SessionID, req.Host, scope, matcher, req.StdinSHA256, req.ID, req.ReqID, ttl, opts.Channel)
 }
 
 func applyHostGrant(opts ApplyOptions, req PendingRequest) (string, error) {
@@ -174,6 +174,9 @@ func appendApprovalAudit(opts ApplyOptions, req PendingRequest, verdict Verdict,
 		ApprovalScope:   string(scope),
 		ApprovalMatcher: req.Candidate.Regex,
 		ApprovalChannel: opts.Channel,
+		StdinSHA256:     req.StdinSHA256,
+		StdinBytes:      req.StdinBytes,
+		PlanID:          req.PlanID,
 	}
 	_, err := opts.Audit.Append(record)
 	return err

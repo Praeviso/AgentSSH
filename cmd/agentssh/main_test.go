@@ -924,7 +924,7 @@ output:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := (approval.SessionStore{Dir: filepath.Join(home, "approvals", "sessions")}).Grant("s_test", "web-1", approval.ScopeSession, matcher, "ap_0123456789abcdef01234567", "r1", time.Hour, approval.ChannelCLI); err != nil {
+	if _, err := (approval.SessionStore{Dir: filepath.Join(home, "approvals", "sessions")}).Grant("s_test", "web-1", approval.ScopeSession, matcher, "", "ap_0123456789abcdef01234567", "r1", time.Hour, approval.ChannelCLI); err != nil {
 		t.Fatal(err)
 	}
 

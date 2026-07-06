@@ -35,6 +35,7 @@ const (
 	ChannelCLI  = "cli"
 	ChannelTUI  = "tui"
 	ChannelExit = "exit"
+	ChannelPlan = "plan"
 )
 
 // Matcher is the reusable command matcher that can be stored in session grants

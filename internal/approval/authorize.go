@@ -26,15 +26,27 @@ type Authorization struct {
 	ApprovalMatcher Matcher
 }
 
-func Authorize(cfg policy.Config, inv inventory.Inventory, sessionStore SessionStore, runtime RuntimeConfig, sessionID string, host string, command string) (Authorization, error) {
-	return authorize(cfg, inv, sessionStore, runtime, sessionID, host, command, true)
+// Authorize decides one run request. A matching once grant is claimed under
+// reqID (two-phase consumption): the caller must settle the claim with
+// SessionStore.Commit once the command reaches the remote, or
+// SessionStore.Release if it verifiably never executed.
+// stdinSHA256 is empty for runs without stdin; when set, grants must carry the
+// same stdin hash, persistent host approval rules never match, and the
+// candidate matcher is forced to exact and non-promotable.
+func Authorize(cfg policy.Config, inv inventory.Inventory, sessionStore SessionStore, runtime RuntimeConfig, sessionID string, host string, command string, stdinSHA256 string, reqID string) (Authorization, error) {
+	if reqID == "" {
+		return Authorization{}, fmt.Errorf("authorize requires a request id")
+	}
+	return authorize(cfg, inv, sessionStore, runtime, sessionID, host, command, stdinSHA256, reqID)
 }
 
-func PreflightAuthorize(cfg policy.Config, inv inventory.Inventory, sessionStore SessionStore, runtime RuntimeConfig, sessionID string, host string, command string) (Authorization, error) {
-	return authorize(cfg, inv, sessionStore, runtime, sessionID, host, command, false)
+// PreflightAuthorize is the side-effect-free variant used to preview a batch
+// before executing any of it.
+func PreflightAuthorize(cfg policy.Config, inv inventory.Inventory, sessionStore SessionStore, runtime RuntimeConfig, sessionID string, host string, command string, stdinSHA256 string) (Authorization, error) {
+	return authorize(cfg, inv, sessionStore, runtime, sessionID, host, command, stdinSHA256, "")
 }
 
-func authorize(cfg policy.Config, inv inventory.Inventory, sessionStore SessionStore, runtime RuntimeConfig, sessionID string, host string, command string, consumeOnce bool) (Authorization, error) {
+func authorize(cfg policy.Config, inv inventory.Inventory, sessionStore SessionStore, runtime RuntimeConfig, sessionID string, host string, command string, stdinSHA256 string, claimReqID string) (Authorization, error) {
 	if !runtime.Enabled {
 		engine, err := policy.NewEngine(cfg, inv)
 		if err != nil {
@@ -70,10 +82,10 @@ func authorize(cfg policy.Config, inv inventory.Inventory, sessionStore SessionS
 	}
 	var grant Grant
 	var ok bool
-	if consumeOnce {
-		grant, ok, err = sessionStore.Match(sessionID, host, command)
+	if claimReqID != "" {
+		grant, ok, err = sessionStore.Claim(sessionID, host, command, stdinSHA256, claimReqID)
 	} else {
-		grant, ok, err = sessionStore.Peek(sessionID, host, command)
+		grant, ok, err = sessionStore.Peek(sessionID, host, command, stdinSHA256)
 	}
 	if err != nil {
 		return Authorization{}, err
@@ -86,18 +98,22 @@ func authorize(cfg policy.Config, inv inventory.Inventory, sessionStore SessionS
 			GrantMatcher: grant.Regex,
 		}, nil
 	}
-	for _, matcher := range hostMatchers {
-		matches, err := matcher.Match(command)
-		if err != nil {
-			return Authorization{}, err
-		}
-		if matches {
-			return Authorization{
-				Status:       AuthAllowByGrant,
-				Decision:     policy.Decision{Action: policy.ActionAllow, Rule: "approval/host/" + matcherSHA12(matcher)},
-				GrantScope:   ScopeHost,
-				GrantMatcher: matcher.Regex,
-			}, nil
+	// Persistent host approval rules match the command text only; they cannot
+	// vouch for an arbitrary stdin payload, so stdin runs skip them entirely.
+	if stdinSHA256 == "" {
+		for _, matcher := range hostMatchers {
+			matches, err := matcher.Match(command)
+			if err != nil {
+				return Authorization{}, err
+			}
+			if matches {
+				return Authorization{
+					Status:       AuthAllowByGrant,
+					Decision:     policy.Decision{Action: policy.ActionAllow, Rule: "approval/host/" + matcherSHA12(matcher)},
+					GrantScope:   ScopeHost,
+					GrantMatcher: matcher.Regex,
+				}, nil
+			}
 		}
 	}
 	matcher, err := Generalize(command, runtime.HostGrantMode)
@@ -106,6 +122,16 @@ func authorize(cfg policy.Config, inv inventory.Inventory, sessionStore SessionS
 	}
 	if err != nil {
 		return Authorization{}, err
+	}
+	if stdinSHA256 != "" {
+		// The operator sees only the stdin hash and size, never the content, so
+		// a stdin approval must stay pinned to this exact command + payload and
+		// must never widen into a persistent host rule.
+		matcher, err = Exact(command)
+		if err != nil {
+			return Authorization{}, err
+		}
+		matcher.Promotable = false
 	}
 	return Authorization{Status: AuthNeedsApproval, Decision: decision, ApprovalMatcher: matcher}, nil
 }
