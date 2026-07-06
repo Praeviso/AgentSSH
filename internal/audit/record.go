@@ -54,6 +54,13 @@ type Record struct {
 	ApprovalScope   string `json:"approval_scope,omitempty"`
 	ApprovalMatcher string `json:"approval_matcher,omitempty"`
 	ApprovalChannel string `json:"approval_channel,omitempty"`
+	// StdinSHA256/StdinBytes record the stdin payload fed to the remote command
+	// (content stays out of the log). Appended after the approval fields with
+	// omitempty so pre-stdin records keep a byte-identical canonical form.
+	StdinSHA256 string `json:"stdin_sha256,omitempty"`
+	StdinBytes  int64  `json:"stdin_bytes,omitempty"`
+	// PlanID links approval lifecycle events minted by one `plan submit`.
+	PlanID string `json:"plan_id,omitempty"`
 }
 
 const ZeroHash = "0000000000000000000000000000000000000000000000000000000000000000"
@@ -364,6 +371,9 @@ type canonicalRecord struct {
 	ApprovalScope   string `json:"approval_scope,omitempty"`
 	ApprovalMatcher string `json:"approval_matcher,omitempty"`
 	ApprovalChannel string `json:"approval_channel,omitempty"`
+	StdinSHA256     string `json:"stdin_sha256,omitempty"`
+	StdinBytes      int64  `json:"stdin_bytes,omitempty"`
+	PlanID          string `json:"plan_id,omitempty"`
 }
 
 func canonicalJSON(record Record) ([]byte, error) {
@@ -389,5 +399,8 @@ func canonicalJSON(record Record) ([]byte, error) {
 		ApprovalScope:   record.ApprovalScope,
 		ApprovalMatcher: record.ApprovalMatcher,
 		ApprovalChannel: record.ApprovalChannel,
+		StdinSHA256:     record.StdinSHA256,
+		StdinBytes:      record.StdinBytes,
+		PlanID:          record.PlanID,
 	})
 }
