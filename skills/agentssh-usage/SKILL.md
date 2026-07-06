@@ -61,7 +61,7 @@ AgentSSH is the only way you touch managed hosts. You call `agentssh`; the CLI r
 ## Practices that matter
 
 - **Policy is the safety boundary, not a suggestion.** Exit `6` is final — do not retry the same command, reword it, or look for a syntax that slips past. It means a hard deny or disabled gray-area approval path blocked the command.
-- **Never self-approve.** You may read `approval status` / `approval wait`, but you must never run `approval grant`, `approval deny`, edit policy, write approval files, or otherwise approve your own command. If a run returns exit `7`, surface the approval id and exact command to the operator, wait for the operator's decision, then rerun the same command only after approval.
+- **Never self-approve.** You may read `approval status` / `approval wait` and `plan status` / `plan wait`, but you must never run `approval grant`, `approval deny`, `plan grant`, `plan deny`, edit policy, write approval files, or otherwise approve your own command. If a run returns exit `7`, surface the approval id and exact command to the operator, wait for the operator's decision, then rerun the same command only after approval.
 - **One session per task.** Don't reuse a previous task's session id, and don't share one session across unrelated tasks — that merges them in the audit trail. Start a new task → mint a new id.
 - **Bounded, relevant output.** Prefer targeted commands (`systemctl status`, `journalctl -n`, `ps --sort`) over broad recursive scans. Output filtering may redact secrets and truncate length before results reach you; treat `«REDACTED»` and truncation as expected.
 - **Prefer `--json` on `run`.** The structured response carries `req_id`, `approval_id`, `redactions`, and `output_truncated`, none of which appear in the human-readable output. Parse it instead of scraping text.
@@ -113,9 +113,11 @@ agentssh plan submit web-1 --session s_1a2b3c4d --json -- \
 Each quoted argument is one complete command (`--file cmds.txt` also works, one command per line). Already-allowed commands are reported as `allowed`; hard-denied ones as `denied` (final — drop them); the rest become one pending approval each under a single `plan_id`. The operator reviews the batch once (TUI `[p]` or `agentssh plan grant <plan_id> --once|--session`), which mints one exact-match grant per command. Then:
 
 ```bash
-agentssh plan wait <plan_id> --timeout 10m    # 0 all approved · 6 any denied · 7 still pending
+agentssh plan wait <plan_id> --timeout 10m    # 0 all approved · 6 any denied · 7 still pending · 2 records expired (re-submit)
 agentssh run web-1 --session s_1a2b3c4d --json -- <cmd...>   # run each command as usual
 ```
+
+(A plan queried long after resolution can report `expired` with exit `2` once its approval records are reaped — that is not a denial; re-submit the plan.)
 
 Execution still happens per command through `run` with full per-command audit; a plan never bypasses explicit deny rules. Submit the plan with the same `--session` you will run under — the grants are bound to that session.
 
@@ -140,7 +142,7 @@ agentssh status <req_id> [--json]                    # look up a past run's resu
 agentssh approval status <approval_id>               # read approval result: 0 approved, 6 denied, 7 pending
 agentssh approval wait <approval_id> [--timeout 10m]  # wait for approval result, never grants approval
 agentssh plan submit <host> --session <id> [--json] -- '<cmd>' '<cmd>'...  # bundle gray commands into one review
-agentssh plan status <plan_id> | wait <plan_id> [--timeout 10m]            # 0 approved, 6 denied, 7 pending
+agentssh plan status <plan_id> | wait <plan_id> [--timeout 10m]            # 0 approved, 6 denied, 7 pending, 2 expired
 agentssh audit ls [--session <id>] | show <req_id> | verify   # browse / inspect / verify the hash chain
 agentssh policy test --host <host> '<cmd>'           # static check; verdict on stdout (allow/deny/needs-approval), exits 0 either way
 agentssh tui                                         # interactive audit + policy viewer (operator-facing)
