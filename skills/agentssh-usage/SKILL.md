@@ -36,11 +36,20 @@ AgentSSH is the only way you touch managed hosts. You call `agentssh`; the CLI r
 
    Optionally label the task on its first run: `--session-label "fix 502 on web-1"`.
 
-3. **Diagnose read-only first.** Inspect before you change anything — status, logs, metrics. Keep output bounded (`-n`, `head`, `--no-pager`); large dumps get truncated and waste context.
+3. **Pre-check commands with `policy test` before sending them.** It predicts the exact runtime verdict — `allow`, `deny`, or `needs-approval` — without executing anything or creating approval requests. Use it whenever you are not certain a command is already allowed, and pre-check a whole batch before starting a multi-step change so every approval need surfaces up front instead of one costly round-trip at a time:
 
-4. **Act only after summarizing.** Before a state-changing command (restart, reload, write, delete), state what you found, the risk, and the exact command. Rely on the harness/operator confirmation flow for the go-ahead.
+   ```bash
+   agentssh policy test --host web-1 'systemctl status nginx'
+   agentssh policy test --host web-1 'docker compose -f /opt/app/compose.yml up -d'
+   ```
 
-5. **Review via audit.** Hand back the session id and key request ids so the operator can replay the task. A run's `req_id` appears in its `--json` response and in `audit ls`; the human-readable run output omits it.
+   A `deny` verdict is final — don't send that command at all. A `needs-approval` verdict tells you to bundle it into a plan or flag it to the operator before you begin.
+
+4. **Diagnose read-only first.** Inspect before you change anything — status, logs, metrics. Keep output bounded (`-n`, `head`, `--no-pager`); large dumps get truncated and waste context.
+
+5. **Act only after summarizing.** Before a state-changing command (restart, reload, write, delete), state what you found, the risk, and the exact command. Rely on the harness/operator confirmation flow for the go-ahead.
+
+6. **Review via audit.** Hand back the session id and key request ids so the operator can replay the task. A run's `req_id` appears in its `--json` response and in `audit ls`; the human-readable run output omits it.
 
    ```bash
    agentssh audit ls --session s_1a2b3c4d
@@ -56,7 +65,7 @@ AgentSSH is the only way you touch managed hosts. You call `agentssh`; the CLI r
 - **One session per task.** Don't reuse a previous task's session id, and don't share one session across unrelated tasks — that merges them in the audit trail. Start a new task → mint a new id.
 - **Bounded, relevant output.** Prefer targeted commands (`systemctl status`, `journalctl -n`, `ps --sort`) over broad recursive scans. Output filtering may redact secrets and truncate length before results reach you; treat `«REDACTED»` and truncation as expected.
 - **Prefer `--json` on `run`.** The structured response carries `req_id`, `approval_id`, `redactions`, and `output_truncated`, none of which appear in the human-readable output. Parse it instead of scraping text.
-- **`policy test` reports its verdict on stdout, not via exit code.** It prints `allow`, `deny`, or `needs-approval` and exits `0` in all three cases — never chain it as `policy test ... && run ...`.
+- **`policy test` before `run`, and read its verdict on stdout, not via exit code.** Pre-checking is free and saves whole approval round-trips; skipping it means discovering `needs-approval` one command at a time. It prints `allow`, `deny`, or `needs-approval` and exits `0` in all three cases — never chain it as `policy test ... && run ...`.
 - **No destructive exploration.** Never run recursive deletes, mass `kill`, or cleanup as part of diagnosis. If the task needs them, propose them explicitly and let policy + the operator gate it.
 - **Read exit codes, don't fight them.** `0` ok · `1` remote command failed · `2` usage (e.g. no session declared, missing `--`) · `6` policy denied/final · `7` approval required or still pending · `9` connection failed. A `9` means fix connectivity/inventory, not retry blindly.
 
@@ -90,19 +99,53 @@ Your flow is:
 
 `agentssh approval status <id>` and `agentssh approval wait <id>` are read-only and agent-safe. Their exit codes are: approved `0`, denied `6`, pending/timeout `7`, malformed or unknown id `2`.
 
+### Plan approvals — one review for a multi-step task
+
+When a task needs several gray-zone commands, do not submit them one at a time — that costs one operator round-trip per command. Bundle them into a plan:
+
+```bash
+agentssh plan submit web-1 --session s_1a2b3c4d --json -- \
+  'mkdir -p /opt/app/releases' \
+  'docker compose -f /opt/app/compose.yml pull' \
+  'docker compose -f /opt/app/compose.yml up -d'
+```
+
+Each quoted argument is one complete command (`--file cmds.txt` also works, one command per line). Already-allowed commands are reported as `allowed`; hard-denied ones as `denied` (final — drop them); the rest become one pending approval each under a single `plan_id`. The operator reviews the batch once (TUI `[p]` or `agentssh plan grant <plan_id> --once|--session`), which mints one exact-match grant per command. Then:
+
+```bash
+agentssh plan wait <plan_id> --timeout 10m    # 0 all approved · 6 any denied · 7 still pending
+agentssh run web-1 --session s_1a2b3c4d --json -- <cmd...>   # run each command as usual
+```
+
+Execution still happens per command through `run` with full per-command audit; a plan never bypasses explicit deny rules. Submit the plan with the same `--session` you will run under — the grants are bound to that session.
+
+### Sending stdin — config files without quoting pain
+
+`run --stdin-file <path>` streams a local file (up to 32 MiB) to the remote command's stdin, replacing fragile `printf`-quoting and oversized inline arguments:
+
+```bash
+agentssh run web-1 --session s_1a2b3c4d --json --stdin-file nginx.conf -- tee /etc/nginx/nginx.conf
+```
+
+The content never enters the approval store or audit log — both record only `stdin_sha256` + `stdin_bytes`. A stdin approval is pinned to the exact content hash: change the file and the same command needs a fresh approval, so re-run with byte-identical content after approval.
+
 ## Command reference
 
 ```bash
 agentssh hosts [--json]                              # list targets (names + tags only; no credentials)
 agentssh session new                                 # mint a fresh session id for a task
 agentssh session ls                                  # recent sessions (id / label / span / command count)
-agentssh run <host|group> [--session <id>] [--session-label <text>] [--json] -- <cmd...>
+agentssh run <host|group> [--session <id>] [--session-label <text>] [--stdin-file <path>] [--json] [--fields a,b,c] -- <cmd...>
 agentssh status <req_id> [--json]                    # look up a past run's result (exit / denied)
 agentssh approval status <approval_id>               # read approval result: 0 approved, 6 denied, 7 pending
 agentssh approval wait <approval_id> [--timeout 10m]  # wait for approval result, never grants approval
+agentssh plan submit <host> --session <id> [--json] -- '<cmd>' '<cmd>'...  # bundle gray commands into one review
+agentssh plan status <plan_id> | wait <plan_id> [--timeout 10m]            # 0 approved, 6 denied, 7 pending
 agentssh audit ls [--session <id>] | show <req_id> | verify   # browse / inspect / verify the hash chain
 agentssh policy test --host <host> '<cmd>'           # static check; verdict on stdout (allow/deny/needs-approval), exits 0 either way
 agentssh tui                                         # interactive audit + policy viewer (operator-facing)
 ```
+
+Large-output note: `run --json` truncates the echoed `cmd` field at 2 KiB (`cmd_truncated: true`, full command stays in the audit log; correlate via `cmd_sha256`). Use `--fields req_id,status,exit_code,stdout` to keep responses small when you only need a few fields.
 
 The command after `--` is sent verbatim as one remote command. Bind every run in a task to the same session (via `--session <id>`, or `$AGENTSSH_SESSION` in a persistent shell) so audit groups them by task.
