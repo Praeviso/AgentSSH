@@ -179,6 +179,9 @@ func (e NativeExecutor) runSession(ctx context.Context, request Request, stdout 
 
 	session.Stdout = stdout
 	session.Stderr = stderr
+	if request.Stdin != nil {
+		session.Stdin = bytes.NewReader(request.Stdin)
+	}
 
 	runErr := runSSHSession(ctx, session, request.Command, closeCurrentClient)
 	exitCode, err := nativeExitCode(runErr)
