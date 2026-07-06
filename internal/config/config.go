@@ -86,6 +86,7 @@ type Paths struct {
 	SessionsDir   string
 	PendingDir    string
 	ResponsesDir  string
+	PlansDir      string
 }
 
 // Config is the parsed local configuration set.
@@ -207,6 +208,7 @@ func NewPaths(home string) Paths {
 		SessionsDir:   filepath.Join(approvalsDir, "sessions"),
 		PendingDir:    filepath.Join(approvalsDir, "pending"),
 		ResponsesDir:  filepath.Join(approvalsDir, "responses"),
+		PlansDir:      filepath.Join(approvalsDir, "plans"),
 	}
 }
 
