@@ -241,6 +241,10 @@ SKILL.md 指南:拿到 `run` 的 `exit 7` → 把 `id` + 原命令 + 候选范�
 
 1. **同 uid 自批准**(核心):见 §11。同 uid 下审批是「护栏 + 审计」,不是沙箱;唯一硬化办法 = 让 agent 跑独立 OS 用户/容器 + broker(可选 hard 模式)。密码学签名方案经红队否决(被改 `policy.yaml` / 直连 ssh 两扇侧门绕过)。
 2. **非锚定 / `\s` 正则缺陷 = 立即注入**:`Generalize` 一旦漏锚或用 `\s`,`ls\nrm -rf /` 即可绕过(引擎子串匹配 + `\s` 吃换行,均已实测)。缓解:代码内不变量自检(缺锚、含 `\s`/换行、含 `.*` 即测试失败)+ 注入语料表驱动测试 + fuzz。**最高优先级正确性风险**。
+2b. **转义放行表里的元字符 = 静默改写正则语义(2026-08-03 实测发生)**:`quoteBytesForRegexp` 曾把 `+` 当字面量放行,而 `+` 是量词。后果双向:批准 `echo a+b` 生成的 `\Aecho\x20a+b\z` **既不匹配自己的源串**(grant 静默失效 → 反复重批,一次远端部署里同一命令 12h 内被批 3 次),**又匹配 `echo ab`/`echo aab`**(授权操作者从未批准的命令)。串级不变量(锚定/无 `\s`/无 `.*`)全部通过,挡不住这类缺陷 —— 它们只看正则字符串,不看正则**含义**。
+   缓解(已实施):① 放行表提为 `literalSafePunct` 常量,并有测试逐字节断言 `regexp.QuoteMeta(b) == b`,再加回任何元字符即 CI 失败;② 构造闸门 `newMatcher` 断言**能编译 + 匹配自己的 `SourceCmd` + (exact 档)语法树恰为 `Concat[BeginText, Literal(SourceCmd), EndText]`** —— 最后一条是「只匹配这一条命令」的结构性证明,仅靠自匹配挡不住放宽;③ `FuzzExactMatcherSelfMatch` 用单字节增删改变异证明精确性。
+   同一批护栏另外抓出两个既有缺陷:**非法 UTF-8 命令**(Go 正则里 `\xF3` 表示 *rune* U+00F3 而非字节 0xF3,matcher 无法表达单个非法字节 → 现返回 `ErrInvalidUTF8Command`,与 NUL 同样按 hard-deny 处理)和**前导空格命令**(`splitASCIIWords` 丢前导空格,prefix 正则由 token 重建后匹配不上源串 → 改走 exact)。
+   存量修复:session grant 存了 `source_cmd`,读时按它重算(`sessionFileVersion` 2 + `normalizeGrants`),**严格收窄**且与今天重新审批的结果逐比特相同;`policy.yaml` 没有 `source_cmd`,故只用 `looksLegacyEscaped` 判定后**拒绝采信、不改写**(从可轮转的审计日志反推原文去改写操作者可见的 allow 规则不可靠),命令回落 exit 7 重批一次即可。
 3. **`prefix` 档(需显式开)的过度放宽**:会放宽写类多路子命令(`systemctl restart *`、`docker run *`、`git push *`)与读任意文件 leaf(`cat *`)。**默认 `safe-prefix` 不放宽这些**;开 `prefix` 即接受该取舍。边界仍由 解释器/特权/破坏性 denylist + 分离引擎兜。
 4. **审计 hash 回归**:新字段必须 `,omitempty` 且 `Record`/`canonicalRecord` 同步;用 golden 链 + 逐字段 tamper 测试守住。
 5. **resolution 重放 / 陈旧 pending**:`req_digest` 绑定 + `O_EXCL` + `id` 归属校验;pending/responses 按 TTL 清扫。无 HMAC,故不防同 uid **伪造**(同 §11),但防住**意外串号/重放**。
@@ -249,6 +253,8 @@ SKILL.md 指南:拿到 `run` 的 `exit 7` → 把 `id` + 原命令 + 候选范�
 ## 14. 测试要点
 
 - `Generalize`:护栏 denylist、元字符/控制字符/Unicode 空白拒绝、锚定 + 无 `\s`/`.*` 不变量、prefix/exact 分流、字节级切词器;表驱动 + 注入语料(`\n \r \t \f \v` / Unicode 空白 / `$()` / 管道 / 反斜杠续行 / 引号 / glob)+ fuzz;**专测 `ls\nrm -rf /` 不被任何前缀 grant 命中**。
+- **matcher 语义(见 §13.2b)**:放行表逐字节 `QuoteMeta` 自检;每个可打印字节 `a<b>b` 既匹配源串、又不匹配去掉该字节的变体(量词探针);`+` 放宽用例(`echo a+b` 不得命中 `echo ab`);非法 UTF-8 与前导空格分流;`FuzzExactMatcherSelfMatch`(单字节增删改变异证明只匹配源串)+ `FuzzGeneralizeNoWiden`(不跨 `;`/换行/管道延伸)。
+- **存量修复**:v1 session 文件里的 legacy grant 按 `source_cmd` 重算且**修复被落盘**(不是每次读都重做);无法重算的丢弃;单条坏 grant 不得使整个 session 的匹配失败;legacy host 规则不再进 `hostMatchers`。
 - `Authorize`:**host_overrides 物理在前 + global 有显式 deny → 必返 HardDeny**;session/host grant 命中;实时重判(运行前新增 deny 使 grant 失效);once 在并发重跑下只被消费一次。
 - session store:flock 并发、TTL 过期、`session end` 清除、`host` 绑定。
 - request/resolution:`req_digest` 不符当未批;`O_EXCL` 防覆盖;`approval wait/status` 各退出码与缺失/过期/畸形分支。

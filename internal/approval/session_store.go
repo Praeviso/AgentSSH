@@ -53,6 +53,57 @@ type sessionFile struct {
 	Grants    []Grant `json:"grants"`
 }
 
+// sessionFileVersion 2 marks a file whose grants have been checked against the
+// matcher rules current at the time of writing. Version 1 files may contain
+// grants minted before '+' was escaped, whose patterns fail to match the
+// approved command while matching commands the operator never saw.
+const sessionFileVersion = 2
+
+// normalizeGrants repairs grants written by an older AgentSSH. Every session
+// grant is minted by applySessionGrant → Exact(req.Cmd), so an exact grant's
+// pattern is a pure function of SourceCmd: re-deriving reproduces exactly what
+// approving the same command today would produce, preserves the operator's
+// intent, and is strictly narrowing (the repaired pattern matches only
+// SourceCmd, where the old one matched a superset). A grant that cannot be
+// re-derived — no SourceCmd to derive from, or still not self-matching
+// afterwards — is dropped rather than trusted.
+//
+// It returns the number of grants repaired and dropped.
+func normalizeGrants(doc *sessionFile) (repaired int, dropped int) {
+	kept := make([]Grant, 0, len(doc.Grants))
+	for _, grant := range doc.Grants {
+		if grant.Kind != MatcherExact || grant.SourceCmd == "" {
+			// Prefix grants carry no reliable way back to their source, and a
+			// grant with no source cannot be proven at all. Keep it only if it
+			// still matches nothing it should not.
+			if expr, err := compileMatcher(grant.Regex); err == nil && !looksLegacyEscaped(grant.Regex) {
+				if grant.SourceCmd == "" || expr.MatchString(grant.SourceCmd) {
+					kept = append(kept, grant)
+					continue
+				}
+			}
+			dropped++
+			continue
+		}
+		matcher, err := Exact(grant.SourceCmd)
+		if err != nil {
+			dropped++
+			continue
+		}
+		if matcher.Regex == grant.Regex {
+			kept = append(kept, grant)
+			continue
+		}
+		grant.Regex = matcher.Regex
+		grant.Kind = matcher.Kind
+		grant.Prefix = append([]string(nil), matcher.Prefix...)
+		kept = append(kept, grant)
+		repaired++
+	}
+	doc.Grants = kept
+	return repaired, dropped
+}
+
 func (s SessionStore) Grant(sessionID string, host string, scope Scope, matcher Matcher, stdinSHA256 string, approvalID string, reqID string, ttl time.Duration, channel string) (Grant, error) {
 	if scope != ScopeOnce && scope != ScopeSession {
 		return Grant{}, fmt.Errorf("session store cannot grant scope %q", scope)
@@ -76,8 +127,8 @@ func (s SessionStore) Grant(sessionID string, host string, scope Scope, matcher 
 		StdinSHA256: stdinSHA256,
 	}
 	err := s.withLockedSession(sessionID, func(doc *sessionFile) error {
-		if doc.Version == 0 {
-			doc.Version = 1
+		if doc.Version < sessionFileVersion {
+			doc.Version = sessionFileVersion
 		}
 		if doc.SessionID == "" {
 			doc.SessionID = sessionID
@@ -207,7 +258,11 @@ func (s SessionStore) match(sessionID string, host string, command string, stdin
 			matcher := grant.matcher()
 			matches, err := matcher.Match(command)
 			if err != nil {
-				return err
+				// A grant whose stored pattern will not compile is poisoned
+				// data: drop it and keep going. Aborting here would fail every
+				// command in the session, not just this one.
+				changed = true
+				continue
 			}
 			if !matches {
 				remaining = append(remaining, grant)
@@ -296,7 +351,18 @@ func (s SessionStore) withLockedSession(sessionID string, fn func(*sessionFile) 
 	if err != nil {
 		return err
 	}
+	// Snapshot before repairing, so a repair counts as a change and is written
+	// back rather than being redone on every read.
 	before, _ := json.Marshal(doc)
+	// Repair grants written by an older AgentSSH before anything reads them, so
+	// a stale pattern can neither authorize an unapproved command nor silently
+	// fail to authorize an approved one.
+	if doc.SessionID != "" && doc.Version < sessionFileVersion {
+		if repaired, dropped := normalizeGrants(&doc); repaired > 0 || dropped > 0 {
+			fmt.Fprintf(os.Stderr, "agentssh: repaired %d and dropped %d approval grant(s) written by an older AgentSSH\n", repaired, dropped)
+		}
+		doc.Version = sessionFileVersion
+	}
 	if err := fn(&doc); err != nil {
 		return err
 	}

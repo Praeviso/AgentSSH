@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"regexp"
+	"regexp/syntax"
 	"strconv"
 	"strings"
 )
@@ -49,10 +50,7 @@ type Matcher struct {
 }
 
 func (m Matcher) Match(command string) (bool, error) {
-	if err := validateMatcherInvariant(m.Regex); err != nil {
-		return false, err
-	}
-	expr, err := regexp.Compile(m.Regex)
+	expr, err := compileMatcher(m.Regex)
 	if err != nil {
 		return false, err
 	}
@@ -70,6 +68,29 @@ func matcherSHA12(m Matcher) string {
 		return sum
 	}
 	return sum[:12]
+}
+
+// looksLegacyEscaped reports whether a stored pattern was generated before '+'
+// was escaped, i.e. it carries a bare '+' that acts as a quantifier. Such a
+// pattern authorizes commands the operator never approved (an approved "a+b"
+// also matches "ab" and "aab"), so callers must stop honoring it.
+//
+// Order matters: prefix matchers legitimately contain structural '+' in
+// `[ \t]+` and in tailTokenClass's trailing quantifier. Those fixed fragments
+// are stripped first, so only a generator-emitted bare '+' remains. Exact
+// matchers contain none of the fragments, so the strip is a no-op for them.
+func looksLegacyEscaped(pattern string) bool {
+	stripped := pattern
+	for _, fragment := range []string{
+		`(?:[ \t]+` + tailTokenClass + `)*`,
+		`[ \t]+`,
+		`[ \t]*`,
+		`\A`,
+		`\z`,
+	} {
+		stripped = strings.ReplaceAll(stripped, fragment, "")
+	}
+	return strings.Contains(stripped, "+")
 }
 
 func validateMatcherInvariant(pattern string) error {
@@ -94,4 +115,85 @@ func mustValidateMatcher(m Matcher) Matcher {
 		panic(err)
 	}
 	return m
+}
+
+// compileMatcher enforces the string invariant and then compiles. Callers that
+// only hold a stored pattern (no SourceCmd) use this; construction goes through
+// newMatcher, which additionally proves the pattern against its source.
+func compileMatcher(pattern string) (*regexp.Regexp, error) {
+	if err := validateMatcherInvariant(pattern); err != nil {
+		return nil, err
+	}
+	expr, err := regexp.Compile(pattern)
+	if err != nil {
+		return nil, fmt.Errorf("approval matcher does not compile: %w", err)
+	}
+	return expr, nil
+}
+
+// newMatcher is the single gate every generated matcher passes through. It
+// proves three things a string-level invariant check cannot:
+//
+//  1. the pattern compiles — a generator bug that emits an invalid quantifier
+//     is caught here rather than at match time, where the error would surface
+//     against unrelated commands;
+//  2. the pattern matches the command it was generated from — a matcher that
+//     cannot authorize its own source is silently useless and forces the
+//     operator to re-approve the same command forever;
+//  3. for exact matchers, the pattern matches *nothing but* that command.
+//     Self-match alone is not enough: a pattern can match its source and still
+//     match more, which is authorization widening.
+//
+// Returns an error rather than panicking: this runs on the Authorize hot path
+// over an agent-supplied command string, so a panic would be a denial of
+// service reachable from untrusted input, and inside ApplyDecision it would
+// land between the audit append and the grant write, destroying the operator's
+// decision.
+func newMatcher(m Matcher) (Matcher, error) {
+	expr, err := compileMatcher(m.Regex)
+	if err != nil {
+		return Matcher{}, err
+	}
+	if !expr.MatchString(m.SourceCmd) {
+		return Matcher{}, fmt.Errorf("approval matcher does not match the command it was generated from: %q", m.Regex)
+	}
+	if m.Kind == MatcherExact {
+		if err := assertExactLiteral(m.Regex, m.SourceCmd); err != nil {
+			return Matcher{}, err
+		}
+	}
+	return m, nil
+}
+
+// assertExactLiteral proves an exact matcher is anchored around one literal
+// equal to the source command, so it can match that command and nothing else.
+// The parsed form of \A<escaped>\z is Concat[BeginText, Literal, EndText] —
+// the parser folds adjacent escapes into a single literal run — degenerating
+// to Concat[BeginText, EndText] for the empty command.
+func assertExactLiteral(pattern string, source string) error {
+	parsed, err := syntax.Parse(pattern, syntax.Perl)
+	if err != nil {
+		return fmt.Errorf("approval matcher does not parse: %w", err)
+	}
+	parsed = parsed.Simplify()
+	widened := fmt.Errorf("exact approval matcher is not a single anchored literal (would match more than the approved command): %q", pattern)
+	if parsed.Op != syntax.OpConcat || len(parsed.Sub) == 0 {
+		return widened
+	}
+	if parsed.Sub[0].Op != syntax.OpBeginText || parsed.Sub[len(parsed.Sub)-1].Op != syntax.OpEndText {
+		return widened
+	}
+	switch len(parsed.Sub) {
+	case 2:
+		if source != "" {
+			return widened
+		}
+	case 3:
+		if parsed.Sub[1].Op != syntax.OpLiteral || string(parsed.Sub[1].Rune) != source {
+			return widened
+		}
+	default:
+		return widened
+	}
+	return nil
 }
