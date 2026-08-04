@@ -110,13 +110,6 @@ func validateMatcherInvariant(pattern string) error {
 	}
 }
 
-func mustValidateMatcher(m Matcher) Matcher {
-	if err := validateMatcherInvariant(m.Regex); err != nil {
-		panic(err)
-	}
-	return m
-}
-
 // compileMatcher enforces the string invariant and then compiles. Callers that
 // only hold a stored pattern (no SourceCmd) use this; construction goes through
 // newMatcher, which additionally proves the pattern against its source.
