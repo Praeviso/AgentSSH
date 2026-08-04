@@ -50,7 +50,13 @@ func ApplyDecision(opts ApplyOptions, id string, verdict Verdict, scope Scope) (
 			if !req.Candidate.Promotable {
 				return ApplyResult{}, fmt.Errorf("approval %s cannot be promoted to host scope", req.ID)
 			}
-			if err := validateMatcherInvariant(req.Candidate.Regex); err != nil {
+			// Validate the stored candidate BEFORE anything durable is written.
+			// applyHostGrant persists req.Candidate.Regex verbatim, so a request
+			// minted by an older binary can carry a matcher that does not match
+			// its own command. Rejecting here — ahead of Resolve and the audit
+			// append — keeps a rejection from burning the resolution and leaving
+			// an approval that can never be re-decided.
+			if err := validateHostCandidate(req); err != nil {
 				return ApplyResult{}, err
 			}
 		} else if _, err := Exact(req.Cmd); err != nil {
@@ -116,7 +122,7 @@ func applyHostGrant(opts ApplyOptions, req PendingRequest) (string, error) {
 	if !req.Candidate.Promotable {
 		return "", fmt.Errorf("approval %s cannot be promoted to host scope", req.ID)
 	}
-	if err := validateMatcherInvariant(req.Candidate.Regex); err != nil {
+	if err := validateHostCandidate(req); err != nil {
 		return "", err
 	}
 	next := opts.Bundle
@@ -158,6 +164,25 @@ func applyHostGrant(opts ApplyOptions, req PendingRequest) (string, error) {
 		}
 	}
 	return ruleName, nil
+}
+
+// validateHostCandidate proves a pending request's stored matcher is safe to
+// persist as a host rule: it must satisfy the string invariant, compile, and
+// actually match the command the operator reviewed. The last check is what
+// stops a request minted before the '+' escaping fix from being promoted into
+// a permanent rule that authorizes commands nobody approved.
+func validateHostCandidate(req PendingRequest) error {
+	expr, err := compileMatcher(req.Candidate.Regex)
+	if err != nil {
+		return err
+	}
+	if !expr.MatchString(req.Cmd) {
+		return fmt.Errorf("approval %s carries a matcher that does not match its own command; have the agent re-submit the request", req.ID)
+	}
+	if looksLegacyEscaped(req.Candidate.Regex) {
+		return fmt.Errorf("approval %s was created by an older AgentSSH with an unsafe matcher; have the agent re-submit the request", req.ID)
+	}
+	return nil
 }
 
 func appendApprovalAudit(opts ApplyOptions, req PendingRequest, verdict Verdict, scope Scope) error {

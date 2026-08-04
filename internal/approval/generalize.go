@@ -18,7 +18,27 @@ const (
 
 var ErrNULCommand = errors.New("approval command contains NUL")
 
+// ErrInvalidUTF8Command rejects commands that are not valid UTF-8. Go's regexp
+// has no way to express a single invalid byte: `\xF3` in a pattern denotes the
+// *rune* U+00F3 (encoded C3 B3), not the byte 0xF3. A matcher generated from
+// such a command would therefore fail to match the approved command while
+// matching a different one, so these commands are rejected outright rather
+// than approved with a matcher that cannot mean what it says.
+var ErrInvalidUTF8Command = errors.New("approval command is not valid UTF-8")
+
 const tailTokenClass = `[A-Za-z0-9@%+=:,./_-]+`
+
+// literalSafePunct lists the punctuation bytes quoteBytesForRegexp may emit
+// verbatim into a regex. Every byte here MUST be a regex non-metacharacter:
+// the output is spliced into a pattern outside any character class, so a
+// quantifier ('+', '*', '?') would silently rewrite the pattern's meaning.
+// '+' used to live here and did exactly that — an approved "a+b" produced
+// \Aa+b\z, which failed to match its own source yet matched "ab" and "aab",
+// authorizing commands the operator never approved.
+// TestLiteralAllowlistContainsNoRegexMetachar enforces this invariant.
+// Note: tailTokenClass above is a character class, where '+' is literal and
+// the trailing '+' is a deliberate quantifier — that one is correct as-is.
+const literalSafePunct = `@%=:,/_-`
 
 var interpreterOrEscapable = map[string]struct{}{
 	"sh": {}, "bash": {}, "dash": {}, "zsh": {}, "ksh": {}, "env": {}, "find": {}, "xargs": {},
@@ -57,13 +77,16 @@ func Generalize(command string, mode HostGrantMode) (Matcher, error) {
 	if strings.Contains(command, "\x00") {
 		return Matcher{}, ErrNULCommand
 	}
+	if !utf8.ValidString(command) {
+		return Matcher{}, ErrInvalidUTF8Command
+	}
 	if mode == "" {
 		mode = HostGrantSafePrefix
 	}
 	forceExact := scanForExactOnly(command)
 	tokens := splitASCIIWords(command)
 	if len(tokens) == 0 {
-		return exactMatcher(command, true), nil
+		return exactMatcher(command, true)
 	}
 	head := commandBase(tokens[0])
 	promotable := true
@@ -74,27 +97,37 @@ func Generalize(command string, mode HostGrantMode) (Matcher, error) {
 	if isInterpreterOrEscapable(head) || isDestructiveLeaf(head) || hasEnvPrefix(command) {
 		forceExact = true
 	}
+	// splitASCIIWords drops leading spaces, and prefixMatcher rebuilds the
+	// pattern from tokens — so a leading-space command would produce a prefix
+	// matcher that cannot match the command it came from. The exact matcher
+	// preserves bytes, and is the narrower choice regardless.
+	if strings.HasPrefix(command, " ") {
+		forceExact = true
+	}
 	if forceExact || mode == HostGrantExact {
-		return exactMatcher(command, promotable), nil
+		return exactMatcher(command, promotable)
 	}
 
 	prefix := prefixForMode(tokens, head, mode)
 	tail := tokens[len(prefix):]
 	if len(prefix) == 0 || !tailTokensSafe(tail) || (mode == HostGrantSafePrefix && !safePrefixTailTokensSafe(head, tail)) {
-		return exactMatcher(command, promotable), nil
+		return exactMatcher(command, promotable)
 	}
-	return prefixMatcher(command, prefix, promotable), nil
+	return prefixMatcher(command, prefix, promotable)
 }
 
 func Exact(command string) (Matcher, error) {
 	if strings.Contains(command, "\x00") {
 		return Matcher{}, ErrNULCommand
 	}
-	return exactMatcher(command, true), nil
+	if !utf8.ValidString(command) {
+		return Matcher{}, ErrInvalidUTF8Command
+	}
+	return exactMatcher(command, true)
 }
 
-func exactMatcher(command string, promotable bool) Matcher {
-	return mustValidateMatcher(Matcher{
+func exactMatcher(command string, promotable bool) (Matcher, error) {
+	return newMatcher(Matcher{
 		Kind:       MatcherExact,
 		Regex:      `\A` + quoteBytesForRegexp(command) + `\z`,
 		Promotable: promotable,
@@ -102,12 +135,12 @@ func exactMatcher(command string, promotable bool) Matcher {
 	})
 }
 
-func prefixMatcher(command string, prefix []string, promotable bool) Matcher {
+func prefixMatcher(command string, prefix []string, promotable bool) (Matcher, error) {
 	parts := make([]string, 0, len(prefix))
 	for _, token := range prefix {
 		parts = append(parts, quoteBytesForRegexp(token))
 	}
-	return mustValidateMatcher(Matcher{
+	return newMatcher(Matcher{
 		Kind:       MatcherPrefix,
 		Regex:      `\A` + strings.Join(parts, `[ \t]+`) + `(?:[ \t]+` + tailTokenClass + `)*[ \t]*\z`,
 		Prefix:     append([]string(nil), prefix...),
@@ -299,7 +332,7 @@ func quoteBytesForRegexp(value string) string {
 	for i := 0; i < len(value); {
 		b := value[i]
 		if (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9') ||
-			b == '@' || b == '%' || b == '+' || b == '=' || b == ':' || b == ',' || b == '/' || b == '_' || b == '-' {
+			strings.IndexByte(literalSafePunct, b) >= 0 {
 			builder.WriteByte(b)
 			i++
 			continue
