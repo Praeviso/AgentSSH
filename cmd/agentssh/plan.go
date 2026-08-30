@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"slices"
 	"strings"
 
 	"github.com/Praeviso/AgentSSH/internal/approval"
@@ -13,6 +16,7 @@ import (
 	"github.com/Praeviso/AgentSSH/internal/policy"
 	"github.com/Praeviso/AgentSSH/internal/session"
 	"github.com/spf13/cobra"
+	"gopkg.in/yaml.v3"
 )
 
 // A plan bundles one task's commands into a single approval round-trip: the
@@ -37,7 +41,8 @@ func newPlanCommand() *cobra.Command {
 		Use:   "submit <host> [--session <id>] [--file <path>] [--json] [-- <cmd> <cmd>...]",
 		Short: "Submit a batch of commands for one approval review.",
 		Long: "Each argument after -- is one complete remote command (quote each one).\n" +
-			"--file adds one command per line (blank lines and # comments are skipped).\n" +
+			"--file adds one command per line (blank lines and # comments are skipped),\n" +
+			"or a structured version: 1 file with commands[].cmd and optional stdin_file.\n" +
 			"Allowed commands are reported as such; gray-zone commands become one\n" +
 			"pending approval each, bundled under a single plan id.",
 		Args: func(cmd *cobra.Command, args []string) error {
@@ -56,7 +61,7 @@ func newPlanCommand() *cobra.Command {
 	}
 	submitCmd.Flags().StringVar(&submitFlags.session, "session", "", "associate the plan with a session id")
 	submitCmd.Flags().StringVar(&submitFlags.sessionLabel, "session-label", "", "attach a human-readable label to the session")
-	submitCmd.Flags().StringVar(&submitFlags.file, "file", "", "read additional commands from a file, one per line")
+	submitCmd.Flags().StringVar(&submitFlags.file, "file", "", "read commands from a legacy line file or a structured version: 1 plan")
 	submitCmd.Flags().BoolVar(&submitFlags.jsonOutput, "json", false, "emit machine-readable JSON")
 
 	var statusJSON bool
@@ -120,11 +125,13 @@ func newPlanCommand() *cobra.Command {
 }
 
 type planSubmitLine struct {
-	Seq        int    `json:"seq"`
-	Cmd        string `json:"cmd"`
-	Status     string `json:"status"` // allowed | denied | approval_pending
-	PolicyRule string `json:"policy_rule,omitempty"`
-	ApprovalID string `json:"approval_id,omitempty"`
+	Seq         int    `json:"seq"`
+	Cmd         string `json:"cmd"`
+	Status      string `json:"status"` // allowed | denied | approval_pending
+	PolicyRule  string `json:"policy_rule,omitempty"`
+	ApprovalID  string `json:"approval_id,omitempty"`
+	StdinSHA256 string `json:"stdin_sha256,omitempty"`
+	StdinBytes  int64  `json:"stdin_bytes,omitempty"`
 }
 
 type planSubmitResponse struct {
@@ -137,11 +144,24 @@ type planSubmitResponse struct {
 	Pending   int              `json:"pending"`
 }
 
-func readPlanFile(path string) ([]string, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, newUsageError("cannot read --file: %v", err)
-	}
+type planSpec struct {
+	Version  int           `yaml:"version"`
+	Commands []planCommand `yaml:"commands"`
+}
+
+type planCommand struct {
+	Cmd string `yaml:"cmd"`
+	// StdinFile is resolved relative to the current working directory, the same
+	// frame of reference as run --stdin-file -- not relative to the plan file.
+	StdinFile string `yaml:"stdin_file"`
+	// stdin holds the payload identity once resolveStdin has run. Unexported, so
+	// the YAML decoder leaves it alone.
+	stdin stdinSpec
+}
+
+// planFileLines splits a legacy plan file: one command per line, blank lines
+// and # comments skipped.
+func planFileLines(data []byte) []string {
 	var commands []string
 	for _, line := range strings.Split(string(data), "\n") {
 		trimmed := strings.TrimSpace(line)
@@ -150,7 +170,56 @@ func readPlanFile(path string) ([]string, error) {
 		}
 		commands = append(commands, trimmed)
 	}
-	return commands, nil
+	return commands
+}
+
+// declaresStructuredPlan dispatches on the first meaningful line alone, so a
+// structured file that fails to parse is a usage error rather than a pile of
+// YAML fragments silently read as commands.
+func declaresStructuredPlan(data []byte) bool {
+	lines := planFileLines(data)
+	return len(lines) > 0 && strings.HasPrefix(lines[0], "version:")
+}
+
+func parseStructuredPlan(data []byte) ([]planCommand, error) {
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	var spec planSpec
+	if err := decoder.Decode(&spec); err != nil {
+		return nil, newUsageError("cannot parse structured --file: %v", err)
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return nil, newUsageError("structured --file must contain exactly one YAML document")
+		}
+		return nil, newUsageError("cannot parse structured --file: %v", err)
+	}
+	if spec.Version != 1 {
+		return nil, newUsageError("unsupported structured plan version %d; supported version is 1", spec.Version)
+	}
+	if spec.Commands == nil {
+		return nil, newUsageError("structured plan commands is required")
+	}
+	for i, command := range spec.Commands {
+		if strings.TrimSpace(command.Cmd) == "" {
+			return nil, newUsageError("structured plan commands[%d].cmd is required", i)
+		}
+	}
+	return spec.Commands, nil
+}
+
+func resolveStdin(commands []planCommand) error {
+	for i := range commands {
+		stdin, err := loadStdinSpec(commands[i].StdinFile)
+		if err != nil {
+			return err
+		}
+		// Submit stores only identity metadata; release the payload immediately
+		// so peak memory is bounded by one file.
+		stdin.data = nil
+		commands[i].stdin = stdin
+	}
+	return nil
 }
 
 func runPlanSubmit(cmd *cobra.Command, targetName string, commands []string, sessionFlag string, sessionLabel string, file string, jsonOutput bool) error {
@@ -164,22 +233,37 @@ func runPlanSubmit(cmd *cobra.Command, targetName string, commands []string, ses
 			"  enable it in ~/.agentssh/policy.yaml (approval.enabled: true) or via AGENTSSH_APPROVAL\n" +
 			"  without approval, pre-check commands with: agentssh policy test --host <host> '<cmd>'")
 	}
-	if file != "" {
-		fromFile, err := readPlanFile(file)
-		if err != nil {
-			return err
-		}
-		commands = append(commands, fromFile...)
-	}
-	cleaned := make([]string, 0, len(commands))
+	planCommands := make([]planCommand, 0, len(commands))
 	for _, command := range commands {
 		if strings.TrimSpace(command) == "" {
 			continue
 		}
-		cleaned = append(cleaned, command)
+		planCommands = append(planCommands, planCommand{Cmd: command})
 	}
-	if len(cleaned) == 0 {
+	if file != "" {
+		data, err := os.ReadFile(file)
+		if err != nil {
+			return newUsageError("cannot read --file: %v", err)
+		}
+		if declaresStructuredPlan(data) {
+			fromFile, err := parseStructuredPlan(data)
+			if err != nil {
+				return err
+			}
+			planCommands = append(planCommands, fromFile...)
+		} else {
+			for _, command := range planFileLines(data) {
+				planCommands = append(planCommands, planCommand{Cmd: command})
+			}
+		}
+	}
+	if len(planCommands) == 0 {
 		return newUsageError("plan submit requires at least one command (after -- or via --file)")
+	}
+	// Resolve every stdin_file before the first pending request is written. A
+	// missing, non-regular, or oversized payload therefore has zero side effects.
+	if err := resolveStdin(planCommands); err != nil {
+		return err
 	}
 
 	resolved, err := inventory.NewResolver(cfg.Inventory).Resolve(targetName)
@@ -210,11 +294,16 @@ func runPlanSubmit(cmd *cobra.Command, targetName string, commands []string, ses
 	}
 
 	response := planSubmitResponse{SessionID: sessionCtx.ID, Host: target.Name}
-	var memberIDs []string
+	memberIDs := make([]string, 0, len(planCommands))
 	exitCode := exitOK
-	for i, command := range cleaned {
-		line := planSubmitLine{Seq: i + 1, Cmd: command}
-		auth, err := approval.PreflightAuthorize(cfg.Policy, cfg.Inventory, sessionStore, runtime, sessionCtx.ID, target.Name, command, "")
+	for i, command := range planCommands {
+		line := planSubmitLine{
+			Seq:         i + 1,
+			Cmd:         command.Cmd,
+			StdinSHA256: command.stdin.sha256,
+			StdinBytes:  command.stdin.bytes,
+		}
+		auth, err := approval.PreflightAuthorize(cfg.Policy, cfg.Inventory, sessionStore, runtime, sessionCtx.ID, target.Name, command.Cmd, command.stdin.sha256)
 		if err != nil {
 			return newUsageError("policy.yaml is invalid: %v\n  fix the rule in ~/.agentssh/policy.yaml (check: agentssh policy show)", err)
 		}
@@ -233,23 +322,29 @@ func runPlanSubmit(cmd *cobra.Command, targetName string, commands []string, ses
 				return err
 			}
 			req, err := pendingStore.Create(approval.PendingRequest{
-				ReqID:     reqID,
-				SessionID: sessionCtx.ID,
-				Host:      target.Name,
-				Cmd:       command,
-				Candidate: auth.ApprovalMatcher,
-				PlanID:    planID,
-				PlanSeq:   i + 1,
-				PlanTotal: len(cleaned),
+				ReqID:       reqID,
+				SessionID:   sessionCtx.ID,
+				Host:        target.Name,
+				Cmd:         command.Cmd,
+				Candidate:   auth.ApprovalMatcher,
+				StdinSHA256: command.stdin.sha256,
+				StdinBytes:  command.stdin.bytes,
+				PlanID:      planID,
+				PlanSeq:     i + 1,
+				PlanTotal:   len(planCommands),
 			})
 			if err != nil {
 				return err
 			}
 			line.Status = "approval_pending"
 			line.ApprovalID = req.ID
-			memberIDs = append(memberIDs, req.ID)
+			// Two identical lines share one pending request; the manifest must
+			// still list it once.
+			if !slices.Contains(memberIDs, req.ID) {
+				memberIDs = append(memberIDs, req.ID)
+			}
 			exit := exitApprovalRequired
-			record := baseAuditRecord(reqID, sessionCtx, audit.EventApprovalRequested, target.Name, command, auth.Decision, &exit, "", 0)
+			record := stampStdin(baseAuditRecord(reqID, sessionCtx, audit.EventApprovalRequested, target.Name, command.Cmd, auth.Decision, &exit, "", 0), command.stdin)
 			record.ApprovalID = req.ID
 			record.ApprovalMatcher = req.Candidate.Regex
 			record.ApprovalChannel = approval.ChannelPlan
@@ -303,6 +398,9 @@ func printPlanSubmitHuman(cmd *cobra.Command, response planSubmitResponse) {
 		case "approval_pending":
 			marker = "!"
 			note = "approval pending " + line.ApprovalID
+		}
+		if line.StdinSHA256 != "" {
+			note += fmt.Sprintf(" · stdin %d B", line.StdinBytes)
 		}
 		_, _ = fmt.Fprintf(out, "%s %d/%d %s · %s\n", marker, line.Seq, len(response.Commands), line.Cmd, note)
 	}

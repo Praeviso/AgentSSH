@@ -48,3 +48,4 @@ stdin 是操作员在审批界面上**看不见的内容**,所以:
 - 32 MiB 上限是常量,不是 policy 可调项;需要更大传输时应做 `push/pull` 原语而非调大 stdin。
 - stdin 内容在本地进程内存中整体读入(为了先算哈希再授权);上限保证了内存可控。
 - `policy test` 不感知 stdin(引擎判定只看命令文本,stdin 不改变 allow/deny/needs-approval 三态结论)。
+- **`plan submit` 无法声明 stdin**:计划路径固定传空哈希,批准出的 grant 绑 `stdin_sha256 == ""`,带 `--stdin-file` 的 run 必然落空、重新走审批。设计见 `docs/plans/plan-stdin.md`(未实现)。

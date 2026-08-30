@@ -65,5 +65,5 @@
 ## 7. 未来项
 
 - 组 target 的多 host 计划(每 host preflight,与 run 的 group preflight 语义对齐)。
-- 计划行内嵌 stdin(当前 `--stdin-file` 只在 `run` 上;计划行如需 stdin,先单独 run 走 stdin 审批)。
+- ~~计划行内嵌 stdin~~ → **已出设计:`docs/plans/plan-stdin.md`**(结构化计划文件 `version: 1` + `commands[].stdin_file`)。当前形态下 `plan submit` 固定传空 stdin 哈希(`plan.go:217/235`),而 grant 无条件绑定 `stdin_sha256`,所以带 stdin 的行**结构上不可能命中计划批准的 grant** —— 已在真实二进制上复现;计划行如需 stdin,眼下只能先单独 run 走一次 stdin 审批。
 - TUI 折叠视图(同一计划聚合成一行,展开逐行)——当前逐行 + `[p]` 已可用,聚合视图等实测反馈。
