@@ -54,12 +54,14 @@ agentssh plan submit web-1 --session s_1a2b3c4d --json --file deploy.yaml
 
 ### 2.1 两种文件格式的分派规则(刻意做成机械规则,不做内容猜测)
 
-**跳过空行与 `#` 注释后的第一行以 `version:` 开头 → 结构化;否则 → 现有的一行一条命令。**
+**跳过空行与 `#` 注释后的第一行是 `---`、或以 `version:` / `commands:` 开头 → 结构化;否则 → 现有的一行一条命令。**
 
 - 两种格式都跳过 `#` 注释,而 YAML 的注释也是 `#`,规则在两边都自洽。
+- 三个触发词都要认:**只认 `version:` 是不够的**。开头写一行 `---` 是最常见的 YAML 写法,把 `commands:` 写在 `version:` 前面也完全合法 —— 两者都会 decode 成正确的结构化计划,却会被窄规则判成行模式,于是 `---` / `version: 1` / `commands:` / `- cmd: …` / `stdin_file: …` 每行各自变成一条"命令"送审,真命令被打散,**所有 stdin 绑定被静默丢弃**。这恰是本规则要防的事,窄一格就等于没防。
 - 一旦判定为结构化,YAML 语法错误就是**硬 usage error,绝不回落到行模式**。回落会把一个手滑的结构化文件按行拆成一堆"命令"提交审批 —— 虽然 fail-closed(每条都是 default-deny),但会给操作员一屏垃圾。
+- 单文档校验只拒**有实际内容**的第二个文档:结尾多一行 `---`、或尾部是纯注释文档,decode 出来是 nil,按结束处理。
 - `version` 非 1 → usage error 并写明支持的版本。
-- 反向误判(行模式文件恰好首行以 `version:` 开头)要求存在一条名为 `version:` 的命令,不是现实场景;真发生了,submit 的逐行输出立刻可见。
+- 反向误判(行模式文件恰好首行以这三者之一开头)要求存在一条名为 `---` / `version:` / `commands:` 的命令,不是现实场景;真发生了,submit 的逐行输出立刻可见。
 
 不引第二个 flag(`--plan-file` 之类):一个 flag 一件事,格式由文件自己声明,和 `policy.yaml` / `inventory.yaml` 都写 `version: 1` 的既有约定一致。
 
@@ -68,8 +70,10 @@ agentssh plan submit web-1 --session s_1a2b3c4d --json --file deploy.yaml
 | 字段 | 必填 | 语义 |
 |---|---|---|
 | `version` | 是 | 固定 `1` |
-| `commands[].cmd` | 是 | 一条完整远端命令(等价 `--` 后的一个位置参数),不做 join、不过 shell |
+| `commands[].cmd` | 是 | 一条完整远端命令(等价 `--` 后的一个位置参数),不做 join、不过 shell;**与行模式一样 trim,且必须是单行** |
 | `commands[].stdin_file` | 否 | 本地文件路径,**相对当前工作目录**解析 |
+
+`cmd` 必须 trim 且单行,和行模式对齐:YAML 块标量(`cmd: |`)会带一个尾随换行,而 `run` 送出的命令没有。不 trim 的话铸出的 matcher 是 `\Asystemctl restart nginx\n\z`,操作员批了也永远匹配不上 —— 一个操作员无法打破的审批循环。
 
 `stdin_file` 相对 **cwd** 而非计划文件所在目录:与 `run --stdin-file` 同一个参照系,全流程只有一个坐标系。要做可迁移的"计划 + 载荷"包就用绝对路径。
 
@@ -158,7 +162,9 @@ stdin 引入了一整类新的读取失败(文件不存在、非常规文件、�
 - **头号回归**:结构化文件提交 `tee /etc/nginx/nginx.conf` + `stdin_file` → `plan grant --session` → `run --stdin-file` 同内容 → **exit 0 且 executor 收到内容**。
 - 绑定成立的另一半:换内容 → exit 7;去掉 `--stdin-file` → exit 7;两者都不得触发 executor。
 - `host_grant_mode: prefix` 下,带 stdin 的计划行候选 matcher 仍是 exact 且 `proposed_scope` 无 host。
-- 格式分派:行模式文件逐字节同今(back-compat);结构化文件 YAML 语法错 → usage error 且**不回落行模式**;`version: 2` → usage error。
+- 格式分派:行模式文件逐字节同今(back-compat);`---` / `commands:` 开头也判为结构化;结构化文件 YAML 语法错 → usage error 且**不回落行模式**;结尾多一个 `---` 仍合法;`version: 2` → usage error;块标量多行命令 → usage error。
+- `stdin_file` 出错时的报错指名 `commands[i].stdin_file`,不提 `plan submit` 根本没有的 `--stdin-file` flag。
+- `submit` 报的 `pending` 数与 `plan status` 一致:两条相同的行共享一个审批单,只算一个。
 - 原子性:任一行 `stdin_file` 不存在 / 是目录 / 超 32 MiB → usage error,且 `approvals/pending/` **为空**、无 manifest。
 - 审计:计划的 `approval_requested` 记录带 `stdin_sha256` / `stdin_bytes`,内容不出现在日志里,`audit verify` 通过(含升级前 fixture 的 golden 链)。
 - TUI:带 stdin 的计划成员同时显示 `plan k/N` 与 `stdin N B sha256=…`;**空 stdin 文件**标为 `stdin` 而非 `priv`(§4.1)。

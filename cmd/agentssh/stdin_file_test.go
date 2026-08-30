@@ -15,7 +15,7 @@ func TestLoadStdinSpecRejectsNonRegularFile(t *testing.T) {
 		t.Skipf("cannot create FIFO on this platform: %v", err)
 	}
 	// loadStdinSpec must reject the FIFO by mode, not block reading it.
-	_, err := loadStdinSpec(fifo)
+	_, err := loadStdinSpec("--stdin-file", fifo)
 	if err == nil || !strings.Contains(err.Error(), "not a regular file") {
 		t.Fatalf("err = %v, want non-regular-file rejection", err)
 	}
@@ -32,7 +32,7 @@ func TestLoadStdinSpecRejectsOversizeDuringRead(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = f.Close()
-	_, err = loadStdinSpec(path)
+	_, err = loadStdinSpec("--stdin-file", path)
 	if err == nil || !strings.Contains(err.Error(), "limit") {
 		t.Fatalf("err = %v, want size-limit rejection", err)
 	}
@@ -44,7 +44,7 @@ func TestLoadStdinSpecReadsRegularFile(t *testing.T) {
 	if err := os.WriteFile(path, []byte("hello"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	spec, err := loadStdinSpec(path)
+	spec, err := loadStdinSpec("--stdin-file", path)
 	if err != nil {
 		t.Fatalf("loadStdinSpec: %v", err)
 	}

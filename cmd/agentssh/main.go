@@ -971,36 +971,38 @@ type stdinSpec struct {
 	bytes  int64
 }
 
-func loadStdinSpec(path string) (stdinSpec, error) {
+// source names the field the path came from, so a plan file's error points at
+// the plan line rather than at a --stdin-file flag plan submit does not have.
+func loadStdinSpec(source string, path string) (stdinSpec, error) {
 	if strings.TrimSpace(path) == "" {
 		return stdinSpec{}, nil
 	}
 	info, err := os.Stat(path)
 	if err != nil {
-		return stdinSpec{}, newUsageError("cannot read --stdin-file: %v", err)
+		return stdinSpec{}, newUsageError("cannot read %s: %v", source, err)
 	}
 	// Require a regular file. A device (/dev/zero), FIFO, or socket reports size
 	// 0 from Stat yet streams unbounded bytes, so reading it whole would hang or
 	// exhaust memory before any size check — reject it up front.
 	if !info.Mode().IsRegular() {
-		return stdinSpec{}, newUsageError("--stdin-file %s is not a regular file", path)
+		return stdinSpec{}, newUsageError("%s %s is not a regular file", source, path)
 	}
 	if info.Size() > maxStdinBytes {
-		return stdinSpec{}, newUsageError("--stdin-file %s is %d bytes; the limit is %d bytes (32 MiB)", path, info.Size(), int64(maxStdinBytes))
+		return stdinSpec{}, newUsageError("%s %s is %d bytes; the limit is %d bytes (32 MiB)", source, path, info.Size(), int64(maxStdinBytes))
 	}
 	file, err := os.Open(path)
 	if err != nil {
-		return stdinSpec{}, newUsageError("cannot read --stdin-file: %v", err)
+		return stdinSpec{}, newUsageError("cannot read %s: %v", source, err)
 	}
 	defer func() { _ = file.Close() }()
 	// Enforce the cap during the read (LimitReader to cap+1) so a file that grew
 	// between Stat and Open, or a lying size, still cannot exceed the limit.
 	data, err := io.ReadAll(io.LimitReader(file, maxStdinBytes+1))
 	if err != nil {
-		return stdinSpec{}, newUsageError("cannot read --stdin-file: %v", err)
+		return stdinSpec{}, newUsageError("cannot read %s: %v", source, err)
 	}
 	if len(data) > maxStdinBytes {
-		return stdinSpec{}, newUsageError("--stdin-file %s exceeds the limit of %d bytes (32 MiB)", path, int64(maxStdinBytes))
+		return stdinSpec{}, newUsageError("%s %s exceeds the limit of %d bytes (32 MiB)", source, path, int64(maxStdinBytes))
 	}
 	sum := sha256.Sum256(data)
 	return stdinSpec{
@@ -2268,7 +2270,7 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 	store := audit.NewStore(cfg.Paths.AuditFile)
 	sessionStore := approval.SessionStore{Dir: cfg.Paths.SessionsDir}
 	pendingStore := approvalStore(cfg.Paths)
-	stdin, err := loadStdinSpec(flags.stdinFile)
+	stdin, err := loadStdinSpec("--stdin-file", flags.stdinFile)
 	if err != nil {
 		return err
 	}

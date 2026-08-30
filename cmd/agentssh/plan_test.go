@@ -325,16 +325,30 @@ func TestStructuredPlanUsageErrorsLeaveNoArtifacts(t *testing.T) {
 			wantErr: "version",
 		},
 		{
+			name:    "multi-line block scalar command",
+			plan:    func(*testing.T) string { return "version: 1\ncommands:\n  - cmd: |\n      echo one\n      echo two\n" },
+			wantErr: "single line",
+		},
+		{
+			name:    "two documents with real content",
+			plan:    func(*testing.T) string { return "version: 1\ncommands: []\n---\nversion: 1\ncommands: []\n" },
+			wantErr: "exactly one YAML document",
+		},
+		{
 			name: "stdin_file missing on disk",
 			plan: func(t *testing.T) string {
 				return stdinPlanFile(writeStdinFile(t, "valid payload"), filepath.Join(t.TempDir(), "does-not-exist"))
 			},
+			wantErr: "commands[1].stdin_file",
 		},
 		{
 			name: "stdin_file over the size cap",
 			plan: func(t *testing.T) string {
 				return stdinPlanFile(writeStdinFile(t, "valid payload"), writeOversizedFile(t))
 			},
+			// The broken path is the second command, and plan submit has no
+			// --stdin-file flag to blame.
+			wantErr: "commands[1].stdin_file",
 		},
 	}
 	for _, tc := range cases {
@@ -381,6 +395,44 @@ func writeOversizedFile(t *testing.T) string {
 	return path
 }
 
+// Dispatch must survive the shapes a real operator writes: a leading document
+// marker, keys in either order, a trailing '---'. Getting this wrong is silent
+// -- the file falls back to line mode and every stdin_file binding is dropped.
+func TestStructuredPlanDispatchAcceptsOperatorYAMLShapes(t *testing.T) {
+	cases := []struct {
+		name string
+		plan string
+	}{
+		{"leading document marker", "---\nversion: 1\ncommands:\n  - cmd: systemctl restart nginx\n"},
+		{"commands before version", "commands:\n  - cmd: systemctl restart nginx\nversion: 1\n"},
+		{"trailing document marker", "version: 1\ncommands:\n  - cmd: systemctl restart nginx\n---\n"},
+		{"leading comment", "# deploy\nversion: 1\ncommands:\n  - cmd: systemctl restart nginx\n"},
+		{"block scalar command", "version: 1\ncommands:\n  - cmd: |\n      systemctl restart nginx\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			setupPlanHome(t)
+			withFakeExecutor(t, fakeExecutor{})
+			path := filepath.Join(t.TempDir(), "plan.yaml")
+			if err := os.WriteFile(path, []byte(tc.plan), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			code, stdout, stderr := runExit(t, "plan", "submit", "web-1", "--json", "--file", path)
+			if code != exitApprovalRequired {
+				t.Fatalf("exit=%d want 7; stderr=%q", code, stderr)
+			}
+			var response planSubmitResponse
+			if err := json.Unmarshal([]byte(stdout), &response); err != nil {
+				t.Fatalf("decode submit response: %v", err)
+			}
+			// Line mode would have split the YAML into several bogus commands.
+			if len(response.Commands) != 1 || response.Commands[0].Cmd != "systemctl restart nginx" {
+				t.Fatalf("commands=%+v want one exact command", response.Commands)
+			}
+		})
+	}
+}
+
 func TestStructuredPlanDuplicateCommandsHaveOneManifestMember(t *testing.T) {
 	home := setupPlanHome(t)
 	withFakeExecutor(t, fakeExecutor{})
@@ -408,6 +460,10 @@ func TestStructuredPlanDuplicateCommandsHaveOneManifestMember(t *testing.T) {
 	}
 	if status.Pending != 1 || len(status.Members) != 1 {
 		t.Fatalf("status=%+v want one pending member", status)
+	}
+	// submit must not claim more approvals than plan status will ever show.
+	if response.Pending != status.Pending {
+		t.Fatalf("submit pending=%d status pending=%d; counts must agree", response.Pending, status.Pending)
 	}
 }
 

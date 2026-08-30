@@ -175,10 +175,17 @@ func planFileLines(data []byte) []string {
 
 // declaresStructuredPlan dispatches on the first meaningful line alone, so a
 // structured file that fails to parse is a usage error rather than a pile of
-// YAML fragments silently read as commands.
+// YAML fragments silently read as commands. A legacy plan file holds shell
+// commands, and none of those open with a YAML document marker or with one of
+// the plan schema's own top-level keys.
 func declaresStructuredPlan(data []byte) bool {
 	lines := planFileLines(data)
-	return len(lines) > 0 && strings.HasPrefix(lines[0], "version:")
+	if len(lines) == 0 {
+		return false
+	}
+	return lines[0] == "---" ||
+		strings.HasPrefix(lines[0], "version:") ||
+		strings.HasPrefix(lines[0], "commands:")
 }
 
 func parseStructuredPlan(data []byte) ([]planCommand, error) {
@@ -187,12 +194,15 @@ func parseStructuredPlan(data []byte) ([]planCommand, error) {
 	if err := decoder.Decode(&spec); err != nil {
 		return nil, newUsageError("cannot parse structured --file: %v", err)
 	}
+	// A trailing '---' or a comment-only document decodes as nil; only a second
+	// document carrying real content means the file holds more than one plan.
 	var extra any
-	if err := decoder.Decode(&extra); err != io.EOF {
-		if err == nil {
-			return nil, newUsageError("structured --file must contain exactly one YAML document")
-		}
+	switch err := decoder.Decode(&extra); {
+	case errors.Is(err, io.EOF):
+	case err != nil:
 		return nil, newUsageError("cannot parse structured --file: %v", err)
+	case extra != nil:
+		return nil, newUsageError("structured --file must contain exactly one YAML document")
 	}
 	if spec.Version != 1 {
 		return nil, newUsageError("unsupported structured plan version %d; supported version is 1", spec.Version)
@@ -200,9 +210,16 @@ func parseStructuredPlan(data []byte) ([]planCommand, error) {
 	if spec.Commands == nil {
 		return nil, newUsageError("structured plan commands is required")
 	}
-	for i, command := range spec.Commands {
-		if strings.TrimSpace(command.Cmd) == "" {
+	for i := range spec.Commands {
+		// Trim the way line mode does. A YAML block scalar carries a trailing
+		// newline, and a command whose text differs by so much as that newline
+		// mints a grant no later run can ever match.
+		spec.Commands[i].Cmd = strings.TrimSpace(spec.Commands[i].Cmd)
+		if spec.Commands[i].Cmd == "" {
 			return nil, newUsageError("structured plan commands[%d].cmd is required", i)
+		}
+		if strings.ContainsAny(spec.Commands[i].Cmd, "\n\r") {
+			return nil, newUsageError("structured plan commands[%d].cmd must be a single line", i)
 		}
 	}
 	return spec.Commands, nil
@@ -210,7 +227,7 @@ func parseStructuredPlan(data []byte) ([]planCommand, error) {
 
 func resolveStdin(commands []planCommand) error {
 	for i := range commands {
-		stdin, err := loadStdinSpec(commands[i].StdinFile)
+		stdin, err := loadStdinSpec(fmt.Sprintf("commands[%d].stdin_file", i), commands[i].StdinFile)
 		if err != nil {
 			return err
 		}
@@ -352,13 +369,16 @@ func runPlanSubmit(cmd *cobra.Command, targetName string, commands []string, ses
 			if _, err := store.Append(record); err != nil {
 				return err
 			}
-			response.Pending++
 			exitCode = mergeExitCode(exitCode, exitApprovalRequired)
 		default:
 			return fmt.Errorf("unknown approval authorization status %q", auth.Status)
 		}
 		response.Commands = append(response.Commands, line)
 	}
+
+	// Identical lines share one pending request, so count distinct members --
+	// otherwise submit reports more approvals than plan status will ever show.
+	response.Pending = len(memberIDs)
 
 	if len(memberIDs) > 0 {
 		manifest, err := pendingStore.CreatePlan(approval.PlanManifest{
