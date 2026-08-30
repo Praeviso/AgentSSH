@@ -531,7 +531,7 @@ func approvalRow(req approval.PendingRequest) []string {
 // the consequence line spells out for the focused row.
 func kindLabel(req approval.PendingRequest) string {
 	switch {
-	case req.StdinBytes > 0:
+	case req.StdinSHA256 != "":
 		return "stdin"
 	case !req.Candidate.Promotable:
 		return "priv"
@@ -552,7 +552,7 @@ func (s approvalsSection) consequenceLine(req approval.PendingRequest) string {
 			s.styles.dim.Render(" [p] decide whole plan")
 	}
 	c := req.Candidate
-	if req.StdinBytes > 0 {
+	if req.StdinSHA256 != "" {
 		sha := req.StdinSHA256
 		if len(sha) > 12 {
 			sha = sha[:12]
