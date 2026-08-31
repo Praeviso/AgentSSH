@@ -234,6 +234,7 @@ agentssh policy host rule rm web-1 0
 agentssh policy host group rm web-1 readonly
 agentssh policy host rm web-1
 agentssh policy test --host web-1 'rm -rf /'
+agentssh policy test --host web-1 --json -- 'uptime' 'systemctl restart nginx'   # batch pre-check, one call
 agentssh audit ls
 agentssh audit show <req_id>
 agentssh audit verify        # confirm the tamper-evident hash chain is intact

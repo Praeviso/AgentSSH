@@ -456,16 +456,36 @@ func newPolicyCommand() *cobra.Command {
 		Short: "Manage command policy.",
 	}
 	cmd.AddCommand(newPolicyRuleCommand(), newPolicyGroupCommand(), newPolicyHostCommand())
-	var testHost string
+	var testFlags struct {
+		host       string
+		file       string
+		jsonOutput bool
+	}
 	testCmd := &cobra.Command{
-		Use:   "test <cmd>",
-		Short: "Evaluate a command against policy.",
-		Args:  minArgs(1),
+		Use:   "test [--host <host>] [--file <path>] [--json] <cmd> | -- <cmd> <cmd>...",
+		Short: "Evaluate one or more commands against policy.",
+		Long: "Without --, the arguments join into one command.\n" +
+			"After --, each argument is one complete command (quote each one), and --file adds one\n" +
+			"command per line -- or the same structured version: 1 plan file that plan submit takes,\n" +
+			"so a whole batch is pre-checked in a single call instead of one call per command.\n" +
+			"stdin_file entries are ignored: policy never matches on stdin.\n" +
+			"Verdicts print on stdout; the exit code stays 0 for allow, deny and needs-approval alike.",
+		Args: func(cmd *cobra.Command, args []string) error {
+			if cmd.ArgsLenAtDash() > 0 {
+				return newUsageError("policy test takes no positional target; pass --host and put commands after --")
+			}
+			if len(args) == 0 && strings.TrimSpace(testFlags.file) == "" {
+				return newUsageError("requires a command (or -- <cmd> <cmd>... / --file <path>)")
+			}
+			return nil
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runPolicyTest(cmd, testHost, strings.Join(args, " "))
+			return runPolicyTest(cmd, testFlags.host, policyTestCommands(cmd, args), testFlags.file, testFlags.jsonOutput)
 		},
 	}
-	testCmd.Flags().StringVar(&testHost, "host", "", "include host/group override context")
+	testCmd.Flags().StringVar(&testFlags.host, "host", "", "include host/group override context")
+	testCmd.Flags().StringVar(&testFlags.file, "file", "", "read commands from a line file or a structured version: 1 plan")
+	testCmd.Flags().BoolVar(&testFlags.jsonOutput, "json", false, "emit machine-readable JSON")
 	cmd.AddCommand(
 		&cobra.Command{
 			Use:   "show",
@@ -3409,7 +3429,62 @@ func formatRuleFields(rule policy.Rule, includeGroup bool) string {
 	return strings.Join(parts, " ")
 }
 
-func runPolicyTest(cmd *cobra.Command, host string, command string) error {
+// verdictNeedsApproval is the pre-check verdict for a command that would hit
+// default-deny while the async approval channel is on: not denied, but not
+// runnable until the operator adjudicates it.
+const verdictNeedsApproval = "needs-approval"
+
+type policyTestLine struct {
+	Seq        int    `json:"seq"`
+	Cmd        string `json:"cmd"`
+	Verdict    string `json:"verdict"` // allow | deny | needs-approval
+	PolicyRule string `json:"policy_rule"`
+}
+
+type policyTestResponse struct {
+	Host          string           `json:"host,omitempty"`
+	Commands      []policyTestLine `json:"commands"`
+	Allow         int              `json:"allow"`
+	Deny          int              `json:"deny"`
+	NeedsApproval int              `json:"needs_approval"`
+}
+
+// policyTestCommands splits positional args the way plan submit does: after --
+// each argument is one complete command, so a batch costs one call. Without --
+// the arguments still join into a single command, keeping the unquoted legacy
+// form (policy test --host web-1 systemctl status nginx) working.
+func policyTestCommands(cmd *cobra.Command, args []string) []string {
+	if dash := cmd.ArgsLenAtDash(); dash >= 0 {
+		return append([]string(nil), args[dash:]...)
+	}
+	if len(args) == 0 {
+		return nil
+	}
+	return []string{strings.Join(args, " ")}
+}
+
+// policyTestFileCommands reads the same two file shapes plan submit accepts, so
+// the file an agent is about to submit as a plan can be pre-checked as is.
+func policyTestFileCommands(file string) ([]string, error) {
+	data, err := os.ReadFile(file)
+	if err != nil {
+		return nil, newUsageError("cannot read --file: %v", err)
+	}
+	if !declaresStructuredPlan(data) {
+		return planFileLines(data), nil
+	}
+	planCommands, err := parseStructuredPlan(data)
+	if err != nil {
+		return nil, err
+	}
+	commands := make([]string, 0, len(planCommands))
+	for _, planCommand := range planCommands {
+		commands = append(commands, planCommand.Cmd)
+	}
+	return commands, nil
+}
+
+func runPolicyTest(cmd *cobra.Command, host string, commands []string, file string, jsonOutput bool) error {
 	cfg, err := config.Load()
 	if err != nil {
 		return classifyConfigError(err)
@@ -3422,19 +3497,89 @@ func runPolicyTest(cmd *cobra.Command, host string, command string) error {
 	if err != nil {
 		return newUsageError("policy.yaml is invalid: %v\n  fix the rule in ~/.agentssh/policy.yaml, then re-run (check: agentssh policy show)", err)
 	}
-	decision, err := engine.Evaluate(host, command)
-	if err != nil {
-		return err
+	if strings.TrimSpace(file) != "" {
+		fromFile, err := policyTestFileCommands(file)
+		if err != nil {
+			return err
+		}
+		commands = append(commands, fromFile...)
 	}
-	if decision.Rule == policy.RuleDefaultDeny && runtime.Enabled {
-		decision = policy.Decision{Action: policy.Action("needs-approval"), Rule: policy.RuleDefaultDeny}
+
+	response := policyTestResponse{Host: host}
+	for _, command := range commands {
+		if strings.TrimSpace(command) == "" {
+			continue
+		}
+		decision, err := engine.Evaluate(host, command)
+		if err != nil {
+			return err
+		}
+		verdict := string(decision.Action)
+		if decision.Rule == policy.RuleDefaultDeny && runtime.Enabled {
+			verdict = verdictNeedsApproval
+		}
+		switch verdict {
+		case verdictNeedsApproval:
+			response.NeedsApproval++
+		case string(policy.ActionAllow):
+			response.Allow++
+		default:
+			response.Deny++
+		}
+		response.Commands = append(response.Commands, policyTestLine{
+			Seq:        len(response.Commands) + 1,
+			Cmd:        command,
+			Verdict:    verdict,
+			PolicyRule: string(decision.Rule),
+		})
 	}
-	if host != "" {
-		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s · rule=%s · host=%s\n", decision.Action, decision.Rule, host)
-		return nil
+	if len(response.Commands) == 0 {
+		return newUsageError("requires at least one command (after -- or via --file <path>)")
 	}
-	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s · rule=%s\n", decision.Action, decision.Rule)
+	if jsonOutput {
+		return writeJSON(cmd, response)
+	}
+	printPolicyTest(cmd, response)
 	return nil
+}
+
+func printPolicyTest(cmd *cobra.Command, response policyTestResponse) {
+	out := cmd.OutOrStdout()
+	// One command keeps the original single-line shape; the command text is
+	// already on the caller's screen.
+	if len(response.Commands) == 1 {
+		line := response.Commands[0]
+		if response.Host != "" {
+			_, _ = fmt.Fprintf(out, "%s · rule=%s · host=%s\n", line.Verdict, line.PolicyRule, response.Host)
+			return
+		}
+		_, _ = fmt.Fprintf(out, "%s · rule=%s\n", line.Verdict, line.PolicyRule)
+		return
+	}
+
+	summary := []string{fmt.Sprintf("%d commands", len(response.Commands))}
+	if response.Allow > 0 {
+		summary = append(summary, fmt.Sprintf("%d allow", response.Allow))
+	}
+	if response.NeedsApproval > 0 {
+		summary = append(summary, fmt.Sprintf("%d needs-approval", response.NeedsApproval))
+	}
+	if response.Deny > 0 {
+		summary = append(summary, fmt.Sprintf("%d deny", response.Deny))
+	}
+	if response.Host != "" {
+		summary = append(summary, "host="+response.Host)
+	}
+	_, _ = fmt.Fprintln(out, strings.Join(summary, " · "))
+
+	verdictWidth, ruleWidth := 0, 0
+	for _, line := range response.Commands {
+		verdictWidth = max(verdictWidth, len(line.Verdict))
+		ruleWidth = max(ruleWidth, len("rule=")+len(line.PolicyRule))
+	}
+	for _, line := range response.Commands {
+		_, _ = fmt.Fprintf(out, "%-*s · %-*s · %s\n", verdictWidth, line.Verdict, ruleWidth, "rule="+line.PolicyRule, line.Cmd)
+	}
 }
 
 func runAuditLS(cmd *cobra.Command, filters audit.Filters) error {

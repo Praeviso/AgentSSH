@@ -36,12 +36,23 @@ AgentSSH is the only way you touch managed hosts. You call `agentssh`; the CLI r
 
    Optionally label the task on its first run: `--session-label "fix 502 on web-1"`.
 
-3. **Pre-check commands with `policy test` before sending them.** It predicts the exact runtime verdict — `allow`, `deny`, or `needs-approval` — without executing anything or creating approval requests. Use it whenever you are not certain a command is already allowed, and pre-check a whole batch before starting a multi-step change so every approval need surfaces up front instead of one costly round-trip at a time:
+3. **Pre-check the whole task in one `policy test` call.** It predicts the exact runtime verdict — `allow`, `deny`, or `needs-approval` — for each command, without executing anything or creating approval requests. Pass every command you plan to send after `--`, one quoted argument each:
 
    ```bash
-   agentssh policy test --host web-1 'systemctl status nginx'
-   agentssh policy test --host web-1 'docker compose -f /opt/app/compose.yml up -d'
+   agentssh policy test --host web-1 --json -- \
+     'systemctl status nginx' \
+     'journalctl -u nginx -n 50 --no-pager' \
+     'docker compose -f /opt/app/compose.yml up -d'
    ```
+
+   ```
+   3 commands · 2 allow · 1 needs-approval · host=web-1
+   allow          · rule=rules:readonly · systemctl status nginx
+   allow          · rule=rules:readonly · journalctl -u nginx -n 50 --no-pager
+   needs-approval · rule=default-deny   · docker compose -f /opt/app/compose.yml up -d
+   ```
+
+   One call, one verdict per command — never loop `policy test` command by command. `--file <path>` reads one command per line, or the same structured plan file `plan submit --file` takes, so the batch you are about to submit is pre-checked as is. Without `--`, the arguments still join into a single command for the occasional one-off check.
 
    A `deny` verdict is final — don't send that command at all. A `needs-approval` verdict tells you to bundle it into a plan or flag it to the operator before you begin.
 
@@ -65,7 +76,7 @@ AgentSSH is the only way you touch managed hosts. You call `agentssh`; the CLI r
 - **One session per task.** Don't reuse a previous task's session id, and don't share one session across unrelated tasks — that merges them in the audit trail. Start a new task → mint a new id.
 - **Bounded, relevant output.** Prefer targeted commands (`systemctl status`, `journalctl -n`, `ps --sort`) over broad recursive scans. Output filtering may redact secrets and truncate length before results reach you; treat `«REDACTED»` and truncation as expected.
 - **Prefer `--json` on `run`.** The structured response carries `req_id`, `approval_id`, `redactions`, and `output_truncated`, none of which appear in the human-readable output. Parse it instead of scraping text.
-- **`policy test` before `run`, and read its verdict on stdout, not via exit code.** Pre-checking is free and saves whole approval round-trips; skipping it means discovering `needs-approval` one command at a time. It prints `allow`, `deny`, or `needs-approval` and exits `0` in all three cases — never chain it as `policy test ... && run ...`.
+- **One batched `policy test` before the first `run`, and read its verdict on stdout, not via exit code.** Pre-checking is free and saves whole approval round-trips; skipping it means discovering `needs-approval` one command at a time. Check every command of the task in a single call (`-- 'cmd' 'cmd' ...` or `--file`) — a separate call per command is the same round-trip cost you are trying to avoid. It prints `allow`, `deny`, or `needs-approval` and exits `0` in all cases — never chain it as `policy test ... && run ...`.
 - **No destructive exploration.** Never run recursive deletes, mass `kill`, or cleanup as part of diagnosis. If the task needs them, propose them explicitly and let policy + the operator gate it.
 - **Read exit codes, don't fight them.** `0` ok · `1` remote command failed · `2` usage (e.g. no session declared, missing `--`) · `6` policy denied/final · `7` approval required or still pending · `9` connection failed. A `9` means fix connectivity/inventory, not retry blindly.
 
@@ -144,7 +155,7 @@ agentssh approval wait <approval_id> [--timeout 10m]  # wait for approval result
 agentssh plan submit <host> --session <id> [--json] -- '<cmd>' '<cmd>'...  # bundle gray commands into one review
 agentssh plan status <plan_id> | wait <plan_id> [--timeout 10m]            # 0 approved, 6 denied, 7 pending, 2 expired
 agentssh audit ls [--session <id>] | show <req_id> | verify   # browse / inspect / verify the hash chain
-agentssh policy test --host <host> '<cmd>'           # static check; verdict on stdout (allow/deny/needs-approval), exits 0 either way
+agentssh policy test [--host <host>] [--file <path>] [--json] -- '<cmd>' '<cmd>'...   # batch static check; verdicts on stdout (allow/deny/needs-approval), always exits 0
 agentssh tui                                         # interactive audit + policy viewer (operator-facing)
 ```
 

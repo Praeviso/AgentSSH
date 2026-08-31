@@ -957,6 +957,121 @@ output:
 	}
 }
 
+func TestPolicyTestBatch(t *testing.T) {
+	home := t.TempDir()
+	writeTestInventory(t, home)
+	writePolicy(t, home, `
+version: 1
+approval:
+  enabled: true
+rules:
+  - name: allow-id
+    match: { cmd_regex: '^id$' }
+    action: allow
+  - name: deny-rm
+    match: { cmd_regex: '^rm ' }
+    action: deny
+`)
+	t.Setenv("AGENTSSH_HOME", home)
+
+	stdout, stderr, err := runCommandForTest(t, "policy", "test", "--host", "web-1", "--",
+		"id", "rm -rf /srv", "systemctl restart nginx")
+	if err != nil {
+		t.Fatalf("policy test batch err=%v stdout=%s stderr=%s", err, stdout, stderr)
+	}
+	for _, want := range []string{
+		"3 commands · 1 allow · 1 needs-approval · 1 deny · host=web-1",
+		"rule=rules:allow-id",
+		"rule=rules:deny-rm",
+		"needs-approval",
+		"systemctl restart nginx",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("policy test batch missing %q:\n%s", want, stdout)
+		}
+	}
+
+	stdout, stderr, err = runCommandForTest(t, "policy", "test", "--host", "web-1", "--json", "--",
+		"id", "rm -rf /srv", "systemctl restart nginx")
+	if err != nil {
+		t.Fatalf("policy test --json err=%v stdout=%s stderr=%s", err, stdout, stderr)
+	}
+	var response policyTestResponse
+	if err := json.Unmarshal([]byte(stdout), &response); err != nil {
+		t.Fatalf("decode policy test json: %v\n%s", err, stdout)
+	}
+	if response.Host != "web-1" || response.Allow != 1 || response.Deny != 1 || response.NeedsApproval != 1 {
+		t.Fatalf("policy test json counts = %+v", response)
+	}
+	if len(response.Commands) != 3 {
+		t.Fatalf("policy test json commands = %+v", response.Commands)
+	}
+	want := []policyTestLine{
+		{Seq: 1, Cmd: "id", Verdict: "allow", PolicyRule: "rules:allow-id"},
+		{Seq: 2, Cmd: "rm -rf /srv", Verdict: "deny", PolicyRule: "rules:deny-rm"},
+		{Seq: 3, Cmd: "systemctl restart nginx", Verdict: "needs-approval", PolicyRule: string(policy.RuleDefaultDeny)},
+	}
+	for i, line := range want {
+		if response.Commands[i] != line {
+			t.Fatalf("policy test json commands[%d] = %+v, want %+v", i, response.Commands[i], line)
+		}
+	}
+
+	// The unquoted single-command form still joins its arguments.
+	stdout, _, err = runCommandForTest(t, "policy", "test", "--host", "web-1", "rm", "/srv/old")
+	if err != nil {
+		t.Fatalf("policy test single err=%v", err)
+	}
+	if stdout != "deny · rule=rules:deny-rm · host=web-1\n" {
+		t.Fatalf("policy test single output = %q", stdout)
+	}
+}
+
+func TestPolicyTestFile(t *testing.T) {
+	home := t.TempDir()
+	writeTestInventory(t, home)
+	writePolicy(t, home, `
+version: 1
+rules:
+  - name: allow-id
+    match: { cmd_regex: '^id$' }
+    action: allow
+`)
+	t.Setenv("AGENTSSH_HOME", home)
+
+	lineFile := filepath.Join(t.TempDir(), "cmds.txt")
+	if err := os.WriteFile(lineFile, []byte("# diagnose\nid\n\nuptime\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stdout, stderr, err := runCommandForTest(t, "policy", "test", "--host", "web-1", "--file", lineFile)
+	if err != nil {
+		t.Fatalf("policy test --file err=%v stdout=%s stderr=%s", err, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "2 commands · 1 allow · 1 deny") || !strings.Contains(stdout, "uptime") {
+		t.Fatalf("policy test --file output = %q", stdout)
+	}
+
+	// The structured plan file plan submit takes is pre-checkable as is.
+	planFile := filepath.Join(t.TempDir(), "plan.yaml")
+	if err := os.WriteFile(planFile, []byte("version: 1\ncommands:\n  - cmd: id\n  - cmd: tee /etc/nginx/nginx.conf\n    stdin_file: nginx.conf\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stdout, stderr, err = runCommandForTest(t, "policy", "test", "--host", "web-1", "--file", planFile)
+	if err != nil {
+		t.Fatalf("policy test structured --file err=%v stdout=%s stderr=%s", err, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "2 commands · 1 allow · 1 deny") || !strings.Contains(stdout, "tee /etc/nginx/nginx.conf") {
+		t.Fatalf("policy test structured --file output = %q", stdout)
+	}
+
+	if _, _, err := runCommandForTest(t, "policy", "test", "--host", "web-1"); err == nil || !isUsageError(err) {
+		t.Fatalf("policy test with no command err = %T %[1]v, want usageError", err)
+	}
+	if _, _, err := runCommandForTest(t, "policy", "test", "web-1", "--", "id"); err == nil || !isUsageError(err) {
+		t.Fatalf("policy test with positional target err = %T %[1]v, want usageError", err)
+	}
+}
+
 func TestApprovalSessionGrantE2E(t *testing.T) {
 	home := t.TempDir()
 	writeTestInventory(t, home)

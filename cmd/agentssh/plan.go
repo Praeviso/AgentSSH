@@ -248,7 +248,7 @@ func runPlanSubmit(cmd *cobra.Command, targetName string, commands []string, ses
 	if !runtime.Enabled {
 		return newUsageError("plan submit requires the async approval channel\n" +
 			"  enable it in ~/.agentssh/policy.yaml (approval.enabled: true) or via AGENTSSH_APPROVAL\n" +
-			"  without approval, pre-check commands with: agentssh policy test --host <host> '<cmd>'")
+			"  without approval, pre-check commands with: agentssh policy test --host <host> -- '<cmd>' '<cmd>'...")
 	}
 	planCommands := make([]planCommand, 0, len(commands))
 	for _, command := range commands {
