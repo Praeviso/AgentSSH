@@ -120,6 +120,9 @@ func (s PendingStore) Create(req PendingRequest) (PendingRequest, error) {
 	}
 	if len(req.ProposedScopes) == 0 {
 		req.ProposedScopes = proposedScopes(req.Candidate)
+		if TaskCandidate(req.Cmd, req.StdinSHA256) != nil {
+			req.ProposedScopes = append(req.ProposedScopes, ScopeTask)
+		}
 	}
 	data, err := json.MarshalIndent(req, "", "  ")
 	if err != nil {

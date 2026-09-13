@@ -21,11 +21,13 @@ import (
 // operator decide each with o/s/h/d. "Consequence-first": the footer shows, for
 // the focused request, exactly what an [h] host-allow would free.
 type approvalsSection struct {
-	paths   config.Paths
-	styles  appStyles
-	runtime approval.RuntimeConfig
-	pending []approval.PendingRequest
-	cursor  int
+	paths         config.Paths
+	styles        appStyles
+	runtime       approval.RuntimeConfig
+	pending       []approval.PendingRequest
+	cursor        int
+	expandedPlans map[string]bool
+	previewOffset int
 	// choosing is the Enter-driven verdict menu: while open the footer swaps to a
 	// selectable once/session/host/deny chooser and this tab owns the keyboard.
 	choosing  bool
@@ -133,10 +135,23 @@ func (s approvalsSection) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		s.cursor = 0
 		s.clearStatus()
 	case "G", "end":
-		s.cursor = maxInt(len(s.pending)-1, 0)
+		s.cursor = s.lastVisibleIndex()
 		s.clearStatus()
 	case "enter":
+		if req, ok := s.selected(); ok && req.PlanID != "" && !s.expandedPlans[req.PlanID] {
+			return s.openPlanChooser()
+		}
 		return s.openChooser()
+	case "e", " ":
+		if req, ok := s.selected(); ok && req.PlanID != "" {
+			if s.expandedPlans == nil {
+				s.expandedPlans = map[string]bool{}
+			}
+			s.expandedPlans[req.PlanID] = !s.expandedPlans[req.PlanID]
+			s.clampCursor()
+		}
+	case "t":
+		return s.openTaskChooser()
 	case "o":
 		return s.resolveWith(approval.VerdictApproved, approval.ScopeOnce)
 	case "s":
@@ -160,6 +175,10 @@ func (s approvalsSection) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (s approvalsSection) updateChoosing(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	choices := s.choices()
 	switch msg.String() {
+	case "j", "down", "pgdown":
+		s.previewOffset++
+	case "k", "up", "pgup":
+		s.previewOffset = maxInt(0, s.previewOffset-1)
 	case "left", "shift+tab":
 		s.choiceIdx = maxInt(s.choiceIdx-1, 0)
 	case "right", "tab":
@@ -171,6 +190,7 @@ func (s approvalsSection) updateChoosing(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "esc":
 		s.choosing = false
+		s.planMode = false
 		s.choiceID = ""
 		s.clearStatus()
 	case "o":
@@ -182,6 +202,11 @@ func (s approvalsSection) updateChoosing(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return s, nil
 		}
 		return s.resolveWith(approval.VerdictApproved, approval.ScopeHost)
+	case "t":
+		if !s.hasTaskChoice() {
+			return s, nil
+		}
+		return s.resolveWith(approval.VerdictApproved, approval.ScopeTask)
 	case "d":
 		return s.resolveWith(approval.VerdictDenied, "")
 	}
@@ -231,6 +256,13 @@ func (s approvalsSection) resolveWith(verdict approval.Verdict, scope approval.S
 		return s, nil
 	}
 	planMode := s.planMode
+	if req, ok := s.selected(); ok && req.PlanID != "" && !s.expandedPlans[req.PlanID] {
+		planMode = true
+	}
+	if planMode && scope == approval.ScopeHost {
+		s.err = fmt.Errorf("expand the plan to approve a single host rule")
+		return s, nil
+	}
 	s.choosing = false
 	s.planMode = false
 	s.choiceID = ""
@@ -289,31 +321,64 @@ func (s approvalsSection) choices() []approvalChoice {
 	if req, ok := s.selected(); ok && !s.planMode && req.Candidate.Promotable {
 		out = append(out, approvalChoice{"host", approval.VerdictApproved, approval.ScopeHost})
 	}
+	if s.hasTaskChoice() {
+		out = append(out, approvalChoice{"task", approval.VerdictApproved, approval.ScopeTask})
+	}
 	return append(out, approvalChoice{"deny", approval.VerdictDenied, ""})
 }
 
+func (s approvalsSection) visibleIndices() []int {
+	var indices []int
+	seen := map[string]bool{}
+	for i, req := range s.pending {
+		if req.PlanID != "" && !s.expandedPlans[req.PlanID] {
+			if seen[req.PlanID] {
+				continue
+			}
+			seen[req.PlanID] = true
+		}
+		indices = append(indices, i)
+	}
+	return indices
+}
+func (s approvalsSection) lastVisibleIndex() int {
+	indices := s.visibleIndices()
+	if len(indices) == 0 {
+		return 0
+	}
+	return indices[len(indices)-1]
+}
 func (s *approvalsSection) moveCursor(delta int) {
 	s.clearStatus()
-	n := len(s.pending)
-	if n == 0 {
+	indices := s.visibleIndices()
+	if len(indices) == 0 {
 		s.cursor = 0
 		return
 	}
-	s.cursor += delta
-	if s.cursor < 0 {
-		s.cursor = 0
+	pos := 0
+	for i, index := range indices {
+		if index == s.cursor {
+			pos = i
+			break
+		}
 	}
-	if s.cursor >= n {
-		s.cursor = n - 1
-	}
+	pos = maxInt(0, minInt(len(indices)-1, pos+delta))
+	s.cursor = indices[pos]
 }
-
 func (s *approvalsSection) clampCursor() {
 	if s.cursor >= len(s.pending) {
 		s.cursor = maxInt(len(s.pending)-1, 0)
 	}
 	if s.cursor < 0 {
 		s.cursor = 0
+	}
+	if req, ok := s.selected(); ok && req.PlanID != "" && !s.expandedPlans[req.PlanID] {
+		for i, r := range s.pending {
+			if r.PlanID == req.PlanID {
+				s.cursor = i
+				break
+			}
+		}
 	}
 }
 
@@ -362,6 +427,7 @@ func (s approvalsSection) decide(verdict approval.Verdict, scope approval.Scope)
 		Bundle:     policy.Bundle{Policy: pol, Inventory: inv},
 		PolicyPath: s.paths.PolicyFile,
 		SessionTTL: s.runtime.SessionTTL,
+		TaskTTL:    s.runtime.TaskTTL,
 		Channel:    approval.ChannelTUI,
 		SavePolicy: func(next policy.Config) error {
 			return policy.Save(s.paths.PolicyFile, next)
@@ -406,6 +472,7 @@ func (s approvalsSection) decidePlan(verdict approval.Verdict, scope approval.Sc
 		Bundle:     policy.Bundle{Policy: pol, Inventory: inv},
 		PolicyPath: s.paths.PolicyFile,
 		SessionTTL: s.runtime.SessionTTL,
+		TaskTTL:    s.runtime.TaskTTL,
 		Channel:    approval.ChannelTUI,
 		SavePolicy: func(next policy.Config) error {
 			return policy.Save(s.paths.PolicyFile, next)
@@ -453,7 +520,7 @@ func (s approvalsSection) helpKeyMap() help.KeyMap {
 		short: []key.Binding{hk("enter", "decide"), hk("j/k", "move"), hk("r", "refresh")},
 		full: [][]key.Binding{
 			{hk("j/k", "move"), hk("g/G", "home/end"), hk("enter", "decide"), hk("r", "refresh")},
-			{hk("o", "once"), hk("s", "session"), hk("h", "host"), hk("d", "deny"), hk("p", "plan")},
+			{hk("o", "once"), hk("s", "exact session"), hk("t", "task scope"), hk("e", "expand plan"), hk("h", "host"), hk("d", "deny"), hk("p", "plan")},
 		},
 	}
 }
@@ -474,27 +541,52 @@ func (s approvalsSection) View() string {
 		}
 		return body
 	}
+	if s.choosing && s.choiceIdx < len(s.choices()) && s.choices()[s.choiceIdx].scope == approval.ScopeTask {
+		return s.taskReviewView(inner)
+	}
 
 	var b strings.Builder
 	visible := s.visibleRows()
-	start, end := scrollWindow(s.cursor, len(s.pending), visible)
+	indices := s.visibleIndices()
+	position := 0
+	for i, index := range indices {
+		if index == s.cursor {
+			position = i
+			break
+		}
+	}
+	start, end := scrollWindow(position, len(indices), visible)
 	rows := make([][]string, 0, end-start)
 	for i := start; i < end; i++ {
-		rows = append(rows, approvalRow(s.pending[i]))
+		req := s.pending[indices[i]]
+		row := approvalRow(req)
+		if req.PlanID != "" && !s.expandedPlans[req.PlanID] {
+			count := 0
+			for _, member := range s.pending {
+				if member.PlanID == req.PlanID {
+					count++
+				}
+			}
+			row = []string{shortPlanID(req.PlanID), req.Host, fmt.Sprintf("%d commands · %s · [e] expand", count, req.SessionID), "plan"}
+		}
+		rows = append(rows, row)
 	}
 	// Reuse the shared responsive table (fill=true) so the columns span the
 	// frame instead of clumping at fixed widths: COMMAND takes the slack, HOST
 	// shows in full, KIND is a tidy right column.
-	b.WriteString(renderTable(s.styles, approvalColumns, rows, s.cursor-start, inner, true))
+	b.WriteString(renderTable(s.styles, approvalColumns, rows, position-start, inner, true))
 	b.WriteString("\n")
-	if end < len(s.pending) || start > 0 {
-		b.WriteString(s.styles.dim.Render(fmt.Sprintf("%d-%d of %d", start+1, end, len(s.pending))))
+	if end < len(indices) || start > 0 {
+		b.WriteString(s.styles.dim.Render(fmt.Sprintf("%d-%d of %d", start+1, end, len(indices))))
 		b.WriteString("\n")
 	}
 	b.WriteString(s.styles.dim.Render(strings.Repeat("─", inner)))
 	b.WriteString("\n")
 	if req, ok := s.selected(); ok {
 		b.WriteString(truncate(s.consequenceLine(req), inner))
+		if s.hasTaskChoice() && !s.choosing {
+			b.WriteString("\n" + s.styles.dim.Render("[t] review task permissions · expires "+s.taskTTL().String()+" after approval"))
+		}
 	}
 	switch {
 	case s.choosing:

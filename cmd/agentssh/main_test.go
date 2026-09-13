@@ -908,7 +908,7 @@ output:
 	}
 }
 
-func TestPolicyTestIsStaticAndIgnoresSessionGrant(t *testing.T) {
+func TestPolicyTestIncludesSessionGrant(t *testing.T) {
 	home := t.TempDir()
 	writeTestInventory(t, home)
 	writePolicy(t, home, `
@@ -932,8 +932,8 @@ output:
 	if err != nil {
 		t.Fatalf("policy test err=%v stdout=%s stderr=%s", err, stdout, stderr)
 	}
-	if !strings.Contains(stdout, "needs-approval") || strings.Contains(stdout, "approval/session") {
-		t.Fatalf("policy test should be static gray, got %q", stdout)
+	if !strings.Contains(stdout, "allow") || !strings.Contains(stdout, "approval/session") {
+		t.Fatalf("policy test should include session grants, got %q", stdout)
 	}
 
 	cfg := readPolicyFile(t, home)
@@ -948,11 +948,11 @@ output:
 	if err := policy.Save(filepath.Join(home, "policy.yaml"), cfg); err != nil {
 		t.Fatal(err)
 	}
-	stdout, stderr, err = runCommandForTest(t, "policy", "test", "--host", "web-1", "id")
+	stdout, stderr, err = runCommandForTest(t, "policy", "test", "--host", "web-1", "--session", "other", "id")
 	if err != nil {
 		t.Fatalf("policy test persisted host grant err=%v stdout=%s stderr=%s", err, stdout, stderr)
 	}
-	if !strings.Contains(stdout, "allow") || !strings.Contains(stdout, "host:web-1/rules[0]") {
+	if !strings.Contains(stdout, "allow") || !strings.Contains(stdout, "approval/host/") {
 		t.Fatalf("policy test should include persisted host grants, got %q", stdout)
 	}
 }
@@ -1012,7 +1012,7 @@ rules:
 		{Seq: 3, Cmd: "systemctl restart nginx", Verdict: "needs-approval", PolicyRule: string(policy.RuleDefaultDeny)},
 	}
 	for i, line := range want {
-		if response.Commands[i] != line {
+		if got := response.Commands[i]; got.Seq != line.Seq || got.Cmd != line.Cmd || got.Verdict != line.Verdict || got.PolicyRule != line.PolicyRule {
 			t.Fatalf("policy test json commands[%d] = %+v, want %+v", i, response.Commands[i], line)
 		}
 	}
@@ -1053,7 +1053,8 @@ rules:
 
 	// The structured plan file plan submit takes is pre-checkable as is.
 	planFile := filepath.Join(t.TempDir(), "plan.yaml")
-	if err := os.WriteFile(planFile, []byte("version: 1\ncommands:\n  - cmd: id\n  - cmd: tee /etc/nginx/nginx.conf\n    stdin_file: nginx.conf\n"), 0o600); err != nil {
+	payload := writeStdinFile(t, "test config")
+	if err := os.WriteFile(planFile, []byte("version: 1\ncommands:\n  - cmd: id\n  - cmd: tee /etc/nginx/nginx.conf\n    stdin_file: "+payload+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	stdout, stderr, err = runCommandForTest(t, "policy", "test", "--host", "web-1", "--file", planFile)

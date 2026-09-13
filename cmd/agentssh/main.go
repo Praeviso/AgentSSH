@@ -23,6 +23,7 @@ import (
 	"filippo.io/age"
 	"github.com/Praeviso/AgentSSH/internal/approval"
 	"github.com/Praeviso/AgentSSH/internal/audit"
+	"github.com/Praeviso/AgentSSH/internal/commandline"
 	"github.com/Praeviso/AgentSSH/internal/config"
 	"github.com/Praeviso/AgentSSH/internal/discovery"
 	"github.com/Praeviso/AgentSSH/internal/executor"
@@ -199,7 +200,13 @@ func newRunCommand() *cobra.Command {
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			target := args[0]
-			remoteCommand := strings.Join(args[1:], " ")
+			remoteCommand, err := commandline.Shell(strings.Join(args[1:], " "), flags.cwd)
+			if flags.argv {
+				remoteCommand, err = commandline.Render(args[1:], flags.cwd)
+			}
+			if err != nil {
+				return newUsageError("%v", err)
+			}
 			if _, err := parseRunFields(flags.fields); err != nil {
 				return err
 			}
@@ -214,6 +221,9 @@ func newRunCommand() *cobra.Command {
 	cmd.Flags().BoolVar(&flags.jsonOutput, "json", false, "emit machine-readable JSON")
 	cmd.Flags().StringVar(&flags.fields, "fields", "", "comma-separated JSON fields to emit (implies --json), e.g. req_id,status,exit_code,stdout")
 	cmd.Flags().StringVar(&flags.stdinFile, "stdin-file", "", "local file streamed to the remote command's stdin (audited by sha256+size; approvals bind to the exact content)")
+	cmd.Flags().StringVar(&flags.cwd, "cwd", "", "absolute remote working directory (not an isolation boundary)")
+	cmd.Flags().BoolVar(&flags.argv, "argv", false, "treat arguments after -- as literal argv, preserving argument boundaries")
+	cmd.Flags().StringVar(&flags.waitApproval, "wait-approval", "", "wait up to this duration for approval, then execute the unchanged request, e.g. 30s")
 	return cmd
 }
 
@@ -460,6 +470,9 @@ func newPolicyCommand() *cobra.Command {
 		host       string
 		file       string
 		jsonOutput bool
+		session    string
+		stdinFile  string
+		cwd        string
 	}
 	testCmd := &cobra.Command{
 		Use:   "test [--host <host>] [--file <path>] [--json] <cmd> | -- <cmd> <cmd>...",
@@ -468,7 +481,7 @@ func newPolicyCommand() *cobra.Command {
 			"After --, each argument is one complete command (quote each one), and --file adds one\n" +
 			"command per line -- or the same structured version: 1 plan file that plan submit takes,\n" +
 			"so a whole batch is pre-checked in a single call instead of one call per command.\n" +
-			"stdin_file entries are ignored: policy never matches on stdin.\n" +
+			"Includes current session grants and stdin identities; execution rechecks authorization.\n" +
 			"Verdicts print on stdout; the exit code stays 0 for allow, deny and needs-approval alike.",
 		Args: func(cmd *cobra.Command, args []string) error {
 			if cmd.ArgsLenAtDash() > 0 {
@@ -480,12 +493,15 @@ func newPolicyCommand() *cobra.Command {
 			return nil
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runPolicyTest(cmd, testFlags.host, policyTestCommands(cmd, args), testFlags.file, testFlags.jsonOutput)
+			return runPolicyTest(cmd, testFlags.host, policyTestCommands(cmd, args), testFlags.file, testFlags.jsonOutput, runFlags{session: testFlags.session, stdinFile: testFlags.stdinFile, cwd: testFlags.cwd})
 		},
 	}
-	testCmd.Flags().StringVar(&testFlags.host, "host", "", "include host/group override context")
+	testCmd.Flags().StringVar(&testFlags.host, "host", "", "evaluate one configured host, including its policy overrides and grants")
 	testCmd.Flags().StringVar(&testFlags.file, "file", "", "read commands from a line file or a structured version: 1 plan")
 	testCmd.Flags().BoolVar(&testFlags.jsonOutput, "json", false, "emit machine-readable JSON")
+	testCmd.Flags().StringVar(&testFlags.session, "session", "", "include grants from this session (defaults to AGENTSSH_SESSION)")
+	testCmd.Flags().StringVar(&testFlags.stdinFile, "stdin-file", "", "include the exact stdin payload for command arguments")
+	testCmd.Flags().StringVar(&testFlags.cwd, "cwd", "", "absolute remote working directory for command arguments")
 	cmd.AddCommand(
 		&cobra.Command{
 			Use:   "show",
@@ -841,14 +857,14 @@ func newApprovalCommand() *cobra.Command {
 	}
 	lsCmd.Flags().BoolVar(&lsJSON, "json", false, "emit machine-readable JSON")
 
-	var grantOnce, grantSession, grantHost bool
+	var grantOnce, grantSession, grantHost, grantTask bool
 	grantCmd := &cobra.Command{
-		Use:               "grant <id> --once|--session|--host",
+		Use:               "grant <id> --once|--session|--host|--task",
 		Short:             "Approve a pending request.",
 		Args:              exactArgs(1),
 		PersistentPreRunE: requireOperator,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			scope, err := approvalScopeFromFlags(grantOnce, grantSession, grantHost)
+			scope, err := approvalScopeFromFlags(grantOnce, grantSession, grantHost, grantTask)
 			if err != nil {
 				return err
 			}
@@ -858,6 +874,7 @@ func newApprovalCommand() *cobra.Command {
 	grantCmd.Flags().BoolVar(&grantOnce, "once", false, "approve one rerun")
 	grantCmd.Flags().BoolVar(&grantSession, "session", false, "approve this session")
 	grantCmd.Flags().BoolVar(&grantHost, "host", false, "persist an approval host rule")
+	grantCmd.Flags().BoolVar(&grantTask, "task", false, "approve the displayed bounded task profile until task_ttl (default 2h)")
 
 	denyCmd := &cobra.Command{
 		Use:               "deny <id>",
@@ -896,6 +913,23 @@ func newSessionCommand() *cobra.Command {
 		Use:   "session",
 		Short: "Browse audit sessions.",
 	}
+	cmd.AddCommand(&cobra.Command{
+		Use: "grants <id>", Short: "Show current session permissions and expiry as JSON.", Args: exactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.Load()
+			if err != nil {
+				return classifyConfigError(err)
+			}
+			grants, err := (approval.SessionStore{Dir: cfg.Paths.SessionsDir}).List(args[0])
+			if err != nil {
+				return err
+			}
+			if grants == nil {
+				grants = []approval.Grant{}
+			}
+			return writeJSON(cmd, grants)
+		},
+	})
 	cmd.AddCommand(&cobra.Command{
 		Use:   "ls",
 		Short: "List recent sessions.",
@@ -961,21 +995,16 @@ func exactArgs(count int) cobra.PositionalArgs {
 	}
 }
 
-func minArgs(count int) cobra.PositionalArgs {
-	return func(_ *cobra.Command, args []string) error {
-		if len(args) < count {
-			return newUsageError("requires at least %d arg(s), received %d", count, len(args))
-		}
-		return nil
-	}
-}
-
 type runFlags struct {
-	session      string
-	sessionLabel string
-	jsonOutput   bool
-	fields       string
-	stdinFile    string
+	cwd           string
+	argv          bool
+	waitApproval  string
+	stdinSnapshot *stdinSpec
+	session       string
+	sessionLabel  string
+	jsonOutput    bool
+	fields        string
+	stdinFile     string
 }
 
 // maxStdinBytes caps --stdin-file payloads. Stdin exists for configuration
@@ -1039,26 +1068,31 @@ func stampStdin(record audit.Record, stdin stdinSpec) audit.Record {
 }
 
 type runResponse struct {
-	ReqID           string   `json:"req_id"`
-	SessionID       string   `json:"session_id"`
-	Host            string   `json:"host"`
-	Cmd             string   `json:"cmd,omitempty"`
-	CmdSHA256       string   `json:"cmd_sha256,omitempty"`
-	CmdTruncated    bool     `json:"cmd_truncated,omitempty"`
-	StdinSHA256     string   `json:"stdin_sha256,omitempty"`
-	StdinBytes      int64    `json:"stdin_bytes,omitempty"`
-	Status          string   `json:"status"`
-	ExitCode        int      `json:"exit_code"`
-	DurationMS      int64    `json:"duration_ms"`
-	Stdout          string   `json:"stdout"`
-	Stderr          string   `json:"stderr"`
-	OutputTruncated bool     `json:"output_truncated"`
-	Redactions      int      `json:"redactions"`
-	PolicyAction    string   `json:"policy_action,omitempty"`
-	PolicyRule      string   `json:"policy_rule,omitempty"`
-	ApprovalID      string   `json:"approval_id,omitempty"`
-	ApprovalMatcher string   `json:"approval_matcher,omitempty"`
-	ProposedScopes  []string `json:"proposed_scope,omitempty"`
+	ExecutionState  string                   `json:"execution_state"`
+	NextAction      string                   `json:"next_action,omitempty"`
+	GrantScope      string                   `json:"grant_scope,omitempty"`
+	GrantExpiresTS  string                   `json:"grant_expires_ts,omitempty"`
+	Task            *approval.TaskPermission `json:"task_permission,omitempty"`
+	ReqID           string                   `json:"req_id"`
+	SessionID       string                   `json:"session_id"`
+	Host            string                   `json:"host"`
+	Cmd             string                   `json:"cmd,omitempty"`
+	CmdSHA256       string                   `json:"cmd_sha256,omitempty"`
+	CmdTruncated    bool                     `json:"cmd_truncated,omitempty"`
+	StdinSHA256     string                   `json:"stdin_sha256,omitempty"`
+	StdinBytes      int64                    `json:"stdin_bytes,omitempty"`
+	Status          string                   `json:"status"`
+	ExitCode        int                      `json:"exit_code"`
+	DurationMS      int64                    `json:"duration_ms"`
+	Stdout          string                   `json:"stdout"`
+	Stderr          string                   `json:"stderr"`
+	OutputTruncated bool                     `json:"output_truncated"`
+	Redactions      int                      `json:"redactions"`
+	PolicyAction    string                   `json:"policy_action,omitempty"`
+	PolicyRule      string                   `json:"policy_rule,omitempty"`
+	ApprovalID      string                   `json:"approval_id,omitempty"`
+	ApprovalMatcher string                   `json:"approval_matcher,omitempty"`
+	ProposedScopes  []string                 `json:"proposed_scope,omitempty"`
 }
 
 // cmdEchoMaxBytes caps the command echoed back in run JSON responses. The full
@@ -1071,6 +1105,21 @@ const cmdEchoMaxBytes = 2048
 // status branches carry the same fields.
 func finalizeRunResponses(responses []runResponse, stdin stdinSpec) {
 	for i := range responses {
+		switch responses[i].Status {
+		case "completed", "failed":
+			responses[i].ExecutionState = "finished"
+		case "ssh_error":
+			responses[i].ExecutionState = "unknown"
+			responses[i].NextAction = "inspect_before_retry"
+		default:
+			responses[i].ExecutionState = "not_started"
+		}
+		if responses[i].Status == "approval_pending" {
+			responses[i].NextAction = "wait_for_approval"
+		}
+		if responses[i].Status == "denied" {
+			responses[i].NextAction = "stop"
+		}
 		responses[i].StdinSHA256 = stdin.sha256
 		responses[i].StdinBytes = stdin.bytes
 		if responses[i].Cmd == "" {
@@ -2268,6 +2317,9 @@ func printHosts(cmd *cobra.Command, public inventory.PublicInventory, jsonOutput
 }
 
 func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flags runFlags) error {
+	if flags.waitApproval != "" {
+		return runAwaited(cmd, targetName, remoteCommand, flags)
+	}
 	cfg, err := config.Load()
 	if err != nil {
 		return classifyConfigError(err)
@@ -2290,7 +2342,12 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 	store := audit.NewStore(cfg.Paths.AuditFile)
 	sessionStore := approval.SessionStore{Dir: cfg.Paths.SessionsDir}
 	pendingStore := approvalStore(cfg.Paths)
-	stdin, err := loadStdinSpec("--stdin-file", flags.stdinFile)
+	var stdin stdinSpec
+	if flags.stdinSnapshot != nil {
+		stdin = *flags.stdinSnapshot
+	} else {
+		stdin, err = loadStdinSpec("--stdin-file", flags.stdinFile)
+	}
 	if err != nil {
 		return err
 	}
@@ -2307,7 +2364,7 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 	// Intercept SIGINT/SIGTERM so a locally cancelled run can settle its
 	// once-grant claim (release, not consume) and audit the failed attempt.
 	// A second signal restores default delivery and kills the process.
-	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stopSignals := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
 	go func() {
 		<-ctx.Done()
@@ -2317,6 +2374,9 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 	exitCode := exitOK
 	responses := make([]runResponse, 0, len(resolved.Targets))
 	for _, plan := range plans {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		target := plan.Target
 		sessionCtx := plan.SessionCtx
 		reqID := plan.ReqID
@@ -2435,6 +2495,8 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 				Redactions:      filtered.Redactions,
 				PolicyAction:    string(decision.Action),
 				PolicyRule:      decision.Rule,
+				GrantScope:      string(auth.GrantScope),
+				GrantExpiresTS:  auth.GrantExpiresTS,
 			})
 			if isSSHErrorResult(result) {
 				printSSHErrorHint(cmd, result)
@@ -2629,6 +2691,7 @@ func appendApprovalPending(cmd *cobra.Command, pending approval.PendingStore, st
 		ApprovalID:      req.ID,
 		ApprovalMatcher: req.Candidate.Regex,
 		ProposedScopes:  scopeStrings(req.ProposedScopes),
+		Task:            approval.TaskCandidate(req.Cmd, req.StdinSHA256),
 	}
 	if !flags.jsonOutput {
 		printApprovalPendingHuman(cmd, plan.Target.Name, req)
@@ -3435,10 +3498,15 @@ func formatRuleFields(rule policy.Rule, includeGroup bool) string {
 const verdictNeedsApproval = "needs-approval"
 
 type policyTestLine struct {
-	Seq        int    `json:"seq"`
-	Cmd        string `json:"cmd"`
-	Verdict    string `json:"verdict"` // allow | deny | needs-approval
-	PolicyRule string `json:"policy_rule"`
+	Authorization  string                   `json:"authorization"`
+	GrantScope     string                   `json:"grant_scope,omitempty"`
+	GrantExpiresTS string                   `json:"grant_expires_ts,omitempty"`
+	StdinSHA256    string                   `json:"stdin_sha256,omitempty"`
+	Task           *approval.TaskPermission `json:"task_permission,omitempty"`
+	Seq            int                      `json:"seq"`
+	Cmd            string                   `json:"cmd"`
+	Verdict        string                   `json:"verdict"` // allow | deny | needs-approval
+	PolicyRule     string                   `json:"policy_rule"`
 }
 
 type policyTestResponse struct {
@@ -3463,28 +3531,7 @@ func policyTestCommands(cmd *cobra.Command, args []string) []string {
 	return []string{strings.Join(args, " ")}
 }
 
-// policyTestFileCommands reads the same two file shapes plan submit accepts, so
-// the file an agent is about to submit as a plan can be pre-checked as is.
-func policyTestFileCommands(file string) ([]string, error) {
-	data, err := os.ReadFile(file)
-	if err != nil {
-		return nil, newUsageError("cannot read --file: %v", err)
-	}
-	if !declaresStructuredPlan(data) {
-		return planFileLines(data), nil
-	}
-	planCommands, err := parseStructuredPlan(data)
-	if err != nil {
-		return nil, err
-	}
-	commands := make([]string, 0, len(planCommands))
-	for _, planCommand := range planCommands {
-		commands = append(commands, planCommand.Cmd)
-	}
-	return commands, nil
-}
-
-func runPolicyTest(cmd *cobra.Command, host string, commands []string, file string, jsonOutput bool) error {
+func runPolicyTest(cmd *cobra.Command, host string, commands []string, file string, jsonOutput bool, options ...runFlags) error {
 	cfg, err := config.Load()
 	if err != nil {
 		return classifyConfigError(err)
@@ -3493,48 +3540,74 @@ func runPolicyTest(cmd *cobra.Command, host string, commands []string, file stri
 	if err != nil {
 		return newUsageError("%v", err)
 	}
-	engine, err := policy.NewEngine(cfg.Policy, cfg.Inventory)
-	if err != nil {
-		return newUsageError("policy.yaml is invalid: %v\n  fix the rule in ~/.agentssh/policy.yaml, then re-run (check: agentssh policy show)", err)
+	var flags runFlags
+	if len(options) > 0 {
+		flags = options[0]
 	}
-	if strings.TrimSpace(file) != "" {
-		fromFile, err := policyTestFileCommands(file)
+	sessionID := flags.session
+	if sessionID == "" {
+		sessionID = os.Getenv(session.EnvSession)
+	}
+	if host != "" {
+		resolved, err := inventory.NewResolver(cfg.Inventory).Resolve(host)
 		if err != nil {
-			return err
+			return newUsageError("%v", err)
 		}
-		commands = append(commands, fromFile...)
+		if len(resolved.Targets) != 1 || resolved.Kind != inventory.TargetKindHost {
+			return newUsageError("policy test --host requires one host")
+		}
+		host = resolved.Targets[0].Name
 	}
-
-	response := policyTestResponse{Host: host}
+	var inputs []planCommand
 	for _, command := range commands {
 		if strings.TrimSpace(command) == "" {
 			continue
 		}
-		decision, err := engine.Evaluate(host, command)
+		rendered, err := commandline.Shell(command, flags.cwd)
+		if err != nil {
+			return newUsageError("%v", err)
+		}
+		inputs = append(inputs, planCommand{Cmd: rendered, StdinFile: flags.stdinFile})
+	}
+	if file != "" {
+		fromFile, err := readPlanCommands(file)
 		if err != nil {
 			return err
 		}
-		verdict := string(decision.Action)
-		if decision.Rule == policy.RuleDefaultDeny && runtime.Enabled {
-			verdict = verdictNeedsApproval
+		inputs = append(inputs, fromFile...)
+	}
+	if len(inputs) == 0 {
+		return newUsageError("requires at least one command (after -- or via --file <path>)")
+	}
+	if err := resolveStdin(inputs); err != nil {
+		return err
+	}
+	response := policyTestResponse{Host: host}
+	for _, input := range inputs {
+		auth, err := approval.PreflightAuthorize(cfg.Policy, cfg.Inventory, approval.SessionStore{Dir: cfg.Paths.SessionsDir}, runtime, sessionID, host, input.Cmd, input.stdin.sha256)
+		if err != nil {
+			return newUsageError("cannot evaluate authorization: %v", err)
 		}
-		switch verdict {
-		case verdictNeedsApproval:
-			response.NeedsApproval++
-		case string(policy.ActionAllow):
+		verdict := "deny"
+		switch auth.Status {
+		case approval.AuthAllow, approval.AuthAllowByGrant:
+			verdict = "allow"
 			response.Allow++
+		case approval.AuthNeedsApproval:
+			if runtime.Enabled {
+				verdict = verdictNeedsApproval
+				response.NeedsApproval++
+			} else {
+				response.Deny++
+			}
 		default:
 			response.Deny++
 		}
-		response.Commands = append(response.Commands, policyTestLine{
-			Seq:        len(response.Commands) + 1,
-			Cmd:        command,
-			Verdict:    verdict,
-			PolicyRule: string(decision.Rule),
-		})
-	}
-	if len(response.Commands) == 0 {
-		return newUsageError("requires at least one command (after -- or via --file <path>)")
+		permission := auth.Task
+		if permission == nil && auth.Status == approval.AuthNeedsApproval {
+			permission = approval.TaskCandidate(input.Cmd, input.stdin.sha256)
+		}
+		response.Commands = append(response.Commands, policyTestLine{Seq: len(response.Commands) + 1, Cmd: input.Cmd, Verdict: verdict, PolicyRule: auth.Decision.Rule, Authorization: string(auth.Status), GrantScope: string(auth.GrantScope), GrantExpiresTS: auth.GrantExpiresTS, StdinSHA256: input.stdin.sha256, Task: permission})
 	}
 	if jsonOutput {
 		return writeJSON(cmd, response)
@@ -3808,6 +3881,7 @@ func runApprovalGrant(cmd *cobra.Command, id string, scope approval.Scope) error
 		Bundle:     policy.Bundle{Policy: cfg.Policy, Inventory: cfg.Inventory},
 		PolicyPath: cfg.Paths.PolicyFile,
 		SessionTTL: runtime.SessionTTL,
+		TaskTTL:    runtime.TaskTTL,
 		Channel:    approval.ChannelCLI,
 		SavePolicy: func(next policy.Config) error {
 			return saveValidatedPolicy(cfg.Paths, next)
@@ -3929,9 +4003,13 @@ func approvalStatusExit(status approval.StatusResult) error {
 	}
 }
 
-func approvalScopeFromFlags(once, sessionScope, host bool) (approval.Scope, error) {
+func approvalScopeFromFlags(once, sessionScope, host bool, task ...bool) (approval.Scope, error) {
 	count := 0
 	var scope approval.Scope
+	if len(task) > 0 && task[0] {
+		count++
+		scope = approval.ScopeTask
+	}
 	if once {
 		count++
 		scope = approval.ScopeOnce
@@ -3945,7 +4023,7 @@ func approvalScopeFromFlags(once, sessionScope, host bool) (approval.Scope, erro
 		scope = approval.ScopeHost
 	}
 	if count != 1 {
-		return "", newUsageError("approval grant requires exactly one of --once, --session, or --host")
+		return "", newUsageError("approval grant requires exactly one of --once, --session, --host, or --task")
 	}
 	return scope, nil
 }

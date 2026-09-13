@@ -11,6 +11,7 @@ import (
 
 	"github.com/Praeviso/AgentSSH/internal/approval"
 	"github.com/Praeviso/AgentSSH/internal/audit"
+	"github.com/Praeviso/AgentSSH/internal/commandline"
 	"github.com/Praeviso/AgentSSH/internal/config"
 	"github.com/Praeviso/AgentSSH/internal/inventory"
 	"github.com/Praeviso/AgentSSH/internal/policy"
@@ -88,27 +89,23 @@ func newPlanCommand() *cobra.Command {
 	waitCmd.Flags().StringVar(&waitTimeout, "timeout", "", "maximum wait duration, e.g. 10m")
 	waitCmd.Flags().BoolVar(&waitJSON, "json", false, "emit machine-readable JSON")
 
-	var grantOnce, grantSession bool
+	var grantOnce, grantSession, grantTask bool
 	grantCmd := &cobra.Command{
-		Use:               "grant <plan_id> --once|--session",
+		Use:               "grant <plan_id> --once|--session|--task",
 		Short:             "Approve every pending command in a plan.",
 		Args:              exactArgs(1),
 		PersistentPreRunE: requireOperator,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			var scope approval.Scope
-			switch {
-			case grantOnce && !grantSession:
-				scope = approval.ScopeOnce
-			case grantSession && !grantOnce:
-				scope = approval.ScopeSession
-			default:
-				return newUsageError("choose exactly one of --once or --session (plans never grant host scope; use approval grant <id> --host per command)")
+			scope, err := approvalScopeFromFlags(grantOnce, grantSession, false, grantTask)
+			if err != nil {
+				return newUsageError("choose exactly one of --once, --session or --task (plans never grant host scope)")
 			}
 			return runPlanDecision(cmd, args[0], approval.VerdictApproved, scope)
 		},
 	}
 	grantCmd.Flags().BoolVar(&grantOnce, "once", false, "approve one run per command")
 	grantCmd.Flags().BoolVar(&grantSession, "session", false, "approve each command for this session")
+	grantCmd.Flags().BoolVar(&grantTask, "task", false, "approve bounded task profiles; unsupported commands stay exact for the same task lifetime")
 
 	denyCmd := &cobra.Command{
 		Use:               "deny <plan_id>",
@@ -120,18 +117,19 @@ func newPlanCommand() *cobra.Command {
 		},
 	}
 
-	cmd.AddCommand(submitCmd, statusCmd, waitCmd, grantCmd, denyCmd)
+	cmd.AddCommand(submitCmd, statusCmd, waitCmd, grantCmd, denyCmd, newPlanRunCommand(), newPlanResumeCommand(), newPlanExecutionStatusCommand())
 	return cmd
 }
 
 type planSubmitLine struct {
-	Seq         int    `json:"seq"`
-	Cmd         string `json:"cmd"`
-	Status      string `json:"status"` // allowed | denied | approval_pending
-	PolicyRule  string `json:"policy_rule,omitempty"`
-	ApprovalID  string `json:"approval_id,omitempty"`
-	StdinSHA256 string `json:"stdin_sha256,omitempty"`
-	StdinBytes  int64  `json:"stdin_bytes,omitempty"`
+	Seq         int                      `json:"seq"`
+	Cmd         string                   `json:"cmd"`
+	Status      string                   `json:"status"` // allowed | denied | approval_pending
+	PolicyRule  string                   `json:"policy_rule,omitempty"`
+	ApprovalID  string                   `json:"approval_id,omitempty"`
+	StdinSHA256 string                   `json:"stdin_sha256,omitempty"`
+	StdinBytes  int64                    `json:"stdin_bytes,omitempty"`
+	Task        *approval.TaskPermission `json:"task_permission,omitempty"`
 }
 
 type planSubmitResponse struct {
@@ -150,7 +148,9 @@ type planSpec struct {
 }
 
 type planCommand struct {
-	Cmd string `yaml:"cmd"`
+	Cmd  string   `yaml:"cmd"`
+	Argv []string `yaml:"argv,omitempty"`
+	CWD  string   `yaml:"cwd,omitempty"`
 	// StdinFile is resolved relative to the current working directory, the same
 	// frame of reference as run --stdin-file -- not relative to the plan file.
 	StdinFile string `yaml:"stdin_file"`
@@ -190,6 +190,7 @@ func declaresStructuredPlan(data []byte) bool {
 
 func parseStructuredPlan(data []byte) ([]planCommand, error) {
 	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	decoder.KnownFields(true)
 	var spec planSpec
 	if err := decoder.Decode(&spec); err != nil {
 		return nil, newUsageError("cannot parse structured --file: %v", err)
@@ -215,12 +216,27 @@ func parseStructuredPlan(data []byte) ([]planCommand, error) {
 		// newline, and a command whose text differs by so much as that newline
 		// mints a grant no later run can ever match.
 		spec.Commands[i].Cmd = strings.TrimSpace(spec.Commands[i].Cmd)
-		if spec.Commands[i].Cmd == "" {
-			return nil, newUsageError("structured plan commands[%d].cmd is required", i)
-		}
-		if strings.ContainsAny(spec.Commands[i].Cmd, "\n\r") {
+		c := &spec.Commands[i]
+		if strings.ContainsAny(c.Cmd, "\n\r") {
 			return nil, newUsageError("structured plan commands[%d].cmd must be a single line", i)
 		}
+		if c.Cmd == "" && len(c.Argv) == 0 {
+			return nil, newUsageError("structured plan commands[%d].cmd or argv is required", i)
+		}
+		if c.Cmd != "" && c.Argv != nil {
+			return nil, newUsageError("structured plan commands[%d] must choose cmd or argv", i)
+		}
+		var err error
+		if c.Argv != nil {
+			c.Cmd, err = commandline.Render(c.Argv, c.CWD)
+		} else {
+			c.Cmd, err = commandline.Shell(c.Cmd, c.CWD)
+		}
+		if err != nil {
+			return nil, newUsageError("commands[%d]: %v", i, err)
+		}
+		c.Argv = nil
+		c.CWD = ""
 	}
 	return spec.Commands, nil
 }
@@ -237,6 +253,21 @@ func resolveStdin(commands []planCommand) error {
 		commands[i].stdin = stdin
 	}
 	return nil
+}
+
+func readPlanCommands(file string) ([]planCommand, error) {
+	data, err := os.ReadFile(file)
+	if err != nil {
+		return nil, newUsageError("cannot read --file: %v", err)
+	}
+	if declaresStructuredPlan(data) {
+		return parseStructuredPlan(data)
+	}
+	var commands []planCommand
+	for _, line := range planFileLines(data) {
+		commands = append(commands, planCommand{Cmd: line})
+	}
+	return commands, nil
 }
 
 func runPlanSubmit(cmd *cobra.Command, targetName string, commands []string, sessionFlag string, sessionLabel string, file string, jsonOutput bool) error {
@@ -283,23 +314,39 @@ func runPlanSubmit(cmd *cobra.Command, targetName string, commands []string, ses
 		return err
 	}
 
+	response, err := submitPlanInputs(cmd, cfg, runtime, targetName, planCommands, sessionFlag, sessionLabel)
+	if response.SessionID == "" {
+		return err
+	}
+	if jsonOutput {
+		if emitErr := writeJSON(cmd, response); emitErr != nil {
+			return emitErr
+		}
+	} else {
+		printPlanSubmitHuman(cmd, response)
+	}
+	return err
+}
+
+func submitPlanInputs(cmd *cobra.Command, cfg *config.Config, runtime approval.RuntimeConfig, targetName string, planCommands []planCommand, sessionFlag, sessionLabel string) (response planSubmitResponse, resultErr error) {
+
 	resolved, err := inventory.NewResolver(cfg.Inventory).Resolve(targetName)
 	if err != nil {
-		return newUsageError("%v\n  list all hosts: agentssh hosts", err)
+		return response, newUsageError("%v\n  list all hosts: agentssh hosts", err)
 	}
 	if resolved.Kind != inventory.TargetKindHost || len(resolved.Targets) != 1 {
-		return newUsageError("plan submit targets a single host; submit one plan per host")
+		return response, newUsageError("plan submit targets a single host; submit one plan per host")
 	}
 	target := resolved.Targets[0]
 
 	sessionCtx, err := (session.Resolver{}).Resolve(target.Name, sessionFlag, sessionLabel)
 	if err != nil {
 		if errors.Is(err, session.ErrNoSession) {
-			return newUsageError("a session must be declared for plan submit\n" +
+			return response, newUsageError("a session must be declared for plan submit\n" +
 				"  mint one id per task: agentssh session new\n" +
 				"  then pass --session <id> here and on every run in the task")
 		}
-		return fmt.Errorf("resolve session: %w", err)
+		return response, fmt.Errorf("resolve session: %w", err)
 	}
 
 	pendingStore := approvalStore(cfg.Paths)
@@ -307,10 +354,10 @@ func runPlanSubmit(cmd *cobra.Command, targetName string, commands []string, ses
 	store := audit.NewStore(cfg.Paths.AuditFile)
 	planID, err := approval.NewPlanID()
 	if err != nil {
-		return err
+		return response, err
 	}
 
-	response := planSubmitResponse{SessionID: sessionCtx.ID, Host: target.Name}
+	response = planSubmitResponse{SessionID: sessionCtx.ID, Host: target.Name}
 	memberIDs := make([]string, 0, len(planCommands))
 	exitCode := exitOK
 	for i, command := range planCommands {
@@ -319,10 +366,11 @@ func runPlanSubmit(cmd *cobra.Command, targetName string, commands []string, ses
 			Cmd:         command.Cmd,
 			StdinSHA256: command.stdin.sha256,
 			StdinBytes:  command.stdin.bytes,
+			Task:        approval.TaskCandidate(command.Cmd, command.stdin.sha256),
 		}
 		auth, err := approval.PreflightAuthorize(cfg.Policy, cfg.Inventory, sessionStore, runtime, sessionCtx.ID, target.Name, command.Cmd, command.stdin.sha256)
 		if err != nil {
-			return newUsageError("policy.yaml is invalid: %v\n  fix the rule in ~/.agentssh/policy.yaml (check: agentssh policy show)", err)
+			return response, newUsageError("policy.yaml is invalid: %v\n  fix the rule in ~/.agentssh/policy.yaml (check: agentssh policy show)", err)
 		}
 		line.PolicyRule = auth.Decision.Rule
 		switch auth.Status {
@@ -334,9 +382,15 @@ func runPlanSubmit(cmd *cobra.Command, targetName string, commands []string, ses
 			response.Denied++
 			exitCode = mergeExitCode(exitCode, exitPolicyDenied)
 		case approval.AuthNeedsApproval:
+			if !runtime.Enabled {
+				line.Status = "denied"
+				response.Denied++
+				exitCode = mergeExitCode(exitCode, exitPolicyDenied)
+				break
+			}
 			reqID, err := newReqID()
 			if err != nil {
-				return err
+				return response, err
 			}
 			req, err := pendingStore.Create(approval.PendingRequest{
 				ReqID:       reqID,
@@ -351,7 +405,7 @@ func runPlanSubmit(cmd *cobra.Command, targetName string, commands []string, ses
 				PlanTotal:   len(planCommands),
 			})
 			if err != nil {
-				return err
+				return response, err
 			}
 			line.Status = "approval_pending"
 			line.ApprovalID = req.ID
@@ -367,11 +421,11 @@ func runPlanSubmit(cmd *cobra.Command, targetName string, commands []string, ses
 			record.ApprovalChannel = approval.ChannelPlan
 			record.PlanID = planID
 			if _, err := store.Append(record); err != nil {
-				return err
+				return response, err
 			}
 			exitCode = mergeExitCode(exitCode, exitApprovalRequired)
 		default:
-			return fmt.Errorf("unknown approval authorization status %q", auth.Status)
+			return response, fmt.Errorf("unknown approval authorization status %q", auth.Status)
 		}
 		response.Commands = append(response.Commands, line)
 	}
@@ -388,22 +442,15 @@ func runPlanSubmit(cmd *cobra.Command, targetName string, commands []string, ses
 			MemberIDs: memberIDs,
 		})
 		if err != nil {
-			return err
+			return response, err
 		}
 		response.PlanID = manifest.ID
 	}
 
-	if jsonOutput {
-		if err := writeJSON(cmd, response); err != nil {
-			return err
-		}
-	} else {
-		printPlanSubmitHuman(cmd, response)
-	}
 	if exitCode != exitOK {
-		return commandExitError{Code: exitCode}
+		return response, commandExitError{Code: exitCode}
 	}
-	return nil
+	return response, nil
 }
 
 func printPlanSubmitHuman(cmd *cobra.Command, response planSubmitResponse) {
@@ -513,6 +560,7 @@ func runPlanDecision(cmd *cobra.Command, id string, verdict approval.Verdict, sc
 		Bundle:     policy.Bundle{Policy: cfg.Policy, Inventory: cfg.Inventory},
 		PolicyPath: cfg.Paths.PolicyFile,
 		SessionTTL: runtime.SessionTTL,
+		TaskTTL:    runtime.TaskTTL,
 		Channel:    approval.ChannelCLI,
 		SavePolicy: func(next policy.Config) error {
 			return saveValidatedPolicy(cfg.Paths, next)

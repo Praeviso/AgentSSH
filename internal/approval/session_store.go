@@ -21,17 +21,18 @@ type SessionStore struct {
 }
 
 type Grant struct {
-	Scope      Scope       `json:"scope"`
-	Kind       MatcherKind `json:"kind"`
-	Regex      string      `json:"regex"`
-	Prefix     []string    `json:"prefix,omitempty"`
-	SourceCmd  string      `json:"source_cmd"`
-	Host       string      `json:"host"`
-	GrantedTS  string      `json:"granted_ts"`
-	ExpiresTS  string      `json:"expires_ts"`
-	ApprovalID string      `json:"approval_id"`
-	ReqID      string      `json:"req_id"`
-	Channel    string      `json:"channel"`
+	Scope      Scope           `json:"scope"`
+	Kind       MatcherKind     `json:"kind"`
+	Regex      string          `json:"regex"`
+	Prefix     []string        `json:"prefix,omitempty"`
+	SourceCmd  string          `json:"source_cmd"`
+	Host       string          `json:"host"`
+	GrantedTS  string          `json:"granted_ts"`
+	ExpiresTS  string          `json:"expires_ts"`
+	ApprovalID string          `json:"approval_id"`
+	ReqID      string          `json:"req_id"`
+	Channel    string          `json:"channel"`
+	Task       *TaskPermission `json:"task,omitempty"`
 	// StdinSHA256 binds the grant to one exact stdin payload. Empty means the
 	// approved command had no stdin; a grant never matches a run whose stdin
 	// hash differs from the one the operator approved.
@@ -105,8 +106,14 @@ func normalizeGrants(doc *sessionFile) (repaired int, dropped int) {
 }
 
 func (s SessionStore) Grant(sessionID string, host string, scope Scope, matcher Matcher, stdinSHA256 string, approvalID string, reqID string, ttl time.Duration, channel string) (Grant, error) {
-	if scope != ScopeOnce && scope != ScopeSession {
+	if scope != ScopeOnce && scope != ScopeSession && scope != ScopeTask {
 		return Grant{}, fmt.Errorf("session store cannot grant scope %q", scope)
+	}
+	if scope == ScopeTask && (stdinSHA256 != "" || !validTaskMatcher(matcher)) {
+		return Grant{}, fmt.Errorf("task grants require a valid bounded command without stdin")
+	}
+	if scope != ScopeTask && matcher.Kind == MatcherTask {
+		return Grant{}, fmt.Errorf("task matchers require task scope")
 	}
 	if err := os.MkdirAll(s.Dir, 0o700); err != nil {
 		return Grant{}, fmt.Errorf("create approval session directory: %w", err)
@@ -124,6 +131,7 @@ func (s SessionStore) Grant(sessionID string, host string, scope Scope, matcher 
 		ApprovalID:  approvalID,
 		ReqID:       reqID,
 		Channel:     channel,
+		Task:        matcher.Task,
 		StdinSHA256: stdinSHA256,
 	}
 	err := s.withLockedSession(sessionID, func(doc *sessionFile) error {
@@ -156,6 +164,40 @@ func (s SessionStore) Grant(sessionID string, host string, scope Scope, matcher 
 // invisible: they can no longer authorize a different request.
 func (s SessionStore) Peek(sessionID string, host string, command string, stdinSHA256 string) (Grant, bool, error) {
 	return s.match(sessionID, host, command, stdinSHA256, "")
+}
+
+// Preview is a read-only snapshot for preflight. It neither creates lock files
+// nor persists expiry cleanup or legacy repairs; Claim performs those under its
+// lock at execution time. Atomic session writes make a lock-free read safe.
+func (s SessionStore) Preview(sessionID, host, command, stdinSHA256 string) (Grant, bool, error) {
+	if sessionID == "" {
+		return Grant{}, false, nil
+	}
+	doc, err := readSessionFile(sessionPath(s.Dir, sessionID))
+	if err != nil {
+		return Grant{}, false, err
+	}
+	if doc.SessionID == "" {
+		return Grant{}, false, nil
+	}
+	if doc.SessionID != sessionID {
+		return Grant{}, false, fmt.Errorf("session store file mismatch")
+	}
+	if doc.Version < sessionFileVersion {
+		normalizeGrants(&doc)
+	}
+	for _, grant := range filterLiveGrants(doc.Grants, s.now()) {
+		if grant.Host != host || grant.StdinSHA256 != stdinSHA256 || grant.Scope == ScopeOnce && grant.ClaimReqID != "" {
+			continue
+		}
+		if grant.Scope == ScopeTask && (grant.Kind != MatcherTask || grant.ExpiresTS == "") || grant.Kind == MatcherTask && grant.Scope != ScopeTask {
+			continue
+		}
+		if matches, err := grant.matcher().Match(command); err == nil && matches {
+			return grant, true, nil
+		}
+	}
+	return Grant{}, false, nil
 }
 
 // Claim matches a grant for one run request. A matching once grant is marked
@@ -237,6 +279,10 @@ func (s SessionStore) match(sessionID string, host string, command string, stdin
 		changed := len(live) != len(doc.Grants)
 		remaining := make([]Grant, 0, len(live))
 		for _, grant := range live {
+			if grant.Scope == ScopeTask && (grant.Kind != MatcherTask || grant.ExpiresTS == "") || grant.Kind == MatcherTask && grant.Scope != ScopeTask {
+				changed = true
+				continue
+			}
 			if ok {
 				remaining = append(remaining, grant)
 				continue
@@ -454,5 +500,19 @@ func (g Grant) matcher() Matcher {
 		Prefix:     append([]string(nil), g.Prefix...),
 		Promotable: true,
 		SourceCmd:  g.SourceCmd,
+		Task:       g.Task,
 	}
+}
+
+// List returns the live grants for an explicitly named task, without consuming
+// grants or exposing connection credentials.
+func (s SessionStore) List(sessionID string) ([]Grant, error) {
+	doc, err := readSessionFile(sessionPath(s.Dir, sessionID))
+	if err != nil {
+		return nil, err
+	}
+	if doc.SessionID != "" && doc.SessionID != sessionID {
+		return nil, fmt.Errorf("session id mismatch")
+	}
+	return filterLiveGrants(doc.Grants, s.now()), nil
 }

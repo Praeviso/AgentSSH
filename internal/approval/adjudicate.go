@@ -16,6 +16,7 @@ type ApplyOptions struct {
 	Bundle     policy.Bundle
 	PolicyPath string
 	SessionTTL time.Duration
+	TaskTTL    time.Duration
 	Channel    string
 	SavePolicy func(policy.Config) error
 }
@@ -43,8 +44,11 @@ func ApplyDecision(opts ApplyOptions, id string, verdict Verdict, scope Scope) (
 	result := ApplyResult{Request: req}
 	switch verdict {
 	case VerdictApproved:
-		if scope != ScopeOnce && scope != ScopeSession && scope != ScopeHost {
+		if scope != ScopeOnce && scope != ScopeSession && scope != ScopeHost && scope != ScopeTask {
 			return ApplyResult{}, fmt.Errorf("approval grant scope is required")
+		}
+		if scope == ScopeTask && TaskCandidate(req.Cmd, req.StdinSHA256) == nil {
+			return ApplyResult{}, fmt.Errorf("approval %s has no bounded task profile; choose once or exact session", req.ID)
 		}
 		if scope == ScopeHost {
 			if !req.Candidate.Promotable {
@@ -112,6 +116,16 @@ func applySessionGrant(opts ApplyOptions, req PendingRequest, scope Scope) (Gran
 		return Grant{}, err
 	}
 	ttl := opts.SessionTTL
+	if scope == ScopeTask {
+		matcher, err = taskMatcher(req.Cmd)
+		if err != nil {
+			return Grant{}, err
+		}
+		ttl = opts.TaskTTL
+		if ttl <= 0 {
+			ttl = DefaultTaskTTL
+		}
+	}
 	if ttl <= 0 {
 		ttl = DefaultSessionTTL
 	}
@@ -210,6 +224,15 @@ func appendApprovalAudit(opts ApplyOptions, req PendingRequest, verdict Verdict,
 		StdinSHA256:     req.StdinSHA256,
 		StdinBytes:      req.StdinBytes,
 		PlanID:          req.PlanID,
+	}
+	if scope == ScopeTask {
+		if permission := TaskCandidate(req.Cmd, req.StdinSHA256); permission != nil {
+			ttl := opts.TaskTTL
+			if ttl <= 0 {
+				ttl = DefaultTaskTTL
+			}
+			record.ApprovalMatcher = permission.Summary() + "; ttl=" + ttl.String()
+		}
 	}
 	_, err := opts.Audit.Append(record)
 	return err

@@ -489,7 +489,7 @@ func TestPlanGrantRequiresScope(t *testing.T) {
 	}
 	withOperatorAuth(t, home)
 	_, _, err := runCommandForTest(t, "plan", "grant", response.PlanID)
-	if exitCodeForError(err) != exitUsage || !strings.Contains(err.Error(), "--once or --session") {
+	if exitCodeForError(err) != exitUsage || !strings.Contains(err.Error(), "--once, --session or --task") {
 		t.Fatalf("err=%v", err)
 	}
 }

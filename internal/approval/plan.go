@@ -17,7 +17,7 @@ import (
 var (
 	ErrInvalidPlanID = errors.New("invalid plan id")
 	ErrPlanNotFound  = errors.New("plan not found")
-	ErrPlanScope     = errors.New("plan approvals support --once or --session only")
+	ErrPlanScope     = errors.New("plan approvals support --once, --session or --task only")
 	ErrPlanNoPending = errors.New("plan has no pending requests")
 	ErrPlansDirUnset = errors.New("plan store directory is not configured")
 )
@@ -199,7 +199,7 @@ func (s PendingStore) WaitPlan(id string, timeout time.Duration) (PlanStatus, er
 // verdict. Approvals are capped at once/session: host promotion widens policy
 // permanently and must stay a deliberate per-command decision.
 func ApplyPlanDecision(opts ApplyOptions, id string, verdict Verdict, scope Scope) ([]ApplyResult, error) {
-	if verdict == VerdictApproved && scope != ScopeOnce && scope != ScopeSession {
+	if verdict == VerdictApproved && scope != ScopeOnce && scope != ScopeSession && scope != ScopeTask {
 		return nil, ErrPlanScope
 	}
 	status, err := opts.Pending.PlanStatus(id)
@@ -211,7 +211,15 @@ func ApplyPlanDecision(opts ApplyOptions, id string, verdict Verdict, scope Scop
 		if member.Status != "pending" {
 			continue
 		}
-		result, err := ApplyDecision(opts, member.ApprovalID, verdict, scope)
+		memberScope, memberOpts := scope, opts
+		if scope == ScopeTask && member.Request != nil && TaskCandidate(member.Request.Cmd, member.Request.StdinSHA256) == nil {
+			memberScope = ScopeSession
+			memberOpts.SessionTTL = opts.TaskTTL
+			if memberOpts.SessionTTL <= 0 {
+				memberOpts.SessionTTL = DefaultTaskTTL
+			}
+		}
+		result, err := ApplyDecision(memberOpts, member.ApprovalID, verdict, memberScope)
 		if errors.Is(err, ErrAlreadyResolved) {
 			continue
 		}

@@ -53,9 +53,9 @@ func TestApprovalsPlanMemberShowsPlanHintAndChooser(t *testing.T) {
 	if !strings.Contains(view, "decide plan pl_92bf9463") {
 		t.Errorf("plan chooser label missing:\n%s", view)
 	}
-	// The chooser itself offers once/session/deny only — no host scope.
-	if !strings.Contains(view, "[once]  session   deny") {
-		t.Errorf("plan chooser options wrong (want once/session/deny only):\n%s", view)
+	// The chooser itself offers once/session/task/deny — no host scope.
+	if !strings.Contains(view, "[once]  session   task   deny") {
+		t.Errorf("plan chooser options wrong (want once/session/task/deny):\n%s", view)
 	}
 }
 

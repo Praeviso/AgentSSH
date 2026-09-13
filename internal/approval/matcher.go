@@ -15,6 +15,7 @@ type MatcherKind string
 const (
 	MatcherExact  MatcherKind = "exact"
 	MatcherPrefix MatcherKind = "prefix"
+	MatcherTask   MatcherKind = "task"
 )
 
 type Scope string
@@ -23,6 +24,7 @@ const (
 	ScopeOnce    Scope = "once"
 	ScopeSession Scope = "session"
 	ScopeHost    Scope = "host"
+	ScopeTask    Scope = "task"
 )
 
 type Verdict string
@@ -42,14 +44,21 @@ const (
 // Matcher is the reusable command matcher that can be stored in session grants
 // or generated host rules.
 type Matcher struct {
-	Kind       MatcherKind `json:"kind"`
-	Regex      string      `json:"regex"`
-	Prefix     []string    `json:"prefix,omitempty"`
-	Promotable bool        `json:"promotable"`
-	SourceCmd  string      `json:"source_cmd"`
+	Kind       MatcherKind     `json:"kind"`
+	Regex      string          `json:"regex"`
+	Prefix     []string        `json:"prefix,omitempty"`
+	Promotable bool            `json:"promotable"`
+	SourceCmd  string          `json:"source_cmd"`
+	Task       *TaskPermission `json:"task,omitempty"`
 }
 
 func (m Matcher) Match(command string) (bool, error) {
+	if m.Kind == MatcherTask {
+		if !validTaskMatcher(m) {
+			return false, fmt.Errorf("invalid task permission")
+		}
+		return m.Task.Match(command), nil
+	}
 	expr, err := compileMatcher(m.Regex)
 	if err != nil {
 		return false, err

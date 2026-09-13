@@ -11,6 +11,7 @@ import (
 const (
 	DefaultSessionTTL  = 12 * time.Hour
 	DefaultWaitTimeout = 10 * time.Minute
+	DefaultTaskTTL     = 2 * time.Hour
 )
 
 type RuntimeConfig struct {
@@ -18,6 +19,7 @@ type RuntimeConfig struct {
 	HostGrantMode HostGrantMode
 	SessionTTL    time.Duration
 	WaitTimeout   time.Duration
+	TaskTTL       time.Duration
 }
 
 func RuntimeConfigFromPolicy(cfg policy.Approval, envValue string) (RuntimeConfig, error) {
@@ -26,6 +28,7 @@ func RuntimeConfigFromPolicy(cfg policy.Approval, envValue string) (RuntimeConfi
 		HostGrantMode: HostGrantSafePrefix,
 		SessionTTL:    DefaultSessionTTL,
 		WaitTimeout:   DefaultWaitTimeout,
+		TaskTTL:       DefaultTaskTTL,
 	}
 	if cfg.HostGrantMode != "" {
 		switch HostGrantMode(cfg.HostGrantMode) {
@@ -41,6 +44,13 @@ func RuntimeConfigFromPolicy(cfg policy.Approval, envValue string) (RuntimeConfi
 			return out, fmt.Errorf("invalid approval.session_ttl %q", cfg.SessionTTL)
 		}
 		out.SessionTTL = duration
+	}
+	if cfg.TaskTTL != "" {
+		duration, err := time.ParseDuration(cfg.TaskTTL)
+		if err != nil || duration <= 0 {
+			return out, fmt.Errorf("invalid approval.task_ttl %q", cfg.TaskTTL)
+		}
+		out.TaskTTL = duration
 	}
 	if cfg.WaitTimeout != "" {
 		duration, err := time.ParseDuration(cfg.WaitTimeout)

@@ -5,7 +5,7 @@ AgentSSH is a local, single-binary SSH gateway for AI agents. It keeps SSH crede
 Two principals, one binary:
 
 - **You (the operator)** drive everything from one full-screen console — `agentssh tui` — to onboard hosts, register credentials, test connectivity, tune policy, and review the audit trail.
-- **The agent** only ever calls `agentssh run` / `agentssh hosts`. It never sees addresses, keys, or passwords — those stay in your ssh-agent, `~/.ssh/`, and an encrypted local store.
+- **The agent** uses `agentssh hosts`, `run`, `plan run/resume`, and read-only status commands. It never sees addresses, keys, or passwords — those stay in your ssh-agent, `~/.ssh/`, and an encrypted local store.
 
 AgentSSH uses standard SSH from the local machine (its built-in Go SSH client by default) and needs no agent or daemon on remote hosts.
 
@@ -45,6 +45,61 @@ agentssh tui            # Hosts tab for inventory · Policy tab for global/group
 ```
 
 That is the whole loop: you own hosts, policy, and the audit trail through `agentssh tui`; the agent only ever calls `agentssh`.
+
+## Task approvals and executable plans
+
+AgentSSH can approve a bounded family of operations for one host and session,
+with a default two-hour lifetime. An operator chooses `--task` (or **t** in the
+Approvals tab) to review and approve service diagnostics/maintenance or a fixed
+Compose project's operations. Existing `--once`, `--session`, and `--host` scopes
+retain their meaning; unsupported scripts and stdin remain exact.
+
+```yaml
+approval:
+  enabled: true
+  task_ttl: 2h
+```
+
+The agent can run a complete saved plan and continue it after approval:
+
+```bash
+agentssh session new
+agentssh plan run web-1 --session <session_id> --file deploy.yaml --wait-approval 30s --json
+agentssh plan resume <execution_id> --wait-approval 30s --json
+agentssh plan execution <execution_id>       # saved progress as JSON
+agentssh session grants <session_id>         # permissions and expiry as JSON
+```
+
+```yaml
+version: 1
+commands:
+  - argv: [docker, compose, -f, /opt/app/compose.yaml, build, app]
+    cwd: /opt/app
+  - argv: [docker, compose, -f, /opt/app/compose.yaml, up, -d, app]
+    cwd: /opt/app
+```
+
+The TUI groups plans by default: **e** expands their commands, **enter** reviews
+one plan, and **t** previews task permissions and exact fallback members. Human
+CLI equivalents are `approval grant <id> --task` and `plan grant <id> --task`;
+operator authentication still applies. `session end <id>` revokes session and
+task grants. Expiry/revocation prevents subsequent commands; it does not undo or
+forcibly terminate commands already running.
+
+`run --wait-approval 30s` can wait and execute an unchanged single request too.
+`run --argv --cwd /opt/app -- <arguments...>` preserves argument boundaries and
+sets the remote working directory. `policy test --host <host> --session <id>`
+now checks current grants and stdin identities, using the same authorization
+path as execution. Preflight is optional and never substitutes for runtime checks.
+
+Saved plans stop on failure and resume only unstarted steps. Completed steps are
+never replayed; uncertain SSH outcomes require inspection and an explicit new
+plan. Input-file hashes remain pinned to the original snapshot. Arbitrary shell
+programs, pipelines, changed Compose projects, destructive options, and changed
+stdin do not inherit a task grant.
+
+See [the operating skill](skills/agentssh-usage/SKILL.md) for the full workflow and
+[the implementation contract](docs/plans/task-authorization.md) for boundaries.
 
 ## The console (`agentssh tui`)
 

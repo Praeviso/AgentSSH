@@ -1,5 +1,7 @@
 # 计划行携带 stdin — 实现
 
+> 当前结构化计划还支持 `argv` 和远端 `cwd`，并可通过 `plan run/resume` 执行和恢复，见 [任务授权与执行流程](task-authorization.md)。本文的 stdin 哈希绑定规则继续适用；`stdin_file` 的本地相对路径不受远端 `cwd` 影响。
+
 > 状态:**已实现** · 配套:`docs/plans/plan-approval.md`(计划审批)、`docs/plans/run-stdin.md`(`run --stdin-file`)
 >
 > 起因:`plan-approval.md` §7 曾列出未来项「计划行内嵌 stdin」。旧版 `plan submit` 只接受命令文本,而 grant 绑定 `(命令, stdin 内容哈希)` —— 于是「写配置文件」这类最常见的部署动作**必然逃出计划**,操作员批了计划还要再批一次;本实现已补齐这条数据链路。

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/Praeviso/AgentSSH/internal/commandline"
 	"github.com/Praeviso/AgentSSH/internal/inventory"
 	"github.com/Praeviso/AgentSSH/internal/policy"
 )
@@ -24,6 +25,8 @@ type Authorization struct {
 	GrantScope      Scope
 	GrantMatcher    string
 	ApprovalMatcher Matcher
+	GrantExpiresTS  string
+	Task            *TaskPermission
 }
 
 // Authorize decides one run request. A matching once grant is claimed under
@@ -94,17 +97,54 @@ func authorize(cfg policy.Config, inv inventory.Inventory, sessionStore SessionS
 	if claimReqID != "" {
 		grant, ok, err = sessionStore.Claim(sessionID, host, command, stdinSHA256, claimReqID)
 	} else {
-		grant, ok, err = sessionStore.Peek(sessionID, host, command, stdinSHA256)
+		grant, ok, err = sessionStore.Preview(sessionID, host, command, stdinSHA256)
 	}
 	if err != nil {
 		return Authorization{}, err
 	}
 	if ok {
+		// Task permissions understand literal quoting and cwd. Check the same
+		// operation in plain form too, so quoting a denied verb cannot turn a
+		// hard deny into a task-grant match.
+		if grant.Scope == ScopeTask {
+			if argv, cwd, err := commandline.Parse(command); err == nil {
+				forms := []string{strings.Join(argv, " ")}
+				if cwd != "" {
+					forms = append(forms, "cd "+cwd+" && "+strings.Join(argv, " "))
+				}
+				// Recognized absolute tool paths and sudo spellings represent the
+				// same operation. Check its bare form as well as the exact text.
+				for i := range argv {
+					if i == 0 || i <= 2 && (argv[0] == "sudo" || argv[0] == "/usr/bin/sudo") {
+						argv[i] = strings.TrimPrefix(strings.TrimPrefix(argv[i], "/usr/bin/"), "/bin/")
+					}
+				}
+				forms = append(forms, strings.Join(argv, " "))
+				if argv[0] == "sudo" {
+					argv = argv[1:]
+					if len(argv) > 0 && (argv[0] == "-n" || argv[0] == "--non-interactive") {
+						argv = argv[1:]
+					}
+					forms = append(forms, strings.Join(argv, " "))
+				}
+				for _, form := range forms {
+					d, err := engine.Evaluate(host, form)
+					if err != nil {
+						return Authorization{}, err
+					}
+					if d.Action == policy.ActionDeny && d.Rule != policy.RuleDefaultDeny {
+						return Authorization{Status: AuthHardDeny, Decision: d}, nil
+					}
+				}
+			}
+		}
 		return Authorization{
-			Status:       AuthAllowByGrant,
-			Decision:     policy.Decision{Action: policy.ActionAllow, Rule: "approval/session/" + grant.ApprovalID},
-			GrantScope:   grant.Scope,
-			GrantMatcher: grant.Regex,
+			Status:         AuthAllowByGrant,
+			Decision:       policy.Decision{Action: policy.ActionAllow, Rule: "approval/session/" + grant.ApprovalID},
+			GrantScope:     grant.Scope,
+			GrantMatcher:   grant.Regex,
+			GrantExpiresTS: grant.ExpiresTS,
+			Task:           grant.Task,
 		}, nil
 	}
 	// Persistent host approval rules match the command text only; they cannot

@@ -1,5 +1,7 @@
 # 计划审批(Plan Approval)— 设计与实现记录
 
+> 本文保留最初的审批批处理设计。当前新增的限时 task 授权、`plan run/resume` 和 TUI 分组见 [任务授权与执行流程](task-authorization.md)；`plan submit` 仍只提交审批，不执行命令。
+
 > 状态:已实现 · 配套:`docs/plans/approval-system.md`(单命令异步审批 v1.1)
 >
 > 起因:实测反馈「精确匹配审批太细碎——一次部署十几条命令批了 ~10 次」。

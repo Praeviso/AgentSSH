@@ -63,6 +63,7 @@ type Approval struct {
 	HostGrantMode string `yaml:"host_grant_mode,omitempty" json:"host_grant_mode,omitempty"`
 	SessionTTL    string `yaml:"session_ttl,omitempty" json:"session_ttl,omitempty"`
 	WaitTimeout   string `yaml:"wait_timeout,omitempty" json:"wait_timeout,omitempty"`
+	TaskTTL       string `yaml:"task_ttl,omitempty" json:"task_ttl,omitempty"`
 }
 
 // RuleGroup is an authoring-only preset. The engine ignores it; callers stamp a
@@ -208,7 +209,7 @@ func (c Config) MarshalYAML() (any, error) {
 }
 
 func approvalZero(value Approval) bool {
-	return !value.Enabled && value.HostGrantMode == "" && value.SessionTTL == "" && value.WaitTimeout == ""
+	return !value.Enabled && value.HostGrantMode == "" && value.SessionTTL == "" && value.WaitTimeout == "" && value.TaskTTL == ""
 }
 
 func appendNode(mapping *yaml.Node, key string, value *yaml.Node) {

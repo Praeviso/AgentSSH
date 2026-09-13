@@ -226,8 +226,8 @@ func TestApprovalsChooserOmitsHostOnPrivileged(t *testing.T) {
 	m = press(t, m, "enter") // open the chooser
 
 	got := m.approvals.choices()
-	if len(got) != 3 {
-		t.Fatalf("privileged request should offer 3 options (once/session/deny), got %d: %+v", len(got), got)
+	if len(got) != 4 {
+		t.Fatalf("supported privileged request should offer 4 options (once/session/task/deny), got %d: %+v", len(got), got)
 	}
 	for _, c := range got {
 		if c.scope == approval.ScopeHost {
