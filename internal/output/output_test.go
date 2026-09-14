@@ -2,6 +2,8 @@ package output
 
 import (
 	"bytes"
+	"errors"
+	"io"
 	"strings"
 	"testing"
 
@@ -169,6 +171,31 @@ func TestStreamWriterFlushesTailLineWithSecret(t *testing.T) {
 	}
 }
 
+func TestStreamWriterStickyErrorDoesNotDuplicatePartialOnFlush(t *testing.T) {
+	filter := mustStreamFilter(t, policy.Output{Redact: []string{`password=\S+`}})
+	dst := &failAfterWriter{limit: 1}
+	writer := filter.NewStreamWriter(dst)
+
+	if _, err := writer.Write([]byte("first line\npassword=secret\n")); !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("write err=%v want short write", err)
+	}
+	writer.Flush()
+	writer.Flush()
+
+	if dst.calls != 1 {
+		t.Fatalf("writer calls=%d want 1", dst.calls)
+	}
+	if got, want := string(writer.Emitted()), "first line\n"; got != want {
+		t.Fatalf("emitted = %q, want %q", got, want)
+	}
+	if !errors.Is(writer.Err(), io.ErrShortWrite) {
+		t.Fatalf("Err=%v want short write", writer.Err())
+	}
+	if writer.Redactions() != 0 {
+		t.Fatalf("redactions=%d want 0 because failed partial line was not reprocessed", writer.Redactions())
+	}
+}
+
 func TestNewFilterRejectsMultiLinePatterns(t *testing.T) {
 	tests := []string{`(?s)BEGIN.*END`, `(?s)secret`, "BEGIN\nEND", `BEGIN\nEND`}
 	for _, pattern := range tests {
@@ -231,4 +258,20 @@ func writeChunks(t *testing.T, writer *StreamWriter, input []byte, chunkSize int
 		}
 		input = input[n:]
 	}
+}
+
+type failAfterWriter struct {
+	limit int
+	calls int
+}
+
+func (w *failAfterWriter) Write(p []byte) (int, error) {
+	w.calls++
+	if w.calls > w.limit {
+		return 0, errors.New("unexpected write")
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+	return len(p) - 1, nil
 }

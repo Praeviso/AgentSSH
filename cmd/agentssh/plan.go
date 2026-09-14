@@ -8,12 +8,14 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/Praeviso/AgentSSH/internal/approval"
 	"github.com/Praeviso/AgentSSH/internal/audit"
 	"github.com/Praeviso/AgentSSH/internal/commandline"
 	"github.com/Praeviso/AgentSSH/internal/config"
 	"github.com/Praeviso/AgentSSH/internal/inventory"
+	"github.com/Praeviso/AgentSSH/internal/payload"
 	"github.com/Praeviso/AgentSSH/internal/policy"
 	"github.com/Praeviso/AgentSSH/internal/session"
 	"github.com/spf13/cobra"
@@ -37,6 +39,8 @@ func newPlanCommand() *cobra.Command {
 		sessionLabel string
 		file         string
 		jsonOutput   bool
+		savePayloads bool
+		payloadTTL   string
 	}
 	submitCmd := &cobra.Command{
 		Use:   "submit <host> [--session <id>] [--file <path>] [--json] [-- <cmd> <cmd>...]",
@@ -57,13 +61,15 @@ func newPlanCommand() *cobra.Command {
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			commands := append([]string(nil), args[1:]...)
-			return runPlanSubmit(cmd, args[0], commands, submitFlags.session, submitFlags.sessionLabel, submitFlags.file, submitFlags.jsonOutput)
+			return runPlanSubmit(cmd, args[0], commands, submitFlags.session, submitFlags.sessionLabel, submitFlags.file, submitFlags.jsonOutput, submitFlags.savePayloads, submitFlags.payloadTTL)
 		},
 	}
 	submitCmd.Flags().StringVar(&submitFlags.session, "session", "", "associate the plan with a session id")
 	submitCmd.Flags().StringVar(&submitFlags.sessionLabel, "session-label", "", "attach a human-readable label to the session")
 	submitCmd.Flags().StringVar(&submitFlags.file, "file", "", "read commands from a legacy line file or a structured version: 1 plan")
 	submitCmd.Flags().BoolVar(&submitFlags.jsonOutput, "json", false, "emit machine-readable JSON")
+	submitCmd.Flags().BoolVar(&submitFlags.savePayloads, "save-payloads", false, "retain stdin payload bytes in the local content-addressed payload store")
+	submitCmd.Flags().StringVar(&submitFlags.payloadTTL, "payload-ttl", "24h", "retention for --save-payloads payloads, e.g. 24h")
 
 	var statusJSON bool
 	statusCmd := &cobra.Command{
@@ -117,7 +123,7 @@ func newPlanCommand() *cobra.Command {
 		},
 	}
 
-	cmd.AddCommand(submitCmd, statusCmd, waitCmd, grantCmd, denyCmd, newPlanRunCommand(), newPlanResumeCommand(), newPlanExecutionStatusCommand())
+	cmd.AddCommand(submitCmd, statusCmd, waitCmd, grantCmd, denyCmd, newPlanInspectCommand(), newPlanRunCommand(), newPlanResumeCommand(), newPlanExecutionStatusCommand(), newPlanPayloadCommand(), newPlanTemplateCommand())
 	return cmd
 }
 
@@ -133,27 +139,41 @@ type planSubmitLine struct {
 }
 
 type planSubmitResponse struct {
-	PlanID    string           `json:"plan_id,omitempty"`
-	SessionID string           `json:"session_id"`
-	Host      string           `json:"host"`
-	Commands  []planSubmitLine `json:"commands"`
-	Allowed   int              `json:"allowed"`
-	Denied    int              `json:"denied"`
-	Pending   int              `json:"pending"`
+	PlanID       string                `json:"plan_id,omitempty"`
+	SessionID    string                `json:"session_id"`
+	Host         string                `json:"host"`
+	Metadata     approval.PlanMetadata `json:"metadata,omitempty"`
+	ReviewSHA256 string                `json:"review_sha256,omitempty"`
+	Commands     []planSubmitLine      `json:"commands"`
+	Allowed      int                   `json:"allowed"`
+	Denied       int                   `json:"denied"`
+	Pending      int                   `json:"pending"`
+}
+
+type planSubmitOptions struct {
+	Review           approval.PlanReview
+	SavePayloads     bool
+	PayloadRetainFor time.Duration
 }
 
 type planSpec struct {
-	Version  int           `yaml:"version"`
-	Commands []planCommand `yaml:"commands"`
+	Version  int                   `yaml:"version"`
+	Metadata approval.PlanMetadata `yaml:"metadata,omitempty"`
+	Commands []planCommand         `yaml:"commands"`
 }
 
 type planCommand struct {
-	Cmd  string   `yaml:"cmd"`
-	Argv []string `yaml:"argv,omitempty"`
-	CWD  string   `yaml:"cwd,omitempty"`
+	ID        string   `yaml:"id,omitempty"`
+	Name      string   `yaml:"name,omitempty"`
+	Phase     string   `yaml:"phase,omitempty"`
+	OnFailure string   `yaml:"on_failure,omitempty"`
+	Cmd       string   `yaml:"cmd"`
+	Argv      []string `yaml:"argv,omitempty"`
+	CWD       string   `yaml:"cwd,omitempty"`
 	// StdinFile is resolved relative to the current working directory, the same
 	// frame of reference as run --stdin-file -- not relative to the plan file.
-	StdinFile string `yaml:"stdin_file"`
+	StdinFile  string `yaml:"stdin_file"`
+	PayloadRef string `yaml:"payload_ref,omitempty"`
 	// stdin holds the payload identity once resolveStdin has run. Unexported, so
 	// the YAML decoder leaves it alone.
 	stdin stdinSpec
@@ -188,12 +208,12 @@ func declaresStructuredPlan(data []byte) bool {
 		strings.HasPrefix(lines[0], "commands:")
 }
 
-func parseStructuredPlan(data []byte) ([]planCommand, error) {
+func parseStructuredPlanDocument(data []byte) (planSpec, error) {
 	decoder := yaml.NewDecoder(bytes.NewReader(data))
 	decoder.KnownFields(true)
 	var spec planSpec
 	if err := decoder.Decode(&spec); err != nil {
-		return nil, newUsageError("cannot parse structured --file: %v", err)
+		return planSpec{}, newUsageError("cannot parse structured --file: %v", err)
 	}
 	// A trailing '---' or a comment-only document decodes as nil; only a second
 	// document carrying real content means the file holds more than one plan.
@@ -201,30 +221,47 @@ func parseStructuredPlan(data []byte) ([]planCommand, error) {
 	switch err := decoder.Decode(&extra); {
 	case errors.Is(err, io.EOF):
 	case err != nil:
-		return nil, newUsageError("cannot parse structured --file: %v", err)
+		return planSpec{}, newUsageError("cannot parse structured --file: %v", err)
 	case extra != nil:
-		return nil, newUsageError("structured --file must contain exactly one YAML document")
+		return planSpec{}, newUsageError("structured --file must contain exactly one YAML document")
 	}
 	if spec.Version != 1 {
-		return nil, newUsageError("unsupported structured plan version %d; supported version is 1", spec.Version)
+		return planSpec{}, newUsageError("unsupported structured plan version %d; supported version is 1", spec.Version)
 	}
 	if spec.Commands == nil {
-		return nil, newUsageError("structured plan commands is required")
+		return planSpec{}, newUsageError("structured plan commands is required")
 	}
+	seen := map[string]bool{}
 	for i := range spec.Commands {
+		spec.Commands[i].ID = stableStepID(i, spec.Commands[i].ID)
+		if seen[spec.Commands[i].ID] {
+			return planSpec{}, newUsageError("structured plan commands[%d].id duplicates %q", i, spec.Commands[i].ID)
+		}
+		seen[spec.Commands[i].ID] = true
+		spec.Commands[i].Phase = strings.TrimSpace(spec.Commands[i].Phase)
+		if spec.Commands[i].Phase == "" {
+			spec.Commands[i].Phase = "apply"
+		}
+		spec.Commands[i].OnFailure = strings.TrimSpace(spec.Commands[i].OnFailure)
+		if spec.Commands[i].OnFailure == "" {
+			spec.Commands[i].OnFailure = "stop"
+		}
+		if err := validatePlanCommand(spec.Commands[i], i); err != nil {
+			return planSpec{}, err
+		}
 		// Trim the way line mode does. A YAML block scalar carries a trailing
 		// newline, and a command whose text differs by so much as that newline
 		// mints a grant no later run can ever match.
 		spec.Commands[i].Cmd = strings.TrimSpace(spec.Commands[i].Cmd)
 		c := &spec.Commands[i]
 		if strings.ContainsAny(c.Cmd, "\n\r") {
-			return nil, newUsageError("structured plan commands[%d].cmd must be a single line", i)
+			return planSpec{}, newUsageError("structured plan commands[%d].cmd must be a single line", i)
 		}
 		if c.Cmd == "" && len(c.Argv) == 0 {
-			return nil, newUsageError("structured plan commands[%d].cmd or argv is required", i)
+			return planSpec{}, newUsageError("structured plan commands[%d].cmd or argv is required", i)
 		}
 		if c.Cmd != "" && c.Argv != nil {
-			return nil, newUsageError("structured plan commands[%d] must choose cmd or argv", i)
+			return planSpec{}, newUsageError("structured plan commands[%d] must choose cmd or argv", i)
 		}
 		var err error
 		if c.Argv != nil {
@@ -233,44 +270,100 @@ func parseStructuredPlan(data []byte) ([]planCommand, error) {
 			c.Cmd, err = commandline.Shell(c.Cmd, c.CWD)
 		}
 		if err != nil {
-			return nil, newUsageError("commands[%d]: %v", i, err)
+			return planSpec{}, newUsageError("commands[%d]: %v", i, err)
 		}
 		c.Argv = nil
 		c.CWD = ""
 	}
-	return spec.Commands, nil
+	return spec, nil
 }
 
-func resolveStdin(commands []planCommand) error {
+func validatePlanCommand(command planCommand, index int) error {
+	phase := strings.TrimSpace(command.Phase)
+	if phase == "" {
+		phase = "apply"
+	}
+	if phase != "apply" && phase != "verify" {
+		return newUsageError("structured plan commands[%d].phase must be apply or verify", index)
+	}
+	onFailure := strings.TrimSpace(command.OnFailure)
+	if onFailure == "" {
+		onFailure = "stop"
+	}
+	if onFailure != "stop" && onFailure != "continue" {
+		return newUsageError("structured plan commands[%d].on_failure must be stop or continue", index)
+	}
+	if onFailure == "continue" && phase != "verify" {
+		return newUsageError("structured plan commands[%d].on_failure: continue is only valid for verify phase", index)
+	}
+	if command.StdinFile != "" && command.PayloadRef != "" {
+		return newUsageError("structured plan commands[%d] must choose stdin_file or payload_ref", index)
+	}
+	return nil
+}
+
+func validatePlanCommands(commands []planCommand) error {
+	seen := map[string]bool{}
+	for i, command := range commands {
+		if command.ID == "" {
+			commands[i].ID = stableStepID(i, "")
+			command.ID = commands[i].ID
+		}
+		if seen[command.ID] {
+			return newUsageError("structured plan commands[%d].id duplicates %q", i, command.ID)
+		}
+		seen[command.ID] = true
+		if err := validatePlanCommand(command, i); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func resolveStdin(commands []planCommand, keepDataOpt ...bool) error {
+	keepData := len(keepDataOpt) > 0 && keepDataOpt[0]
 	for i := range commands {
+		if commands[i].PayloadRef != "" {
+			continue
+		}
 		stdin, err := loadStdinSpec(fmt.Sprintf("commands[%d].stdin_file", i), commands[i].StdinFile)
 		if err != nil {
 			return err
 		}
 		// Submit stores only identity metadata; release the payload immediately
 		// so peak memory is bounded by one file.
-		stdin.data = nil
+		if !keepData {
+			stdin.data = nil
+		}
 		commands[i].stdin = stdin
 	}
 	return nil
 }
 
-func readPlanCommands(file string) ([]planCommand, error) {
+func readPlanDocument(file string) (planSpec, error) {
 	data, err := os.ReadFile(file)
 	if err != nil {
-		return nil, newUsageError("cannot read --file: %v", err)
+		return planSpec{}, newUsageError("cannot read --file: %v", err)
 	}
 	if declaresStructuredPlan(data) {
-		return parseStructuredPlan(data)
+		return parseStructuredPlanDocument(data)
 	}
 	var commands []planCommand
-	for _, line := range planFileLines(data) {
-		commands = append(commands, planCommand{Cmd: line})
+	for i, line := range planFileLines(data) {
+		commands = append(commands, planCommand{ID: stableStepID(i, ""), Phase: "apply", OnFailure: "stop", Cmd: line})
 	}
-	return commands, nil
+	return planSpec{Version: 1, Commands: commands}, nil
 }
 
-func runPlanSubmit(cmd *cobra.Command, targetName string, commands []string, sessionFlag string, sessionLabel string, file string, jsonOutput bool) error {
+func readPlanCommands(file string) ([]planCommand, error) {
+	spec, err := readPlanDocument(file)
+	if err != nil {
+		return nil, err
+	}
+	return spec.Commands, nil
+}
+
+func runPlanSubmit(cmd *cobra.Command, targetName string, commands []string, sessionFlag string, sessionLabel string, file string, jsonOutput bool, savePayloads bool, payloadTTLValue string) error {
 	cfg, err := config.Load()
 	if err != nil {
 		return classifyConfigError(err)
@@ -282,39 +375,44 @@ func runPlanSubmit(cmd *cobra.Command, targetName string, commands []string, ses
 			"  without approval, pre-check commands with: agentssh policy test --host <host> -- '<cmd>' '<cmd>'...")
 	}
 	planCommands := make([]planCommand, 0, len(commands))
-	for _, command := range commands {
+	for i, command := range commands {
 		if strings.TrimSpace(command) == "" {
 			continue
 		}
-		planCommands = append(planCommands, planCommand{Cmd: command})
+		planCommands = append(planCommands, planCommand{ID: stableStepID(i, ""), Phase: "apply", OnFailure: "stop", Cmd: command})
 	}
+	var metadata approval.PlanMetadata
 	if file != "" {
-		data, err := os.ReadFile(file)
+		spec, err := readPlanDocument(file)
 		if err != nil {
-			return newUsageError("cannot read --file: %v", err)
+			return err
 		}
-		if declaresStructuredPlan(data) {
-			fromFile, err := parseStructuredPlan(data)
-			if err != nil {
-				return err
-			}
-			planCommands = append(planCommands, fromFile...)
-		} else {
-			for _, command := range planFileLines(data) {
-				planCommands = append(planCommands, planCommand{Cmd: command})
-			}
-		}
+		metadata = spec.Metadata
+		planCommands = append(planCommands, spec.Commands...)
 	}
 	if len(planCommands) == 0 {
 		return newUsageError("plan submit requires at least one command (after -- or via --file)")
 	}
-	// Resolve every stdin_file before the first pending request is written. A
-	// missing, non-regular, or oversized payload therefore has zero side effects.
-	if err := resolveStdin(planCommands); err != nil {
+	if err := validatePlanCommands(planCommands); err != nil {
 		return err
 	}
+	// Resolve every stdin_file before the first pending request is written. A
+	// missing, non-regular, or oversized payload therefore has zero side effects.
+	if err := resolvePayloadRefs(cfg, planCommands); err != nil {
+		return err
+	}
+	if err := resolveStdin(planCommands, savePayloads); err != nil {
+		return err
+	}
+	var retainFor time.Duration
+	if savePayloads {
+		retainFor, err = time.ParseDuration(payloadTTLValue)
+		if err != nil || retainFor <= 0 {
+			return newUsageError("--payload-ttl requires a positive duration")
+		}
+	}
 
-	response, err := submitPlanInputs(cmd, cfg, runtime, targetName, planCommands, sessionFlag, sessionLabel)
+	response, err := submitPlanInputsWithOptions(cmd, cfg, runtime, targetName, planCommands, sessionFlag, sessionLabel, planSubmitOptions{Review: approval.PlanReview{Metadata: metadata}, SavePayloads: savePayloads, PayloadRetainFor: retainFor})
 	if response.SessionID == "" {
 		return err
 	}
@@ -328,7 +426,17 @@ func runPlanSubmit(cmd *cobra.Command, targetName string, commands []string, ses
 	return err
 }
 
-func submitPlanInputs(cmd *cobra.Command, cfg *config.Config, runtime approval.RuntimeConfig, targetName string, planCommands []planCommand, sessionFlag, sessionLabel string) (response planSubmitResponse, resultErr error) {
+func submitPlanInputs(cmd *cobra.Command, cfg *config.Config, runtime approval.RuntimeConfig, targetName string, planCommands []planCommand, sessionFlag, sessionLabel string, reviews ...approval.PlanReview) (response planSubmitResponse, resultErr error) {
+	var opts planSubmitOptions
+	if len(reviews) > 0 {
+		opts.Review = reviews[0]
+	}
+	return submitPlanInputsWithOptions(cmd, cfg, runtime, targetName, planCommands, sessionFlag, sessionLabel, opts)
+}
+
+func submitPlanInputsWithOptions(cmd *cobra.Command, cfg *config.Config, runtime approval.RuntimeConfig, targetName string, planCommands []planCommand, sessionFlag, sessionLabel string, opts planSubmitOptions) (response planSubmitResponse, resultErr error) {
+	reviewTemplate := opts.Review
+	metadata := reviewTemplate.Metadata
 
 	resolved, err := inventory.NewResolver(cfg.Inventory).Resolve(targetName)
 	if err != nil {
@@ -356,9 +464,29 @@ func submitPlanInputs(cmd *cobra.Command, cfg *config.Config, runtime approval.R
 	if err != nil {
 		return response, err
 	}
+	var pinnedRefs []payload.Ref
+	defer func() {
+		if response.PlanID == "" || resultErr != nil && exitCodeForError(resultErr) != exitApprovalRequired && exitCodeForError(resultErr) != exitPolicyDenied {
+			releasePayloadPins(cfg.Paths, planID, pinnedRefs)
+		}
+	}()
+	if opts.SavePayloads {
+		refs, err := saveCommandPayloads(cfg, planCommands, opts.PayloadRetainFor, planID)
+		pinnedRefs = append(pinnedRefs, refs...)
+		if err != nil {
+			return response, err
+		}
+	}
+	refs, err := pinCommandPayloadRefs(cfg, planCommands, planID)
+	pinnedRefs = append(pinnedRefs, refs...)
+	if err != nil {
+		return response, err
+	}
 
-	response = planSubmitResponse{SessionID: sessionCtx.ID, Host: target.Name}
+	response = planSubmitResponse{SessionID: sessionCtx.ID, Host: target.Name, Metadata: metadata}
 	memberIDs := make([]string, 0, len(planCommands))
+	requestedRecords := make([]audit.Record, 0, len(planCommands))
+	reviewSteps := make([]approval.PlanReviewStep, 0, len(planCommands))
 	exitCode := exitOK
 	for i, command := range planCommands {
 		line := planSubmitLine{
@@ -420,14 +548,31 @@ func submitPlanInputs(cmd *cobra.Command, cfg *config.Config, runtime approval.R
 			record.ApprovalMatcher = req.Candidate.Regex
 			record.ApprovalChannel = approval.ChannelPlan
 			record.PlanID = planID
-			if _, err := store.Append(record); err != nil {
-				return response, err
-			}
+			record.ExecutionID = reviewTemplate.ExecutionID
+			record.StepID = command.ID
+			requestedRecords = append(requestedRecords, record)
 			exitCode = mergeExitCode(exitCode, exitApprovalRequired)
 		default:
 			return response, fmt.Errorf("unknown approval authorization status %q", auth.Status)
 		}
 		response.Commands = append(response.Commands, line)
+		reviewSteps = append(reviewSteps, approval.PlanReviewStep{
+			Seq:               i + 1,
+			ID:                command.ID,
+			Name:              command.Name,
+			Phase:             command.Phase,
+			OnFailure:         command.OnFailure,
+			Cmd:               command.Cmd,
+			Status:            line.Status,
+			PolicyRule:        line.PolicyRule,
+			ApprovalID:        line.ApprovalID,
+			StdinSHA256:       line.StdinSHA256,
+			StdinBytes:        line.StdinBytes,
+			PayloadRef:        command.PayloadRef,
+			PayloadRetained:   command.PayloadRef != "",
+			Task:              line.Task,
+			AlreadyAuthorized: line.Status == "allowed",
+		})
 	}
 
 	// Identical lines share one pending request, so count distinct members --
@@ -435,16 +580,36 @@ func submitPlanInputs(cmd *cobra.Command, cfg *config.Config, runtime approval.R
 	response.Pending = len(memberIDs)
 
 	if len(memberIDs) > 0 {
+		finalReviewSteps := mergePlanReviewSteps(reviewTemplate.Steps, reviewSteps)
+		review := approval.PlanReview{
+			Version:     1,
+			PlanID:      planID,
+			ExecutionID: reviewTemplate.ExecutionID,
+			SessionID:   sessionCtx.ID,
+			Host:        target.Name,
+			Metadata:    metadata,
+			Steps:       finalReviewSteps,
+		}
 		manifest, err := pendingStore.CreatePlan(approval.PlanManifest{
-			ID:        planID,
-			SessionID: sessionCtx.ID,
-			Host:      target.Name,
-			MemberIDs: memberIDs,
+			ID:          planID,
+			SessionID:   sessionCtx.ID,
+			Host:        target.Name,
+			ExecutionID: reviewTemplate.ExecutionID,
+			Metadata:    metadata,
+			Review:      &review,
+			MemberIDs:   memberIDs,
 		})
 		if err != nil {
 			return response, err
 		}
 		response.PlanID = manifest.ID
+		response.ReviewSHA256 = manifest.ReviewSHA256
+		for _, record := range requestedRecords {
+			record.ReviewSHA256 = manifest.ReviewSHA256
+			if _, err := store.Append(record); err != nil {
+				return response, err
+			}
+		}
 	}
 
 	if exitCode != exitOK {
@@ -479,6 +644,32 @@ func printPlanSubmitHuman(cmd *cobra.Command, response planSubmitResponse) {
 	}
 }
 
+func mergePlanReviewSteps(template []approval.PlanReviewStep, current []approval.PlanReviewStep) []approval.PlanReviewStep {
+	if len(template) == 0 {
+		return current
+	}
+	out := append([]approval.PlanReviewStep(nil), template...)
+	index := map[string]int{}
+	for i, step := range out {
+		if step.ID != "" {
+			index[step.ID] = i
+		}
+	}
+	for _, step := range current {
+		if i, ok := index[step.ID]; ok {
+			out[i] = step
+			continue
+		}
+		out = append(out, step)
+	}
+	for i := range out {
+		if out[i].Seq == 0 {
+			out[i].Seq = i + 1
+		}
+	}
+	return out
+}
+
 func runPlanStatus(cmd *cobra.Command, id string, jsonOutput bool) error {
 	cfg, err := config.Load()
 	if err != nil {
@@ -487,6 +678,9 @@ func runPlanStatus(cmd *cobra.Command, id string, jsonOutput bool) error {
 	status, err := approvalStore(cfg.Paths).PlanStatus(id)
 	if err != nil {
 		return mapPlanError(err)
+	}
+	if status.Status != "pending" {
+		releasePlanStatusPayloadPins(cfg.Paths, status)
 	}
 	return emitPlanStatus(cmd, status, jsonOutput)
 }
@@ -504,6 +698,9 @@ func runPlanWait(cmd *cobra.Command, id string, timeoutValue string, jsonOutput 
 	status, err := approvalStore(cfg.Paths).WaitPlan(id, timeout)
 	if err != nil {
 		return mapPlanError(err)
+	}
+	if status.Status != "pending" {
+		releasePlanStatusPayloadPins(cfg.Paths, status)
 	}
 	return emitPlanStatus(cmd, status, jsonOutput)
 }
@@ -569,6 +766,9 @@ func runPlanDecision(cmd *cobra.Command, id string, verdict approval.Verdict, sc
 	if err != nil {
 		return mapPlanError(err)
 	}
+	if manifest, manifestErr := approvalStore(cfg.Paths).GetPlan(id); manifestErr == nil {
+		releasePlanPayloadPins(cfg.Paths, manifest)
+	}
 	action := "denied"
 	if verdict == approval.VerdictApproved {
 		action = fmt.Sprintf("approved scope=%s", scope)
@@ -582,7 +782,8 @@ func mapPlanError(err error) error {
 	case errors.Is(err, approval.ErrInvalidPlanID),
 		errors.Is(err, approval.ErrPlanNotFound),
 		errors.Is(err, approval.ErrPlanScope),
-		errors.Is(err, approval.ErrPlanNoPending):
+		errors.Is(err, approval.ErrPlanNoPending),
+		errors.Is(err, approval.ErrPlanDigest):
 		return newUsageError("%v", err)
 	default:
 		return err

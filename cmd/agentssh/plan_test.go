@@ -325,6 +325,41 @@ func TestStructuredPlanUsageErrorsLeaveNoArtifacts(t *testing.T) {
 			wantErr: "version",
 		},
 		{
+			name: "duplicate step id",
+			plan: func(*testing.T) string {
+				return "version: 1\ncommands:\n  - id: restart\n    cmd: systemctl restart nginx\n  - id: restart\n    cmd: systemctl restart redis\n"
+			},
+			wantErr: "duplicates",
+		},
+		{
+			name: "invalid phase",
+			plan: func(*testing.T) string {
+				return "version: 1\ncommands:\n  - id: check\n    phase: observe\n    cmd: systemctl restart nginx\n"
+			},
+			wantErr: "phase",
+		},
+		{
+			name: "invalid on failure",
+			plan: func(*testing.T) string {
+				return "version: 1\ncommands:\n  - id: check\n    on_failure: retry\n    cmd: systemctl restart nginx\n"
+			},
+			wantErr: "on_failure",
+		},
+		{
+			name: "apply cannot continue",
+			plan: func(*testing.T) string {
+				return "version: 1\ncommands:\n  - id: apply\n    phase: apply\n    on_failure: continue\n    cmd: systemctl restart nginx\n"
+			},
+			wantErr: "continue",
+		},
+		{
+			name: "stdin file and payload ref are exclusive",
+			plan: func(t *testing.T) string {
+				return fmt.Sprintf("version: 1\ncommands:\n  - id: write\n    cmd: tee /etc/app.conf\n    stdin_file: %q\n    payload_ref: sha256:%s:1\n", writeStdinFile(t, "x"), strings.Repeat("a", 64))
+			},
+			wantErr: "stdin_file or payload_ref",
+		},
+		{
 			name:    "multi-line block scalar command",
 			plan:    func(*testing.T) string { return "version: 1\ncommands:\n  - cmd: |\n      echo one\n      echo two\n" },
 			wantErr: "single line",

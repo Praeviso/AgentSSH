@@ -1,7 +1,9 @@
 package approval
 
 import (
+	"encoding/json"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -90,5 +92,89 @@ func TestWaitPlanReturnsOnceAllResolved(t *testing.T) {
 	status, err := store.WaitPlan(manifest.ID, time.Second)
 	if err != nil || status.Status != "denied" || status.Pending != 0 {
 		t.Fatalf("wait status = %+v err=%v", status, err)
+	}
+}
+
+func TestPlanReviewDigestTamperingFailsClosed(t *testing.T) {
+	store := planTestStore(t)
+	member := mintPlanMember(t, store, "systemctl restart nginx")
+	review := PlanReview{
+		Version:   1,
+		SessionID: "s_plan",
+		Host:      "web-1",
+		Metadata:  PlanMetadata{Title: "deploy"},
+		Steps: []PlanReviewStep{{
+			Seq:        1,
+			ID:         "restart",
+			Cmd:        "systemctl restart nginx",
+			Status:     "approval_pending",
+			ApprovalID: member.ID,
+		}},
+	}
+	manifest, err := store.CreatePlan(PlanManifest{
+		SessionID: "s_plan",
+		Host:      "web-1",
+		Metadata:  review.Metadata,
+		Review:    &review,
+		MemberIDs: []string{member.ID},
+	})
+	if err != nil {
+		t.Fatalf("create plan: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(store.PlansDir, manifest.ID+".json"))
+	if err != nil {
+		t.Fatalf("read manifest: %v", err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	raw["host"] = "web-2"
+	data, _ = json.MarshalIndent(raw, "", "  ")
+	if err := os.WriteFile(filepath.Join(store.PlansDir, manifest.ID+".json"), append(data, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.GetPlan(manifest.ID); err != ErrPlanDigest {
+		t.Fatalf("GetPlan err=%v, want ErrPlanDigest", err)
+	}
+}
+
+func TestPlanMetadataDoesNotChangeGrantSemantics(t *testing.T) {
+	root := t.TempDir()
+	store := PendingStore{PendingDir: filepath.Join(root, "pending"), ResponsesDir: filepath.Join(root, "responses"), PlansDir: filepath.Join(root, "plans")}
+	member := mintPlanMember(t, store, "systemctl restart nginx")
+	review := PlanReview{
+		Version:   1,
+		SessionID: member.SessionID,
+		Host:      member.Host,
+		Metadata:  PlanMetadata{Title: "operator prose", Impact: "restart service"},
+		Steps: []PlanReviewStep{{
+			Seq:        1,
+			ID:         "step-001",
+			Cmd:        member.Cmd,
+			Status:     "approval_pending",
+			ApprovalID: member.ID,
+		}},
+	}
+	manifest, err := store.CreatePlan(PlanManifest{
+		SessionID: member.SessionID,
+		Host:      member.Host,
+		Metadata:  review.Metadata,
+		Review:    &review,
+		MemberIDs: []string{member.ID},
+	})
+	if err != nil {
+		t.Fatalf("create plan: %v", err)
+	}
+	sessions := SessionStore{Dir: filepath.Join(root, "sessions")}
+	results, err := ApplyPlanDecision(ApplyOptions{Pending: store, Sessions: sessions, TaskTTL: time.Hour}, manifest.ID, VerdictApproved, ScopeSession)
+	if err != nil {
+		t.Fatalf("apply plan: %v", err)
+	}
+	if len(results) != 1 || results[0].Grant == nil || results[0].Grant.Regex == "" {
+		t.Fatalf("results=%+v", results)
+	}
+	if results[0].Grant.Regex == review.Metadata.Title || results[0].Grant.Regex == review.Metadata.Impact {
+		t.Fatalf("metadata affected matcher: %+v", results[0].Grant)
 	}
 }

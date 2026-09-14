@@ -2,6 +2,8 @@ package approval
 
 import (
 	"fmt"
+	"math"
+	"net/url"
 	"path"
 	"reflect"
 	"slices"
@@ -52,6 +54,10 @@ func (p TaskPermission) Summary() string {
 		actions = "ps, bounded logs"
 	case "compose-maintenance":
 		actions = "ps, bounded logs, build, pull, up, restart"
+	case "http-probe":
+		actions = "fixed GET with curl -q and bounded timeouts"
+	case "file-checks":
+		actions = "sha256sum for explicit files"
 	}
 	if p.CWD != "" {
 		resource += " cwd=" + p.CWD
@@ -287,8 +293,106 @@ func taskOperation(command string) (TaskPermission, string, bool) {
 			return p, "", false
 		}
 		return p, verb, boundedLogs
+	case "curl":
+		p.Profile = "http-probe"
+		if len(args) < 4 || args[1] != "-q" && args[1] != "--disable" {
+			return p, "", false
+		}
+		var probeURL string
+		maxTime := false
+		for i := 2; i < len(args); i++ {
+			arg := args[i]
+			switch arg {
+			case "--fail", "-f", "--silent", "-s", "--show-error", "-S":
+				continue
+			case "--max-time", "-m":
+				i++
+				if i >= len(args) || !boundedSeconds(args[i], 30) {
+					return p, "", false
+				}
+				maxTime = true
+				continue
+			case "--connect-timeout":
+				i++
+				if i >= len(args) || !boundedSeconds(args[i], 30) {
+					return p, "", false
+				}
+				continue
+			default:
+				if strings.HasPrefix(arg, "--max-time=") {
+					if !boundedSeconds(strings.TrimPrefix(arg, "--max-time="), 30) {
+						return p, "", false
+					}
+					maxTime = true
+					continue
+				}
+				if strings.HasPrefix(arg, "--connect-timeout=") {
+					if !boundedSeconds(strings.TrimPrefix(arg, "--connect-timeout="), 30) {
+						return p, "", false
+					}
+					continue
+				}
+				if strings.HasPrefix(arg, "-") {
+					return p, "", false
+				}
+				if probeURL != "" {
+					return p, "", false
+				}
+				if !fixedHTTPURL(arg) {
+					return p, "", false
+				}
+				probeURL = arg
+			}
+		}
+		if probeURL == "" || !maxTime {
+			return p, "", false
+		}
+		p.Resources = []string{probeURL}
+		return p, "get", true
+	case "sha256sum":
+		p.Profile = "file-checks"
+		if len(args) < 2 {
+			return p, "", false
+		}
+		for _, arg := range args[1:] {
+			resource, ok := fixedHashPath(p.CWD, arg)
+			if !ok {
+				return p, "", false
+			}
+			p.Resources = append(p.Resources, resource)
+		}
+		return p, "sha256sum", len(p.Resources) > 0
 	}
 	return p, "", false
+}
+
+func fixedHTTPURL(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || u == nil {
+		return false
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return false
+	}
+	return u.Host != "" && u.User == nil && u.Fragment == ""
+}
+
+func fixedHashPath(cwd string, raw string) (string, bool) {
+	if raw == "" || raw == "-" || strings.HasPrefix(raw, "-") || strings.ContainsAny(raw, "*?[{") || strings.ContainsAny(raw, "\x00\r\n") || strings.HasSuffix(raw, "/") {
+		return "", false
+	}
+	if path.IsAbs(raw) {
+		clean := path.Clean(raw)
+		return clean, clean == raw && clean != "/"
+	}
+	if cwd == "" || !path.IsAbs(cwd) || path.Clean(cwd) != cwd {
+		return "", false
+	}
+	clean := path.Clean(raw)
+	if clean == "." || clean != raw || strings.HasPrefix(clean, "../") || clean == ".." || strings.Contains(clean, "/../") {
+		return "", false
+	}
+	return path.Join(cwd, clean), true
 }
 
 func resourceName(s string) bool {
@@ -300,6 +404,10 @@ func resourceName(s string) bool {
 func boundedInt(s string, max int) bool {
 	n, err := strconv.Atoi(s)
 	return err == nil && n >= 0 && n <= max
+}
+func boundedSeconds(s string, max float64) bool {
+	n, err := strconv.ParseFloat(s, 64)
+	return err == nil && n > 0 && n <= max && !math.IsNaN(n) && !math.IsInf(n, 0)
 }
 func timeValue(s string) bool {
 	return s != "" && !strings.HasPrefix(s, "-") && !strings.ContainsAny(s, "\x00\r\n")

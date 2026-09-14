@@ -20,6 +20,8 @@ func TestTaskPermissionBoundaries(t *testing.T) {
 		{"sudo -n systemctl restart nginx", []string{"sudo -n systemctl reload nginx", "sudo -n journalctl -u nginx -n 50 --no-pager"}, []string{"sudo systemctl restart nginx", "systemctl restart nginx", "sudo -u root systemctl restart nginx", "sudo -n systemctl stop nginx", "sudo -n systemctl restart redis"}},
 		{"cd /opt/app && docker compose -f /opt/app/compose.yaml up -d app", []string{"cd '/opt/app' && docker compose -f /opt/app/compose.yaml build --no-cache app", "cd /opt/app && docker compose -f /opt/app/compose.yaml logs --tail 100 app", "cd /opt/app && docker compose -f /opt/app/compose.yaml restart app"}, []string{"docker compose -f /opt/app/compose.yaml up -d app", "cd /opt/other && docker compose -f /opt/app/compose.yaml up -d app", "cd /opt/app && docker compose -f /opt/app/other.yaml up -d app", "cd /opt/app && docker compose -f /opt/app/compose.yaml up -d db", "cd /opt/app && docker compose -f /opt/app/compose.yaml up -d", "cd /opt/app && docker compose -f /opt/app/compose.yaml down -v", "cd /opt/app && docker compose -f /opt/app/compose.yaml up --remove-orphans app", "cd /opt/app && docker compose -f /opt/app/compose.yaml build --build-arg CMD=bad app", "cd /opt/app && docker compose -f /opt/app/compose.yaml exec app sh"}},
 		{"docker compose -f /opt/app/compose.yaml ps", []string{"docker compose -f /opt/app/compose.yaml logs --tail 100 app"}, []string{"docker compose -f /opt/app/compose.yaml up -d", "docker compose -f /opt/app/compose.yaml logs --tail 10000", "docker --context prod compose -f /opt/app/compose.yaml ps"}},
+		{"curl -q --fail --silent --show-error --max-time 10 --connect-timeout 2 'https://example.test/health?ready=1'", []string{"curl -q -f -s -S -m 1 'https://example.test/health?ready=1'", "curl --disable --max-time=30 --connect-timeout=5 'https://example.test/health?ready=1'"}, []string{"curl --fail --silent --show-error --max-time 10 'https://example.test/health?ready=1'", "curl -q --max-time 31 'https://example.test/health?ready=1'", "curl -q --max-time NaN 'https://example.test/health?ready=1'", "curl -q --max-time 10 -L 'https://example.test/health?ready=1'", "curl -q --max-time 10 -H X:1 'https://example.test/health?ready=1'", "curl -q --max-time 10 -d body 'https://example.test/health?ready=1'", "curl -q --max-time 10 -o /tmp/out 'https://example.test/health?ready=1'", "curl -q --max-time 10 --proxy http://proxy 'https://example.test/health?ready=1'", "curl -q --max-time 10 --insecure 'https://example.test/health?ready=1'", "curl -q --max-time 10 'https://user@example.test/health?ready=1'", "curl -q --max-time 10 'https://example.test/health?ready=1#frag'", "curl -q --max-time 10 https://example.test/other", "curl -q --max-time 10 'https://example.test/health?ready=1' https://example.test/other"}},
+		{"cd /opt/app && sha256sum config/app.yml /etc/hosts", []string{"cd /opt/app && sha256sum config/app.yml", "cd /opt/app && sha256sum /opt/app/config/app.yml /etc/hosts"}, []string{"sha256sum config/app.yml", "cd /opt/app && sha256sum ../secret", "cd /opt/app && sha256sum config/*.yml", "cd /opt/app && sha256sum -", "cd /opt/app && sha256sum --check config/app.yml", "cd /opt/app && sha256sum config/", "cd /opt/app && sha256sum /etc/shadow"}},
 	} {
 		t.Run(tc.source, func(t *testing.T) {
 			p := TaskCandidate(tc.source, "")
@@ -46,8 +48,60 @@ func TestTaskPermissionBoundaries(t *testing.T) {
 			t.Errorf("unexpected profile %q", command)
 		}
 	}
-	if TaskCandidate("systemctl restart nginx", "payload-hash") != nil {
+	if TaskCandidate("systemctl restart nginx", "payload-hash") != nil ||
+		TaskCandidate("curl -q --max-time 5 https://example.test/health", "payload-hash") != nil ||
+		TaskCandidate("sha256sum /etc/hosts", "payload-hash") != nil {
 		t.Fatal("stdin acquired task scope")
+	}
+}
+
+func TestHTTPAndFileTaskGrantsStayBounded(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	root := t.TempDir()
+	store := SessionStore{Dir: filepath.Join(root, "sessions"), Now: func() time.Time { return now }}
+	pending := PendingStore{PendingDir: filepath.Join(root, "pending"), ResponsesDir: filepath.Join(root, "responses")}
+	inv := inventory.Inventory{Hosts: map[string]inventory.Host{"web-1": {}}}
+	runtime := RuntimeConfig{Enabled: true}
+	for _, source := range []string{
+		"curl -q --fail --silent --show-error --max-time 10 https://example.test/health",
+		"cd /opt/app && sha256sum config/app.yml /etc/hosts",
+	} {
+		matcher, err := Exact(source)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req, err := pending.Create(PendingRequest{ReqID: source, SessionID: "s", Host: "web-1", Cmd: source, Candidate: matcher})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ApplyDecision(ApplyOptions{Pending: pending, Sessions: store, TaskTTL: time.Hour}, req.ID, VerdictApproved, ScopeTask); err != nil {
+			t.Fatalf("task approve %q: %v", source, err)
+		}
+	}
+	for _, command := range []string{
+		"curl -q --max-time 1 https://example.test/health",
+		"cd /opt/app && sha256sum config/app.yml",
+	} {
+		auth, err := PreflightAuthorize(policy.Config{}, inv, store, runtime, "s", "web-1", command, "")
+		if err != nil || auth.Status != AuthAllowByGrant {
+			t.Fatalf("expected task grant for %q: %+v %v", command, auth, err)
+		}
+	}
+	for _, command := range []string{
+		"curl -q --max-time 1 https://example.test/other",
+		"curl -q --max-time 1 'https://example.test/health?x=1'",
+		"cd /opt/app && sha256sum /etc/shadow",
+		"cd /opt/other && sha256sum config/app.yml",
+	} {
+		auth, err := PreflightAuthorize(policy.Config{}, inv, store, runtime, "s", "web-1", command, "")
+		if err != nil || auth.Status != AuthNeedsApproval {
+			t.Fatalf("grant widened for %q: %+v %v", command, auth, err)
+		}
+	}
+	deny := policy.Config{Rules: []policy.Rule{{Name: "no-health", Match: policy.Match{CmdRegex: "example\\.test/health"}, Action: policy.ActionDeny}}}
+	auth, err := PreflightAuthorize(deny, inv, store, runtime, "s", "web-1", "curl -q --max-time 1 https://example.test/health", "")
+	if err != nil || auth.Status != AuthHardDeny {
+		t.Fatalf("deny precedence failed: %+v %v", auth, err)
 	}
 }
 

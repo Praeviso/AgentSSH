@@ -14,6 +14,11 @@ import (
 const (
 	// EnvHome overrides the default ~/.agentssh configuration directory.
 	EnvHome = "AGENTSSH_HOME"
+	// EnvStateDir overrides the runtime state directory. Configuration,
+	// inventory, policy, secrets, and operator verification remain under EnvHome;
+	// audit, approvals, sessions, responses, plans, executions, and payloads
+	// move together under this directory.
+	EnvStateDir = "AGENTSSH_STATE_DIR"
 	// EnvApproval can enable the optional async approval flow when set truthy;
 	// false values do not disable policy-file approval.
 	EnvApproval = "AGENTSSH_APPROVAL"
@@ -78,6 +83,7 @@ output:
 // Paths contains all MVP file locations under the AgentSSH home directory.
 type Paths struct {
 	Home          string
+	StateDir      string
 	InventoryFile string
 	PolicyFile    string
 	AuditFile     string
@@ -87,6 +93,7 @@ type Paths struct {
 	PendingDir    string
 	ResponsesDir  string
 	PlansDir      string
+	PayloadsDir   string
 }
 
 // Config is the parsed local configuration set.
@@ -150,6 +157,14 @@ func ResolveHome() (string, error) {
 	return filepath.Join(home, DefaultDirName), nil
 }
 
+// ResolveStateDir returns the active AgentSSH runtime state directory.
+func ResolveStateDir(home string) string {
+	if override := os.Getenv(EnvStateDir); override != "" {
+		return filepath.Clean(override)
+	}
+	return home
+}
+
 // EnsureHome creates the configuration directory (0700) and seeds starter
 // inventory.yaml and policy.yaml when they are absent, so the first run of an
 // operator entry point (agentssh tui) works without manual setup. It is
@@ -197,18 +212,21 @@ func seedFileIfMissing(path, content string) error {
 
 // NewPaths derives the MVP file layout from a configuration home directory.
 func NewPaths(home string) Paths {
-	approvalsDir := filepath.Join(home, "approvals")
+	stateDir := ResolveStateDir(home)
+	approvalsDir := filepath.Join(stateDir, "approvals")
 	return Paths{
 		Home:          home,
+		StateDir:      stateDir,
 		InventoryFile: filepath.Join(home, "inventory.yaml"),
 		PolicyFile:    filepath.Join(home, "policy.yaml"),
-		AuditFile:     filepath.Join(home, "audit.log"),
+		AuditFile:     filepath.Join(stateDir, "audit.log"),
 		SecretsFile:   filepath.Join(home, "secrets.enc"),
 		ApprovalsDir:  approvalsDir,
 		SessionsDir:   filepath.Join(approvalsDir, "sessions"),
 		PendingDir:    filepath.Join(approvalsDir, "pending"),
 		ResponsesDir:  filepath.Join(approvalsDir, "responses"),
 		PlansDir:      filepath.Join(approvalsDir, "plans"),
+		PayloadsDir:   filepath.Join(stateDir, "payloads"),
 	}
 }
 

@@ -14,6 +14,8 @@ revokes them.
 | --- | --- | --- |
 | Specified services | status/show/is-active/is-enabled, bounded journal logs | restart/reload |
 | Fixed Compose project | ps, bounded logs | build/pull/up/restart with supported options |
+| Fixed HTTP(S) probe | `curl -q` or `curl --disable` as the first option, fixed URL, `--max-time`/`-m` <= 30s, optional `--connect-timeout` <= 30s, and only fail/silent/show-error flags | none |
+| Fixed file checks | `sha256sum` for explicit clean file paths; absolute paths must be clean, relative paths require a clean absolute `cwd` | none |
 
 Diagnostic requests do not propose maintenance permission. Named service grants
 cover named subsets; omitting selectors may broaden a Compose operation and need
@@ -21,9 +23,20 @@ another approval. Compose file paths are fixed, but remote contents are not
 hash-pinned and normal dependencies may also start.
 
 Task logs require an explicit bound of at most 1000 lines (`journalctl -n` or
-Compose `logs --tail`). Scripts, pipelines, stdin, and unsupported options stay
-exact; a mixed plan's task decision gives these members exact grants of the same
-lifetime. Do not seek persistent host grants merely to avoid task approvals.
+Compose `logs --tail`). HTTP probe task grants do not allow curl config files,
+headers, request bodies, method changes, redirects, shell expansion, multiple
+URLs, credentials in URLs, fragments, or unbounded timeouts. File-check grants do
+not allow globbing, option flags, `-`, trailing slashes, dirty relative paths, or
+paths outside the pinned `cwd` context. Scripts, pipelines, stdin, and
+unsupported options stay exact; a mixed plan's task decision gives these members
+exact grants of the same lifetime. Do not seek persistent host grants merely to
+avoid task approvals.
+
+When a command needs approval again, explain only facts AgentSSH can prove: no
+matching grant for the host/session/cwd/resource context, an expired or revoked
+grant, a changed stdin/payload hash, a changed review or command identity, or an
+explicit deny/default deny. Do not invent causes such as operator intent or
+remote state that AgentSSH did not report.
 
 ## Pending and terminal results
 

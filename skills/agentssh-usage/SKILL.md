@@ -35,6 +35,9 @@ independent work that remains within scope.
 - **A known sequence on one host:** use `plan run`; read
   [plans.md](references/plans.md) for the file format and saved execution rules.
   Separate stages when later commands depend on inspecting earlier output.
+- **A reviewable Compose deployment:** generate an inspectable plan with
+  `plan template compose`, then use `plan run` when execution is requested. Read
+  [compose-deployments.md](references/compose-deployments.md) for the template.
 - **Approval submission only:** use `plan submit`, which does not execute. See
   [plans.md](references/plans.md#approval-only-batching) for that workflow.
 
@@ -48,14 +51,25 @@ Add `--wait-approval 30s` when waiting and continuing in the same call is useful
 It rechecks authorization before execution and emits one final JSON on stdout;
 pending IDs go to stderr. A wait timeout remains pending, not approved.
 
+## Status router
+
+| State | Action |
+| --- | --- |
+| Pending approval/request | Observe the existing `approval_id` or `approval_plan_id`; do not submit a duplicate. |
+| Authorized `not_started` saved step | Resume the same `px_...` execution. |
+| Running execution | Observe `agentssh plan execution px_... --follow --timeout 30s`; do not start another owner. |
+| Failed execution or command | Inspect effects and outputs before retrying. |
+| Unknown execution | Never replay automatically; inspect the remote state and audit trail. |
+| Completed execution | Verify the business/application checks requested by the user. |
+
 ## Read only the detail needed
 
 - For **pending/denied results, permission reuse, or uncertain execution**, read
   [authorization.md](references/authorization.md). It covers task scope, status
   meanings, and continuation without replaying completed operations.
-- For **plans, stdin uploads, or resuming an execution**, read
-  [plans.md](references/plans.md). Preserve the approved command and payload
-  identity across submission and execution.
+- For **stdin uploads, retained payloads, or recovery after a local file is
+  removed**, read [payloads.md](references/payloads.md). It covers exact content
+  identity, storage, inspection, and cleanup.
 
 Preflight is optional; use a batched `policy test` when its verdicts help decide
 the next action. It includes grants but exits **0 even for deny**: inspect its

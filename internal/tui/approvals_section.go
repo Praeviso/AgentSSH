@@ -21,13 +21,16 @@ import (
 // operator decide each with o/s/h/d. "Consequence-first": the footer shows, for
 // the focused request, exactly what an [h] host-allow would free.
 type approvalsSection struct {
-	paths         config.Paths
-	styles        appStyles
-	runtime       approval.RuntimeConfig
-	pending       []approval.PendingRequest
-	cursor        int
-	expandedPlans map[string]bool
-	previewOffset int
+	paths               config.Paths
+	styles              appStyles
+	runtime             approval.RuntimeConfig
+	pending             []approval.PendingRequest
+	cursor              int
+	expandedPlans       map[string]bool
+	previewOffset       int
+	payloadPreview      bool
+	payloadPreviewIndex int
+	payloadPreviewText  []string
 	// choosing is the Enter-driven verdict menu: while open the footer swaps to a
 	// selectable once/session/host/deny chooser and this tab owns the keyboard.
 	choosing  bool
@@ -102,6 +105,9 @@ func (s approvalsSection) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		s.w, s.h = msg.Width, msg.Height
+		if s.payloadPreview {
+			s = s.loadPayloadPreview()
+		}
 		return s, nil
 	case approvalsTickMsg:
 		if !s.runtime.Enabled {
@@ -191,8 +197,33 @@ func (s approvalsSection) updateChoosing(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "esc":
 		s.choosing = false
 		s.planMode = false
+		s.payloadPreview = false
+		s.payloadPreviewIndex = 0
+		s.payloadPreviewText = nil
 		s.choiceID = ""
 		s.clearStatus()
+	case "v":
+		if s.planMode {
+			if s.payloadPreview {
+				s.payloadPreview = false
+				s.payloadPreviewIndex = 0
+				s.payloadPreviewText = nil
+			} else {
+				s.payloadPreview = true
+				s.payloadPreviewIndex = 0
+				s = s.loadPayloadPreview()
+			}
+		}
+	case "n":
+		if s.planMode && s.payloadPreview {
+			s.payloadPreviewIndex++
+			s = s.loadPayloadPreview()
+		}
+	case "p":
+		if s.planMode && s.payloadPreview {
+			s.payloadPreviewIndex--
+			s = s.loadPayloadPreview()
+		}
 	case "o":
 		return s.resolveWith(approval.VerdictApproved, approval.ScopeOnce)
 	case "s":
@@ -244,6 +275,10 @@ func (s approvalsSection) openPlanChooser() (tea.Model, tea.Cmd) {
 	s.clearStatus()
 	s.choosing = true
 	s.planMode = true
+	s.previewOffset = 0
+	s.payloadPreview = false
+	s.payloadPreviewIndex = 0
+	s.payloadPreviewText = nil
 	s.choiceIdx = 0
 	s.choiceID = req.ID
 	return s, nil
@@ -265,6 +300,9 @@ func (s approvalsSection) resolveWith(verdict approval.Verdict, scope approval.S
 	}
 	s.choosing = false
 	s.planMode = false
+	s.payloadPreview = false
+	s.payloadPreviewIndex = 0
+	s.payloadPreviewText = nil
 	s.choiceID = ""
 	if planMode {
 		return s.decidePlan(verdict, scope)
@@ -283,6 +321,9 @@ func (s *approvalsSection) resyncChooser() {
 	if idx < 0 {
 		s.choosing = false
 		s.planMode = false
+		s.payloadPreview = false
+		s.payloadPreviewIndex = 0
+		s.payloadPreviewText = nil
 		s.choiceID = ""
 		return
 	}
@@ -483,6 +524,9 @@ func (s approvalsSection) decidePlan(verdict approval.Verdict, scope approval.Sc
 		s.result = ""
 		return s, s.loadCmd()
 	}
+	if status, statusErr := s.pendingStore().PlanStatus(req.PlanID); statusErr == nil && status.Status != "pending" {
+		s.releasePlanPayloadPins(status)
+	}
 	s.err = nil
 	s.result = ""
 	toast := fmt.Sprintf("plan %s · denied %d command(s)", shortPlanID(req.PlanID), len(results))
@@ -541,8 +585,13 @@ func (s approvalsSection) View() string {
 		}
 		return body
 	}
-	if s.choosing && s.choiceIdx < len(s.choices()) && s.choices()[s.choiceIdx].scope == approval.ScopeTask {
-		return s.taskReviewView(inner)
+	if s.choosing {
+		if s.choiceIdx < len(s.choices()) && s.choices()[s.choiceIdx].scope == approval.ScopeTask {
+			return s.taskReviewView(inner)
+		}
+		if s.planMode {
+			return s.planReviewView(inner)
+		}
 	}
 
 	var b strings.Builder

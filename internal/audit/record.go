@@ -60,7 +60,10 @@ type Record struct {
 	StdinSHA256 string `json:"stdin_sha256,omitempty"`
 	StdinBytes  int64  `json:"stdin_bytes,omitempty"`
 	// PlanID links approval lifecycle events minted by one `plan submit`.
-	PlanID string `json:"plan_id,omitempty"`
+	PlanID       string `json:"plan_id,omitempty"`
+	ExecutionID  string `json:"execution_id,omitempty"`
+	StepID       string `json:"step_id,omitempty"`
+	ReviewSHA256 string `json:"review_sha256,omitempty"`
 }
 
 const ZeroHash = "0000000000000000000000000000000000000000000000000000000000000000"
@@ -313,9 +316,11 @@ func (s Store) TruncateBroken() (RepairResult, error) {
 
 // Filters narrows audit list results.
 type Filters struct {
-	Host      string
-	SessionID string
-	Event     Event
+	Host        string
+	SessionID   string
+	Event       Event
+	ExecutionID string
+	StepID      string
 }
 
 // FilterRecords applies host/session/event filters.
@@ -329,6 +334,12 @@ func FilterRecords(records []Record, filters Filters) []Record {
 			continue
 		}
 		if filters.Event != "" && record.Event != filters.Event {
+			continue
+		}
+		if filters.ExecutionID != "" && record.ExecutionID != filters.ExecutionID {
+			continue
+		}
+		if filters.StepID != "" && record.StepID != filters.StepID {
 			continue
 		}
 		result = append(result, record)
@@ -384,6 +395,9 @@ type canonicalRecord struct {
 	StdinSHA256     string `json:"stdin_sha256,omitempty"`
 	StdinBytes      int64  `json:"stdin_bytes,omitempty"`
 	PlanID          string `json:"plan_id,omitempty"`
+	ExecutionID     string `json:"execution_id,omitempty"`
+	StepID          string `json:"step_id,omitempty"`
+	ReviewSHA256    string `json:"review_sha256,omitempty"`
 }
 
 func canonicalJSON(record Record) ([]byte, error) {
@@ -412,5 +426,8 @@ func canonicalJSON(record Record) ([]byte, error) {
 		StdinSHA256:     record.StdinSHA256,
 		StdinBytes:      record.StdinBytes,
 		PlanID:          record.PlanID,
+		ExecutionID:     record.ExecutionID,
+		StepID:          record.StepID,
+		ReviewSHA256:    record.ReviewSHA256,
 	})
 }

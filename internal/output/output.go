@@ -128,6 +128,7 @@ type StreamWriter struct {
 	redacts   int
 	truncated bool
 	processed bool
+	err       error
 }
 
 func newStreamWriter(dst io.Writer, filter compiledFilter, maxLineCap int) *StreamWriter {
@@ -141,15 +142,25 @@ func (w *StreamWriter) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
+	if w.err != nil {
+		return 0, w.err
+	}
 	w.partial = append(w.partial, p...)
 	for len(w.partial) > 0 {
 		if idx := bytes.IndexByte(w.partial, '\n'); idx >= 0 {
-			w.processLine(w.partial[:idx+1])
-			w.partial = w.partial[idx+1:]
+			lineLen := idx + 1
+			if err := w.processLine(w.partial[:idx+1]); err != nil {
+				w.partial = w.partial[lineLen:]
+				return 0, err
+			}
+			w.partial = w.partial[lineLen:]
 			continue
 		}
 		if len(w.partial) >= w.maxLineCap {
-			w.processLine(w.partial[:w.maxLineCap])
+			if err := w.processLine(w.partial[:w.maxLineCap]); err != nil {
+				w.partial = w.partial[w.maxLineCap:]
+				return 0, err
+			}
 			w.partial = w.partial[w.maxLineCap:]
 			continue
 		}
@@ -163,8 +174,16 @@ func (w *StreamWriter) Flush() {
 	if len(w.partial) == 0 {
 		return
 	}
-	w.processLine(w.partial)
+	if w.err != nil {
+		w.partial = nil
+		return
+	}
+	_ = w.processLine(w.partial)
 	w.partial = nil
+}
+
+func (w *StreamWriter) Err() error {
+	return w.err
 }
 
 func (w *StreamWriter) Emitted() []byte {
@@ -179,12 +198,12 @@ func (w *StreamWriter) Truncated() bool {
 	return w.truncated
 }
 
-func (w *StreamWriter) processLine(line []byte) {
+func (w *StreamWriter) processLine(line []byte) error {
 	filtered, redactions := w.filter.redactLine(string(line), !w.processed)
 	w.processed = true
 	w.redacts += redactions
 	if w.truncated {
-		return
+		return nil
 	}
 	if w.filter.maxBytes > 0 {
 		remaining := w.filter.maxBytes - len(w.emitted)
@@ -192,24 +211,32 @@ func (w *StreamWriter) processLine(line []byte) {
 			if len(filtered) > 0 {
 				w.truncated = true
 			}
-			return
+			return nil
 		}
 		if len(filtered) > remaining {
 			filtered = truncateUTF8Prefix(filtered, remaining)
 			w.truncated = true
 		}
 	}
-	w.emit([]byte(filtered))
+	return w.emit([]byte(filtered))
 }
 
-func (w *StreamWriter) emit(p []byte) {
+func (w *StreamWriter) emit(p []byte) error {
 	if len(p) == 0 {
-		return
+		return nil
 	}
 	w.emitted = append(w.emitted, p...)
 	if w.dst != nil {
-		_, _ = w.dst.Write(p)
+		n, err := w.dst.Write(p)
+		if err == nil && n < len(p) {
+			err = io.ErrShortWrite
+		}
+		if err != nil {
+			w.err = err
+			return err
+		}
 	}
+	return nil
 }
 
 func truncateUTF8(value string, maxBytes int) (string, bool) {

@@ -24,6 +24,17 @@ func (s approvalsSection) taskMembers() []approval.PendingRequest {
 	if req.PlanID == "" || (!s.planMode && s.expandedPlans[req.PlanID]) {
 		return []approval.PendingRequest{req}
 	}
+	if status, err := s.pendingStore().PlanStatus(req.PlanID); err == nil {
+		var members []approval.PendingRequest
+		for _, member := range status.Members {
+			if member.Request != nil && member.Status == "pending" {
+				members = append(members, *member.Request)
+			}
+		}
+		if len(members) > 0 {
+			return members
+		}
+	}
 	var members []approval.PendingRequest
 	for _, member := range s.pending {
 		if member.PlanID == req.PlanID {

@@ -108,6 +108,8 @@ func buildAppWith(t *testing.T, inv, pol string) appModel {
 		SessionsDir:   filepath.Join(dir, "approvals", "sessions"),
 		PendingDir:    filepath.Join(dir, "approvals", "pending"),
 		ResponsesDir:  filepath.Join(dir, "approvals", "responses"),
+		PlansDir:      filepath.Join(dir, "approvals", "plans"),
+		PayloadsDir:   filepath.Join(dir, "payloads"),
 	}
 	return newAppModel(paths, lipgloss.NewRenderer(os.Stdout))
 }

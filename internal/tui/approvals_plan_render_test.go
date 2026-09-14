@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/Praeviso/AgentSSH/internal/approval"
+	"github.com/Praeviso/AgentSSH/internal/payload"
 )
 
 // planApprovalQueue mixes plan members, a stdin request, and a plain request so
@@ -37,6 +38,30 @@ func loadedPlanApprovalsApp(t *testing.T) appModel {
 
 func TestApprovalsPlanMemberShowsPlanHintAndChooser(t *testing.T) {
 	m := loadedPlanApprovalsApp(t)
+	store := m.approvals.pendingStore()
+	pending := planApprovalQueue(t)
+	payloadRef, err := (payload.Store{Dir: m.approvals.paths.PayloadsDir}).Put([]byte("preview text"), payload.PutOptions{})
+	if err != nil {
+		t.Fatalf("put payload: %v", err)
+	}
+	secondPayloadRef, err := (payload.Store{Dir: m.approvals.paths.PayloadsDir}).Put([]byte("second preview"), payload.PutOptions{})
+	if err != nil {
+		t.Fatalf("put second payload: %v", err)
+	}
+	review := approval.PlanReview{
+		Version:   1,
+		PlanID:    pending[0].PlanID,
+		SessionID: pending[0].SessionID,
+		Host:      pending[0].Host,
+		Metadata:  approval.PlanMetadata{Title: "deploy \x1b[31mapi"},
+		Steps: []approval.PlanReviewStep{
+			{Seq: 1, ID: "restart", Name: "Restart  API", Cmd: pending[0].Cmd + " 'a  b'\x1b[31m", Status: "approval_pending", ApprovalID: pending[0].ID, PayloadRef: payloadRef.String(), PayloadRetained: true},
+			{Seq: 2, ID: "compose", Cmd: pending[1].Cmd, Status: "approval_pending", ApprovalID: pending[1].ID, PayloadRef: secondPayloadRef.String(), PayloadRetained: true},
+		},
+	}
+	if _, err := store.CreatePlan(approval.PlanManifest{ID: pending[0].PlanID, SessionID: pending[0].SessionID, Host: pending[0].Host, Metadata: review.Metadata, Review: &review, MemberIDs: []string{pending[0].ID, pending[1].ID}}); err != nil {
+		t.Fatalf("create plan: %v", err)
+	}
 	view := m.View()
 	t.Logf("\n%s", view)
 	if !strings.Contains(view, "plan 1/2") {
@@ -53,9 +78,37 @@ func TestApprovalsPlanMemberShowsPlanHintAndChooser(t *testing.T) {
 	if !strings.Contains(view, "decide plan pl_92bf9463") {
 		t.Errorf("plan chooser label missing:\n%s", view)
 	}
+	if !strings.Contains(view, "deploy api") || !strings.Contains(view, "review sha256=") {
+		t.Errorf("full review missing metadata/digest:\n%s", view)
+	}
+	if strings.Contains(view, "\x1b[31m") {
+		t.Errorf("review rendered terminal escape:\n%s", view)
+	}
+	if !strings.Contains(view, "recorded facts") || !strings.Contains(view, "submitter descriptions") {
+		t.Errorf("review did not separate facts from submitter descriptions:\n%s", view)
+	}
+	if !strings.Contains(view, "submitter step name (unverified)") {
+		t.Errorf("step name not labeled as submitter description:\n%s", view)
+	}
+	if !strings.Contains(view, "a  b") || strings.Contains(view, "a b") && !strings.Contains(view, "a  b") {
+		t.Errorf("command whitespace was not preserved in escaped display:\n%s", view)
+	}
+	if strings.Contains(view, "preview text") {
+		t.Errorf("payload preview loaded without v:\n%s", view)
+	}
 	// The chooser itself offers once/session/task/deny — no host scope.
 	if !strings.Contains(view, "[once]  session   task   deny") {
 		t.Errorf("plan chooser options wrong (want once/session/task/deny):\n%s", view)
+	}
+	m = press(t, m, "v")
+	view = m.View()
+	if !strings.Contains(view, "preview text") {
+		t.Errorf("payload preview missing after v:\n%s", view)
+	}
+	m = press(t, m, "n")
+	view = m.View()
+	if !strings.Contains(view, "second preview") {
+		t.Errorf("payload preview did not advance to selected payload step:\n%s", view)
 	}
 }
 

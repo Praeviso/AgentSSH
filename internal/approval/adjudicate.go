@@ -10,15 +10,19 @@ import (
 )
 
 type ApplyOptions struct {
-	Pending    PendingStore
-	Sessions   SessionStore
-	Audit      audit.Store
-	Bundle     policy.Bundle
-	PolicyPath string
-	SessionTTL time.Duration
-	TaskTTL    time.Duration
-	Channel    string
-	SavePolicy func(policy.Config) error
+	Pending      PendingStore
+	Sessions     SessionStore
+	Audit        audit.Store
+	Bundle       policy.Bundle
+	PolicyPath   string
+	SessionTTL   time.Duration
+	TaskTTL      time.Duration
+	Channel      string
+	PlanID       string
+	ReviewSHA256 string
+	ExecutionID  string
+	StepID       string
+	SavePolicy   func(policy.Config) error
 }
 
 type ApplyResult struct {
@@ -203,6 +207,20 @@ func appendApprovalAudit(opts ApplyOptions, req PendingRequest, verdict Verdict,
 	if opts.Audit.Path == "" {
 		return nil
 	}
+	planID := opts.PlanID
+	reviewSHA256 := opts.ReviewSHA256
+	executionID := opts.ExecutionID
+	stepID := opts.StepID
+	if planID == "" {
+		planID = req.PlanID
+	}
+	if reviewSHA256 == "" && req.PlanID != "" {
+		if manifest, err := opts.Pending.GetPlan(req.PlanID); err == nil {
+			reviewSHA256 = manifest.ReviewSHA256
+			executionID = manifest.ExecutionID
+			stepID = unambiguousStepID(manifest.Review, req.ID)
+		}
+	}
 	event := audit.EventApprovalDenied
 	action := string(policy.ActionDeny)
 	if verdict == VerdictApproved {
@@ -223,7 +241,10 @@ func appendApprovalAudit(opts ApplyOptions, req PendingRequest, verdict Verdict,
 		ApprovalChannel: opts.Channel,
 		StdinSHA256:     req.StdinSHA256,
 		StdinBytes:      req.StdinBytes,
-		PlanID:          req.PlanID,
+		PlanID:          planID,
+		ExecutionID:     executionID,
+		StepID:          stepID,
+		ReviewSHA256:    reviewSHA256,
 	}
 	if scope == ScopeTask {
 		if permission := TaskCandidate(req.Cmd, req.StdinSHA256); permission != nil {

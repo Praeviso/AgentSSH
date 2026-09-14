@@ -13,7 +13,7 @@ AgentSSH uses standard SSH from the local machine (its built-in Go SSH client by
 
 ```bash
 # 1. Install — static binary, no Go required (see "Install" for macOS / arm64).
-curl -fsSL https://github.com/Praeviso/AgentSSH/releases/download/v0.12.0/agentssh_v0.12.0_linux_amd64.tar.gz \
+curl -fsSL https://github.com/Praeviso/AgentSSH/releases/download/v0.13.0/agentssh_v0.13.0_linux_amd64.tar.gz \
   | sudo tar xz --strip-components=1 -C /usr/local/bin agentssh_v0.12.0_linux_amd64/agentssh
 
 # 2. Open the console — this is your main entry point:
@@ -67,6 +67,7 @@ agentssh session new
 agentssh plan run web-1 --session <session_id> --file deploy.yaml --wait-approval 30s --json
 agentssh plan resume <execution_id> --wait-approval 30s --json
 agentssh plan execution <execution_id>       # saved progress as JSON
+agentssh plan execution <execution_id> --follow --after-seq <n> --timeout 30s
 agentssh session grants <session_id>         # permissions and expiry as JSON
 ```
 
@@ -93,13 +94,64 @@ now checks current grants and stdin identities, using the same authorization
 path as execution. Preflight is optional and never substitutes for runtime checks.
 
 Saved plans stop on failure and resume only unstarted steps. Completed steps are
-never replayed; uncertain SSH outcomes require inspection and an explicit new
-plan. Input-file hashes remain pinned to the original snapshot. Arbitrary shell
-programs, pipelines, changed Compose projects, destructive options, and changed
-stdin do not inherit a task grant.
+never replayed; a `running` execution should be observed with `plan execution
+<px_...> --follow --timeout 30s`, and an `unknown` execution must be inspected
+before creating a new plan. A failed step also requires effect inspection. `verify` steps may use
+`on_failure: continue` for independent checks, but the overall execution still
+finishes failed when any continued verification fails.
+
+Reviewable deployment plans can be generated before submission:
+
+```bash
+agentssh plan template compose \
+  --cwd /opt/app \
+  --service web \
+  --compose-file compose.yaml \
+  --compose-file compose.production.yaml \
+  --revision REV \
+  --archive ./release.tar \
+  --output deploy.yaml
+```
+
+The template command only writes ordinary `version: 1` plan YAML; it does not
+submit, approve, or execute anything. It validates the local tar/tar.gz archive,
+rejects unsafe tar member paths, leading/trailing whitespace, control characters,
+unsupported tar types, and the reserved `.agentssh-deploy/` subtree, creates a
+validated archive copy beside the YAML, preserves every `--compose-file` in order
+by resolving it against `--cwd`, and fails if `--output` or the archive copy
+already exists. The generated plan uploads that validated copy, asserts its
+SHA-256 before extraction, writes existing and missing member lists, rejects
+existing member paths and parents that are symlinks before backup and before
+extraction, backs up only existing readable regular archive member files with a
+NUL-delimited verbatim tar list, records the backup contents, captures current
+Compose image/status evidence, extracts the archive, builds and starts only the
+selected service, then runs bounded verification/evidence steps. The Compose
+status assertion requires every selected service container to be running and, if
+a Docker healthcheck exists, healthy. An empty backup can be valid for first
+deploys but is not a rollback by itself. It never embeds project-specific
+credentials or automatic rollback.
+
+Input-file hashes remain pinned to the original snapshot. `plan run
+--save-payloads` can retain stdin payload bytes for resume; retained payloads
+are sensitive local state and remain removable only when no active execution or
+plan pin references them. Without saved payloads, resume rereads the original
+absolute local paths and refuses changed bytes. Arbitrary shell programs,
+pipelines, changed Compose projects, destructive options, and changed stdin do
+not inherit a task grant.
+
+By default, configuration and runtime state both live under `AGENTSSH_HOME`
+(`~/.agentssh`). Set `AGENTSSH_STATE_DIR` to move runtime state only: audit,
+pending approvals, responses, session grants, plans, executions, events, and
+payloads. Inventory, policy, secrets, and the operator verifier stay under
+`AGENTSSH_HOME`. Use the same `AGENTSSH_STATE_DIR` for operator TUI/CLI and
+agent commands; AgentSSH does not migrate old state automatically. `agentssh
+diagnostics --json` reports path existence and local filesystem writability
+without creating directories, but it cannot prove access through an outer
+sandbox, container mount, or remote filesystem policy.
 
 See [the operating skill](skills/agentssh-usage/SKILL.md) for the full workflow and
-[the implementation contract](docs/plans/task-authorization.md) for boundaries.
+[the reviewable execution guide](docs/plans/reviewable-executions.md) for plan
+states, payload retention, and deployment templates.
 
 ## The console (`agentssh tui`)
 
@@ -130,23 +182,23 @@ Static binaries (`CGO_ENABLED=0`, no runtime deps). Pick your platform; each is 
 
 ```bash
 # Linux x86_64
-curl -fsSL https://github.com/Praeviso/AgentSSH/releases/download/v0.12.0/agentssh_v0.12.0_linux_amd64.tar.gz \
+curl -fsSL https://github.com/Praeviso/AgentSSH/releases/download/v0.13.0/agentssh_v0.13.0_linux_amd64.tar.gz \
   | sudo tar xz --strip-components=1 -C /usr/local/bin agentssh_v0.12.0_linux_amd64/agentssh
 
 # Linux arm64
-curl -fsSL https://github.com/Praeviso/AgentSSH/releases/download/v0.12.0/agentssh_v0.12.0_linux_arm64.tar.gz \
+curl -fsSL https://github.com/Praeviso/AgentSSH/releases/download/v0.13.0/agentssh_v0.13.0_linux_arm64.tar.gz \
   | sudo tar xz --strip-components=1 -C /usr/local/bin agentssh_v0.12.0_linux_arm64/agentssh
 
 # macOS Apple Silicon (arm64)
-curl -fsSL https://github.com/Praeviso/AgentSSH/releases/download/v0.12.0/agentssh_v0.12.0_darwin_arm64.tar.gz \
+curl -fsSL https://github.com/Praeviso/AgentSSH/releases/download/v0.13.0/agentssh_v0.13.0_darwin_arm64.tar.gz \
   | sudo tar xz --strip-components=1 -C /usr/local/bin agentssh_v0.12.0_darwin_arm64/agentssh
 
 # macOS Intel (amd64)
-curl -fsSL https://github.com/Praeviso/AgentSSH/releases/download/v0.12.0/agentssh_v0.12.0_darwin_amd64.tar.gz \
+curl -fsSL https://github.com/Praeviso/AgentSSH/releases/download/v0.13.0/agentssh_v0.13.0_darwin_amd64.tar.gz \
   | sudo tar xz --strip-components=1 -C /usr/local/bin agentssh_v0.12.0_darwin_amd64/agentssh
 ```
 
-Verify: `agentssh --version`. (Bump `v0.12.0` for a different release; checksums are in `SHA256SUMS.txt` on the Releases page.)
+Verify: `agentssh --version`. (Bump `v0.13.0` for a different release; checksums are in `SHA256SUMS.txt` on the Releases page.)
 
 ### From source (needs Go matching the go.mod directive)
 

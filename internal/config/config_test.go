@@ -57,11 +57,49 @@ func TestLoadValid(t *testing.T) {
 	if cfg.Paths.AuditFile != filepath.Join(dir, "audit.log") {
 		t.Fatalf("audit path = %q", cfg.Paths.AuditFile)
 	}
+	if cfg.Paths.StateDir != dir {
+		t.Fatalf("state dir = %q", cfg.Paths.StateDir)
+	}
 	if cfg.Paths.ApprovalsDir != filepath.Join(dir, "approvals") ||
 		cfg.Paths.SessionsDir != filepath.Join(dir, "approvals", "sessions") ||
 		cfg.Paths.PendingDir != filepath.Join(dir, "approvals", "pending") ||
-		cfg.Paths.ResponsesDir != filepath.Join(dir, "approvals", "responses") {
+		cfg.Paths.ResponsesDir != filepath.Join(dir, "approvals", "responses") ||
+		cfg.Paths.PayloadsDir != filepath.Join(dir, "payloads") {
 		t.Fatalf("approval paths = %#v", cfg.Paths)
+	}
+}
+
+func TestLoadUsesSeparateStateDirWhenConfigured(t *testing.T) {
+	home := t.TempDir()
+	state := filepath.Join(t.TempDir(), "agentssh-state")
+	if err := os.WriteFile(filepath.Join(home, "inventory.yaml"), []byte("version: 1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(EnvHome, home)
+	t.Setenv(EnvStateDir, state)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load valid with state dir: %v", err)
+	}
+	if cfg.Paths.Home != home || cfg.Paths.StateDir != state {
+		t.Fatalf("paths home/state = %q/%q", cfg.Paths.Home, cfg.Paths.StateDir)
+	}
+	if cfg.Paths.InventoryFile != filepath.Join(home, "inventory.yaml") ||
+		cfg.Paths.PolicyFile != filepath.Join(home, "policy.yaml") ||
+		cfg.Paths.SecretsFile != filepath.Join(home, "secrets.enc") {
+		t.Fatalf("configuration paths moved into state dir: %#v", cfg.Paths)
+	}
+	if cfg.Paths.AuditFile != filepath.Join(state, "audit.log") ||
+		cfg.Paths.ApprovalsDir != filepath.Join(state, "approvals") ||
+		cfg.Paths.SessionsDir != filepath.Join(state, "approvals", "sessions") ||
+		cfg.Paths.PendingDir != filepath.Join(state, "approvals", "pending") ||
+		cfg.Paths.ResponsesDir != filepath.Join(state, "approvals", "responses") ||
+		cfg.Paths.PlansDir != filepath.Join(state, "approvals", "plans") ||
+		cfg.Paths.PayloadsDir != filepath.Join(state, "payloads") {
+		t.Fatalf("runtime paths did not move together: %#v", cfg.Paths)
+	}
+	if _, err := os.Stat(state); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Load should not create state dir, stat err=%v", err)
 	}
 }
 

@@ -2467,8 +2467,9 @@ func (e fakeExecutor) RunStreaming(_ context.Context, request executor.Request, 
 	if out == "" && e.exitCode == 0 && e.err == nil {
 		out = "ok\n"
 	}
-	writeInChunks(stdout, []byte(out), 7)
-	writeInChunks(stderr, []byte(e.stderr), 7)
+	if err := writeInChunks(stdout, []byte(out), 7); err == nil {
+		_ = writeInChunks(stderr, []byte(e.stderr), 7)
+	}
 	return executor.Result{
 		ExitCode: e.exitCode,
 		Duration: time.Millisecond,
@@ -2496,15 +2497,18 @@ func (e osDetectingExecutor) Close() error { return nil }
 
 var _ executor.Executor = osDetectingExecutor{}
 
-func writeInChunks(w io.Writer, data []byte, size int) {
+func writeInChunks(w io.Writer, data []byte, size int) error {
 	for len(data) > 0 {
 		n := size
 		if n > len(data) {
 			n = len(data)
 		}
-		_, _ = w.Write(data[:n])
+		if _, err := w.Write(data[:n]); err != nil {
+			return err
+		}
 		data = data[n:]
 	}
+	return nil
 }
 
 type bufferedOnlyExecutor struct {

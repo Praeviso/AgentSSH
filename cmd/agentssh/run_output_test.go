@@ -1,12 +1,18 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"strings"
 	"sync/atomic"
 	"testing"
+
+	"github.com/Praeviso/AgentSSH/internal/audit"
+	"github.com/spf13/cobra"
 )
 
 func TestRunJSONCmdEchoTruncatedWithSHA(t *testing.T) {
@@ -115,6 +121,96 @@ func TestRunFieldsRejectsUnknownName(t *testing.T) {
 	}
 	if atomic.LoadInt32(&calls) != 0 {
 		t.Fatalf("executor ran despite invalid --fields")
+	}
+}
+
+func TestRunJSONStreamsFilteredOutputToCallbackWithoutCorruptingResult(t *testing.T) {
+	home := setupHome(t)
+	var calls int32
+	withFakeExecutor(t, fakeExecutor{calls: &calls, stdout: "password=secret\nvisible\n"})
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	var events []runOutputEvent
+	cmd := &cobra.Command{}
+	cmd.SetContext(context.Background())
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stderr)
+	err := runDirect(cmd, "web-1", "echo secret", runFlags{
+		jsonOutput:   true,
+		executionID:  "exec-1",
+		stepID:       "step-1",
+		reviewSHA256: "reviewhash",
+		onOutput: func(event runOutputEvent) error {
+			events = append(events, event)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("runDirect err=%v stderr=%s", err, stderr.String())
+	}
+	if atomic.LoadInt32(&calls) != 1 {
+		t.Fatalf("executor calls=%d want 1", calls)
+	}
+	var response runResponse
+	if err := json.Unmarshal(stdout.Bytes(), &response); err != nil {
+		t.Fatalf("decode JSON result: %v\n%s", err, stdout.String())
+	}
+	if strings.Contains(stdout.String(), "password=secret") || !strings.Contains(response.Stdout, "«REDACTED»") {
+		t.Fatalf("JSON result leaked or missed filtered stdout: stdout=%q response=%#v", stdout.String(), response)
+	}
+	if response.ExecutionID != "exec-1" || response.StepID != "step-1" || response.ReviewSHA256 != "reviewhash" {
+		t.Fatalf("response runtime metadata = %#v", response)
+	}
+	if len(events) == 0 {
+		t.Fatal("no output callback events captured")
+	}
+	var eventText strings.Builder
+	for _, event := range events {
+		if event.ExecutionID != "exec-1" || event.StepID != "step-1" || event.ReqID == "" || event.Host != "web-1" {
+			t.Fatalf("event metadata = %#v", event)
+		}
+		eventText.WriteString(event.Data)
+	}
+	if got := eventText.String(); strings.Contains(got, "password=secret") || !strings.Contains(got, "«REDACTED»") {
+		t.Fatalf("event stream not filtered: %q", got)
+	}
+	records := mustReadAudit(t, home)
+	completed := records[len(records)-1]
+	if completed.ExecutionID != "exec-1" || completed.StepID != "step-1" || completed.ReviewSHA256 != "reviewhash" {
+		t.Fatalf("audit runtime metadata = %#v", completed)
+	}
+	if completed.OutputSHA256 != audit.ComputeOutputSHA256(response.Stdout, response.Stderr) {
+		t.Fatalf("audit output hash=%s response hash=%s", completed.OutputSHA256, audit.ComputeOutputSHA256(response.Stdout, response.Stderr))
+	}
+}
+
+func TestRunJSONReturnsOutputCallbackErrorAfterAudit(t *testing.T) {
+	home := setupHome(t)
+	withFakeExecutor(t, fakeExecutor{stdout: "ok\n"})
+	callbackErr := errors.New("write durable event")
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd := &cobra.Command{}
+	cmd.SetContext(context.Background())
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stderr)
+	err := runDirect(cmd, "web-1", "echo secret", runFlags{
+		jsonOutput: true,
+		onOutput: func(runOutputEvent) error {
+			return callbackErr
+		},
+	})
+	if !errors.Is(err, callbackErr) {
+		t.Fatalf("err=%v want callback error", err)
+	}
+	var response runResponse
+	if decodeErr := json.Unmarshal(stdout.Bytes(), &response); decodeErr != nil {
+		t.Fatalf("callback error should not corrupt JSON result: %v\n%s", decodeErr, stdout.String())
+	}
+	records := mustReadAudit(t, home)
+	if got := records[len(records)-1].Event; got != audit.EventCompleted {
+		t.Fatalf("audit event=%s want completed", got)
 	}
 }
 

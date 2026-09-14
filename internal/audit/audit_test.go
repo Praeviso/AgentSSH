@@ -104,6 +104,9 @@ func TestApprovalFieldsAreHashProtectedAndOldRecordsVerify(t *testing.T) {
 		ApprovalScope:   "session",
 		ApprovalMatcher: `\Aid\z`,
 		ApprovalChannel: approval.ChannelExit,
+		ExecutionID:     "exec-1",
+		StepID:          "step-1",
+		ReviewSHA256:    "reviewhash",
 	})
 	if err != nil {
 		t.Fatalf("append approval: %v", err)
@@ -129,6 +132,9 @@ func TestApprovalFieldsAreHashProtectedAndOldRecordsVerify(t *testing.T) {
 		{"approval_scope", func(r *audit.Record) { r.ApprovalScope = "host" }},
 		{"approval_matcher", func(r *audit.Record) { r.ApprovalMatcher = `\Als\z` }},
 		{"approval_channel", func(r *audit.Record) { r.ApprovalChannel = "cli" }},
+		{"execution_id", func(r *audit.Record) { r.ExecutionID = "exec-2" }},
+		{"step_id", func(r *audit.Record) { r.StepID = "step-2" }},
+		{"review_sha256", func(r *audit.Record) { r.ReviewSHA256 = "other" }},
 	}
 	for _, tt := range fields {
 		t.Run(tt.name, func(t *testing.T) {
@@ -144,6 +150,18 @@ func TestApprovalFieldsAreHashProtectedAndOldRecordsVerify(t *testing.T) {
 			}
 			writeRecords(t, store.Path, records)
 		})
+	}
+}
+
+func TestFilterRecordsByExecutionAndStep(t *testing.T) {
+	records := []audit.Record{
+		{ReqID: "r1", ExecutionID: "exec-1", StepID: "step-1"},
+		{ReqID: "r2", ExecutionID: "exec-1", StepID: "step-2"},
+		{ReqID: "r3", ExecutionID: "exec-2", StepID: "step-1"},
+	}
+	filtered := audit.FilterRecords(records, audit.Filters{ExecutionID: "exec-1", StepID: "step-2"})
+	if len(filtered) != 1 || filtered[0].ReqID != "r2" {
+		t.Fatalf("filtered = %#v", filtered)
 	}
 }
 
