@@ -39,7 +39,9 @@ jobs:
         run: go build ./...
 
       - name: Test (race)
-        run: go test -race ./...
+        # CLI approval tests exercise real scrypt verifiers. With race
+        # instrumentation, hosted runners can exceed Go's default 10m timeout.
+        run: go test -race -timeout=20m ./...
 
   lint:
     runs-on: ubuntu-latest
