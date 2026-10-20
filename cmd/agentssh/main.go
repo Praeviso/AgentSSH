@@ -71,6 +71,10 @@ var newExecutor = func(cfg *config.Config) executor.Executor {
 			options.DisableConnectionReuse = !sshMultiplexingEnabled(cfg)
 			options.KeepAliveInterval = sshKeepAliveInterval(cfg)
 		}
+		if cfg != nil && cfg.Remote != nil {
+			cfg.Remote.ApplyNativeOptions(&options)
+			return cfg.Remote.WrapExecutor(executor.NewNativeExecutor(options))
+		}
 		return executor.NewNativeExecutor(options)
 	default:
 		return executor.NewSSHExecutorWithOptions(nil, executor.SSHOptions{
@@ -164,6 +168,7 @@ func newRootCommand() *cobra.Command {
 		newAuditCommand(),
 		newSessionCommand(),
 		newDiagnosticsCommand(),
+		newRemoteCommand(),
 	)
 
 	return cmd
@@ -287,8 +292,10 @@ func runTUI(cmd *cobra.Command) error {
 		// A malformed inventory.yaml/policy.yaml must not lock the operator out of
 		// the console — launch so the Hosts/Policy tabs can show a fixable error
 		// card. (The agent-facing commands still treat this as a setup error.)
+		// An unavailable remote bundle is the same: audit stays reviewable.
 		var parseErr config.ParseError
-		if !errors.As(err, &parseErr) {
+		var remoteErr config.RemoteError
+		if !errors.As(err, &parseErr) && !errors.As(err, &remoteErr) {
 			return classifyConfigError(err)
 		}
 	} else {
@@ -935,7 +942,7 @@ func newSessionCommand() *cobra.Command {
 	cmd.AddCommand(&cobra.Command{
 		Use: "grants <id>", Short: "Show current session permissions and expiry as JSON.", Args: exactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := config.Load()
+			cfg, err := config.LoadPaths()
 			if err != nil {
 				return classifyConfigError(err)
 			}
@@ -1361,10 +1368,18 @@ func classifyConfigError(err error) error {
 	if errors.As(err, &setupErr) {
 		return newUsageError("%v\n  fix AGENTSSH_HOME or your ~/.agentssh setup, then re-run", err)
 	}
+	var remoteErr config.RemoteError
+	if errors.As(err, &remoteErr) {
+		return newUsageError("%v\n  check the control plane with: agentssh remote status", err)
+	}
 	return fmt.Errorf("%w", err)
 }
 
 func selectedTransport(cfg *config.Config) string {
+	if cfg != nil && cfg.Remote != nil {
+		// Remote signing exists only in the native client.
+		return executor.TransportNative
+	}
 	transport := ""
 	if env := os.Getenv("AGENTSSH_TRANSPORT"); env != "" {
 		transport = env
@@ -2354,13 +2369,17 @@ func runInventoryTest(cmd *cobra.Command, name string) error {
 	if resolved.Kind != inventory.TargetKindHost || len(resolved.Targets) != 1 {
 		return newUsageError("inventory test requires a host name, got group %q", name)
 	}
-	exec := executor.NewNativeExecutor(executor.NativeOptions{
+	options := executor.NativeOptions{
 		ConnectTimeout: executor.ProbeTimeout,
 		HostKeyPolicy:  cfg.Inventory.HostKeyPolicy,
 		// Test the same credentials `run` will use, including a stored password
 		// (env-only master).
 		PasswordSource: passwordSourceForRun(cfg.Paths),
-	})
+	}
+	if cfg.Remote != nil {
+		cfg.Remote.ApplyNativeOptions(&options)
+	}
+	exec := executor.NewNativeExecutor(options)
 	defer func() { _ = exec.Close() }()
 	result := exec.Probe(context.Background(), resolved.Targets[0])
 	if result.Err == nil && result.ExitCode == 0 {
@@ -2557,7 +2576,7 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 				OutputTruncated: streamed.OutputTruncated,
 				Redactions:      streamed.Redactions,
 			}
-			if _, err := store.Append(stampRunMetadata(stampStdin(baseAuditRecord(reqID, sessionCtx, event, target.Name, remoteCommand, decision, &result.ExitCode, outputHash, result.Duration.Milliseconds(), filtered), stdin), flags)); err != nil {
+			if _, err := store.Append(stampRemoteSign(stampRunMetadata(stampStdin(baseAuditRecord(reqID, sessionCtx, event, target.Name, remoteCommand, decision, &result.ExitCode, outputHash, result.Duration.Milliseconds(), filtered), stdin), flags), result)); err != nil {
 				return err
 			}
 			settleOnceClaimWithWarning(cmd, sessionStore, sessionCtx.ID, reqID, auth, result)
@@ -2612,7 +2631,7 @@ func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flag
 		// The audit hash records the bytes that crossed the trust boundary and
 		// were returned to the agent after output filtering.
 		outputHash := audit.ComputeOutputSHA256(filtered.Stdout, filtered.Stderr)
-		if _, err := store.Append(stampRunMetadata(stampStdin(baseAuditRecord(reqID, sessionCtx, event, target.Name, remoteCommand, decision, &result.ExitCode, outputHash, result.Duration.Milliseconds(), filtered), stdin), flags)); err != nil {
+		if _, err := store.Append(stampRemoteSign(stampRunMetadata(stampStdin(baseAuditRecord(reqID, sessionCtx, event, target.Name, remoteCommand, decision, &result.ExitCode, outputHash, result.Duration.Milliseconds(), filtered), stdin), flags), result)); err != nil {
 			return err
 		}
 		settleOnceClaimWithWarning(cmd, sessionStore, sessionCtx.ID, reqID, auth, result)
@@ -3052,7 +3071,11 @@ func printSSHErrorHint(cmd *cobra.Command, result executor.Result) {
 func printDenyHuman(cmd *cobra.Command, host string, command string, decision policy.Decision) {
 	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "✗ denied by policy · %s · matched rule %q\n", host, decision.Rule)
 	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "  %s matched a deny rule or no allow rule; this block cannot be approved inline.\n", command)
-	_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "  If the policy should change, ask an operator to edit ~/.agentssh/policy.yaml.")
+	hint := "If the policy should change, ask an operator to edit ~/.agentssh/policy.yaml."
+	if !strings.HasPrefix(decision.Rule, policy.OverlayRulePrefix) && remoteManagedHome() {
+		hint = "This policy is managed by a remote control plane; ask its administrator to change it."
+	}
+	_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "  "+hint)
 }
 
 func printApprovalPendingHuman(cmd *cobra.Command, host string, req approval.PendingRequest) {
@@ -3867,7 +3890,7 @@ func printPolicyTest(cmd *cobra.Command, response policyTestResponse) {
 }
 
 func runAuditLS(cmd *cobra.Command, filters audit.Filters) error {
-	cfg, err := config.Load()
+	cfg, err := config.LoadPaths()
 	if err != nil {
 		return classifyConfigError(err)
 	}
@@ -3904,6 +3927,9 @@ func formatAuditListRecord(record audit.Record) string {
 	}
 	if record.StepID != "" {
 		parts = append(parts, "step="+record.StepID)
+	}
+	if record.RemoteSignID != "" {
+		parts = append(parts, "sign="+record.RemoteSignID)
 	}
 	if record.ReviewSHA256 != "" {
 		parts = append(parts, "review_sha256="+record.ReviewSHA256)
@@ -3963,7 +3989,7 @@ func truncateRunes(value string, limit int) string {
 }
 
 func runAuditShow(cmd *cobra.Command, reqID string) error {
-	cfg, err := config.Load()
+	cfg, err := config.LoadPaths()
 	if err != nil {
 		return classifyConfigError(err)
 	}
@@ -3984,7 +4010,7 @@ func runAuditShow(cmd *cobra.Command, reqID string) error {
 }
 
 func runStatus(cmd *cobra.Command, reqID string, jsonOutput bool) error {
-	cfg, err := config.Load()
+	cfg, err := config.LoadPaths()
 	if err != nil {
 		return classifyConfigError(err)
 	}
@@ -4032,7 +4058,7 @@ func runStatus(cmd *cobra.Command, reqID string, jsonOutput bool) error {
 }
 
 func runAuditVerify(cmd *cobra.Command) error {
-	cfg, err := config.Load()
+	cfg, err := config.LoadPaths()
 	if err != nil {
 		return classifyConfigError(err)
 	}
@@ -4049,7 +4075,7 @@ func runAuditVerify(cmd *cobra.Command) error {
 }
 
 func runAuditRepair(cmd *cobra.Command) error {
-	cfg, err := config.Load()
+	cfg, err := config.LoadPaths()
 	if err != nil {
 		return classifyConfigError(err)
 	}
@@ -4066,7 +4092,7 @@ func runAuditRepair(cmd *cobra.Command) error {
 }
 
 func runApprovalLS(cmd *cobra.Command, jsonOutput bool) error {
-	cfg, err := config.Load()
+	cfg, err := config.LoadPaths()
 	if err != nil {
 		return classifyConfigError(err)
 	}
@@ -4147,7 +4173,7 @@ func runApprovalDeny(cmd *cobra.Command, id string) error {
 }
 
 func runApprovalStatus(cmd *cobra.Command, id string) error {
-	cfg, err := config.Load()
+	cfg, err := config.LoadPaths()
 	if err != nil {
 		return classifyConfigError(err)
 	}
@@ -4191,7 +4217,7 @@ func runApprovalWait(cmd *cobra.Command, id string, timeoutValue string) error {
 }
 
 func runSessionEnd(cmd *cobra.Command, id string) error {
-	cfg, err := config.Load()
+	cfg, err := config.LoadPaths()
 	if err != nil {
 		return classifyConfigError(err)
 	}
@@ -4256,7 +4282,7 @@ func approvalStore(paths config.Paths) approval.PendingStore {
 }
 
 func runSessionLS(cmd *cobra.Command) error {
-	cfg, err := config.Load()
+	cfg, err := config.LoadPaths()
 	if err != nil {
 		return classifyConfigError(err)
 	}
@@ -4272,6 +4298,13 @@ func runSessionLS(cmd *cobra.Command) error {
 		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s label=%q start=%s end=%s commands=%d\n", summary.ID, label, summary.Start, summary.End, summary.CommandCount)
 	}
 	return nil
+}
+
+// stampRemoteSign links a run's audit record to the control plane's signing
+// log entry for the login that carried it.
+func stampRemoteSign(record audit.Record, result executor.Result) audit.Record {
+	record.RemoteSignID = result.RemoteSignID
+	return record
 }
 
 func baseAuditRecord(reqID string, sessionCtx session.Context, event audit.Event, host string, command string, decision policy.Decision, exitCode *int, outputHash string, durationMS int64, filtered ...output.FilterResult) audit.Record {

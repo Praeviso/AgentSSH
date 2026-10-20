@@ -107,4 +107,4 @@ AI Agent 越来越多地需要在真实服务器上做运维(查日志、重启�
 
 **无人值守下的可选 out-of-band 同步审批**、Web 仪表盘、多人与审批路由、MCP server 形态、~~native SSH(替代 shell-out)~~、凭据 vault、会话式多步操作的事务/回滚、远端可选 agent 以支持流式与更强隔离。
 
-> 进展:**native SSH 已实现 Phase 1 + Phase 2a**:Phase 1 = opt-in 原生后端(`docs/architecture/native-ssh.md`,commit 10a8b94);Phase 2a = 流式输出(`docs/architecture/streaming-output.md`,commit e1cb39d)。**仅剩 Phase 2b 连接复用(ControlMaster,需常驻 daemon)未做**。其余增强项(out-of-band 审批、Web、多人、MCP server、凭据 vault、事务回滚、远端 agent)均未开始。
+> 进展:**native SSH 已实现 Phase 1 + Phase 2a**:Phase 1 = opt-in 原生后端(`docs/architecture/native-ssh.md`,commit 10a8b94);Phase 2a = 流式输出(`docs/architecture/streaming-output.md`,commit e1cb39d)。**仅剩 Phase 2b 连接复用(ControlMaster,需常驻 daemon)未做**。**远端管控已实现**(`docs/architecture/remote-control.md`):控制面 `agentssh-server` 持有 SSH 私钥并按次远程签名,inventory/policy 以签名 bundle 下发,可随时吊销设备,覆盖了"凭据 vault"的核心诉求。其余增强项(out-of-band 审批、Web、多人、MCP server、事务回滚、远端 agent)均未开始。

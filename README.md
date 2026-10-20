@@ -286,6 +286,37 @@ agentssh secret rm web-1
 
 > Security note: with `AGENTSSH_MASTER_PASSWORD` in an unattended agent's environment, that process can decrypt every stored password. Prefer key auth for agent-driven hosts; reserve passwords for hosts that truly need them.
 
+### Remote control (optional)
+
+A machine can instead be **managed by a control plane** (`agentssh-server`). The SSH private keys stay on the server, which signs each login on demand, and inventory and policy arrive as a signed bundle. Revoking the device on the server blocks its next command. Target hosts need nothing new: they trust the control plane's public key in `authorized_keys`.
+
+```bash
+# On the control plane (once). The master password comes from
+# AGENTSSH_SERVER_MASTER_PASSWORD or a prompt.
+agentssh-server init --san cp.example.com
+agentssh-server identity create web          # prints the authorized_keys line for your hosts
+agentssh-server serve --listen :8443
+
+# Per device
+agentssh-server device token create --name alice-laptop    # one-time token
+agentssh remote enroll https://cp.example.com:8443 --token <token>   # on the device
+agentssh-server config push --device <dev_id> --inventory inventory.yaml --policy policy.yaml
+
+# Day to day
+agentssh remote status                        # device standing, bundle version and expiry
+agentssh-server log                           # every signature, including refusals
+agentssh-server device revoke <dev_id>        # the device's next login is refused
+```
+
+In remote mode:
+
+- **Inventory** comes only from the bundle. Every host needs `addr`, `user`, and `identity`; `ssh_config_alias`, `identity_file`, and passwords are not allowed.
+- **Policy** is the control plane's. Deny rules in the local `policy.yaml` still apply and take priority; local allow rules are ignored.
+- **Local edits are refused**: inventory and policy edits, plus "always allow on this host" approvals. Once and session approvals still work.
+- **It fails closed**: with the control plane unreachable, a cached bundle is used until it expires (10 minutes by default), but nothing can be signed. Connections are not reused, so every command needs a fresh signature, and a command that is running when its device is revoked is cancelled within 30 seconds.
+
+`agentssh remote leave` (operator-gated) deletes the device credentials and returns to local files. See `docs/architecture/remote-control.md` for the threat model. In short: keys cannot be taken, devices can be revoked, and every signature is logged. Command-level policy is still enforced by the client.
+
 ## What the agent calls
 
 These are the only commands an agent needs. They go through inventory resolution, policy, output filtering, and audit:

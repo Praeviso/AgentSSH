@@ -52,8 +52,15 @@ type Config struct {
 	HostOverrides map[string]HostOverride `yaml:"host_overrides" json:"host_overrides"`
 	Output        Output                  `yaml:"output" json:"output"`
 	Approval      Approval                `yaml:"approval,omitempty" json:"approval,omitempty"`
-	hostOrder     []string
+	// Overlay is a deny-only layer evaluated before every other rule. Remote
+	// mode puts the local policy.yaml here so an operator can tighten, but
+	// never loosen, a control-plane policy. Allow rules in it are ignored.
+	Overlay   *Config `yaml:"-" json:"-"`
+	hostOrder []string
 }
+
+// OverlayRulePrefix marks decisions made by Config.Overlay.
+const OverlayRulePrefix = "local:"
 
 // Approval is the optional async approval policy block. Durations are stored as
 // strings so policy.yaml stays operator-readable ("12h", "10m"); the approval
@@ -130,6 +137,14 @@ func NewEngine(config Config, inv inventory.Inventory) (Engine, error) {
 		})
 	}
 	sortRules(compiled.globalRules)
+
+	if config.Overlay != nil {
+		overlay, err := NewEngine(denyOnly(*config.Overlay), inv)
+		if err != nil {
+			return nil, fmt.Errorf("local overlay: %w", err)
+		}
+		compiled.overlay = overlay
+	}
 
 	for groupName, override := range compiled.config.HostOverrides {
 		for i, rule := range override.Rules {
@@ -318,6 +333,7 @@ func hostOverrideOrder(value *yaml.Node) []string {
 }
 
 type compiledEngine struct {
+	overlay     Engine
 	config      Config
 	inventory   inventory.Inventory
 	globalRules []compiledRule
@@ -332,6 +348,16 @@ type compiledRule struct {
 }
 
 func (e *compiledEngine) Evaluate(host string, command string) (Decision, error) {
+	if e.overlay != nil {
+		decision, err := e.overlay.Evaluate(host, command)
+		if err != nil {
+			return Decision{}, err
+		}
+		if decision.Action == ActionDeny && decision.Rule != RuleDefaultDeny {
+			decision.Rule = OverlayRulePrefix + decision.Rule
+			return decision, nil
+		}
+	}
 	for _, rule := range e.hostRulesFor(host) {
 		if rule.regex.MatchString(command) {
 			return Decision{Action: rule.action, Rule: rule.source}, nil
@@ -444,6 +470,50 @@ func (c Config) orderedHostOverrideKeys(filter map[string]struct{}) []string {
 	}
 	sort.Strings(missing)
 	return append(keys, missing...)
+}
+
+// denyOnly keeps the explicit deny rules of cfg (rule_groups are authoring
+// presets and never evaluated).
+func denyOnly(cfg Config) Config {
+	out := Config{Version: cfg.Version, hostOrder: cfg.hostOrder}
+	for _, rule := range cfg.Rules {
+		if rule.Action == ActionDeny {
+			out.Rules = append(out.Rules, rule)
+		}
+	}
+	for key, override := range cfg.HostOverrides {
+		var rules []Rule
+		for _, rule := range override.Rules {
+			if rule.Action == ActionDeny {
+				rules = append(rules, rule)
+			}
+		}
+		if len(rules) > 0 {
+			if out.HostOverrides == nil {
+				out.HostOverrides = map[string]HostOverride{}
+			}
+			out.HostOverrides[key] = HostOverride{Rules: rules}
+		}
+	}
+	return out
+}
+
+// IgnoredOverlayRules counts non-deny rules in cfg that an overlay drops.
+func IgnoredOverlayRules(cfg Config) int {
+	count := 0
+	for _, rule := range cfg.Rules {
+		if rule.Action != ActionDeny {
+			count++
+		}
+	}
+	for _, override := range cfg.HostOverrides {
+		for _, rule := range override.Rules {
+			if rule.Action != ActionDeny {
+				count++
+			}
+		}
+	}
+	return count
 }
 
 func compileRegex(pattern string, source string) (*regexp.Regexp, error) {

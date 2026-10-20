@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/Praeviso/AgentSSH/internal/inventory"
+	"github.com/Praeviso/AgentSSH/internal/managedmode"
 	"github.com/Praeviso/AgentSSH/internal/policy"
 	"github.com/charmbracelet/bubbles/help"
 	"github.com/charmbracelet/bubbles/key"
@@ -21,6 +22,7 @@ import (
 // only global rules and stamped/host-overrides participate in evaluation.
 type policySection struct {
 	path      string
+	managed   bool // remote control plane owns the policy; edits are refused
 	inventory inventory.Inventory
 	config    policy.Config
 	styles    appStyles
@@ -480,6 +482,9 @@ func (s policySection) hostRuleSet() (policy.HostRuleSet, bool) {
 }
 
 func (s *policySection) reloadForWrite() (policy.Bundle, error) {
+	if s.managed {
+		return policy.Bundle{}, managedmode.ErrManaged
+	}
 	cfg := s.config
 	if s.path != "" {
 		loaded, err := policy.Load(s.path)

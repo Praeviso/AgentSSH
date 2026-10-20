@@ -48,6 +48,8 @@ jobs:
           mkdir -p "dist/${stage}"
           go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
             -o "dist/${stage}/agentssh" ./cmd/agentssh
+          go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
+            -o "dist/${stage}/agentssh-server" ./cmd/agentssh-server
           cp LICENSE README.md "dist/${stage}/"
           tar -C dist -czf "dist/${stage}.tar.gz" "${stage}"
           ( cd dist && sha256sum "${stage}.tar.gz" > "${stage}.tar.gz.sha256" )

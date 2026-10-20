@@ -1,13 +1,16 @@
 package config
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 
 	"github.com/Praeviso/AgentSSH/internal/inventory"
+	"github.com/Praeviso/AgentSSH/internal/managedmode"
 	"github.com/Praeviso/AgentSSH/internal/policy"
+	"github.com/Praeviso/AgentSSH/internal/remoteclient"
 	"gopkg.in/yaml.v3"
 )
 
@@ -96,12 +99,28 @@ type Paths struct {
 	PayloadsDir   string
 }
 
-// Config is the parsed local configuration set.
+// Config is the parsed configuration set.
 type Config struct {
 	Paths     Paths
 	Inventory inventory.Inventory
 	Policy    policy.Config
+	// Remote is the control-plane session when the home is enrolled for remote
+	// control; nil in local mode. In remote mode Inventory and Policy come from
+	// the signed bundle and the local policy.yaml is only a deny overlay.
+	Remote *remoteclient.Session
 }
+
+// RemoteError reports that remote-managed configuration is unavailable. It is
+// fail-closed: nothing runs on stale or unverifiable configuration.
+type RemoteError struct {
+	Err error
+}
+
+func (e RemoteError) Error() string {
+	return fmt.Sprintf("remote configuration unavailable: %v", e.Err)
+}
+
+func (e RemoteError) Unwrap() error { return e.Err }
 
 // MissingHomeError reports an absent configuration directory with setup guidance.
 type MissingHomeError struct {
@@ -239,12 +258,33 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	return LoadHome(home)
+}
 
+// LoadPaths resolves the configuration directory without reading inventory or
+// policy. Commands that only touch local state (audit, sessions, approvals)
+// use it so they keep working in remote mode while the control plane is down.
+func LoadPaths() (*Config, error) {
+	home, err := ResolveHome()
+	if err != nil {
+		return nil, err
+	}
+	if err := requireHome(home); err != nil {
+		return nil, err
+	}
+	return &Config{Paths: NewPaths(home)}, nil
+}
+
+// LoadHome is Load for an explicit configuration directory.
+func LoadHome(home string) (*Config, error) {
 	if err := requireHome(home); err != nil {
 		return nil, err
 	}
 
 	cfg := &Config{Paths: NewPaths(home)}
+	if managedmode.Enrolled(home) {
+		return loadRemote(cfg)
+	}
 	if err := decodeYAMLFile(cfg.Paths.InventoryFile, &cfg.Inventory); err != nil {
 		return nil, err
 	}
@@ -252,6 +292,25 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 
+	return cfg, nil
+}
+
+func loadRemote(cfg *Config) (*Config, error) {
+	session, err := remoteclient.Open(context.Background(), cfg.Paths.Home, remoteclient.OpenOptions{})
+	if err != nil {
+		return nil, RemoteError{Err: err}
+	}
+	var local policy.Config
+	if err := decodeYAMLFile(cfg.Paths.PolicyFile, &local); err != nil {
+		return nil, err
+	}
+	cfg.Remote = session
+	cfg.Inventory = session.Inventory
+	cfg.Policy = session.Policy
+	cfg.Policy.Overlay = &local
+	if _, err := policy.NewEngine(cfg.Policy, cfg.Inventory); err != nil {
+		return nil, ParseError{File: cfg.Paths.PolicyFile, Err: err}
+	}
 	return cfg, nil
 }
 

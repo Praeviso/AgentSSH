@@ -37,12 +37,16 @@ func (c SSHConfig) IsZero() bool {
 
 // Host describes a named SSH target without storing private keys or passwords.
 type Host struct {
-	Addr           string   `yaml:"addr,omitempty" json:"addr"`
-	User           string   `yaml:"user,omitempty" json:"user"`
-	Port           int      `yaml:"port,omitempty" json:"port"`
-	SSHConfigAlias string   `yaml:"ssh_config_alias,omitempty" json:"ssh_config_alias"`
-	IdentityFile   string   `yaml:"identity_file,omitempty" json:"identity_file"`
-	Tags           []string `yaml:"tags,omitempty" json:"tags"`
+	Addr           string `yaml:"addr,omitempty" json:"addr"`
+	User           string `yaml:"user,omitempty" json:"user"`
+	Port           int    `yaml:"port,omitempty" json:"port"`
+	SSHConfigAlias string `yaml:"ssh_config_alias,omitempty" json:"ssh_config_alias"`
+	IdentityFile   string `yaml:"identity_file,omitempty" json:"identity_file"`
+	// Identity names a control-plane SSH identity. It is only meaningful in
+	// remote mode, where the control plane signs authentication with it and the
+	// private key never reaches this machine.
+	Identity string   `yaml:"identity,omitempty" json:"identity,omitempty"`
+	Tags     []string `yaml:"tags,omitempty" json:"tags"`
 	// OS is the host's operating system family (e.g. linux, macos, windows, bsd).
 	// It is display-only metadata: the TUI picks the host card's icon from it. An
 	// empty or unrecognized value renders the generic server icon.

@@ -827,7 +827,7 @@ func (s hostsSection) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (s hostsSection) reloadInventory() (tea.Model, tea.Cmd) {
-	inv, err := inventory.Load(s.paths.InventoryFile)
+	inv, _, err := loadEffective(s.paths)
 	if err != nil {
 		s.loadErr = err
 		return s, nil
@@ -883,13 +883,17 @@ func (s hostsSection) probeHostCmd(name string) tea.Cmd {
 	host := s.inventory.Hosts[name]
 	return func() tea.Msg {
 		cfgPath, knownHostsPath, _ := sshClientPaths()
-		exec := executor.NewNativeExecutor(executor.NativeOptions{
+		options := executor.NativeOptions{
 			ConfigPath:     cfgPath,
 			KnownHostsPath: knownHostsPath,
 			ConnectTimeout: executor.ProbeTimeout,
 			HostKeyPolicy:  s.inventory.HostKeyPolicy,
 			PasswordSource: secrets.EnvPasswordSource(s.paths.SecretsFile),
-		})
+		}
+		if err := applyRemoteProbe(s.paths, &options); err != nil {
+			return hostProbeMsg{name: name, err: err}
+		}
+		exec := executor.NewNativeExecutor(options)
 		ctx, cancel := context.WithTimeout(context.Background(), executor.ProbeTimeout)
 		defer cancel()
 		result := exec.Probe(ctx, inventory.Target{Name: name, Host: host})

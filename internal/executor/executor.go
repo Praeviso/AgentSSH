@@ -37,6 +37,9 @@ type Result struct {
 	Err      error
 	Argv     []string
 	OS       string
+	// RemoteSignID links the run to the control plane's signing log when the
+	// login was remotely signed.
+	RemoteSignID string
 }
 
 // Executor runs commands against remote hosts.
