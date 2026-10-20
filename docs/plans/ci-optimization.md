@@ -24,7 +24,7 @@
 - [x] 日常/全量/发布工作流与缓存。
 - [x] CLI fixture 和通过 operator init 的生产参数覆盖；生产代码零改动。
 - [x] 最终本地验证、性能记录、文档。
-- [ ] 提交、推送、PR 与远端检查。
+- [x] 提交、推送并创建 [PR #9](https://github.com/Praeviso/AgentSSH/pull/9)；远端检查以 PR Checks 为准。
 
 ## 验证
 
@@ -32,11 +32,11 @@
 
 结果（2026-10-20）：
 
-- 19 项 Python 行为测试通过，包含真实 Git 历史、race 包图和失败测试 JSON/退出码。
+- 21 项 Python 行为测试通过，包含真实 Git 历史、race 专用依赖、包内/外测试依赖和失败测试 JSON/退出码。
 - actionlint v1.7.12、shell 语法、gofmt、go vet、两个 CLI 构建、golangci-lint v2.12.2（0 issues）、git diff --check 通过。
 - 最终 go test -race -count=1 -json -timeout=20m ./... 全部通过，墙钟 64.837s，CLI 包 64.220s。
 - 审计 demo --no-tui 通过，另行断言恰有 6 个 pending 请求。
 - 首轮验证发现 fixture 写入缺失父目录的问题，修复后原失败用例和完整验证均通过。
 - 本地耗时和历史 hosted runner 环境不同，不据此声称精确提升比例；PR CI 用于记录 hosted runner 数据。
 
-交付：准备提交和创建 PR；仅创建 PR，不合并或发布版本。分支 ci/affected-tests-and-speedups。
+交付：[PR #9](https://github.com/Praeviso/AgentSSH/pull/9)，分支 ci/affected-tests-and-speedups。远端运行记录见该 PR 的 Checks；不合并或发布版本。

@@ -89,6 +89,20 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(plan["cli_packages"], [])
         self.assertEqual(plan["internal_packages"], ["./leaf"])
 
+    def test_race_only_dependency_selects_consumer(self):
+        self.write("raceconsumer/main.go", "package raceconsumer\n")
+        self.write("raceconsumer/race.go", '//go:build race\n\npackage raceconsumer\nimport "example.test/fixture/leaf"\nvar _ = leaf.Value\n')
+        self.base = self.commit()
+        self.write("leaf/leaf.go", "package leaf\nconst Value = 2\n")
+        self.assertIn("./raceconsumer", self.plan()["internal_packages"])
+
+    def test_internal_test_dependency_selects_consumer(self):
+        self.write("internaltest/main.go", "package internaltest\n")
+        self.write("internaltest/main_test.go", 'package internaltest\nimport "example.test/fixture/leaf"\nvar _ = leaf.Value\n')
+        self.base = self.commit()
+        self.write("leaf/leaf.go", "package leaf\nconst Value = 2\n")
+        self.assertIn("./internaltest", self.plan()["internal_packages"])
+
     def test_server_change_skips_client_cli(self):
         self.write("cmd/agentssh-server/main.go", 'package main\nfunc main() { println("server") }\n')
         plan = self.plan()
