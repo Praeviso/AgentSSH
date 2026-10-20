@@ -37,6 +37,12 @@ func TestRemoteModeFailsClosedButKeepsAuditReadable(t *testing.T) {
 	if code, _, stderr := runExit(t, "session", "ls"); code != exitOK {
 		t.Fatalf("session ls exit=%d stderr=%q, want 0", code, stderr)
 	}
+	// Discovery would probe with local credentials, bypassing remote signing.
+	withOperatorAuth(t, home)
+	_, _, err = runCommandForTest(t, "inventory", "discover", "--probe")
+	if exitCodeForError(err) != exitUsage || err == nil || !strings.Contains(err.Error(), "managed by a remote control plane") {
+		t.Fatalf("inventory discover err=%v, want exit 2 managed refusal", err)
+	}
 }
 
 func TestRemoteStatusRequiresEnrollment(t *testing.T) {

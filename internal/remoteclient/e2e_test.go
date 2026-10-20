@@ -171,6 +171,30 @@ func TestRemoteSignedRunEndToEnd(t *testing.T) {
 	}
 }
 
+// A login the control plane signed but the target then refused still carries
+// the signing-log id, so the failed run reconciles with the signing log.
+func TestFailedLoginAfterSigningKeepsSignID(t *testing.T) {
+	cp := newControlPlane(t)
+	cp.ssh = startSSHServer(t, cp.identity, true)
+	cp.push(t, "deploy", "web")
+	exec := cp.executor(t, cp.open(t))
+
+	result := cp.run(exec, "echo hello")
+	if result.Err == nil {
+		t.Fatalf("run against a refusing server succeeded: %+v", result)
+	}
+	if !strings.HasPrefix(result.RemoteSignID, "sg_") {
+		t.Fatalf("RemoteSignID = %q after a signed but refused login, want the signing-log id (err %v)", result.RemoteSignID, result.Err)
+	}
+	entries, err := cp.store.SignLog(remoteserver.SignLogFilter{DeviceID: cp.deviceID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if last := entries[len(entries)-1]; last.SignID != result.RemoteSignID || last.Result != remoteserver.SignOK {
+		t.Fatalf("sign log = %+v, want the signed entry %s", last, result.RemoteSignID)
+	}
+}
+
 func TestRevokedDeviceCannotLogInOrRefresh(t *testing.T) {
 	cp := newControlPlane(t)
 	session := cp.open(t)
@@ -442,12 +466,20 @@ type sshServer struct {
 	listener net.Listener
 	hostKey  ssh.Signer
 	allowed  ssh.PublicKey
-	wg       sync.WaitGroup
-	blocked  chan struct{}
-	once     sync.Once
+	// rejectSigned fails the login only after the signature has been checked,
+	// like a server that accepts the key offer but then refuses the user.
+	rejectSigned bool
+	wg           sync.WaitGroup
+	blocked      chan struct{}
+	once         sync.Once
 }
 
 func newSSHServer(t *testing.T, allowed ssh.PublicKey) *sshServer {
+	t.Helper()
+	return startSSHServer(t, allowed, false)
+}
+
+func startSSHServer(t *testing.T, allowed ssh.PublicKey, rejectSigned bool) *sshServer {
 	t.Helper()
 	_, hostPriv, _ := ed25519.GenerateKey(rand.Reader)
 	hostKey, err := ssh.NewSignerFromKey(hostPriv)
@@ -458,7 +490,7 @@ func newSSHServer(t *testing.T, allowed ssh.PublicKey) *sshServer {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := &sshServer{listener: ln, hostKey: hostKey, allowed: allowed, blocked: make(chan struct{})}
+	s := &sshServer{listener: ln, hostKey: hostKey, allowed: allowed, rejectSigned: rejectSigned, blocked: make(chan struct{})}
 	s.wg.Add(1)
 	go s.accept()
 	t.Cleanup(func() {
@@ -501,6 +533,11 @@ func (s *sshServer) handle(conn net.Conn) {
 		}
 		return nil, errors.New("unknown key")
 	}}
+	if s.rejectSigned {
+		cfg.VerifiedPublicKeyCallback = func(ssh.ConnMetadata, ssh.PublicKey, *ssh.Permissions, string) (*ssh.Permissions, error) {
+			return nil, errors.New("user refused")
+		}
+	}
 	cfg.AddHostKey(s.hostKey)
 	sshConn, chans, reqs, err := ssh.NewServerConn(conn, cfg)
 	if err != nil {

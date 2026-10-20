@@ -105,32 +105,9 @@ func Init(dir string, master string, sans []string, now time.Time) error {
 		return err
 	}
 
-	tlsKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	tlsDER, tlsKey, err := issueServerCert(caCert, caKey, sans, now)
 	if err != nil {
 		return err
-	}
-	tlsTemplate := &x509.Certificate{
-		SerialNumber: randomSerial(),
-		Subject:      pkix.Name{CommonName: "AgentSSH control plane"},
-		NotBefore:    now.Add(-5 * time.Minute),
-		NotAfter:     now.AddDate(2, 0, 0),
-		KeyUsage:     x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-	}
-	for _, san := range sans {
-		san = strings.TrimSpace(san)
-		if san == "" {
-			continue
-		}
-		if ip := net.ParseIP(san); ip != nil {
-			tlsTemplate.IPAddresses = append(tlsTemplate.IPAddresses, ip)
-		} else {
-			tlsTemplate.DNSNames = append(tlsTemplate.DNSNames, san)
-		}
-	}
-	tlsDER, err := x509.CreateCertificate(rand.Reader, tlsTemplate, caCert, &tlsKey.PublicKey, caKey)
-	if err != nil {
-		return fmt.Errorf("create TLS certificate: %w", err)
 	}
 
 	bundlePub, bundleKey, err := ed25519.GenerateKey(rand.Reader)
@@ -192,6 +169,57 @@ func Init(dir string, master string, sans []string, now time.Time) error {
 
 // Unlock decrypts the data directory's key material with the master password.
 func Unlock(dir string, master string) (*Keys, error) {
+	keys, err := unlockCA(dir, master)
+	if err != nil {
+		return nil, err
+	}
+
+	tlsPEM, err := os.ReadFile(filepath.Join(dir, fileTLSCert))
+	if err != nil {
+		return nil, err
+	}
+	tlsCert, err := parseCertPEM(tlsPEM)
+	if err != nil {
+		return nil, fmt.Errorf("parse TLS certificate: %w", err)
+	}
+	tlsKey, err := keys.readPrivateKey(filepath.Join(dir, fileTLSKey))
+	if err != nil {
+		return nil, fmt.Errorf("unlock TLS key: %w", err)
+	}
+	// A renewal interrupted between its two writes leaves a key that does not
+	// match the certificate; say so instead of failing every handshake.
+	tlsSigner, ok := tlsKey.(crypto.Signer)
+	if !ok || !publicKeyEqual(tlsSigner.Public(), tlsCert.PublicKey) {
+		return nil, errors.New("TLS key does not match tls.crt; run agentssh-server tls renew")
+	}
+	// Serve the CA after the leaf so a client holding only the CA fingerprint
+	// (first enrollment) can find and pin it in the presented chain.
+	keys.TLSCert = tls.Certificate{
+		Certificate: [][]byte{tlsCert.Raw, keys.CACert.Raw},
+		PrivateKey:  tlsKey,
+		Leaf:        tlsCert,
+	}
+
+	bundleKey, err := keys.readPrivateKey(filepath.Join(dir, fileBundleKey))
+	if err != nil {
+		return nil, fmt.Errorf("unlock bundle key: %w", err)
+	}
+	edKey, ok := bundleKey.(ed25519.PrivateKey)
+	if !ok {
+		return nil, errors.New("bundle key is not ed25519")
+	}
+	keys.BundleKey = edKey
+	return keys, nil
+}
+
+func publicKeyEqual(a, b crypto.PublicKey) bool {
+	eq, ok := a.(interface{ Equal(crypto.PublicKey) bool })
+	return ok && eq.Equal(b)
+}
+
+// unlockCA decrypts the X25519 identity and the CA, which is all certificate
+// issuance needs.
+func unlockCA(dir string, master string) (*Keys, error) {
 	blob, err := os.ReadFile(filepath.Join(dir, fileMaster))
 	if err != nil {
 		return nil, fmt.Errorf("read master key (run agentssh-server init first): %w", err)
@@ -226,37 +254,92 @@ func Unlock(dir string, master string) (*Keys, error) {
 		return nil, errors.New("CA key is not a signer")
 	}
 	keys.caKey = signer
+	return keys, nil
+}
 
-	tlsPEM, err := os.ReadFile(filepath.Join(dir, fileTLSCert))
+// serverCertValidity is the lifetime of a control plane TLS certificate.
+// Renew it with RenewTLS; the CA (and so every client's pin) stays the same.
+const serverCertValidity = 2 * 365 * 24 * time.Hour
+
+// issueServerCert creates a TLS server key and certificate signed by the CA.
+func issueServerCert(caCert *x509.Certificate, caKey crypto.Signer, sans []string, now time.Time) ([]byte, *ecdsa.PrivateKey, error) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, nil, err
+	}
+	template := &x509.Certificate{
+		SerialNumber: randomSerial(),
+		Subject:      pkix.Name{CommonName: "AgentSSH control plane"},
+		NotBefore:    now.Add(-5 * time.Minute),
+		NotAfter:     now.Add(serverCertValidity),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	for _, san := range sans {
+		san = strings.TrimSpace(san)
+		if san == "" {
+			continue
+		}
+		if ip := net.ParseIP(san); ip != nil {
+			template.IPAddresses = append(template.IPAddresses, ip)
+		} else {
+			template.DNSNames = append(template.DNSNames, san)
+		}
+	}
+	if len(template.IPAddresses) == 0 && len(template.DNSNames) == 0 {
+		return nil, nil, errors.New("TLS certificate needs at least one DNS name or IP address")
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, caCert, &key.PublicKey, caKey)
+	if err != nil {
+		return nil, nil, fmt.Errorf("create TLS certificate: %w", err)
+	}
+	return der, key, nil
+}
+
+// RenewTLS replaces the control plane's TLS key and certificate with new ones
+// issued by the existing CA. Enrolled devices pin the CA, so they accept the
+// new certificate without re-enrolling. With no sans, the current
+// certificate's names are kept. A running server picks it up on restart.
+func RenewTLS(dir string, master string, sans []string, now time.Time) (*x509.Certificate, error) {
+	keys, err := unlockCA(dir, master)
 	if err != nil {
 		return nil, err
 	}
-	tlsCert, err := parseCertPEM(tlsPEM)
+	if len(sans) == 0 {
+		data, err := os.ReadFile(filepath.Join(dir, fileTLSCert))
+		if err != nil {
+			return nil, fmt.Errorf("read current TLS certificate (pass --san to set names): %w", err)
+		}
+		current, err := parseCertPEM(data)
+		if err != nil {
+			return nil, fmt.Errorf("parse current TLS certificate (pass --san to set names): %w", err)
+		}
+		sans = CertNames(current)
+	}
+	der, key, err := issueServerCert(keys.CACert, keys.caKey, sans, now)
 	if err != nil {
-		return nil, fmt.Errorf("parse TLS certificate: %w", err)
+		return nil, err
 	}
-	tlsKey, err := keys.readPrivateKey(filepath.Join(dir, fileTLSKey))
+	keyBlob, err := encryptPrivateKey(keys.identity.Recipient(), key)
 	if err != nil {
-		return nil, fmt.Errorf("unlock TLS key: %w", err)
+		return nil, err
 	}
-	// Serve the CA after the leaf so a client holding only the CA fingerprint
-	// (first enrollment) can find and pin it in the presented chain.
-	keys.TLSCert = tls.Certificate{
-		Certificate: [][]byte{tlsCert.Raw, keys.CACert.Raw},
-		PrivateKey:  tlsKey,
-		Leaf:        tlsCert,
+	if err := fileutil.WriteFileAtomic(filepath.Join(dir, fileTLSKey), keyBlob, 0o600, fileTLSKey+"-*"); err != nil {
+		return nil, fmt.Errorf("write %s: %w", fileTLSKey, err)
 	}
+	if err := fileutil.WriteFileAtomic(filepath.Join(dir, fileTLSCert), pemBlock("CERTIFICATE", der), 0o644, fileTLSCert+"-*"); err != nil {
+		return nil, fmt.Errorf("write %s: %w", fileTLSCert, err)
+	}
+	return x509.ParseCertificate(der)
+}
 
-	bundleKey, err := keys.readPrivateKey(filepath.Join(dir, fileBundleKey))
-	if err != nil {
-		return nil, fmt.Errorf("unlock bundle key: %w", err)
+// CertNames lists a certificate's DNS and IP subject alternative names.
+func CertNames(cert *x509.Certificate) []string {
+	names := append([]string(nil), cert.DNSNames...)
+	for _, ip := range cert.IPAddresses {
+		names = append(names, ip.String())
 	}
-	edKey, ok := bundleKey.(ed25519.PrivateKey)
-	if !ok {
-		return nil, errors.New("bundle key is not ed25519")
-	}
-	keys.BundleKey = edKey
-	return keys, nil
+	return names
 }
 
 // CAFingerprint returns the pin clients use for this control plane.

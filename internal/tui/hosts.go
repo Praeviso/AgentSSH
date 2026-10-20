@@ -247,6 +247,16 @@ func (s hostsSection) helpKeyMap() help.KeyMap {
 		return helpMap{short: []key.Binding{hk("y", "confirm"), hk("n/esc", "cancel")}}
 	default:
 		// Footer stays terse; ? expands to the grouped full help below.
+		if remoteManaged(s.paths) {
+			// Hosts come from the control plane: no add or discover.
+			return helpMap{
+				short: []key.Binding{hk("enter", "open"), hk("/", "filter"), hk("t", "test")},
+				full: [][]key.Binding{
+					{hk("↑↓←→/hjkl", "move"), hk("g/G", "home/end"), hk("/", "filter")},
+					{hk("enter/i", "open"), hk("t", "test"), hk("r", "reload")},
+				},
+			}
+		}
 		short := []key.Binding{hk("enter", "open"), hk("/", "filter"), hk("a", "add")}
 		// Grouped full help (shown on ?): movement, finding, and actions as columns.
 		full := [][]key.Binding{
@@ -776,11 +786,19 @@ func (s hostsSection) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case "end", "G":
 		s.cursor = maxInt(last, 0)
 	case "a":
+		if remoteManaged(s.paths) {
+			s.setStatus(statusErr, "hosts are managed by the remote control plane")
+			return s, nil
+		}
 		s.focus = hostFocusForm
 		s.form = hostform.New(hostform.Options{ExistingNames: inventory.HostNames(s.inventory)}, s.renderer)
 		s.form = s.form.SetSize(s.w, s.h)
 		return s, s.form.Init()
 	case "D":
+		if remoteManaged(s.paths) {
+			s.setStatus(statusErr, "hosts are managed by the remote control plane")
+			return s, nil
+		}
 		s.focus = hostFocusDiscover
 		s.discoverSeq++
 		s.discover = discoveryOverlay{
@@ -1401,6 +1419,10 @@ func (s hostsSection) View() string {
 		b.WriteString("\n")
 	}
 	if len(s.names) == 0 {
+		if remoteManaged(s.paths) {
+			b.WriteString(s.styles.dim.Render("No hosts yet. Hosts come from the remote control plane."))
+			return b.String()
+		}
 		b.WriteString(s.styles.dim.Render("No hosts yet."))
 		b.WriteString("\n")
 		b.WriteString(keyHint(s.styles, "a", "add a host"))

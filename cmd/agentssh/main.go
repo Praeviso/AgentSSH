@@ -2201,6 +2201,12 @@ func hostParts(host inventory.Host) []string {
 }
 
 func runInventoryDiscover(cmd *cobra.Command, opts inventoryDiscoverOptions) error {
+	// Discovery reads the local ssh config and probes with local credentials;
+	// neither has a place on a machine whose hosts and keys come from a
+	// control plane.
+	if remoteManagedHome() {
+		return newUsageError("inventory discover is unavailable: hosts are managed by a remote control plane\n  ask its administrator to add hosts")
+	}
 	cfg, err := config.Load()
 	if err != nil {
 		return classifyConfigError(err)

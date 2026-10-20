@@ -52,6 +52,11 @@
 - 远端模式下的 deny 提示改为"由控制面管理,请联系管理员"(命中本地覆盖层的 deny 除外)。
 - release.yml 同时打包 `agentssh-server`。
 
+PR #8 评审(Codex)后追加:
+- 远端模式拒绝 `inventory discover` 与 TUI 的 `a`/`D`(否则会用本地凭据探测,绕过远程签名)。
+- 控制面已签名但登录失败时保留 `remote_sign_id`(执行器两处建连失败分支都带上;签名 id 在本地验签前就记录)。
+- 新增 `agentssh-server tls renew`;`serve` 在 TLS 证书 30 天内到期时告警;`Unlock` 检测 TLS 私钥与证书不匹配(换发中断)并提示重跑。
+
 ## 验证
 
 计划命令(与 CI 一致):`gofmt -l .`、`go vet ./...`、`go build ./...`、`go test -race -timeout=20m ./...`、`golangci-lint run`(v2)。

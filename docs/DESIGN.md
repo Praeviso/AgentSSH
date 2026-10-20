@@ -55,7 +55,8 @@ agentssh remote enroll <url> --token <t>|status|refresh|leave   远端管控:注
 
 ```
 agentssh-server init --san <host>…        生成 CA、TLS 证书、bundle 签名密钥与数据库
-agentssh-server serve [--listen :8443]    运行控制面 API
+agentssh-server serve [--listen :8443]    运行控制面 API(TLS 证书 30 天内到期时启动告警)
+agentssh-server tls renew [--san <host>…] 用原 CA 换发 TLS 证书(设备无需重新注册;重启 serve 生效)
 agentssh-server device token create --name N | ls | revoke <id>
 agentssh-server identity create <name> | ls | disable <name>
 agentssh-server config push --device <id> --inventory F --policy F

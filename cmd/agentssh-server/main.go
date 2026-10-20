@@ -62,6 +62,7 @@ func newRootCommand() *cobra.Command {
 	root.AddCommand(
 		newInitCommand(dir),
 		newServeCommand(dir),
+		newTLSCommand(dir),
 		newDeviceCommand(dir),
 		newIdentityCommand(dir),
 		newConfigCommand(dir),
@@ -166,6 +167,9 @@ func newServeCommand(dir func() (string, error)) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if left := time.Until(keys.TLSCert.Leaf.NotAfter); left < tlsRenewWarning {
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "warning: TLS certificate expires %s; run agentssh-server tls renew and restart\n", keys.TLSCert.Leaf.NotAfter.Format(time.RFC3339))
+			}
 			server := remoteserver.NewServer(store, keys)
 			server.BundleTTL = bundleTTL
 			httpServer := &http.Server{
@@ -193,6 +197,44 @@ func newServeCommand(dir func() (string, error)) *cobra.Command {
 	}
 	cmd.Flags().StringVar(&listen, "listen", ":8443", "listen address")
 	cmd.Flags().DurationVar(&bundleTTL, "bundle-ttl", remoteserver.DefaultBundleTTL, "how long a device may use a bundle it cannot refresh")
+	return cmd
+}
+
+// tlsRenewWarning is how close to expiry serve starts warning about the TLS
+// certificate.
+const tlsRenewWarning = 30 * 24 * time.Hour
+
+func newTLSCommand(dir func() (string, error)) *cobra.Command {
+	cmd := &cobra.Command{Use: "tls", Short: "Manage the control plane TLS certificate."}
+	var sans []string
+	renew := &cobra.Command{
+		Use:   "renew [--san <host>...]",
+		Short: "Issue a new TLS certificate under the existing CA (devices stay enrolled).",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			d, err := dir()
+			if err != nil {
+				return err
+			}
+			if !remoteserver.Initialized(d) {
+				return fmt.Errorf("%s is not initialized; run agentssh-server init", d)
+			}
+			master, err := readMaster(false)
+			if err != nil {
+				return err
+			}
+			cert, err := remoteserver.RenewTLS(d, master, sans, time.Now())
+			if err != nil {
+				return err
+			}
+			out := cmd.OutOrStdout()
+			_, _ = fmt.Fprintf(out, "Renewed TLS certificate for %s, valid until %s\n", strings.Join(remoteserver.CertNames(cert), ", "), cert.NotAfter.Format(time.RFC3339))
+			_, _ = fmt.Fprintln(out, "Restart agentssh-server serve to use it.")
+			return nil
+		},
+	}
+	renew.Flags().StringSliceVar(&sans, "san", nil, "DNS name or IP clients use to reach this server (repeatable; default: keep the current names)")
+	cmd.AddCommand(renew)
 	return cmd
 }
 

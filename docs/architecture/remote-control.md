@@ -167,6 +167,7 @@ agentssh remote leave                      # 删除本地设备凭据,退出远�
 ```
 agentssh-server init                         # 生成内部 CA、bundle 签名密钥、数据目录
 agentssh-server serve --listen :8443
+agentssh-server tls renew [--san <host>]     # 用原 CA 换发 TLS 证书
 agentssh-server device token create --name N
 agentssh-server device ls | revoke <id>
 agentssh-server identity create <name>       # 打印 authorized_keys 公钥
@@ -222,3 +223,6 @@ agentssh-server log [--device] [--host]      # 签名审计
 - **离线可复盘**:只读本地状态的命令(audit / session / status / approval ls|status / plan status)用 `config.LoadPaths()`,不碰控制面;`agentssh tui` 在远端配置不可用时仍能打开并显示错误卡片。
 - **host 级审批**:远端模式下在 `Resolve` 之前拒绝,请求仍可按 once / session 裁决,不会留下"已批准但无 grant"的死请求。
 - **deny 提示**:远端模式下非本地覆盖层命中的 deny,提示改为联系控制面管理员,而不是编辑本地 `policy.yaml`。
+- **主机发现**:`inventory discover` 和 TUI 的 `a`/`D` 在远端模式下直接拒绝。发现读本机 ssh_config 并用本地凭据探测,会绕过远程签名;主机只能由控制面下发。
+- **失败登录也对账**:控制面已签名但目标机仍拒绝(或握手中断)时,`Result.RemoteSignID` 照样带上签名 id,审计记录能和签名日志对上。
+- **证书有效期**:CA 10 年,服务端 TLS 证书与设备证书各 2 年。`agentssh-server tls renew` 用原 CA 换发 TLS 证书(默认沿用原 SAN),设备 pin 的是 CA,不需重新注册;`serve` 在证书 30 天内到期时告警。设备证书暂无在线续期,到期后需 `remote leave` + 重新 enroll。

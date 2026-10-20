@@ -1,7 +1,9 @@
 package remoteserver
 
 import (
+	"crypto/x509"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -41,6 +43,61 @@ func TestInitRefusesToOverwriteAndUnlockNeedsMaster(t *testing.T) {
 	fp, err := LoadCAFingerprint(dir)
 	if err != nil || fp != keys.CAFingerprint() {
 		t.Fatalf("CA fingerprint mismatch: %q vs %q (%v)", fp, keys.CAFingerprint(), err)
+	}
+}
+
+func TestRenewTLSKeepsCAAndDeviceTrust(t *testing.T) {
+	dir := t.TempDir()
+	if err := Init(dir, "master", []string{"cp.example", "127.0.0.1"}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	before, err := Unlock(dir, "master")
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldCert, err := os.ReadFile(filepath.Join(dir, "tls.crt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RenewTLS(dir, "wrong", nil, time.Now()); !errors.Is(err, ErrWrongMaster) {
+		t.Fatalf("RenewTLS(wrong master) = %v, want ErrWrongMaster", err)
+	}
+
+	later := time.Now().AddDate(1, 11, 0)
+	renewed, err := RenewTLS(dir, "master", nil, later)
+	if err != nil {
+		t.Fatalf("RenewTLS: %v", err)
+	}
+	if got := strings.Join(CertNames(renewed), ","); got != "cp.example,127.0.0.1" {
+		t.Fatalf("renewed names = %q, want the current names kept", got)
+	}
+	if !renewed.NotAfter.After(before.TLSCert.Leaf.NotAfter) {
+		t.Fatalf("renewed NotAfter %v not after the old %v", renewed.NotAfter, before.TLSCert.Leaf.NotAfter)
+	}
+	after, err := Unlock(dir, "master")
+	if err != nil {
+		t.Fatalf("Unlock after renew: %v", err)
+	}
+	if after.CAFingerprint() != before.CAFingerprint() {
+		t.Fatal("renewal changed the CA, which would break every enrolled device's pin")
+	}
+	roots := x509.NewCertPool()
+	roots.AddCert(after.CACert)
+	if _, err := after.TLSCert.Leaf.Verify(x509.VerifyOptions{DNSName: "cp.example", Roots: roots, CurrentTime: later}); err != nil {
+		t.Fatalf("renewed certificate does not verify under the existing CA: %v", err)
+	}
+
+	replaced, err := RenewTLS(dir, "master", []string{"new.example"}, time.Now())
+	if err != nil || strings.Join(CertNames(replaced), ",") != "new.example" {
+		t.Fatalf("RenewTLS with --san = %v (%v), want only new.example", replaced, err)
+	}
+
+	// An interrupted renewal (new key, old certificate) is reported plainly.
+	if err := os.WriteFile(filepath.Join(dir, "tls.crt"), oldCert, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Unlock(dir, "master"); err == nil || !strings.Contains(err.Error(), "tls renew") {
+		t.Fatalf("Unlock with mismatched TLS key = %v, want a renew hint", err)
 	}
 }
 

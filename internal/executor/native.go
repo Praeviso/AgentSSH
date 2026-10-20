@@ -120,7 +120,7 @@ func (e NativeExecutor) runSession(ctx context.Context, request Request, stdout 
 
 	client, poolKey, poolEntry, pooled, err := e.client(ctx, target, usePool)
 	if err != nil {
-		return Result{ExitCode: -1, Duration: time.Since(start), Err: err, Argv: argv}
+		return Result{ExitCode: -1, Duration: time.Since(start), Err: err, Argv: argv, RemoteSignID: remoteSignIDFromError(err)}
 	}
 	closeClient := !pooled
 	poolReleased := false
@@ -175,7 +175,7 @@ func (e NativeExecutor) runSession(ctx context.Context, request Request, stdout 
 		}
 	}
 	if err != nil {
-		return Result{ExitCode: -1, Duration: time.Since(start), Err: err, Argv: argv}
+		return Result{ExitCode: -1, Duration: time.Since(start), Err: err, Argv: argv, RemoteSignID: remoteSignIDFromError(err)}
 	}
 	defer func() {
 		_ = session.Close()
@@ -464,12 +464,42 @@ func (e NativeExecutor) dial(ctx context.Context, target nativeTarget) (*nativeC
 		cfg.HostKeyAlgorithms = algos
 	}
 	client, err := e.dialWithConfig(ctx, target, cfg)
-	if err == nil && remoteSigner != nil {
+	if remoteSigner != nil {
 		if identified, ok := remoteSigner.(interface{ SignID() string }); ok {
-			client.signID = identified.SignID()
+			signID := identified.SignID()
+			if err != nil {
+				// The control plane already logged this signature; keep the id so
+				// a failed login still reconciles with the signing log.
+				if signID != "" {
+					err = &remoteSignedError{err: err, signID: signID}
+				}
+				return nil, err
+			}
+			client.signID = signID
 		}
 	}
 	return client, err
+}
+
+// remoteSignedError marks a connection failure that happened after the
+// control plane had signed the login (target rejected the key, handshake
+// dropped). It is transparent to error inspection.
+type remoteSignedError struct {
+	err    error
+	signID string
+}
+
+func (e *remoteSignedError) Error() string { return e.err.Error() }
+func (e *remoteSignedError) Unwrap() error { return e.err }
+
+// remoteSignIDFromError returns the signing-log id carried by a connection
+// failure, if any.
+func remoteSignIDFromError(err error) string {
+	var signed *remoteSignedError
+	if errors.As(err, &signed) {
+		return signed.signID
+	}
+	return ""
 }
 
 func (e NativeExecutor) dialWithConfig(ctx context.Context, target nativeTarget, cfg *ssh.ClientConfig) (*nativeClient, error) {

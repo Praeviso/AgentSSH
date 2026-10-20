@@ -211,15 +211,17 @@ func (r *remoteSigner) Sign(_ io.Reader, data []byte) (*ssh.Signature, error) {
 	if err != nil {
 		return nil, &SignError{Err: err}
 	}
+	// Record the id before verifying: the control plane has logged this
+	// signature either way, and the audit record should point at it.
+	r.mu.Lock()
+	r.signID = resp.SignID
+	r.mu.Unlock()
 	sig := &ssh.Signature{Format: resp.Format, Blob: resp.Blob}
 	// Never hand the SSH server a signature we cannot verify ourselves; a wrong
 	// key here would otherwise surface as an opaque authentication failure.
 	if err := r.pub.Verify(data, sig); err != nil {
 		return nil, &SignError{Err: fmt.Errorf("control plane signature does not verify: %w", err)}
 	}
-	r.mu.Lock()
-	r.signID = resp.SignID
-	r.mu.Unlock()
 	return sig, nil
 }
 
