@@ -37,6 +37,7 @@
 - 最终 go test -race -count=1 -json -timeout=20m ./... 全部通过，墙钟 64.837s，CLI 包 64.220s。
 - 审计 demo --no-tui 通过，另行断言恰有 6 个 pending 请求。
 - 首轮验证发现 fixture 写入缺失父目录的问题，修复后原失败用例和完整验证均通过。
+- 新增远端 actionlint 检查发现原发布脚本的 SC2035 glob 提示；改为 cat -- ./*.tar.gz.sha256，并补齐本地 shellcheck 验证。
 - 本地耗时和历史 hosted runner 环境不同，不据此声称精确提升比例；PR CI 用于记录 hosted runner 数据。
 
 交付：[PR #9](https://github.com/Praeviso/AgentSSH/pull/9)，分支 ci/affected-tests-and-speedups。远端运行记录见该 PR 的 Checks；不合并或发布版本。

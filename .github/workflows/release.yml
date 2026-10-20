@@ -79,7 +79,7 @@ jobs:
           merge-multiple: true
 
       - name: Combine checksums
-        run: ( cd dist && cat *.tar.gz.sha256 > SHA256SUMS.txt )
+        run: ( cd dist && cat -- ./*.tar.gz.sha256 > SHA256SUMS.txt )
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
