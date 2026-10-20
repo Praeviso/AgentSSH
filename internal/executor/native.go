@@ -54,6 +54,10 @@ type NativeOptions struct {
 	KeepAliveInterval time.Duration
 	HostKeyPolicy     string // strict | accept-new
 	PasswordSource    func(host string) (string, bool)
+	// RemoteSigner, when set, is the only authentication method: the control
+	// plane signs each login and the private key never reaches this process.
+	// ssh-agent, identity files, default keys, and passwords are all skipped.
+	RemoteSigner func(host string) (ssh.Signer, error)
 }
 
 // NativeExecutor executes commands using golang.org/x/crypto/ssh.
@@ -116,7 +120,7 @@ func (e NativeExecutor) runSession(ctx context.Context, request Request, stdout 
 
 	client, poolKey, poolEntry, pooled, err := e.client(ctx, target, usePool)
 	if err != nil {
-		return Result{ExitCode: -1, Duration: time.Since(start), Err: err, Argv: argv}
+		return Result{ExitCode: -1, Duration: time.Since(start), Err: err, Argv: argv, RemoteSignID: remoteSignIDFromError(err)}
 	}
 	closeClient := !pooled
 	poolReleased := false
@@ -171,7 +175,7 @@ func (e NativeExecutor) runSession(ctx context.Context, request Request, stdout 
 		}
 	}
 	if err != nil {
-		return Result{ExitCode: -1, Duration: time.Since(start), Err: err, Argv: argv}
+		return Result{ExitCode: -1, Duration: time.Since(start), Err: err, Argv: argv, RemoteSignID: remoteSignIDFromError(err)}
 	}
 	defer func() {
 		_ = session.Close()
@@ -189,7 +193,7 @@ func (e NativeExecutor) runSession(ctx context.Context, request Request, stdout 
 		if pooled && isBrokenSSHClientError(err) {
 			e.pool.depoolWhenIdle(poolKey, poolEntry, client)
 		}
-		return Result{ExitCode: -1, Duration: time.Since(start), Err: err, Argv: argv}
+		return Result{ExitCode: -1, Duration: time.Since(start), Err: err, Argv: argv, RemoteSignID: client.signID}
 	}
 	osName := ""
 	if request.Command == OSProbeCommand {
@@ -208,7 +212,7 @@ func (e NativeExecutor) runSession(ctx context.Context, request Request, stdout 
 	if pooled && osName != "" {
 		e.pool.setOS(poolEntry, osName)
 	}
-	return Result{ExitCode: exitCode, Duration: time.Since(start), Argv: argv, OS: osName}
+	return Result{ExitCode: exitCode, Duration: time.Since(start), Argv: argv, OS: osName, RemoteSignID: client.signID}
 }
 
 func (e NativeExecutor) client(ctx context.Context, target nativeTarget, usePool bool) (*nativeClient, string, *nativePoolEntry, bool, error) {
@@ -433,7 +437,18 @@ func (e NativeExecutor) userSettings() (*sshconfig.UserSettings, error) {
 }
 
 func (e NativeExecutor) dial(ctx context.Context, target nativeTarget) (*nativeClient, error) {
-	cfg, agentCloser, err := e.clientConfig(target)
+	var remoteSigner ssh.Signer
+	if e.Options.RemoteSigner != nil {
+		if strings.TrimSpace(target.ProxyJump) != "" && strings.TrimSpace(target.ProxyJump) != "none" {
+			return nil, fmt.Errorf("host %q: ProxyJump is not supported with remote signing", target.Name)
+		}
+		signer, err := e.Options.RemoteSigner(target.Name)
+		if err != nil {
+			return nil, err
+		}
+		remoteSigner = signer
+	}
+	cfg, agentCloser, err := e.clientConfigWith(target, remoteSigner)
 	if err != nil {
 		return nil, err
 	}
@@ -448,7 +463,43 @@ func (e NativeExecutor) dial(ctx context.Context, target nativeTarget) (*nativeC
 	if algos := e.knownHostKeyAlgorithms(target.address()); len(algos) > 0 {
 		cfg.HostKeyAlgorithms = algos
 	}
-	return e.dialWithConfig(ctx, target, cfg)
+	client, err := e.dialWithConfig(ctx, target, cfg)
+	if remoteSigner != nil {
+		if identified, ok := remoteSigner.(interface{ SignID() string }); ok {
+			signID := identified.SignID()
+			if err != nil {
+				// The control plane already logged this signature; keep the id so
+				// a failed login still reconciles with the signing log.
+				if signID != "" {
+					err = &remoteSignedError{err: err, signID: signID}
+				}
+				return nil, err
+			}
+			client.signID = signID
+		}
+	}
+	return client, err
+}
+
+// remoteSignedError marks a connection failure that happened after the
+// control plane had signed the login (target rejected the key, handshake
+// dropped). It is transparent to error inspection.
+type remoteSignedError struct {
+	err    error
+	signID string
+}
+
+func (e *remoteSignedError) Error() string { return e.err.Error() }
+func (e *remoteSignedError) Unwrap() error { return e.err }
+
+// remoteSignIDFromError returns the signing-log id carried by a connection
+// failure, if any.
+func remoteSignIDFromError(err error) string {
+	var signed *remoteSignedError
+	if errors.As(err, &signed) {
+		return signed.signID
+	}
+	return ""
 }
 
 func (e NativeExecutor) dialWithConfig(ctx context.Context, target nativeTarget, cfg *ssh.ClientConfig) (*nativeClient, error) {
@@ -504,6 +555,9 @@ func (e NativeExecutor) dialWithConfig(ctx context.Context, target nativeTarget,
 type nativeClient struct {
 	*ssh.Client
 	closers []io.Closer
+	// signID is the control-plane signing-log id when the login was remotely
+	// signed; empty otherwise.
+	signID string
 }
 
 func (c *nativeClient) Close() error {
@@ -877,7 +931,18 @@ func (e NativeExecutor) parseJump(value string) (nativeTarget, error) {
 }
 
 func (e NativeExecutor) clientConfig(target nativeTarget) (*ssh.ClientConfig, io.Closer, error) {
-	authMethods, closer, err := e.authMethods(target)
+	return e.clientConfigWith(target, nil)
+}
+
+func (e NativeExecutor) clientConfigWith(target nativeTarget, remoteSigner ssh.Signer) (*ssh.ClientConfig, io.Closer, error) {
+	var authMethods []ssh.AuthMethod
+	var closer io.Closer
+	var err error
+	if remoteSigner != nil {
+		authMethods = []ssh.AuthMethod{ssh.PublicKeys(remoteSigner)}
+	} else {
+		authMethods, closer, err = e.authMethods(target)
+	}
 	if err != nil {
 		return nil, nil, err
 	}
@@ -912,7 +977,7 @@ func ProbeStatusForError(err error) ProbeStatus {
 		return ProbeHostKeyIssue
 	}
 	message := strings.ToLower(err.Error())
-	if strings.Contains(message, "authenticate") || strings.Contains(message, "auth methods") {
+	if strings.Contains(message, remoteSigningMarker) || strings.Contains(message, "authenticate") || strings.Contains(message, "auth methods") {
 		return ProbeAuthFailed
 	}
 	return ProbeUnreachable
@@ -930,6 +995,9 @@ func ConnectHint(err error) string {
 		}
 		return "hint: host key changed; possible MITM. Verify the fingerprint before trusting this host."
 	}
+	if hint := remoteSigningHint(err); hint != "" {
+		return hint
+	}
 	if isConnectionRefused(err) || isTimeout(err) {
 		return "hint: cannot reach SSH; check addr, port, network route, and firewall rules."
 	}
@@ -941,6 +1009,26 @@ func ConnectHint(err error) string {
 		return "hint: SSH authentication failed; set identity_file, load a key with ssh-add, or register a password with agentssh secret set <host>. Ensure the remote account and authorized_keys are already configured; AgentSSH never changes the remote host."
 	}
 	return "hint: SSH connection failed; check addr, port, network, host key trust, and available SSH keys."
+}
+
+// remoteSigningMarker is the prefix remoteclient.SignError puts on every
+// remote-signing failure. Matching the text keeps executor independent of the
+// remote client package.
+const remoteSigningMarker = "remote signing failed"
+
+func remoteSigningHint(err error) string {
+	message := strings.ToLower(err.Error())
+	if !strings.Contains(message, remoteSigningMarker) {
+		return ""
+	}
+	switch {
+	case strings.Contains(message, "revoked"):
+		return "hint: the control plane has revoked this device; contact your AgentSSH administrator."
+	case strings.Contains(message, "control plane unreachable"):
+		return "hint: the control plane is unreachable, so no login can be signed; check the network or run agentssh remote status."
+	default:
+		return "hint: the control plane refused to sign this login (identity disabled, host not assigned, or user mismatch); run agentssh remote status or contact your administrator."
+	}
 }
 
 func isTimeout(err error) bool {

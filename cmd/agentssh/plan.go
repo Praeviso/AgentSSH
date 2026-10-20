@@ -671,7 +671,7 @@ func mergePlanReviewSteps(template []approval.PlanReviewStep, current []approval
 }
 
 func runPlanStatus(cmd *cobra.Command, id string, jsonOutput bool) error {
-	cfg, err := config.Load()
+	cfg, err := config.LoadPaths()
 	if err != nil {
 		return classifyConfigError(err)
 	}

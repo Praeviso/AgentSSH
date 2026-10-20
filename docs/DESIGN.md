@@ -48,6 +48,19 @@ agentssh inventory ls|edit   查看/编辑主机清单
 agentssh policy show|rule|group|host|edit|test <cmd>   查看/管理全局规则/规则组/host 绑定/编辑/试判某命令
 agentssh audit ls|show <req>|verify|repair  浏览/查看/校验审计链/截断损坏尾段
 agentssh session ls|new      列出近期会话 / 为新任务 mint 一个会话 id
+agentssh remote enroll <url> --token <t>|status|refresh|leave   远端管控:注册设备 / 查看设备与 bundle / 立即拉取 / 退出远端模式
+```
+
+#### 控制面(`agentssh-server`)
+
+```
+agentssh-server init --san <host>…        生成 CA、TLS 证书、bundle 签名密钥与数据库
+agentssh-server serve [--listen :8443]    运行控制面 API(TLS 证书 30 天内到期时启动告警)
+agentssh-server tls renew [--san <host>…] 用原 CA 换发 TLS 证书(设备无需重新注册;重启 serve 生效)
+agentssh-server device token create --name N | ls | revoke <id>
+agentssh-server identity create <name> | ls | disable <name>
+agentssh-server config push --device <id> --inventory F --policy F
+agentssh-server log [--device] [--host]   签名日志(含拒签)
 ```
 
 ### A.3 输出格式
@@ -104,9 +117,9 @@ nginx.service - A high performance web server
 |---|---|
 | 0 | 命令执行成功(remote exit 0);`audit verify` 链完整 |
 | 1 | 命令执行了但 remote 非零退出(详见 stderr/json);`audit verify` 检出断链(非零=校验失败,符合 verify/check 惯例) |
-| 2 | 用法错误(参数/未知主机/未知命令/未知 flag),以及**配置类 setup 问题**(`inventory.yaml`/`policy.yaml` 解析失败、policy/output 正则非法、配置目录缺失) |
+| 2 | 用法错误(参数/未知主机/未知命令/未知 flag),以及**配置类 setup 问题**(`inventory.yaml`/`policy.yaml` 解析失败、policy/output 正则非法、配置目录缺失;远端模式下配置 bundle 不可用:设备已吊销、控制面不可达且缓存过期、验签失败) |
 | 6 | 被 policy `deny` 拒绝(未执行) |
-| 9 | 连接/SSH 错误 |
+| 9 | 连接/SSH 错误(远端模式下含控制面拒签/不可达,提示行会说明) |
 
 > Agent 据此分流:`6` = 硬边界(别重试同命令,改走手册/换方案);`2` = 用法/配置问题(改输入或让人类修配置,别原样重试);`1/9` = 操作/环境问题(可诊断重试)。
 > cobra/pflag 自身的校验错误(未知命令/flag、参数个数不符)也归 `2`。本地配置错误归 `2` 而非 `1`,因为那是 setup 问题不是远端失败。

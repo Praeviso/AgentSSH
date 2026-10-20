@@ -150,6 +150,7 @@ type appModel struct {
 	entryTab   entryTab
 	pane       detailPane
 	detailHost string // the host whose detail screen is open
+	remote     string // "managed vN" when a control plane owns the config
 }
 
 type appStyles struct {
@@ -211,6 +212,17 @@ func newAppModel(paths config.Paths, renderer *lipgloss.Renderer) appModel {
 	st := newAppStyles(renderer)
 	inv, invErr := inventory.Load(paths.InventoryFile)
 	pol, polErr := loadPolicy(paths.PolicyFile)
+	managed := remoteManaged(paths)
+	badge := ""
+	if managed {
+		cfg, err := loadRemote(paths)
+		inv, pol, invErr, polErr = inventory.Inventory{}, policy.Config{}, err, nil
+		if err == nil {
+			inv, pol, badge = cfg.Inventory, cfg.Policy, remoteBadge(cfg)
+		}
+	}
+	policyPane := newPolicySection(paths.PolicyFile, inv, pol, st, firstErr(invErr, polErr))
+	policyPane.managed = managed
 	store := audit.NewStore(paths.AuditFile)
 	records, _ := store.ReadAll()
 	hosts := hostMetaFromInventory(inv)
@@ -225,8 +237,9 @@ func newAppModel(paths config.Paths, renderer *lipgloss.Renderer) appModel {
 		sessions: newModel(records, hosts, newStyles(renderer), func() (audit.VerifyResult, error) {
 			return store.Verify()
 		}),
-		policy:    newPolicySection(paths.PolicyFile, inv, pol, st, firstErr(invErr, polErr)),
+		policy:    policyPane,
 		approvals: newApprovalsSection(paths, st, runtime),
+		remote:    badge,
 	}
 }
 
@@ -742,6 +755,9 @@ func (m appModel) renderStatusBar() string {
 		}
 		if chain := m.sessions.chainBadge(); chain != "" {
 			bar += m.styles.dim.Render(" · ") + chain
+		}
+		if m.remote != "" {
+			bar += m.styles.dim.Render(" · " + m.remote)
 		}
 	}
 	style := m.styles.statusBar

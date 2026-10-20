@@ -10,6 +10,7 @@ import (
 
 	"github.com/Praeviso/AgentSSH/internal/fileutil"
 	"github.com/Praeviso/AgentSSH/internal/inventory"
+	"github.com/Praeviso/AgentSSH/internal/managedmode"
 	"gopkg.in/yaml.v3"
 )
 
@@ -64,6 +65,9 @@ func Load(path string) (Config, error) {
 
 // Save writes policy.yaml atomically with private file permissions.
 func Save(path string, cfg Config) error {
+	if err := managedmode.CheckWritable(path); err != nil {
+		return err
+	}
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create policy directory: %w", err)

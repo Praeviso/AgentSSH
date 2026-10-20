@@ -8,7 +8,6 @@ import (
 	"github.com/Praeviso/AgentSSH/internal/approval"
 	"github.com/Praeviso/AgentSSH/internal/audit"
 	"github.com/Praeviso/AgentSSH/internal/config"
-	"github.com/Praeviso/AgentSSH/internal/inventory"
 	"github.com/Praeviso/AgentSSH/internal/policy"
 	"github.com/charmbracelet/bubbles/help"
 	"github.com/charmbracelet/bubbles/key"
@@ -449,13 +448,7 @@ func (s approvalsSection) decide(verdict approval.Verdict, scope approval.Scope)
 		s.result = "host scope unavailable — privileged command; use once or session"
 		return s, nil
 	}
-	inv, err := inventory.Load(s.paths.InventoryFile)
-	if err != nil {
-		s.err = err
-		s.result = ""
-		return s, nil
-	}
-	pol, err := policy.Load(s.paths.PolicyFile)
+	inv, pol, err := loadEffective(s.paths)
 	if err != nil {
 		s.err = err
 		s.result = ""
@@ -494,13 +487,7 @@ func (s approvalsSection) decidePlan(verdict approval.Verdict, scope approval.Sc
 	if !ok || req.PlanID == "" {
 		return s, nil
 	}
-	inv, err := inventory.Load(s.paths.InventoryFile)
-	if err != nil {
-		s.err = err
-		s.result = ""
-		return s, nil
-	}
-	pol, err := policy.Load(s.paths.PolicyFile)
+	inv, pol, err := loadEffective(s.paths)
 	if err != nil {
 		s.err = err
 		s.result = ""

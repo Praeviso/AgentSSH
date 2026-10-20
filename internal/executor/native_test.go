@@ -321,6 +321,9 @@ func TestNativeExecutorFallsBackToUnpooledWhenMaxSessionsRejects(t *testing.T) {
 	if first.Err != nil || first.ExitCode != 0 {
 		t.Fatalf("first pooled result = %#v err=%v", first, first.Err)
 	}
+	// The server frees its session slot asynchronously after Run returns; reuse
+	// before that would be rejected again and fall back to a third connection.
+	waitForAtomicAtMost(t, &server.activeSessions, 0)
 	third := exec.Run(context.Background(), Request{Target: target, Command: "ok"})
 	if third.Err != nil || third.ExitCode != 0 {
 		t.Fatalf("third pooled result = %#v err=%v", third, third.Err)
@@ -976,6 +979,18 @@ func waitForAtomic(t *testing.T, value *int32, want int32) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("atomic value = %d, want at least %d", atomic.LoadInt32(value), want)
+}
+
+func waitForAtomicAtMost(t *testing.T, value *int32, want int32) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if got := atomic.LoadInt32(value); got <= want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("atomic value = %d, want at most %d", atomic.LoadInt32(value), want)
 }
 
 func handleSession(conn *ssh.ServerConn, channel ssh.Channel, requests <-chan *ssh.Request, server *testSSHServer) {

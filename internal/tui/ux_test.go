@@ -3,12 +3,14 @@ package tui
 import (
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/Praeviso/AgentSSH/internal/audit"
 	"github.com/Praeviso/AgentSSH/internal/hostform"
 	"github.com/Praeviso/AgentSSH/internal/inventory"
+	"github.com/Praeviso/AgentSSH/internal/managedmode"
 	"github.com/Praeviso/AgentSSH/internal/secrets"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -547,5 +549,27 @@ func TestPolicyAddRuleCreatesHostRuleSet(t *testing.T) {
 	m = press(t, m, "enter")
 	if b, ok := m.policy.hostRuleSet(); !ok || len(b.Override.Rules) != 1 {
 		t.Fatalf("'a' should create host rules: ok=%v hostRules=%#v", ok, b)
+	}
+}
+
+// In remote mode hosts come from the control plane: adding one by hand or
+// discovering (which would probe with local credentials) is refused up front.
+func TestManagedHomeRefusesHostAddAndDiscovery(t *testing.T) {
+	m := sized(t, buildApp(t), 100, 30)
+	dir := managedmode.Dir(m.hosts.paths.Home)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, managedmode.MarkerName), []byte("device_id: dev_test\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"a", "D"} {
+		next := press(t, m, key)
+		if next.hosts.focus != hostFocusList || next.hosts.discover.active {
+			t.Fatalf("%q in a managed home left the grid (focus=%v discover=%v)", key, next.hosts.focus, next.hosts.discover.active)
+		}
+		if next.hosts.statusLevel != statusErr || !strings.Contains(next.hosts.status, "remote control plane") {
+			t.Fatalf("%q status = %q (level %v), want a managed refusal", key, next.hosts.status, next.hosts.statusLevel)
+		}
 	}
 }

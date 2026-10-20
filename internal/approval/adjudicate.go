@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/Praeviso/AgentSSH/internal/audit"
+	"github.com/Praeviso/AgentSSH/internal/managedmode"
 	"github.com/Praeviso/AgentSSH/internal/policy"
 )
 
@@ -57,6 +58,13 @@ func ApplyDecision(opts ApplyOptions, id string, verdict Verdict, scope Scope) (
 		if scope == ScopeHost {
 			if !req.Candidate.Promotable {
 				return ApplyResult{}, fmt.Errorf("approval %s cannot be promoted to host scope", req.ID)
+			}
+			// A remote control plane owns policy.yaml's effect; refuse before
+			// Resolve so the request stays decidable as once or session.
+			if opts.PolicyPath != "" {
+				if err := managedmode.CheckWritable(opts.PolicyPath); err != nil {
+					return ApplyResult{}, fmt.Errorf("host scope is unavailable: %w; approve once or for the session instead", err)
+				}
 			}
 			// Validate the stored candidate BEFORE anything durable is written.
 			// applyHostGrant persists req.Candidate.Regex verbatim, so a request
