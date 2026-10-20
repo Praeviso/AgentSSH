@@ -211,6 +211,8 @@ go build -o agentssh ./cmd/agentssh                           # single binary fr
 
 Put the binary on the local operator machine where SSH already works.
 
+For contributor checks, affected-test selection and release verification, see [CI](docs/ci.md).
+
 ## Configure
 
 AgentSSH reads `~/.agentssh/` by default. Set `AGENTSSH_HOME` to use another directory. The first run of `agentssh tui` creates the directory and seeds `inventory.yaml` + `policy.yaml` for you (existing files are never overwritten), so you can skip the manual setup below and just edit what it wrote.

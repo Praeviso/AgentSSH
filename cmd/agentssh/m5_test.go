@@ -41,9 +41,11 @@ func withOperatorTTY(t *testing.T) {
 
 func initOperatorVerifierForTest(t *testing.T, home string, master string) {
 	t.Helper()
-	if err := saveOperatorVerifier(operatorVerifierPath(config.NewPaths(home)), master); err != nil {
-		t.Fatalf("save operator verifier: %v", err)
-	}
+	// Workflow tests exercise real password verification without repeating the
+	// production scrypt cost for every command. Production writes are covered
+	// separately by TestOperatorVerifierProductionParameters.
+	writeEncryptedFixture(t, operatorVerifierPath(config.NewPaths(home)), master,
+		[]byte(`{"Version":1,"Purpose":"agentssh operator verifier"}`))
 }
 
 func withOperatorPrompt(t *testing.T, prompt func(string) (string, error)) {

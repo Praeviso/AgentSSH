@@ -1,0 +1,38 @@
+name: Set up Go caches
+description: Restore complete module downloads and a build cache owned by this job.
+inputs:
+  build-cache:
+    description: Build cache owner/mode; use none for package selection.
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-go@v5
+      id: go
+      with:
+        go-version-file: go.mod
+        cache: false
+    - name: Locate Go caches
+      id: paths
+      shell: bash
+      run: |
+        echo "modules=$(go env GOMODCACHE)" >> "$GITHUB_OUTPUT"
+        echo "build=$(go env GOCACHE)" >> "$GITHUB_OUTPUT"
+    - name: Cache module downloads
+      id: modules
+      uses: actions/cache@v4
+      with:
+        path: ${{ steps.paths.outputs.modules }}
+        key: go-mod-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.go.outputs.go-version }}-${{ hashFiles('go.mod', 'go.sum') }}
+    - name: Download complete module set
+      if: steps.modules.outputs.cache-hit != 'true'
+      shell: bash
+      run: go mod download
+    - name: Cache build outputs
+      if: inputs.build-cache != 'none'
+      uses: actions/cache@v4
+      with:
+        path: ${{ steps.paths.outputs.build }}
+        key: go-build-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.go.outputs.go-version }}-${{ inputs.build-cache }}-${{ hashFiles('go.mod', 'go.sum', '**/*.go') }}
+        restore-keys: |
+          go-build-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.go.outputs.go-version }}-${{ inputs.build-cache }}-

@@ -727,13 +727,7 @@ func TestOperatorGateIgnoresEnvMasterPassword(t *testing.T) {
 	writePolicy(t, home, "version: 1\n")
 	t.Setenv("AGENTSSH_HOME", home)
 	t.Setenv(envMasterPassword, "master")
-	store, err := secrets.Open(filepath.Join(home, "secrets.enc"), "master")
-	if err != nil {
-		t.Fatalf("open secrets: %v", err)
-	}
-	if err := store.Save("master"); err != nil {
-		t.Fatalf("save secrets: %v", err)
-	}
+	writeSecretsFixture(t, home, "master", map[string]string{})
 	withOperatorPrompt(t, func(prompt string) (string, error) {
 		if strings.Contains(prompt, "AgentSSH master password") {
 			return "wrong", nil
@@ -742,7 +736,7 @@ func TestOperatorGateIgnoresEnvMasterPassword(t *testing.T) {
 		return "", nil
 	})
 
-	_, _, err = runCommandForTest(t, "policy", "rule", "add", "self-allow", "--cmd-regex", ".*", "--action", "allow")
+	_, _, err := runCommandForTest(t, "policy", "rule", "add", "self-allow", "--cmd-regex", ".*", "--action", "allow")
 	if err == nil || !isUsageError(err) || !strings.Contains(err.Error(), "wrong master password") {
 		t.Fatalf("policy mutation err = %T %[1]v, want prompted wrong master to be rejected", err)
 	}
@@ -2064,14 +2058,7 @@ hosts:
     user: test
 `, server.Host(), server.Port()))
 	writeTestPolicy(t, home)
-	store, err := secrets.Open(filepath.Join(home, "secrets.enc"), "master")
-	if err != nil {
-		t.Fatalf("open missing secrets: %v", err)
-	}
-	store.Set("web-1", "ssh-password-value")
-	if err := store.Save("master"); err != nil {
-		t.Fatalf("save secrets: %v", err)
-	}
+	writeSecretsFixture(t, home, "master", map[string]string{"web-1": "ssh-password-value"})
 	t.Setenv("AGENTSSH_HOME", home)
 	t.Setenv("AGENTSSH_SESSION", "s_password")
 	t.Setenv(envMasterPassword, "master")
@@ -2874,14 +2861,7 @@ hosts:
     user: test
 `, server.Host(), server.Port()))
 	writeTestPolicy(t, home)
-	store, err := secrets.Open(filepath.Join(home, "secrets.enc"), "master")
-	if err != nil {
-		t.Fatalf("open secrets: %v", err)
-	}
-	store.Set("web-1", "ssh-password-value")
-	if err := store.Save("master"); err != nil {
-		t.Fatalf("save secrets: %v", err)
-	}
+	writeSecretsFixture(t, home, "master", map[string]string{"web-1": "ssh-password-value"})
 	t.Setenv("AGENTSSH_HOME", home)
 	withOperatorAuth(t, home)
 	t.Setenv(envMasterPassword, "master")
