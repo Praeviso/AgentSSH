@@ -4,25 +4,70 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_call:
+    inputs:
+      full:
+        description: Force complete verification without test-result caching.
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ inputs.full || false }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && !inputs.full }}
+
 jobs:
-  test:
+  changes:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      go: ${{ steps.select.outputs.go }}
+      tooling: ${{ steps.select.outputs.tooling }}
+      smoke: ${{ steps.select.outputs.smoke }}
+      full: ${{ steps.select.outputs.full }}
+      cli: ${{ steps.select.outputs.cli }}
+      internal: ${{ steps.select.outputs.internal }}
+      cli_packages: ${{ steps.select.outputs.cli_packages }}
+      internal_packages: ${{ steps.select.outputs.internal_packages }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
+      - uses: actions/checkout@v4
         with:
-          # Read the Go version from the go directive in go.mod so CI never
-          # drifts from the module (a dependency bumped this to 1.25).
-          go-version-file: go.mod
-          cache: true
+          # Only the classifier needs history (including cumulative PR diffs).
+          fetch-depth: 0
+      - name: Classify changed files without Go
+        id: classify
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          FORCE_FULL: ${{ inputs.full || false }}
+        run: |
+          args=()
+          if [ "$FORCE_FULL" = true ]; then args+=(--full); fi
+          python3 scripts/ci/ci.py classify --base "$BASE_SHA" --head "$GITHUB_SHA" \
+            --plan "$RUNNER_TEMP/ci-plan.json" "${args[@]}"
+      - name: Set up Go for dependency analysis
+        if: steps.classify.outputs.go == 'true'
+        uses: ./.github/actions/setup-go
+        with:
+          build-cache: none
+      - name: Select affected packages
+        id: select
+        run: python3 scripts/ci/ci.py select --plan "$RUNNER_TEMP/ci-plan.json"
 
+  quality:
+    needs: changes
+    if: needs.changes.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-go
+        with:
+          build-cache: quality
       - name: gofmt
         run: |
           unformatted="$(gofmt -l .)"
@@ -31,34 +76,118 @@ jobs:
             echo "$unformatted"
             exit 1
           fi
-
       - name: go vet
         run: go vet ./...
-
-      - name: Build
-        run: go build ./...
-
-      - name: Test (race)
-        # CLI approval tests exercise real scrypt verifiers. With race
-        # instrumentation, hosted runners can exceed Go's default 10m timeout.
-        run: go test -race -timeout=20m ./...
-
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache: true
-
+      - name: Build both commands
+        run: go build ./cmd/...
       - name: golangci-lint
-        # v8 installs golangci-lint v2 (built with a current Go); v6 pinned a v1
-        # built with Go 1.24, which refuses to run against this go 1.25 module.
         uses: golangci/golangci-lint-action@v8
         with:
           version: v2.12.2
           args: --timeout=5m
+
+  test-internal:
+    needs: changes
+    if: needs.changes.outputs.internal == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-go
+        with:
+          build-cache: race-internal
+      - name: Race tests for affected packages
+        env:
+          PACKAGES: ${{ needs.changes.outputs.internal_packages }}
+          FULL: ${{ needs.changes.outputs.full }}
+        run: |
+          args=()
+          if [ "$FULL" = true ]; then args+=(--full); fi
+          python3 scripts/ci/ci.py test --packages "$PACKAGES" \
+            --report "$RUNNER_TEMP/test-internal.jsonl" "${args[@]}"
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-internal
+          path: ${{ runner.temp }}/test-internal.jsonl
+          retention-days: 7
+          if-no-files-found: ignore
+
+  test-cli:
+    needs: changes
+    if: needs.changes.outputs.cli == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-go
+        with:
+          build-cache: race-cli
+      - name: Race tests for CLI
+        env:
+          PACKAGES: ${{ needs.changes.outputs.cli_packages }}
+          FULL: ${{ needs.changes.outputs.full }}
+        run: |
+          args=()
+          if [ "$FULL" = true ]; then args+=(--full); fi
+          python3 scripts/ci/ci.py test --packages "$PACKAGES" \
+            --report "$RUNNER_TEMP/test-cli.jsonl" "${args[@]}"
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-cli
+          path: ${{ runner.temp }}/test-cli.jsonl
+          retention-days: 7
+          if-no-files-found: ignore
+
+  tooling:
+    needs: changes
+    if: needs.changes.outputs.tooling == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Go for CI checks or demo smoke test
+        if: needs.changes.outputs.full == 'true' || needs.changes.outputs.smoke == 'true'
+        uses: ./.github/actions/setup-go
+        with:
+          build-cache: tooling
+      - name: Test selection and result contracts
+        if: needs.changes.outputs.full == 'true'
+        run: python3 -m unittest discover -s scripts/ci -v
+      - name: Validate workflows
+        if: needs.changes.outputs.full == 'true'
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+      - name: Check shell syntax
+        run: |
+          while IFS= read -r -d '' script; do
+            bash -n "$script"
+          done < <(git ls-files -z '*.sh')
+      - name: Smoke test audit demo
+        if: needs.changes.outputs.smoke == 'true' || needs.changes.outputs.full == 'true'
+        env:
+          AGENTSSH_BIN: ${{ runner.temp }}/agentssh
+          AGENTSSH_E2E_HOME: ${{ runner.temp }}/audit-demo
+        run: |
+          go build -o "$AGENTSSH_BIN" ./cmd/agentssh
+          bash scripts/e2e_tui_audit_run_summary.sh --no-tui
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          pending = list((Path(os.environ["AGENTSSH_E2E_HOME"]) / "approvals/pending").glob("*.json"))
+          assert len(pending) == 6, f"Expected six pending approvals, got {len(pending)}"
+          PY
+
+  ci-result:
+    needs: [changes, quality, test-internal, test-cli, tooling]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require all selected checks
+        env:
+          CI_NEEDS: ${{ toJSON(needs) }}
+        run: python3 scripts/ci/ci.py check
