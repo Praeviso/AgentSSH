@@ -119,6 +119,10 @@ only at enrollment, and `agentssh-device` for other operations.
 `nonce` is unpadded base64url of 32 fresh random bytes. `expires > created`, lifetime
 is at most 60 seconds, expiration is strictly after server time, and creation is
 no more than 30 seconds ahead of server time. Synchronize device and service clocks.
+An otherwise authentic but out-of-window proof returns HTTP 401 `clock_skew`,
+with synchronization guidance and server UTC time. Verify the signature before
+diagnosing time drift; do not automatically adjust the clock or widen the window.
+This applies to enrollment and device requests.
 
 The UTF-8 signature base has four lines and no final newline:
 
@@ -134,7 +138,17 @@ byte is authenticated; do not reserialize before digesting. Verify the signature
 check device standing and atomically claim `(device_id, nonce)` in durable storage,
 rechecking active status. Keep that nonce until expiry. Enrollment uses its
 single-use token transaction instead. An unavailable replay store refuses requests.
-The reference server bounds bodies at 64 KiB and removes expired nonces.
+The reference server bounds bodies at 64 KiB and authenticates and decodes the
+same bytes. Its SQLite write transactions acquire write intent before reading;
+nonce admission authoritatively distinguishes revocation from replay. Expired
+nonces are removed using the expiry index at most once per minute per store, in
+the same transaction as admission. Live nonces remain protected until expiry.
+
+Signed requests are single-use even for GET: the client supplies non-rewindable
+bodies, including empty bodies, so HTTP Transport cannot automatically resend a
+consumed proof after losing a response on a reused connection. A subsequent
+explicit operation generates a fresh proof. Enrollment and signing are never
+retried automatically because their outcome may already have been committed.
 
 ## Configuration and SSH signatures
 
@@ -149,7 +163,11 @@ ordering, not a protocol version.
 The client rejects incorrect signatures/device IDs, configuration rollback and
 expired bundles. A fresh cache is reused for 60 seconds; a network failure may
 use a cached bundle only until its expiry (10 minutes by default). An authenticated
-refusal never uses cached configuration. Managed hosts require `addr`, `user`,
+refusal never uses cached configuration. A non-protocol HTTPS ingress 502, 503 or
+504 counts as unreachable, allowing only the same unexpired cache grace. A valid
+protocol error (nonempty `code` and `error`) remains a refusal regardless of HTTP
+status; other invalid responses fail closed. Cache grace does not provide offline
+SSH signatures. Managed hosts require `addr`, `user`,
 `identity` and native transport. Local inventory edits, discovery, local SSH
 credentials and connection reuse are disabled. Local policy contributes deny
 rules only; once/session approvals remain local.

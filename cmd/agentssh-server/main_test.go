@@ -40,4 +40,8 @@ func TestDeviceTokenCreateForHostedHTTPS(t *testing.T) {
 	if strings.Contains(stderr.String(), token.Secret) {
 		t.Fatal("token leaked to stderr")
 	}
+	pub, err := remoteserver.LoadBundlePublicKey(dir)
+	if err != nil || token.BundleFingerprint != remote.PublicKeyFingerprint(pub) {
+		t.Fatalf("token did not pin the stored bundle key: %v", err)
+	}
 }

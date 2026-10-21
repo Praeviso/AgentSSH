@@ -14,7 +14,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/Praeviso/AgentSSH/internal/managedmode"
@@ -54,19 +53,23 @@ func LoadState(home string) (State, error) {
 	decoder := yaml.NewDecoder(bytes.NewReader(data))
 	decoder.KnownFields(true)
 	if err := decoder.Decode(&state); err != nil {
-		return State{}, fmt.Errorf("invalid remote enrollment; re-enroll this device: %w", err)
+		return State{}, invalidEnrollment(err)
 	}
 	if err := decoder.Decode(new(any)); err != io.EOF {
-		return State{}, errors.New("remote enrollment must contain one document")
+		return State{}, invalidEnrollment(errors.New("record must contain one document"))
 	}
 	base, err := remote.HTTPSBaseURL(state.ServerURL)
 	if err != nil || base != state.ServerURL || !validDeviceID(state.DeviceID) || state.EnrolledAt.IsZero() {
-		return State{}, errors.New("invalid remote enrollment; re-enroll this device")
+		return State{}, invalidEnrollment(errors.New("invalid URL, device ID or enrollment time"))
 	}
-	if _, err := remote.DecodeDevicePublicKey(state.BundlePublicKey); err != nil {
-		return State{}, err
+	if _, err := remote.DecodePublicKey(state.BundlePublicKey); err != nil {
+		return State{}, invalidEnrollment(err)
 	}
 	return state, nil
+}
+
+func invalidEnrollment(err error) error {
+	return fmt.Errorf("invalid remote enrollment; run agentssh remote leave, then re-enroll this device: %w", err)
 }
 
 // Client authenticates as one enrolled device.
@@ -122,7 +125,7 @@ func (c *Client) Sign(ctx context.Context, host string, data []byte) (remote.Sig
 }
 
 func (c *Client) call(ctx context.Context, method string, path string, body any, out any) error {
-	return doJSON(ctx, c.http, method, strings.TrimRight(c.State.ServerURL, "/")+path, body, out)
+	return doJSON(ctx, c.http, method, c.State.ServerURL+path, body, out)
 }
 
 func doJSON(ctx context.Context, client *http.Client, method string, endpoint string, body any, out any) error {
@@ -161,7 +164,14 @@ func doJSON(ctx context.Context, client *http.Client, method string, endpoint st
 	}
 	if resp.StatusCode/100 != 2 {
 		var apiErr remote.ErrorResponse
-		if json.Unmarshal(data, &apiErr) != nil || apiErr.Code == "" {
+		if json.Unmarshal(data, &apiErr) != nil || apiErr.Code == "" || apiErr.Error == "" {
+			// An ingress cannot report device standing when its backend is
+			// unavailable. Keep actual protocol refusals distinct from gateway
+			// failures so only the latter permit an unexpired cached bundle.
+			switch resp.StatusCode {
+			case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+				return &UnreachableError{Err: fmt.Errorf("HTTPS ingress returned HTTP %d", resp.StatusCode)}
+			}
 			return &remote.APIError{Status: resp.StatusCode, Code: remote.CodeInternal, Message: fmt.Sprintf("HTTP %d", resp.StatusCode)}
 		}
 		return &remote.APIError{Status: resp.StatusCode, Code: apiErr.Code, Message: apiErr.Error}

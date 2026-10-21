@@ -56,14 +56,7 @@ func writeError(w http.ResponseWriter, status int, code string, message string) 
 	writeJSON(w, status, remote.ErrorResponse{Code: code, Error: message})
 }
 
-func decodeBody(r *http.Request, value any) error {
-	data, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBytes+1))
-	if err != nil {
-		return err
-	}
-	if len(data) > maxRequestBytes {
-		return errors.New("request body too large")
-	}
+func decodeBody(data []byte, value any) error {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(value); err != nil {
@@ -75,13 +68,13 @@ func decodeBody(r *http.Request, value any) error {
 	return nil
 }
 
-type deviceHandler func(http.ResponseWriter, *http.Request, Device)
+type deviceHandler func(http.ResponseWriter, *http.Request, Device, []byte)
 
-func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request, device Device) {
+func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request, device Device, _ []byte) {
 	writeJSON(w, http.StatusOK, remote.StatusResponse{DeviceID: device.ID, Status: device.Status})
 }
 
-func (s *Server) handleBundle(w http.ResponseWriter, _ *http.Request, device Device) {
+func (s *Server) handleBundle(w http.ResponseWriter, _ *http.Request, device Device, _ []byte) {
 	cfg, err := s.Store.Config(device.ID)
 	if errors.Is(err, ErrNotFound) {
 		writeError(w, http.StatusNotFound, remote.CodeNoConfig, "no configuration has been pushed for this device")
@@ -132,9 +125,9 @@ func (s *Server) handleBundle(w http.ResponseWriter, _ *http.Request, device Dev
 	writeJSON(w, http.StatusOK, remote.BundleResponse{Bundle: raw, Signature: sig})
 }
 
-func (s *Server) handleSign(w http.ResponseWriter, r *http.Request, device Device) {
+func (s *Server) handleSign(w http.ResponseWriter, _ *http.Request, device Device, body []byte) {
 	var req remote.SignRequest
-	if err := decodeBody(r, &req); err != nil {
+	if err := decodeBody(body, &req); err != nil {
 		writeError(w, http.StatusBadRequest, remote.CodeBadRequest, "malformed sign request")
 		return
 	}

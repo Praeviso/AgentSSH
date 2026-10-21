@@ -8,7 +8,6 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"golang.org/x/crypto/ssh"
 	"io"
 	"os"
 	"path/filepath"
@@ -17,6 +16,8 @@ import (
 
 	"filippo.io/age"
 	"github.com/Praeviso/AgentSSH/internal/fileutil"
+	"github.com/Praeviso/AgentSSH/internal/remote"
+	"golang.org/x/crypto/ssh"
 )
 
 const (
@@ -131,6 +132,16 @@ func Unlock(dir, master string) (*Keys, error) {
 
 func (k *Keys) BundlePublicKey() string {
 	return base64.StdEncoding.EncodeToString(k.BundleKey.Public().(ed25519.PublicKey))
+}
+
+// LoadBundlePublicKey reads the public bundle-verification key without unlocking
+// private keys. Enrollment-token creation needs only this public information.
+func LoadBundlePublicKey(dir string) (ed25519.PublicKey, error) {
+	data, err := os.ReadFile(filepath.Join(dir, fileBundlePub))
+	if err != nil {
+		return nil, fmt.Errorf("read bundle public key (run agentssh-server init first): %w", err)
+	}
+	return remote.DecodePublicKey(strings.TrimSpace(string(data)))
 }
 
 // DecryptIdentity returns the SSH signer for an identity's encrypted key.

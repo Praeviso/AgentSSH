@@ -23,6 +23,7 @@ const (
 const (
 	CodeBadRequest       = "bad_request"
 	CodeUnauthenticated  = "unauthenticated"
+	CodeClockSkew        = "clock_skew"
 	CodeDeviceRevoked    = "device_revoked"
 	CodeTokenInvalid     = "token_invalid"
 	CodeNoConfig         = "no_config"

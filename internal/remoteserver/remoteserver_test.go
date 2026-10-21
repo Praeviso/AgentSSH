@@ -40,7 +40,7 @@ func TestInitRefusesToOverwriteAndUnlockNeedsMaster(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Unlock: %v", err)
 	}
-	if _, err := remote.DecodeDevicePublicKey(keys.BundlePublicKey()); err != nil {
+	if _, err := remote.DecodePublicKey(keys.BundlePublicKey()); err != nil {
 		t.Fatal(err)
 	}
 }

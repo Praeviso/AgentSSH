@@ -1,7 +1,6 @@
 package remoteserver
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
@@ -9,6 +8,7 @@ import (
 	"net/url"
 	"path"
 	"strings"
+	"time"
 
 	"github.com/Praeviso/AgentSSH/internal/remote"
 )
@@ -64,19 +64,19 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request, base strin
 		writeError(w, 400, remote.CodeBadRequest, "malformed enrollment request")
 		return
 	}
-	r.Body = io.NopCloser(bytes.NewReader(body))
 	var req remote.EnrollRequest
-	if decodeBody(r, &req) != nil {
+	if decodeBody(body, &req) != nil {
 		writeError(w, 400, remote.CodeBadRequest, "malformed enrollment request")
 		return
 	}
-	key, err := remote.DecodeDevicePublicKey(req.PublicKey)
+	key, err := remote.DecodePublicKey(req.PublicKey)
 	if err != nil {
 		writeError(w, 400, remote.CodeBadRequest, "invalid device public key")
 		return
 	}
-	if _, err := remote.VerifyHTTPRequest(r, body, base+remote.PathEnroll, req.TokenID, remote.EnrollSignatureTag, key, s.now()); err != nil {
-		writeError(w, 401, remote.CodeUnauthenticated, "invalid enrollment proof")
+	now := s.now()
+	if _, err := remote.VerifyHTTPRequest(r, body, base+remote.PathEnroll, req.TokenID, remote.EnrollSignatureTag, key, now); err != nil {
+		writeProofError(w, err, now)
 		return
 	}
 	d, err := s.Store.RedeemEnrollToken(req.TokenID, req.TokenSecret, base, req.PublicKey, s.now())
@@ -108,38 +108,48 @@ func (s *Server) device(base, path string, next deviceHandler) http.HandlerFunc 
 			writeError(w, 500, remote.CodeInternal, "device lookup failed")
 			return
 		}
-		key, err := remote.DecodeDevicePublicKey(device.PublicKey)
+		key, err := remote.DecodePublicKey(device.PublicKey)
 		if err != nil {
 			writeError(w, 500, remote.CodeInternal, "device key unavailable")
 			return
 		}
-		proof, err := remote.VerifyHTTPRequest(r, body, base+path, id, remote.DeviceSignatureTag, key, s.now())
+		now := s.now()
+		proof, err := remote.VerifyHTTPRequest(r, body, base+path, id, remote.DeviceSignatureTag, key, now)
 		if err != nil {
-			writeError(w, 401, remote.CodeUnauthenticated, "invalid request signature")
+			writeProofError(w, err, now)
 			return
 		}
-		r.Body = io.NopCloser(bytes.NewReader(body))
-		if device.Status != remote.DeviceActive {
+		err = s.Store.consumeNonce(id, proof.Nonce, proof.Expires, s.now)
+		switch {
+		case errors.Is(err, ErrDeviceRevoked):
 			if path == remote.PathSign {
 				var req remote.SignRequest
 				_ = json.Unmarshal(body, &req)
-				if err := s.Store.AppendSign(SignEntry{SignID: "sg_" + randomHex(8), TS: s.now(), DeviceID: id, Host: req.Host, Result: SignRejected, Reason: "device revoked"}); err != nil {
+				if err := s.Store.AppendSign(SignEntry{SignID: "sg_" + randomHex(8), TS: now, DeviceID: id, Host: req.Host, Result: SignRejected, Reason: "device revoked"}); err != nil {
 					writeError(w, 500, remote.CodeInternal, "signing log unavailable")
 					return
 				}
 			}
 			writeError(w, 403, remote.CodeDeviceRevoked, "this device has been revoked by the control plane")
 			return
-		}
-		ok, err := s.Store.consumeNonce(id, proof.Nonce, proof.Expires, s.now().Unix())
-		if err != nil {
+		case errors.Is(err, ErrRequestReplayed):
+			writeError(w, 403, remote.CodeUnauthenticated, "request replayed")
+			return
+		case errors.Is(err, remote.ErrRequestTime):
+			writeProofError(w, err, s.now())
+			return
+		case err != nil:
 			writeError(w, 500, remote.CodeInternal, "replay protection unavailable")
 			return
 		}
-		if !ok {
-			writeError(w, 403, remote.CodeUnauthenticated, "request replayed or device no longer active")
-			return
-		}
-		next(w, r, device)
+		next(w, r, device, body)
 	}
+}
+
+func writeProofError(w http.ResponseWriter, err error, now time.Time) {
+	if errors.Is(err, remote.ErrRequestTime) {
+		writeError(w, 401, remote.CodeClockSkew, "request time outside accepted window; synchronize this machine's clock; server UTC time: "+now.UTC().Format(time.RFC3339))
+		return
+	}
+	writeError(w, 401, remote.CodeUnauthenticated, "invalid request signature")
 }

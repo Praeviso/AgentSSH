@@ -42,7 +42,7 @@ func Enroll(ctx context.Context, home, serverURL, rawToken string, now time.Time
 		TokenID: token.ID, TokenSecret: token.Secret, PublicKey: base64.StdEncoding.EncodeToString(pub)}, &response); err != nil {
 		return State{}, err
 	}
-	bundlePub, err := remote.DecodeDevicePublicKey(response.BundlePublicKey)
+	bundlePub, err := remote.DecodePublicKey(response.BundlePublicKey)
 	if err != nil || remote.PublicKeyFingerprint(bundlePub) != token.BundleFingerprint {
 		return State{}, errors.New("bundle public key does not match the enrollment token")
 	}

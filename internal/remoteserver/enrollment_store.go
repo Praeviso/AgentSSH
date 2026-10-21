@@ -34,7 +34,7 @@ func (s *Store) CreateEnrollToken(name, publicURL, fingerprint string, ttl time.
 // RedeemEnrollToken consumes the token and persists the public key in the
 // same transaction. The caller verifies proof of possession before calling it.
 func (s *Store) RedeemEnrollToken(id, secret, publicURL, publicKey string, now time.Time) (Device, error) {
-	if _, err := remote.DecodeDevicePublicKey(publicKey); err != nil {
+	if _, err := remote.DecodePublicKey(publicKey); err != nil {
 		return Device{}, err
 	}
 	tx, err := s.db.Begin()
@@ -72,29 +72,52 @@ func (s *Store) RedeemEnrollToken(id, secret, publicURL, publicKey string, now t
 	return d, nil
 }
 
-// consumeNonce is durable across restarts and concurrent handlers. The insert
-// rechecks active status so revocation cannot be bypassed with a cached Device.
-func (s *Store) consumeNonce(device, nonce string, expires, now int64) (bool, error) {
+// consumeNonce orders request authorization against revocation and replay in
+// authoritative storage. Never derive the refusal from a cached Device value.
+func (s *Store) consumeNonce(device, nonce string, expires int64, clock func() time.Time) error {
 	results, err := s.db.Begin()
 	if err != nil {
-		return false, err
+		return err
 	}
 	defer func() { _ = results.Rollback() }()
-	if _, err := results.Exec(`DELETE FROM request_nonces WHERE expires_at<=?`, now); err != nil {
-		return false, err
+	var status string
+	if err := results.QueryRow(`SELECT status FROM devices WHERE id=?`, device).Scan(&status); err != nil {
+		return err
 	}
-	res, err := results.Exec(`INSERT INTO request_nonces (device_id,nonce,expires_at)
- SELECT ?,?,? WHERE EXISTS (SELECT 1 FROM devices WHERE id=? AND status=?)
- ON CONFLICT(device_id,nonce) DO NOTHING`, device, nonce, expires, device, remote.DeviceActive)
+	if status != remote.DeviceActive {
+		return ErrDeviceRevoked
+	}
+	// BEGIN IMMEDIATE may have waited for another writer. Check time after
+	// acquiring the lock, so an expired proof cannot outlive its nonce record.
+	now := clock().Unix()
+	if expires <= now {
+		return remote.ErrRequestTime
+	}
+	// Use the expiry index once per minute, in the same write transaction as
+	// admission. No per-request cleanup or background worker lifecycle is needed.
+	prune := now >= s.nextNoncePrune.Load()
+	if prune {
+		if _, err := results.Exec(`DELETE FROM request_nonces WHERE expires_at<=?`, now); err != nil {
+			return err
+		}
+		// Schedule while holding the writer lock. If this transaction rolls
+		// back, expired rows can safely wait until the next maintenance pass.
+		s.nextNoncePrune.Store(now + int64(time.Minute/time.Second))
+	}
+	res, err := results.Exec(`INSERT INTO request_nonces (device_id,nonce,expires_at) VALUES (?,?,?)
+ ON CONFLICT(device_id,nonce) DO NOTHING`, device, nonce, expires)
 	if err != nil {
-		return false, err
+		return err
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
-		return false, err
+		return err
+	}
+	if n != 1 {
+		return ErrRequestReplayed
 	}
 	if err := results.Commit(); err != nil {
-		return false, err
+		return err
 	}
-	return n == 1, nil
+	return nil
 }

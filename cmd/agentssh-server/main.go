@@ -214,11 +214,7 @@ func newDeviceCommand(dir func() (string, error)) *cobra.Command {
 				return err
 			}
 			defer func() { _ = store.Close() }()
-			pubText, err := os.ReadFile(filepath.Join(d, "bundle.pub"))
-			if err != nil {
-				return err
-			}
-			pub, err := remote.DecodeDevicePublicKey(strings.TrimSpace(string(pubText)))
+			pub, err := remoteserver.LoadBundlePublicKey(d)
 			if err != nil {
 				return err
 			}

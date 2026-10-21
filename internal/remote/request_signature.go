@@ -21,6 +21,10 @@ const (
 	EnrollSignatureTag = "agentssh-enroll"
 )
 
+// ErrRequestTime means an otherwise authentic proof is outside the accepted
+// time window. Do not widen the window or trust a client-supplied clock offset.
+var ErrRequestTime = errors.New("request time outside accepted window")
+
 // This is a deliberately narrow RFC 9421 profile, not a general Structured
 // Fields parser. The exact covered components and parameter order are required.
 const coveredComponents = `("@method" "@target-uri" "content-digest")`
@@ -106,7 +110,7 @@ func VerifyHTTPRequest(req *http.Request, body []byte, target, keyID, tag string
 	}
 	created, _ := strconv.ParseInt(parts[1], 10, 64)
 	expires, _ := strconv.ParseInt(parts[2], 10, 64)
-	if expires <= created || expires-created > int64(RequestLifetime/time.Second) || now.Unix() >= expires || created > now.Add(RequestClockSkew).Unix() {
+	if expires <= created || expires-created > int64(RequestLifetime/time.Second) {
 		return RequestProof{}, fail
 	}
 	nonce, err := base64.RawURLEncoding.Strict().DecodeString(parts[3])
@@ -120,6 +124,9 @@ func VerifyHTTPRequest(req *http.Request, body []byte, target, keyID, tag string
 	sig, err := base64.StdEncoding.Strict().DecodeString(strings.TrimSuffix(strings.TrimPrefix(rawSig, "agentssh=:"), ":"))
 	if err != nil || !ed25519.Verify(key, signatureBase(req.Method, target, contentDigest(body), strings.TrimPrefix(input, "agentssh=")), sig) {
 		return RequestProof{}, fail
+	}
+	if now.Unix() >= expires || created > now.Add(RequestClockSkew).Unix() {
+		return RequestProof{}, ErrRequestTime
 	}
 	return RequestProof{KeyID: keyID, Nonce: parts[3], Expires: expires}, nil
 }

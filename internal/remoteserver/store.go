@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/Praeviso/AgentSSH/internal/remote"
@@ -21,6 +22,10 @@ var (
 	ErrTokenInvalid = errors.New("enrollment token is invalid, expired, or already used")
 	// ErrExists reports a duplicate identity name.
 	ErrExists = errors.New("already exists")
+	// ErrDeviceRevoked reports revocation at the request authorization boundary.
+	ErrDeviceRevoked = errors.New("device revoked")
+	// ErrRequestReplayed reports an already consumed request proof.
+	ErrRequestReplayed = errors.New("request replayed")
 )
 
 const schema = `
@@ -88,7 +93,8 @@ const (
 
 // Store is the control plane's SQLite state.
 type Store struct {
-	db *sql.DB
+	db             *sql.DB
+	nextNoncePrune atomic.Int64
 }
 
 // Device is one enrolled client.
@@ -134,7 +140,9 @@ type SignEntry struct {
 
 // OpenStore opens (creating if needed) the SQLite database at path.
 func OpenStore(path string) (*Store, error) {
-	dsn := "file:" + path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)"
+	// All explicit transactions mutate state. Acquire write intent before any
+	// reads, rather than upgrading a stale WAL snapshot after another writer.
+	dsn := "file:" + path + "?_txlock=immediate&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open control plane database: %w", err)

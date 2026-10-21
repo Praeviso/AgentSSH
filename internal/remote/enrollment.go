@@ -97,7 +97,7 @@ type EnrollResponse struct {
 	BundlePublicKey string `json:"bundle_public_key"`
 }
 
-func DecodeDevicePublicKey(value string) (ed25519.PublicKey, error) {
+func DecodePublicKey(value string) (ed25519.PublicKey, error) {
 	key, err := base64.StdEncoding.Strict().DecodeString(value)
 	if err != nil || len(key) != ed25519.PublicKeySize || base64.StdEncoding.EncodeToString(key) != value {
 		return nil, errors.New("invalid Ed25519 public key")
