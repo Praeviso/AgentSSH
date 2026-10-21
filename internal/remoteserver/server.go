@@ -3,8 +3,6 @@ package remoteserver
 import (
 	"bytes"
 	"crypto/rand"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -41,29 +39,6 @@ func NewServer(store *Store, keys *Keys) *Server {
 	return &Server{Store: store, Keys: keys, BundleTTL: DefaultBundleTTL, Now: time.Now, signers: map[string]ssh.Signer{}}
 }
 
-// TLSConfig requires TLS 1.3 and verifies device certificates when presented.
-// Enrollment is the only endpoint reachable without one.
-func (s *Server) TLSConfig() *tls.Config {
-	pool := x509.NewCertPool()
-	pool.AddCert(s.Keys.CACert)
-	return &tls.Config{
-		MinVersion:   tls.VersionTLS13,
-		Certificates: []tls.Certificate{s.Keys.TLSCert},
-		ClientAuth:   tls.VerifyClientCertIfGiven,
-		ClientCAs:    pool,
-	}
-}
-
-// Handler returns the API routes.
-func (s *Server) Handler() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST "+remote.PathEnroll, s.handleEnroll)
-	mux.HandleFunc("GET "+remote.PathStatus, s.device(s.handleStatus))
-	mux.HandleFunc("GET "+remote.PathBundle, s.device(s.handleBundle))
-	mux.HandleFunc("POST "+remote.PathSign, s.device(s.handleSign))
-	return mux
-}
-
 func (s *Server) now() time.Time {
 	if s.Now != nil {
 		return s.Now()
@@ -81,98 +56,25 @@ func writeError(w http.ResponseWriter, status int, code string, message string) 
 	writeJSON(w, status, remote.ErrorResponse{Code: code, Error: message})
 }
 
-func decodeBody(r *http.Request, value any) error {
-	data, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBytes+1))
-	if err != nil {
-		return err
-	}
-	if len(data) > maxRequestBytes {
-		return errors.New("request body too large")
-	}
+func decodeBody(data []byte, value any) error {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
-	return dec.Decode(value)
+	if err := dec.Decode(value); err != nil {
+		return err
+	}
+	if err := dec.Decode(new(any)); err != io.EOF {
+		return errors.New("request must contain exactly one JSON value")
+	}
+	return nil
 }
 
-func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
-	var req remote.EnrollRequest
-	if err := decodeBody(r, &req); err != nil {
-		writeError(w, http.StatusBadRequest, remote.CodeBadRequest, "malformed enrollment request")
-		return
-	}
-	now := s.now()
-	// Validate the CSR before burning the token so a malformed request can be retried.
-	csr, err := ParseCSR(req.CSRPEM)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, remote.CodeBadRequest, err.Error())
-		return
-	}
-	device, err := s.Store.RedeemEnrollToken(req.TokenID, req.TokenSecret, now)
-	if errors.Is(err, ErrTokenInvalid) {
-		writeError(w, http.StatusForbidden, remote.CodeTokenInvalid, err.Error())
-		return
-	}
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, remote.CodeInternal, "enrollment failed")
-		return
-	}
-	certPEM, err := s.Keys.IssueDeviceCert(csr, device.ID, now)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, remote.CodeInternal, "issue device certificate failed")
-		return
-	}
-	writeJSON(w, http.StatusOK, remote.EnrollResponse{
-		DeviceID:        device.ID,
-		CertPEM:         string(certPEM),
-		CAPEM:           string(pemBlock("CERTIFICATE", s.Keys.CACert.Raw)),
-		BundlePublicKey: s.Keys.BundlePublicKey(),
-	})
-}
+type deviceHandler func(http.ResponseWriter, *http.Request, Device, []byte)
 
-type deviceHandler func(http.ResponseWriter, *http.Request, Device)
-
-// device authenticates the mTLS client certificate and re-checks the device's
-// status on every request, which is what makes revocation immediate.
-func (s *Server) device(next deviceHandler) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.TLS == nil || len(r.TLS.VerifiedChains) == 0 || len(r.TLS.VerifiedChains[0]) == 0 {
-			writeError(w, http.StatusUnauthorized, remote.CodeUnauthenticated, "a device certificate is required")
-			return
-		}
-		id := r.TLS.VerifiedChains[0][0].Subject.CommonName
-		device, err := s.Store.Device(id)
-		if errors.Is(err, ErrNotFound) {
-			writeError(w, http.StatusUnauthorized, remote.CodeUnauthenticated, "unknown device")
-			return
-		}
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, remote.CodeInternal, "device lookup failed")
-			return
-		}
-		if device.Status != remote.DeviceActive {
-			if r.URL.Path == remote.PathSign {
-				// Refused logins belong in the signing log too: an attempt from a
-				// revoked device is exactly what an administrator needs to see.
-				var req remote.SignRequest
-				_ = decodeBody(r, &req)
-				entry := SignEntry{SignID: "sg_" + randomHex(8), TS: s.now(), DeviceID: device.ID, Host: req.Host, Result: SignRejected, Reason: "device revoked"}
-				if err := s.Store.AppendSign(entry); err != nil {
-					writeError(w, http.StatusInternalServerError, remote.CodeInternal, "signing log unavailable")
-					return
-				}
-			}
-			writeError(w, http.StatusForbidden, remote.CodeDeviceRevoked, "this device has been revoked by the control plane")
-			return
-		}
-		next(w, r, device)
-	}
-}
-
-func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request, device Device) {
+func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request, device Device, _ []byte) {
 	writeJSON(w, http.StatusOK, remote.StatusResponse{DeviceID: device.ID, Status: device.Status})
 }
 
-func (s *Server) handleBundle(w http.ResponseWriter, _ *http.Request, device Device) {
+func (s *Server) handleBundle(w http.ResponseWriter, _ *http.Request, device Device, _ []byte) {
 	cfg, err := s.Store.Config(device.ID)
 	if errors.Is(err, ErrNotFound) {
 		writeError(w, http.StatusNotFound, remote.CodeNoConfig, "no configuration has been pushed for this device")
@@ -223,9 +125,9 @@ func (s *Server) handleBundle(w http.ResponseWriter, _ *http.Request, device Dev
 	writeJSON(w, http.StatusOK, remote.BundleResponse{Bundle: raw, Signature: sig})
 }
 
-func (s *Server) handleSign(w http.ResponseWriter, r *http.Request, device Device) {
+func (s *Server) handleSign(w http.ResponseWriter, _ *http.Request, device Device, body []byte) {
 	var req remote.SignRequest
-	if err := decodeBody(r, &req); err != nil {
+	if err := decodeBody(body, &req); err != nil {
 		writeError(w, http.StatusBadRequest, remote.CodeBadRequest, "malformed sign request")
 		return
 	}

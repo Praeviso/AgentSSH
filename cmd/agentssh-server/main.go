@@ -62,7 +62,6 @@ func newRootCommand() *cobra.Command {
 	root.AddCommand(
 		newInitCommand(dir),
 		newServeCommand(dir),
-		newTLSCommand(dir),
 		newDeviceCommand(dir),
 		newIdentityCommand(dir),
 		newConfigCommand(dir),
@@ -110,11 +109,7 @@ func openStore(dir string) (*remoteserver.Store, error) {
 }
 
 func newInitCommand(dir func() (string, error)) *cobra.Command {
-	var sans []string
-	cmd := &cobra.Command{
-		Use:   "init --san <host> [--san <host>...]",
-		Short: "Create the CA, TLS certificate, bundle key, and database.",
-		Args:  cobra.NoArgs,
+	return &cobra.Command{Use: "init", Short: "Create encrypted signing keys and the database.", Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			d, err := dir()
 			if err != nil {
@@ -124,32 +119,26 @@ func newInitCommand(dir func() (string, error)) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if err := remoteserver.Init(d, master, sans, time.Now()); err != nil {
+			if err := remoteserver.Init(d, master); err != nil {
 				return err
 			}
-			fp, err := remoteserver.LoadCAFingerprint(d)
-			if err != nil {
-				return err
-			}
-			out := cmd.OutOrStdout()
-			_, _ = fmt.Fprintf(out, "Initialized %s\n", d)
-			_, _ = fmt.Fprintf(out, "TLS names: %s\n", strings.Join(sans, ", "))
-			_, _ = fmt.Fprintf(out, "CA fingerprint: %s\n", fp)
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Initialized %s\n", d)
 			return nil
-		},
-	}
-	cmd.Flags().StringSliceVar(&sans, "san", []string{"localhost", "127.0.0.1"}, "DNS name or IP clients use to reach this server (repeatable)")
-	return cmd
+		}}
 }
 
 func newServeCommand(dir func() (string, error)) *cobra.Command {
 	var listen string
+	var publicURL string
 	var bundleTTL time.Duration
 	cmd := &cobra.Command{
-		Use:   "serve [--listen :8443]",
+		Use:   "serve --public-url <https-base> [--listen 127.0.0.1:8080]",
 		Short: "Run the control plane API.",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if _, err := remote.HTTPSBaseURL(publicURL); err != nil {
+				return fmt.Errorf("--public-url: %w", err)
+			}
 			d, err := dir()
 			if err != nil {
 				return err
@@ -167,15 +156,15 @@ func newServeCommand(dir func() (string, error)) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if left := time.Until(keys.TLSCert.Leaf.NotAfter); left < tlsRenewWarning {
-				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "warning: TLS certificate expires %s; run agentssh-server tls renew and restart\n", keys.TLSCert.Leaf.NotAfter.Format(time.RFC3339))
-			}
 			server := remoteserver.NewServer(store, keys)
 			server.BundleTTL = bundleTTL
+			handler, err := server.Handler(publicURL)
+			if err != nil {
+				return err
+			}
 			httpServer := &http.Server{
 				Addr:              listen,
-				Handler:           server.Handler(),
-				TLSConfig:         server.TLSConfig(),
+				Handler:           handler,
 				ReadHeaderTimeout: 10 * time.Second,
 				ReadTimeout:       30 * time.Second,
 				WriteTimeout:      30 * time.Second,
@@ -183,8 +172,8 @@ func newServeCommand(dir func() (string, error)) *cobra.Command {
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
 			errCh := make(chan error, 1)
-			go func() { errCh <- httpServer.ListenAndServeTLS("", "") }()
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "agentssh-server listening on %s (CA %s)\n", listen, keys.CAFingerprint())
+			go func() { errCh <- httpServer.ListenAndServe() }()
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "agentssh-server origin %s for %s\n", listen, publicURL)
 			select {
 			case err := <-errCh:
 				return err
@@ -195,46 +184,9 @@ func newServeCommand(dir func() (string, error)) *cobra.Command {
 			}
 		},
 	}
-	cmd.Flags().StringVar(&listen, "listen", ":8443", "listen address")
+	cmd.Flags().StringVar(&listen, "listen", "127.0.0.1:8080", "private HTTP origin listen address behind the public HTTPS ingress")
+	cmd.Flags().StringVar(&publicURL, "public-url", "", "public HTTPS base (including path prefix)")
 	cmd.Flags().DurationVar(&bundleTTL, "bundle-ttl", remoteserver.DefaultBundleTTL, "how long a device may use a bundle it cannot refresh")
-	return cmd
-}
-
-// tlsRenewWarning is how close to expiry serve starts warning about the TLS
-// certificate.
-const tlsRenewWarning = 30 * 24 * time.Hour
-
-func newTLSCommand(dir func() (string, error)) *cobra.Command {
-	cmd := &cobra.Command{Use: "tls", Short: "Manage the control plane TLS certificate."}
-	var sans []string
-	renew := &cobra.Command{
-		Use:   "renew [--san <host>...]",
-		Short: "Issue a new TLS certificate under the existing CA (devices stay enrolled).",
-		Args:  cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			d, err := dir()
-			if err != nil {
-				return err
-			}
-			if !remoteserver.Initialized(d) {
-				return fmt.Errorf("%s is not initialized; run agentssh-server init", d)
-			}
-			master, err := readMaster(false)
-			if err != nil {
-				return err
-			}
-			cert, err := remoteserver.RenewTLS(d, master, sans, time.Now())
-			if err != nil {
-				return err
-			}
-			out := cmd.OutOrStdout()
-			_, _ = fmt.Fprintf(out, "Renewed TLS certificate for %s, valid until %s\n", strings.Join(remoteserver.CertNames(cert), ", "), cert.NotAfter.Format(time.RFC3339))
-			_, _ = fmt.Fprintln(out, "Restart agentssh-server serve to use it.")
-			return nil
-		},
-	}
-	renew.Flags().StringSliceVar(&sans, "san", nil, "DNS name or IP clients use to reach this server (repeatable; default: keep the current names)")
-	cmd.AddCommand(renew)
 	return cmd
 }
 
@@ -242,6 +194,7 @@ func newDeviceCommand(dir func() (string, error)) *cobra.Command {
 	cmd := &cobra.Command{Use: "device", Short: "Enroll, list, and revoke devices."}
 
 	var name string
+	var publicURL string
 	var ttl time.Duration
 	tokenCmd := &cobra.Command{Use: "token", Short: "Manage enrollment tokens."}
 	createCmd := &cobra.Command{
@@ -261,22 +214,23 @@ func newDeviceCommand(dir func() (string, error)) *cobra.Command {
 				return err
 			}
 			defer func() { _ = store.Close() }()
-			fp, err := remoteserver.LoadCAFingerprint(d)
+			pub, err := remoteserver.LoadBundlePublicKey(d)
 			if err != nil {
 				return err
 			}
-			id, secret, err := store.CreateEnrollToken(name, ttl, time.Now())
+			token, err := store.CreateEnrollToken(name, publicURL, remote.PublicKeyFingerprint(pub), ttl, time.Now())
 			if err != nil {
 				return err
 			}
-			token := remote.EnrollToken{ID: id, Secret: secret, CAFingerprint: fp}
 			_, _ = fmt.Fprintln(cmd.OutOrStdout(), token.String())
-			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "One-time token for %q, valid %s. On the device run:\n  agentssh remote enroll https://<server> --token <token>\n", name, ttl)
+			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "One-time HTTPS token for %q, valid %s. On the device run:\n  agentssh remote enroll %s --token <token>\n", name, ttl, token.ServerURL)
 			return nil
 		},
 	}
 	createCmd.Flags().StringVar(&name, "name", "", "device name (e.g. alice-laptop)")
+	createCmd.Flags().StringVar(&publicURL, "public-url", "", "public HTTPS base bound into the enrollment token")
 	createCmd.Flags().DurationVar(&ttl, "ttl", 10*time.Minute, "token lifetime")
+	_ = createCmd.MarkFlagRequired("public-url")
 	tokenCmd.AddCommand(createCmd)
 
 	lsCmd := &cobra.Command{

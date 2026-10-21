@@ -18,7 +18,7 @@ func TestRemoteModeFailsClosedButKeepsAuditReadable(t *testing.T) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	state := "server_url: https://127.0.0.1:1\ndevice_id: dev_test\nca_fingerprint: x\nbundle_public_key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n"
+	state := "server_url: https://127.0.0.1:1\ndevice_id: dev_test\nbundle_public_key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\nenrolled_at: 2026-10-21T00:00:00Z\n"
 	if err := os.WriteFile(filepath.Join(dir, managedmode.MarkerName), []byte(state), 0o600); err != nil {
 		t.Fatal(err)
 	}

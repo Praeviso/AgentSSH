@@ -1,0 +1,47 @@
+package main
+
+import (
+	"bytes"
+	"strings"
+	"testing"
+
+	"github.com/Praeviso/AgentSSH/internal/remote"
+	"github.com/Praeviso/AgentSSH/internal/remoteserver"
+)
+
+func TestHTTPOriginRequiresExplicitPublicHTTPSBase(t *testing.T) {
+	cmd := newRootCommand()
+	cmd.SetArgs([]string{"serve"})
+	if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "--public-url") {
+		t.Fatalf("serve: %v", err)
+	}
+}
+
+func TestDeviceTokenCreateForHostedHTTPS(t *testing.T) {
+	old := remoteserver.ScryptWorkFactor
+	remoteserver.ScryptWorkFactor = 10
+	t.Cleanup(func() { remoteserver.ScryptWorkFactor = old })
+	dir := t.TempDir()
+	if err := remoteserver.Init(dir, "master"); err != nil {
+		t.Fatal(err)
+	}
+	cmd := newRootCommand()
+	var stdout, stderr bytes.Buffer
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stderr)
+	cmd.SetArgs([]string{"--data", dir, "device", "token", "create", "--name", "laptop", "--public-url", "https://config.example/plugins/agentssh"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	token, err := remote.ParseEnrollToken(stdout.String())
+	if err != nil || token.ServerURL != "https://config.example/plugins/agentssh" {
+		t.Fatalf("token: %+v %v", token, err)
+	}
+	if strings.Contains(stderr.String(), token.Secret) {
+		t.Fatal("token leaked to stderr")
+	}
+	pub, err := remoteserver.LoadBundlePublicKey(dir)
+	if err != nil || token.BundleFingerprint != remote.PublicKeyFingerprint(pub) {
+		t.Fatalf("token did not pin the stored bundle key: %v", err)
+	}
+}

@@ -292,35 +292,57 @@ agentssh secret rm web-1
 
 ### Remote control (optional)
 
-A machine can instead be **managed by a control plane** (`agentssh-server`). The SSH private keys stay on the server, which signs each login on demand, and inventory and policy arrive as a signed bundle. Revoking the device on the server blocks its next command. Target hosts need nothing new: they trust the control plane's public key in `authorized_keys`.
+A hosted control plane can manage AgentSSH devices, hold SSH identities and sign
+each login on demand. Clients authenticate over HTTPS using Ed25519 device request
+signatures and obtain inventory/policy as a signed configuration bundle. Revoking
+a device blocks its next login. A config-center plugin can implement this protocol
+inside the existing service; no additional AgentSSH service is required.
+
+The repository also provides `agentssh-server` as a reference implementation. Run
+its private HTTP origin behind an ordinary HTTPS ingress that preserves the path:
 
 ```bash
-# On the control plane (once). The master password comes from
+# On the reference control plane. The master password comes from
 # AGENTSSH_SERVER_MASTER_PASSWORD or a prompt.
-agentssh-server init --san cp.example.com
-agentssh-server identity create web          # prints the authorized_keys line for your hosts
-agentssh-server serve --listen :8443
+agentssh-server init
+agentssh-server identity create web          # public key for target authorized_keys
+agentssh-server serve --public-url https://cp.example/agentssh
+# Default origin: 127.0.0.1:8080, reachable only by the trusted HTTPS ingress.
 
 # Per device
-agentssh-server device token create --name alice-laptop    # one-time token
-agentssh remote enroll https://cp.example.com:8443 --token <token>   # on the device
+agentssh-server device token create --name alice-laptop \
+  --public-url https://cp.example/agentssh
+agentssh remote enroll https://cp.example/agentssh --token '<token>'
 agentssh-server config push --device <dev_id> --inventory inventory.yaml --policy policy.yaml
 
 # Day to day
-agentssh remote status                        # device standing, bundle version and expiry
-agentssh-server log                           # every signature, including refusals
-agentssh-server device revoke <dev_id>        # the device's next login is refused
-agentssh-server tls renew                     # new TLS certificate under the same CA; restart serve
+agentssh remote status
+agentssh-server log
+agentssh-server device revoke <dev_id>
 ```
+
+The one-time token binds the public endpoint and bundle public-key fingerprint.
+The device private key remains local; target SSH private keys remain in the control
+plane. Request signatures cover the method, URL and body, with a short validity
+window and durable replay protection.
 
 In remote mode:
 
-- **Inventory** comes only from the bundle. Every host needs `addr`, `user`, and `identity`; `ssh_config_alias`, `identity_file`, and passwords are not allowed.
-- **Policy** is the control plane's. Deny rules in the local `policy.yaml` still apply and take priority; local allow rules are ignored.
-- **Local edits are refused**: inventory and policy edits, host discovery, and "always allow on this host" approvals. Once and session approvals still work.
-- **It fails closed**: with the control plane unreachable, a cached bundle is used until it expires (10 minutes by default), but nothing can be signed. Connections are not reused, so every command needs a fresh signature, and a command that is running when its device is revoked is cancelled within 30 seconds.
+- **Inventory** comes only from the bundle. Each host needs `addr`, `user` and
+  `identity`; local SSH aliases, identity files and password authentication are
+  unavailable.
+- **Policy** comes from the control plane, with local deny rules applied first.
+  Local allow rules are ignored. Configuration edits and host discovery are
+  refused; once and session approvals still work.
+- **Connections fail closed** when no signature can be obtained. Each command
+  establishes a new SSH connection. A cached bundle is usable only until expiry
+  (10 minutes by default); running commands check device standing every 30 seconds.
 
-`agentssh remote leave` (operator-gated) deletes the device credentials and returns to local files. See `docs/architecture/remote-control.md` for the threat model. In short: keys cannot be taken, devices can be revoked, and every signature is logged. Command-level policy is still enforced by the client.
+`agentssh remote leave` is operator-gated and removes local device credentials.
+See the [remote-control contract](docs/architecture/remote-control.md) for the
+wire protocol, trust boundaries, key storage and configuration-version semantics.
+Previously enrolled devices require a fresh enrollment, and the reference server
+requires a fresh data directory; old state is not automatically migrated.
 
 ## What the agent calls
 

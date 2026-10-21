@@ -23,7 +23,7 @@ func newRemoteCommand() *cobra.Command {
 	var token string
 	enrollCmd := &cobra.Command{
 		Use:   "enroll <url> --token <token>",
-		Short: "Enroll this machine with an agentssh-server control plane.",
+		Short: "Enroll this machine with an AgentSSH-compatible control plane.",
 		Args:  exactArgs(1),
 		PersistentPreRunE: func(*cobra.Command, []string) error {
 			// The one-time token is the authorization; the TTY keeps an agent
@@ -37,7 +37,7 @@ func newRemoteCommand() *cobra.Command {
 			return runRemoteEnroll(cmd, args[0], token)
 		},
 	}
-	enrollCmd.Flags().StringVar(&token, "token", "", "one-time enrollment token from agentssh-server device token create")
+	enrollCmd.Flags().StringVar(&token, "token", "", "one-time enrollment token from the control plane")
 	_ = enrollCmd.MarkFlagRequired("token")
 
 	var jsonOutput bool
@@ -112,7 +112,7 @@ func runRemoteEnroll(cmd *cobra.Command, serverURL string, token string) error {
 	var apiErr *remote.APIError
 	switch {
 	case errors.As(err, &apiErr) && apiErr.Code == remote.CodeNoConfig:
-		_, _ = fmt.Fprintln(out, "No configuration assigned yet; ask the administrator to run: agentssh-server config push --device "+state.DeviceID)
+		_, _ = fmt.Fprintln(out, "No configuration assigned yet; ask the control-plane administrator to assign a configuration to "+state.DeviceID)
 	case err != nil:
 		_, _ = fmt.Fprintf(out, "Configuration not loaded yet: %v\n", err)
 	default:
