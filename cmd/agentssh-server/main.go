@@ -144,12 +144,17 @@ func newInitCommand(dir func() (string, error)) *cobra.Command {
 
 func newServeCommand(dir func() (string, error)) *cobra.Command {
 	var listen string
+	var publicURL string
+	var plainHTTP bool
 	var bundleTTL time.Duration
 	cmd := &cobra.Command{
 		Use:   "serve [--listen :8443]",
 		Short: "Run the control plane API.",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if plainHTTP && publicURL == "" {
+				return errors.New("--http requires --public-url and a trusted HTTPS reverse proxy")
+			}
 			d, err := dir()
 			if err != nil {
 				return err
@@ -172,9 +177,16 @@ func newServeCommand(dir func() (string, error)) *cobra.Command {
 			}
 			server := remoteserver.NewServer(store, keys)
 			server.BundleTTL = bundleTTL
+			handler := server.Handler()
+			if publicURL != "" {
+				handler, err = server.HTTPSHandler(publicURL)
+				if err != nil {
+					return err
+				}
+			}
 			httpServer := &http.Server{
 				Addr:              listen,
-				Handler:           server.Handler(),
+				Handler:           handler,
 				TLSConfig:         server.TLSConfig(),
 				ReadHeaderTimeout: 10 * time.Second,
 				ReadTimeout:       30 * time.Second,
@@ -183,7 +195,13 @@ func newServeCommand(dir func() (string, error)) *cobra.Command {
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
 			errCh := make(chan error, 1)
-			go func() { errCh <- httpServer.ListenAndServeTLS("", "") }()
+			go func() {
+				if plainHTTP {
+					errCh <- httpServer.ListenAndServe()
+				} else {
+					errCh <- httpServer.ListenAndServeTLS("", "")
+				}
+			}()
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "agentssh-server listening on %s (CA %s)\n", listen, keys.CAFingerprint())
 			select {
 			case err := <-errCh:
@@ -196,6 +214,8 @@ func newServeCommand(dir func() (string, error)) *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&listen, "listen", ":8443", "listen address")
+	cmd.Flags().StringVar(&publicURL, "public-url", "", "serve v2 signed requests at this public HTTPS base (including path prefix)")
+	cmd.Flags().BoolVar(&plainHTTP, "http", false, "serve an HTTP origin for a trusted HTTPS proxy; requires --public-url")
 	cmd.Flags().DurationVar(&bundleTTL, "bundle-ttl", remoteserver.DefaultBundleTTL, "how long a device may use a bundle it cannot refresh")
 	return cmd
 }
@@ -242,6 +262,7 @@ func newDeviceCommand(dir func() (string, error)) *cobra.Command {
 	cmd := &cobra.Command{Use: "device", Short: "Enroll, list, and revoke devices."}
 
 	var name string
+	var publicURL string
 	var ttl time.Duration
 	tokenCmd := &cobra.Command{Use: "token", Short: "Manage enrollment tokens."}
 	createCmd := &cobra.Command{
@@ -261,6 +282,23 @@ func newDeviceCommand(dir func() (string, error)) *cobra.Command {
 				return err
 			}
 			defer func() { _ = store.Close() }()
+			if publicURL != "" {
+				pubText, err := os.ReadFile(filepath.Join(d, "bundle.pub"))
+				if err != nil {
+					return err
+				}
+				pub, err := remote.DecodeDevicePublicKey(strings.TrimSpace(string(pubText)))
+				if err != nil {
+					return err
+				}
+				token, err := store.CreateHTTPSEnrollToken(name, publicURL, remote.PublicKeyFingerprint(pub), ttl, time.Now())
+				if err != nil {
+					return err
+				}
+				_, _ = fmt.Fprintln(cmd.OutOrStdout(), token.String())
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "One-time HTTPS token for %q, valid %s. On the device run:\n  agentssh remote enroll %s --token <token>\n", name, ttl, token.ServerURL)
+				return nil
+			}
 			fp, err := remoteserver.LoadCAFingerprint(d)
 			if err != nil {
 				return err
@@ -276,6 +314,7 @@ func newDeviceCommand(dir func() (string, error)) *cobra.Command {
 		},
 	}
 	createCmd.Flags().StringVar(&name, "name", "", "device name (e.g. alice-laptop)")
+	createCmd.Flags().StringVar(&publicURL, "public-url", "", "issue a v2 token bound to this public HTTPS base and the bundle public key")
 	createCmd.Flags().DurationVar(&ttl, "ttl", 10*time.Minute, "token lifetime")
 	tokenCmd.AddCommand(createCmd)
 

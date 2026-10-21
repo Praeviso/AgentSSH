@@ -91,7 +91,13 @@ func decodeBody(r *http.Request, value any) error {
 	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
-	return dec.Decode(value)
+	if err := dec.Decode(value); err != nil {
+		return err
+	}
+	if err := dec.Decode(new(any)); err != io.EOF {
+		return errors.New("request must contain exactly one JSON value")
+	}
+	return nil
 }
 
 func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {

@@ -134,7 +134,7 @@ func OpenStore(path string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open control plane database: %w", err)
 	}
-	if _, err := db.Exec(schema); err != nil {
+	if _, err := db.Exec(schema + httpsSchema); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("initialize control plane database: %w", err)
 	}

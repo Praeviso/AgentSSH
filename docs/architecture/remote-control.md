@@ -1,5 +1,10 @@
 # 设计 — 远端管控:远程签名 + 配置下发
 
+> **托管控制面适配**：新增显式 v2 HTTPS + 设备公钥请求签名协议，支持由
+> config-center 等托管服务直接实现控制面。本文记录原 v1 mTLS 设计；v2 的
+> 协议、路径前缀、注册 pin、防重放和迁移规则见
+> [Hosted HTTPS control plane](https-control-plane.md)。Bundle 与 SSH 签名格式保持一致。
+
 > 状态:**已实现**(三期一并完成,执行记录见 `docs/plans/remote-control.md`)· 2026-10-20 · 关联:`docs/architecture/native-ssh.md`、`docs/architecture/ssh-auth-onboarding.md`、`internal/executor/native.go`、`internal/config`、`docs/plans/approval-system.md`
 >
 > 目标:让一台 AgentSSH 客户端的**连接能力和配置都由远端控制面授予**。控制面能随时让它失效;客户端在任何时刻都拿不到 SSH 私钥原文。

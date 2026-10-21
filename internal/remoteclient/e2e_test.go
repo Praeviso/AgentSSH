@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -48,6 +50,10 @@ type controlPlane struct {
 }
 
 func newControlPlane(t *testing.T) *controlPlane {
+	return newControlPlaneWithProtocol(t, false)
+}
+
+func newControlPlaneWithProtocol(t *testing.T, httpsProtocol bool) *controlPlane {
 	t.Helper()
 	cp := &controlPlane{dir: t.TempDir()}
 	now := time.Now()
@@ -65,11 +71,32 @@ func newControlPlane(t *testing.T) *controlPlane {
 	}
 	cp.store, cp.keys = store, keys
 	cp.server = remoteserver.NewServer(store, keys)
-	cp.http = httptest.NewUnstartedServer(cp.server.Handler())
+	mux := http.NewServeMux()
+	cp.http = httptest.NewUnstartedServer(mux)
 	cp.http.TLS = cp.server.TLSConfig()
 	cp.http.Config.ErrorLog = log.New(io.Discard, "", 0)
 	cp.http.StartTLS()
 	t.Cleanup(cp.http.Close)
+	base := cp.http.URL
+	if httpsProtocol {
+		base += "/v1/plugins/agentssh"
+		handler, err := cp.server.HTTPSHandler(base)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mux.Handle("/", handler)
+		// Emulate a system-trusted ingress certificate without disabling TLS
+		// verification or installing a device client certificate.
+		original := http.DefaultTransport
+		transport := original.(*http.Transport).Clone()
+		pool := x509.NewCertPool()
+		pool.AddCert(keys.CACert)
+		transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS13, RootCAs: pool}
+		http.DefaultTransport = transport
+		t.Cleanup(func() { http.DefaultTransport = original; transport.CloseIdleConnections() })
+	} else {
+		mux.Handle("/", cp.server.Handler())
+	}
 
 	recipient, err := remoteserver.LoadRecipient(cp.dir)
 	if err != nil {
@@ -88,7 +115,15 @@ func newControlPlane(t *testing.T) *controlPlane {
 	}
 
 	cp.home = t.TempDir()
-	state, err := remoteclient.Enroll(context.Background(), cp.home, cp.http.URL, cp.token(t), now)
+	token := cp.token(t)
+	if httpsProtocol {
+		tok, err := cp.store.CreateHTTPSEnrollToken("laptop", base, remote.PublicKeyFingerprint(keys.BundleKey.Public().(ed25519.PublicKey)), time.Minute, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		token = tok.String()
+	}
+	state, err := remoteclient.Enroll(context.Background(), cp.home, base, token, now)
 	if err != nil {
 		t.Fatalf("enroll: %v", err)
 	}

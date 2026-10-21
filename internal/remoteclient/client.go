@@ -1,5 +1,5 @@
 // Package remoteclient is the AgentSSH side of remote control: device
-// enrollment, the mTLS API client, the signed configuration bundle cache, and
+// enrollment, mTLS/v2 HTTPS API clients, the signed configuration bundle cache, and
 // the SSH signer whose private key lives only on the control plane.
 package remoteclient
 
@@ -43,6 +43,7 @@ const (
 
 // State is the enrollment record stored in remote/remote.yaml.
 type State struct {
+	Protocol        string    `yaml:"protocol,omitempty"`
 	ServerURL       string    `yaml:"server_url"`
 	DeviceID        string    `yaml:"device_id"`
 	CAFingerprint   string    `yaml:"ca_fingerprint"`
@@ -75,6 +76,9 @@ func LoadState(home string) (State, error) {
 	if state.ServerURL == "" || state.DeviceID == "" || state.BundlePublicKey == "" {
 		return State{}, errors.New("remote enrollment record is incomplete; run agentssh remote leave and enroll again")
 	}
+	if state.Protocol != "" && state.Protocol != remote.HTTPSProtocol {
+		return State{}, errors.New("unsupported remote enrollment protocol")
+	}
 	return state, nil
 }
 
@@ -84,11 +88,14 @@ type Client struct {
 	http  *http.Client
 }
 
-// NewClient builds an mTLS client pinned to the control plane CA.
+// NewClient uses the protocol explicitly recorded at enrollment.
 func NewClient(home string) (*Client, error) {
 	state, err := LoadState(home)
 	if err != nil {
 		return nil, err
+	}
+	if state.Protocol == remote.HTTPSProtocol {
+		return newHTTPSClient(home, state)
 	}
 	dir := managedmode.Dir(home)
 	caPEM, err := os.ReadFile(filepath.Join(dir, fileCACert))
@@ -135,6 +142,18 @@ func (c *Client) Sign(ctx context.Context, host string, data []byte) (remote.Sig
 }
 
 func (c *Client) call(ctx context.Context, method string, path string, body any, out any) error {
+	if c.State.Protocol == remote.HTTPSProtocol {
+		switch path {
+		case remote.PathStatus:
+			path = remote.PathStatusV2
+		case remote.PathBundle:
+			path = remote.PathBundleV2
+		case remote.PathSign:
+			path = remote.PathSignV2
+		default:
+			return errors.New("unsupported HTTPS control-plane operation")
+		}
+	}
 	return doJSON(ctx, c.http, method, strings.TrimRight(c.State.ServerURL, "/")+path, body, out)
 }
 
@@ -158,12 +177,19 @@ func doJSON(ctx context.Context, client *http.Client, method string, endpoint st
 	}
 	resp, err := client.Do(req)
 	if err != nil {
+		var apiErr *remote.APIError
+		if errors.As(err, &apiErr) {
+			return apiErr
+		}
 		return &UnreachableError{Err: err}
 	}
 	defer func() { _ = resp.Body.Close() }()
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+	data, err := io.ReadAll(io.LimitReader(resp.Body, (16<<20)+1))
 	if err != nil {
 		return &UnreachableError{Err: err}
+	}
+	if len(data) > 16<<20 {
+		return errors.New("control plane response is too large")
 	}
 	if resp.StatusCode/100 != 2 {
 		var apiErr remote.ErrorResponse
@@ -187,6 +213,9 @@ func doJSON(ctx context.Context, client *http.Client, method string, endpoint st
 func Enroll(ctx context.Context, home string, serverURL string, rawToken string, now time.Time) (State, error) {
 	if managedmode.Enrolled(home) {
 		return State{}, errors.New("this AgentSSH home is already enrolled; run agentssh remote leave first")
+	}
+	if strings.HasPrefix(strings.TrimSpace(rawToken), remote.HTTPSTokenPrefix) {
+		return enrollHTTPS(ctx, home, serverURL, rawToken, now)
 	}
 	token, err := remote.ParseEnrollToken(rawToken)
 	if err != nil {

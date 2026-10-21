@@ -292,6 +292,15 @@ agentssh secret rm web-1
 
 ### Remote control (optional)
 
+Hosted control planes can use **v2 HTTPS with device request signatures** instead
+of private-CA mTLS. The enrollment token selects the protocol explicitly and pins
+both the public endpoint (including a plugin path prefix) and the bundle public
+key. This allows a config-center service to implement enrollment, configuration
+delivery and SSH signing itself, without deploying `agentssh-server` alongside it.
+See the [hosted HTTPS protocol](docs/architecture/https-control-plane.md) for the
+wire contract, reference proxy setup, migration and Web Crypto test vectors.
+The commands below describe the existing v1 mTLS deployment.
+
 A machine can instead be **managed by a control plane** (`agentssh-server`). The SSH private keys stay on the server, which signs each login on demand, and inventory and policy arrive as a signed bundle. Revoking the device on the server blocks its next command. Target hosts need nothing new: they trust the control plane's public key in `authorized_keys`.
 
 ```bash
