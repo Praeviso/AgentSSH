@@ -13,25 +13,25 @@ import (
 	"github.com/Praeviso/AgentSSH/internal/remote"
 )
 
-// HTTPSHandler is the v2 reference API. publicURL is trusted deployment
+// Handler is the control-plane API. publicURL is trusted deployment
 // configuration (including a possible plugin path prefix), never a forwarded
 // header. It can sit behind a TLS terminator without client certificates.
 // HTTP origins must be reachable only through that trusted HTTPS ingress.
-func (s *Server) HTTPSHandler(publicURL string) (http.Handler, error) {
+func (s *Server) Handler(publicURL string) (http.Handler, error) {
 	base, err := remote.HTTPSBaseURL(publicURL)
 	if err != nil {
 		return nil, err
 	}
 	u, _ := url.Parse(base)
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST "+u.Path+remote.PathEnrollV2, func(w http.ResponseWriter, r *http.Request) { s.httpsEnroll(w, r, base) })
+	mux.HandleFunc("POST "+u.Path+remote.PathEnroll, func(w http.ResponseWriter, r *http.Request) { s.handleEnroll(w, r, base) })
 	for _, route := range []struct {
 		method, path string
 		handler      deviceHandler
 	}{
-		{"GET", remote.PathStatusV2, s.handleStatus}, {"GET", remote.PathBundleV2, s.handleBundle}, {"POST", remote.PathSignV2, s.handleSign},
+		{"GET", remote.PathStatus, s.handleStatus}, {"GET", remote.PathBundle, s.handleBundle}, {"POST", remote.PathSign, s.handleSign},
 	} {
-		mux.HandleFunc(route.method+" "+u.Path+route.path, s.httpsDevice(base, route.path, route.handler))
+		mux.HandleFunc(route.method+" "+u.Path+route.path, s.device(base, route.path, route.handler))
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
@@ -58,14 +58,14 @@ func requestBytes(r *http.Request) ([]byte, error) {
 	return body, nil
 }
 
-func (s *Server) httpsEnroll(w http.ResponseWriter, r *http.Request, base string) {
+func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request, base string) {
 	body, err := requestBytes(r)
 	if err != nil {
 		writeError(w, 400, remote.CodeBadRequest, "malformed enrollment request")
 		return
 	}
 	r.Body = io.NopCloser(bytes.NewReader(body))
-	var req remote.HTTPSEnrollRequest
+	var req remote.EnrollRequest
 	if decodeBody(r, &req) != nil {
 		writeError(w, 400, remote.CodeBadRequest, "malformed enrollment request")
 		return
@@ -75,11 +75,11 @@ func (s *Server) httpsEnroll(w http.ResponseWriter, r *http.Request, base string
 		writeError(w, 400, remote.CodeBadRequest, "invalid device public key")
 		return
 	}
-	if _, err := remote.VerifyHTTPRequest(r, body, base+remote.PathEnrollV2, req.TokenID, remote.EnrollSignatureTag, key, s.now()); err != nil {
+	if _, err := remote.VerifyHTTPRequest(r, body, base+remote.PathEnroll, req.TokenID, remote.EnrollSignatureTag, key, s.now()); err != nil {
 		writeError(w, 401, remote.CodeUnauthenticated, "invalid enrollment proof")
 		return
 	}
-	d, err := s.Store.RedeemHTTPSEnrollToken(req.TokenID, req.TokenSecret, base, req.PublicKey, s.now())
+	d, err := s.Store.RedeemEnrollToken(req.TokenID, req.TokenSecret, base, req.PublicKey, s.now())
 	if errors.Is(err, ErrTokenInvalid) {
 		writeError(w, 403, remote.CodeTokenInvalid, "enrollment token is invalid, expired, or already used")
 		return
@@ -88,10 +88,10 @@ func (s *Server) httpsEnroll(w http.ResponseWriter, r *http.Request, base string
 		writeError(w, 500, remote.CodeInternal, "enrollment failed")
 		return
 	}
-	writeJSON(w, 200, remote.HTTPSEnrollResponse{DeviceID: d.ID, BundlePublicKey: s.Keys.BundlePublicKey()})
+	writeJSON(w, 200, remote.EnrollResponse{DeviceID: d.ID, BundlePublicKey: s.Keys.BundlePublicKey()})
 }
 
-func (s *Server) httpsDevice(base, path string, next deviceHandler) http.HandlerFunc {
+func (s *Server) device(base, path string, next deviceHandler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		body, err := requestBytes(r)
 		if err != nil {
@@ -99,7 +99,7 @@ func (s *Server) httpsDevice(base, path string, next deviceHandler) http.Handler
 			return
 		}
 		id := remote.RequestKeyID(r)
-		pub, err := s.Store.devicePublicKey(id)
+		device, err := s.Store.Device(id)
 		if errors.Is(err, ErrNotFound) {
 			writeError(w, 401, remote.CodeUnauthenticated, "unknown device key")
 			return
@@ -108,7 +108,7 @@ func (s *Server) httpsDevice(base, path string, next deviceHandler) http.Handler
 			writeError(w, 500, remote.CodeInternal, "device lookup failed")
 			return
 		}
-		key, err := remote.DecodeDevicePublicKey(pub)
+		key, err := remote.DecodeDevicePublicKey(device.PublicKey)
 		if err != nil {
 			writeError(w, 500, remote.CodeInternal, "device key unavailable")
 			return
@@ -118,14 +118,9 @@ func (s *Server) httpsDevice(base, path string, next deviceHandler) http.Handler
 			writeError(w, 401, remote.CodeUnauthenticated, "invalid request signature")
 			return
 		}
-		device, err := s.Store.Device(id)
-		if err != nil {
-			writeError(w, 500, remote.CodeInternal, "device lookup failed")
-			return
-		}
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		if device.Status != remote.DeviceActive {
-			if path == remote.PathSignV2 {
+			if path == remote.PathSign {
 				var req remote.SignRequest
 				_ = json.Unmarshal(body, &req)
 				if err := s.Store.AppendSign(SignEntry{SignID: "sg_" + randomHex(8), TS: s.now(), DeviceID: id, Host: req.Host, Result: SignRejected, Reason: "device revoked"}); err != nil {

@@ -3,9 +3,7 @@ package remoteserver
 import (
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/subtle"
 	"database/sql"
-	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -29,6 +27,7 @@ const schema = `
 CREATE TABLE IF NOT EXISTS devices (
 	id TEXT PRIMARY KEY,
 	name TEXT NOT NULL,
+	public_key TEXT NOT NULL,
 	status TEXT NOT NULL,
 	created_at TEXT NOT NULL,
 	revoked_at TEXT NOT NULL DEFAULT ''
@@ -37,9 +36,9 @@ CREATE TABLE IF NOT EXISTS enroll_tokens (
 	id TEXT PRIMARY KEY,
 	name TEXT NOT NULL,
 	secret_sha256 TEXT NOT NULL,
+	public_url TEXT NOT NULL,
 	expires_at TEXT NOT NULL,
-	used_at TEXT NOT NULL DEFAULT '',
-	device_id TEXT NOT NULL DEFAULT ''
+	used_at TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS identities (
 	name TEXT PRIMARY KEY,
@@ -68,6 +67,11 @@ CREATE TABLE IF NOT EXISTS sign_log (
 	reason TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS sign_log_device ON sign_log(device_id);
+CREATE TABLE IF NOT EXISTS request_nonces (
+ device_id TEXT NOT NULL REFERENCES devices(id), nonce TEXT NOT NULL,
+ expires_at INTEGER NOT NULL, PRIMARY KEY(device_id,nonce)
+);
+CREATE INDEX IF NOT EXISTS request_nonces_expiry ON request_nonces(expires_at);
 `
 
 // Identity statuses.
@@ -91,6 +95,7 @@ type Store struct {
 type Device struct {
 	ID        string
 	Name      string
+	PublicKey string
 	Status    string
 	CreatedAt time.Time
 	RevokedAt time.Time
@@ -134,9 +139,18 @@ func OpenStore(path string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open control plane database: %w", err)
 	}
-	if _, err := db.Exec(schema + httpsSchema); err != nil {
+	if _, err := db.Exec(schema); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("initialize control plane database: %w", err)
+	}
+	rows, err := db.Query(`SELECT devices.public_key, enroll_tokens.public_url FROM devices, enroll_tokens LIMIT 0`)
+	if err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("incompatible control-plane storage; initialize a fresh data directory: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		_ = db.Close()
+		return nil, err
 	}
 	return &Store{db: db}, nil
 }
@@ -177,67 +191,12 @@ func secretDigest(secret string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// CreateEnrollToken stores a one-time token and returns its id and secret.
-func (s *Store) CreateEnrollToken(name string, ttl time.Duration, now time.Time) (string, string, error) {
-	id := "et_" + randomHex(6)
-	raw := make([]byte, 32)
-	if _, err := rand.Read(raw); err != nil {
-		return "", "", err
-	}
-	secret := base64.RawURLEncoding.EncodeToString(raw)
-	_, err := s.db.Exec(`INSERT INTO enroll_tokens (id, name, secret_sha256, expires_at) VALUES (?, ?, ?, ?)`,
-		id, name, secretDigest(secret), formatTime(now.Add(ttl)))
-	if err != nil {
-		return "", "", fmt.Errorf("store enrollment token: %w", err)
-	}
-	return id, secret, nil
-}
-
-// RedeemEnrollToken atomically consumes a token and creates the device it names.
-func (s *Store) RedeemEnrollToken(tokenID string, secret string, now time.Time) (Device, error) {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return Device{}, err
-	}
-	defer func() { _ = tx.Rollback() }()
-	var name, digest, expires, used string
-	err = tx.QueryRow(`SELECT name, secret_sha256, expires_at, used_at FROM enroll_tokens WHERE id = ?`, tokenID).
-		Scan(&name, &digest, &expires, &used)
-	if errors.Is(err, sql.ErrNoRows) {
-		return Device{}, ErrTokenInvalid
-	}
-	if err != nil {
-		return Device{}, err
-	}
-	if used != "" || !now.Before(parseTime(expires)) ||
-		subtle.ConstantTimeCompare([]byte(digest), []byte(secretDigest(secret))) != 1 {
-		return Device{}, ErrTokenInvalid
-	}
-	device := Device{ID: "dev_" + randomHex(8), Name: name, Status: remote.DeviceActive, CreatedAt: now}
-	res, err := tx.Exec(`UPDATE enroll_tokens SET used_at = ?, device_id = ? WHERE id = ? AND used_at = ''`,
-		formatTime(now), device.ID, tokenID)
-	if err != nil {
-		return Device{}, err
-	}
-	if n, _ := res.RowsAffected(); n != 1 {
-		return Device{}, ErrTokenInvalid
-	}
-	if _, err := tx.Exec(`INSERT INTO devices (id, name, status, created_at) VALUES (?, ?, ?, ?)`,
-		device.ID, device.Name, device.Status, formatTime(now)); err != nil {
-		return Device{}, err
-	}
-	if err := tx.Commit(); err != nil {
-		return Device{}, err
-	}
-	return device, nil
-}
-
 // Device returns one device by id.
 func (s *Store) Device(id string) (Device, error) {
 	var d Device
 	var created, revoked string
-	err := s.db.QueryRow(`SELECT id, name, status, created_at, revoked_at FROM devices WHERE id = ?`, id).
-		Scan(&d.ID, &d.Name, &d.Status, &created, &revoked)
+	err := s.db.QueryRow(`SELECT id, name, public_key, status, created_at, revoked_at FROM devices WHERE id = ?`, id).
+		Scan(&d.ID, &d.Name, &d.PublicKey, &d.Status, &created, &revoked)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Device{}, ErrNotFound
 	}
@@ -250,7 +209,7 @@ func (s *Store) Device(id string) (Device, error) {
 
 // Devices lists every device, oldest first.
 func (s *Store) Devices() ([]Device, error) {
-	rows, err := s.db.Query(`SELECT id, name, status, created_at, revoked_at FROM devices ORDER BY created_at, id`)
+	rows, err := s.db.Query(`SELECT id, name, public_key, status, created_at, revoked_at FROM devices ORDER BY created_at, id`)
 	if err != nil {
 		return nil, err
 	}
@@ -259,7 +218,7 @@ func (s *Store) Devices() ([]Device, error) {
 	for rows.Next() {
 		var d Device
 		var created, revoked string
-		if err := rows.Scan(&d.ID, &d.Name, &d.Status, &created, &revoked); err != nil {
+		if err := rows.Scan(&d.ID, &d.Name, &d.PublicKey, &d.Status, &created, &revoked); err != nil {
 			return nil, err
 		}
 		d.CreatedAt, d.RevokedAt = parseTime(created), parseTime(revoked)

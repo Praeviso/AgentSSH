@@ -17,7 +17,7 @@ import (
 	"github.com/Praeviso/AgentSSH/internal/remote"
 )
 
-const testHTTPSBase = "https://config.example/v1/plugins/agentssh"
+const testHTTPSBase = "https://config.example/plugins/agentssh"
 
 type httpsFixture struct {
 	dir     string
@@ -41,16 +41,16 @@ func newHTTPSFixture(t *testing.T) *httpsFixture {
 	}
 	f := &httpsFixture{dir: dir, store: store, server: NewServer(store, keys), key: key, now: time.Unix(1700000000, 0)}
 	f.server.Now = func() time.Time { return f.now }
-	f.handler, err = f.server.HTTPSHandler(testHTTPSBase)
+	f.handler, err = f.server.Handler(testHTTPSBase)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return f
 }
 
-func (f *httpsFixture) token(t *testing.T) remote.HTTPSEnrollToken {
+func (f *httpsFixture) token(t *testing.T) remote.EnrollToken {
 	t.Helper()
-	token, err := f.store.CreateHTTPSEnrollToken("laptop", testHTTPSBase, remote.PublicKeyFingerprint(f.server.Keys.BundleKey.Public().(ed25519.PublicKey)), time.Minute, f.now)
+	token, err := f.store.CreateEnrollToken("laptop", testHTTPSBase, remote.PublicKeyFingerprint(f.server.Keys.BundleKey.Public().(ed25519.PublicKey)), time.Minute, f.now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,13 +73,13 @@ func serve(handler http.Handler, r *http.Request) *httptest.ResponseRecorder {
 	return w
 }
 
-func (f *httpsFixture) enroll(t *testing.T, token remote.HTTPSEnrollToken) *httptest.ResponseRecorder {
+func (f *httpsFixture) enroll(t *testing.T, token remote.EnrollToken) *httptest.ResponseRecorder {
 	t.Helper()
-	body, err := json.Marshal(remote.HTTPSEnrollRequest{TokenID: token.ID, TokenSecret: token.Secret, PublicKey: base64.StdEncoding.EncodeToString(f.key.Public().(ed25519.PublicKey))})
+	body, err := json.Marshal(remote.EnrollRequest{TokenID: token.ID, TokenSecret: token.Secret, PublicKey: base64.StdEncoding.EncodeToString(f.key.Public().(ed25519.PublicKey))})
 	if err != nil {
 		t.Fatal(err)
 	}
-	return serve(f.handler, f.request(t, "POST", remote.PathEnrollV2, token.ID, remote.EnrollSignatureTag, body))
+	return serve(f.handler, f.request(t, "POST", remote.PathEnroll, token.ID, remote.EnrollSignatureTag, body))
 }
 
 func (f *httpsFixture) device(t *testing.T) string {
@@ -88,7 +88,7 @@ func (f *httpsFixture) device(t *testing.T) string {
 	if w.Code != 200 {
 		t.Fatalf("enroll: %d %s", w.Code, w.Body.String())
 	}
-	var response remote.HTTPSEnrollResponse
+	var response remote.EnrollResponse
 	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
 		t.Fatal(err)
 	}
@@ -102,8 +102,8 @@ func TestHTTPSEnrollProofBeforeSingleUseRedemption(t *testing.T) {
 	correct := f.key
 	f.key = other
 	// A claimed public key different from the signing key cannot burn the token.
-	body, _ := json.Marshal(remote.HTTPSEnrollRequest{TokenID: token.ID, TokenSecret: token.Secret, PublicKey: base64.StdEncoding.EncodeToString(correct.Public().(ed25519.PublicKey))})
-	w := serve(f.handler, f.request(t, "POST", remote.PathEnrollV2, token.ID, remote.EnrollSignatureTag, body))
+	body, _ := json.Marshal(remote.EnrollRequest{TokenID: token.ID, TokenSecret: token.Secret, PublicKey: base64.StdEncoding.EncodeToString(correct.Public().(ed25519.PublicKey))})
+	w := serve(f.handler, f.request(t, "POST", remote.PathEnroll, token.ID, remote.EnrollSignatureTag, body))
 	if w.Code != 401 {
 		t.Fatalf("wrong proof: %d %s", w.Code, w.Body.String())
 	}
@@ -114,9 +114,7 @@ func TestHTTPSEnrollProofBeforeSingleUseRedemption(t *testing.T) {
 	if w := f.enroll(t, token); w.Code != 403 {
 		t.Fatalf("reused token: %d", w.Code)
 	}
-	if _, err := f.store.RedeemEnrollToken(token.ID, token.Secret, f.now); err != ErrTokenInvalid {
-		t.Fatalf("v2 token used via v1: %v", err)
-	}
+
 }
 
 func TestHTTPSEnrollWrongSecretExpiryAndOrigin(t *testing.T) {
@@ -127,7 +125,7 @@ func TestHTTPSEnrollWrongSecretExpiryAndOrigin(t *testing.T) {
 	if w := f.enroll(t, wrong); w.Code != 403 {
 		t.Fatalf("wrong secret: %d", w.Code)
 	}
-	other, err := f.store.CreateHTTPSEnrollToken("wrong origin", "https://other.example", token.BundleFingerprint, time.Minute, f.now)
+	other, err := f.store.CreateEnrollToken("wrong origin", "https://other.example", token.BundleFingerprint, time.Minute, f.now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +141,7 @@ func TestHTTPSEnrollWrongSecretExpiryAndOrigin(t *testing.T) {
 func TestHTTPSReplayProtectionSurvivesRestart(t *testing.T) {
 	f := newHTTPSFixture(t)
 	id := f.device(t)
-	req := f.request(t, "GET", remote.PathStatusV2, id, remote.DeviceSignatureTag, nil)
+	req := f.request(t, "GET", remote.PathStatus, id, remote.DeviceSignatureTag, nil)
 	if w := serve(f.handler, req.Clone(req.Context())); w.Code != 200 {
 		t.Fatalf("first: %d %s", w.Code, w.Body.String())
 	}
@@ -161,7 +159,7 @@ func TestHTTPSReplayProtectionSurvivesRestart(t *testing.T) {
 	}
 	f.store = store
 	f.now = f.now.Add(time.Second)
-	if w := serve(f.handler, f.request(t, "GET", remote.PathStatusV2, id, remote.DeviceSignatureTag, nil)); w.Code != 200 {
+	if w := serve(f.handler, f.request(t, "GET", remote.PathStatus, id, remote.DeviceSignatureTag, nil)); w.Code != 200 {
 		t.Fatalf("fresh proof: %d", w.Code)
 	}
 }
@@ -169,7 +167,7 @@ func TestHTTPSReplayProtectionSurvivesRestart(t *testing.T) {
 func TestHTTPSConcurrentReplayHasOneWinner(t *testing.T) {
 	f := newHTTPSFixture(t)
 	id := f.device(t)
-	req := f.request(t, "GET", remote.PathStatusV2, id, remote.DeviceSignatureTag, nil)
+	req := f.request(t, "GET", remote.PathStatus, id, remote.DeviceSignatureTag, nil)
 	var winners atomic.Int32
 	var wg sync.WaitGroup
 	for range 8 {
@@ -198,18 +196,18 @@ func TestHTTPSRejectsExpiredTamperedAndAmbiguousRequests(t *testing.T) {
 		{"missing signature", func(r *http.Request) { r.Header.Del("Signature") }},
 		{"duplicate signature", func(r *http.Request) { r.Header.Add("Signature", r.Header.Get("Signature")) }},
 		{"query", func(r *http.Request) { r.URL.RawQuery = "x=1" }},
-		{"escaped path", func(r *http.Request) { r.URL.RawPath = "/v1/plugins/agentssh/v2/%73tatus" }},
+		{"escaped path", func(r *http.Request) { r.URL.RawPath = "/plugins/agentssh/%73tatus" }},
 		{"body", func(r *http.Request) { r.Body = http.NoBody; r.Header.Set("Content-Digest", "sha-256=:wrong:") }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			r := f.request(t, "GET", remote.PathStatusV2, id, remote.DeviceSignatureTag, nil)
+			r := f.request(t, "GET", remote.PathStatus, id, remote.DeviceSignatureTag, nil)
 			tc.mutate(r)
 			if w := serve(f.handler, r); w.Code == 200 {
 				t.Fatal("invalid request accepted")
 			}
 		})
 	}
-	r := f.request(t, "GET", remote.PathStatusV2, id, remote.DeviceSignatureTag, nil)
+	r := f.request(t, "GET", remote.PathStatus, id, remote.DeviceSignatureTag, nil)
 	f.now = f.now.Add(2 * time.Minute)
 	if w := serve(f.handler, r); w.Code != 401 {
 		t.Fatalf("expired proof: %d", w.Code)

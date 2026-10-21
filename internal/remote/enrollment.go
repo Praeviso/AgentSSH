@@ -10,17 +10,7 @@ import (
 	"strings"
 )
 
-// HTTPSProtocol is explicit in both the token and the enrollment record. It is
-// never inferred from a failed mTLS connection or from an unauthenticated reply.
-const HTTPSProtocol = "https-signatures-v2"
-
-const (
-	HTTPSTokenPrefix = "agentssh-enroll.v2."
-	PathEnrollV2     = "/v2/enroll"
-	PathStatusV2     = "/v2/status"
-	PathBundleV2     = "/v2/bundle"
-	PathSignV2       = "/v2/sign"
-)
+const tokenPrefix = "agentssh-enroll."
 
 // HTTPSBaseURL validates a canonical, prefix-bearing public HTTPS base. Reject
 // ambiguous encodings instead of letting a proxy and the verifier disagree.
@@ -56,53 +46,53 @@ func PublicKeyFingerprint(key ed25519.PublicKey) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// HTTPSEnrollToken carries an HTTPS base and a bundle-key pin, not a private CA.
+// EnrollToken carries an HTTPS base and a bundle-key pin, not a private CA.
 // Only Secret is confidential. Servers persist its SHA-256, never the token.
-type HTTPSEnrollToken struct {
+type EnrollToken struct {
 	ID                string
 	Secret            string
 	BundleFingerprint string
 	ServerURL         string
 }
 
-func (t HTTPSEnrollToken) String() string {
-	return HTTPSTokenPrefix + strings.Join([]string{t.ID, t.Secret, t.BundleFingerprint,
+func (t EnrollToken) String() string {
+	return tokenPrefix + strings.Join([]string{t.ID, t.Secret, t.BundleFingerprint,
 		base64.RawURLEncoding.EncodeToString([]byte(t.ServerURL))}, ".")
 }
 
-func ParseHTTPSEnrollToken(value string) (HTTPSEnrollToken, error) {
-	rest, ok := strings.CutPrefix(strings.TrimSpace(value), HTTPSTokenPrefix)
+func ParseEnrollToken(value string) (EnrollToken, error) {
+	rest, ok := strings.CutPrefix(strings.TrimSpace(value), tokenPrefix)
 	parts := strings.Split(rest, ".")
 	if !ok || len(parts) != 4 || !validKeyID(parts[0]) {
-		return HTTPSEnrollToken{}, errors.New("invalid HTTPS enrollment token")
+		return EnrollToken{}, errors.New("invalid HTTPS enrollment token")
 	}
 	secret, err := base64.RawURLEncoding.Strict().DecodeString(parts[1])
 	if err != nil || len(secret) != 32 || base64.RawURLEncoding.EncodeToString(secret) != parts[1] {
-		return HTTPSEnrollToken{}, errors.New("invalid HTTPS enrollment token secret")
+		return EnrollToken{}, errors.New("invalid HTTPS enrollment token secret")
 	}
 	fp, err := hex.DecodeString(parts[2])
 	if err != nil || len(fp) != sha256.Size || strings.ToLower(parts[2]) != parts[2] {
-		return HTTPSEnrollToken{}, errors.New("invalid bundle public-key fingerprint")
+		return EnrollToken{}, errors.New("invalid bundle public-key fingerprint")
 	}
 	rawURL, err := base64.RawURLEncoding.Strict().DecodeString(parts[3])
 	if err != nil || base64.RawURLEncoding.EncodeToString(rawURL) != parts[3] {
-		return HTTPSEnrollToken{}, errors.New("invalid HTTPS enrollment URL")
+		return EnrollToken{}, errors.New("invalid HTTPS enrollment URL")
 	}
 	base, err := HTTPSBaseURL(string(rawURL))
 	if err != nil || base != string(rawURL) {
-		return HTTPSEnrollToken{}, errors.New("invalid HTTPS enrollment URL")
+		return EnrollToken{}, errors.New("invalid HTTPS enrollment URL")
 	}
-	return HTTPSEnrollToken{ID: parts[0], Secret: parts[1], BundleFingerprint: parts[2], ServerURL: base}, nil
+	return EnrollToken{ID: parts[0], Secret: parts[1], BundleFingerprint: parts[2], ServerURL: base}, nil
 }
 
-// HTTPSEnrollRequest is signed using PublicKey, with the token ID as keyid.
-type HTTPSEnrollRequest struct {
+// EnrollRequest is signed using PublicKey, with the token ID as keyid.
+type EnrollRequest struct {
 	TokenID     string `json:"token_id"`
 	TokenSecret string `json:"token_secret"`
 	PublicKey   string `json:"public_key"`
 }
 
-type HTTPSEnrollResponse struct {
+type EnrollResponse struct {
 	DeviceID        string `json:"device_id"`
 	BundlePublicKey string `json:"bundle_public_key"`
 }

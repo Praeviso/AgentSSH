@@ -15,8 +15,8 @@ import (
 )
 
 func TestHTTPSTokenAndCanonicalBase(t *testing.T) {
-	token := HTTPSEnrollToken{ID: "et_fixture", Secret: base64.RawURLEncoding.EncodeToString(make([]byte, 32)), BundleFingerprint: strings.Repeat("ab", 32), ServerURL: "https://config.example/v1/plugins/agentssh"}
-	got, err := ParseHTTPSEnrollToken(token.String())
+	token := EnrollToken{ID: "et_fixture", Secret: base64.RawURLEncoding.EncodeToString(make([]byte, 32)), BundleFingerprint: strings.Repeat("ab", 32), ServerURL: "https://config.example/plugins/agentssh"}
+	got, err := ParseEnrollToken(token.String())
 	if err != nil || got != token {
 		t.Fatalf("round trip: %+v %v", got, err)
 	}
@@ -25,16 +25,14 @@ func TestHTTPSTokenAndCanonicalBase(t *testing.T) {
 			t.Errorf("accepted %q", base)
 		}
 	}
-	if _, err := ParseEnrollToken(token.String()); err == nil {
-		t.Fatal("v1 accepted v2 token")
-	}
+
 }
 
 func TestHTTPSRequestCoverageAndClockBounds(t *testing.T) {
 	pub, key, _ := ed25519.GenerateKey(rand.Reader)
 	now := time.Unix(1700000000, 0)
 	body := []byte(`{"host":"web-1"}`)
-	target := "https://config.example/plugin/v2/sign"
+	target := "https://config.example/plugin/sign"
 	r := httptest.NewRequest("POST", target, strings.NewReader(string(body)))
 	if err := SignHTTPRequest(r, body, "dev_fixture", DeviceSignatureTag, key, now); err != nil {
 		t.Fatal(err)
@@ -47,8 +45,8 @@ func TestHTTPSRequestCoverageAndClockBounds(t *testing.T) {
 		body                  []byte
 		now                   time.Time
 	}{
-		{"origin", "https://other.example/plugin/v2/sign", "dev_fixture", DeviceSignatureTag, body, now},
-		{"prefix", "https://config.example/other/v2/sign", "dev_fixture", DeviceSignatureTag, body, now},
+		{"origin", "https://other.example/plugin/sign", "dev_fixture", DeviceSignatureTag, body, now},
+		{"prefix", "https://config.example/other/sign", "dev_fixture", DeviceSignatureTag, body, now},
 		{"id", target, "dev_other", DeviceSignatureTag, body, now},
 		{"tag", target, "dev_fixture", EnrollSignatureTag, body, now},
 		{"body", target, "dev_fixture", DeviceSignatureTag, []byte(`{}`), now},
@@ -64,7 +62,7 @@ func TestHTTPSRequestCoverageAndClockBounds(t *testing.T) {
 }
 
 func TestHTTPSIndependentWebCryptoVectors(t *testing.T) {
-	raw, err := os.ReadFile("testdata/https-v2.json")
+	raw, err := os.ReadFile("testdata/https.json")
 	if err != nil {
 		t.Fatal(err)
 	}

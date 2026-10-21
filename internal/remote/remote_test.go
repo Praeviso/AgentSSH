@@ -61,22 +61,6 @@ func TestParseUserAuthRejectsAnythingElse(t *testing.T) {
 	}
 }
 
-func TestEnrollTokenRoundTrip(t *testing.T) {
-	token := EnrollToken{ID: "et_abc", Secret: "c2VjcmV0", CAFingerprint: strings.Repeat("ab", 32)}
-	parsed, err := ParseEnrollToken(token.String())
-	if err != nil {
-		t.Fatalf("ParseEnrollToken: %v", err)
-	}
-	if parsed != token {
-		t.Fatalf("round trip = %+v, want %+v", parsed, token)
-	}
-	for _, bad := range []string{"", "agentssh-enroll.v1.et_abc", "other.v1.a.b." + strings.Repeat("ab", 32), "agentssh-enroll.v1.et_abc.c2VjcmV0.zz"} {
-		if _, err := ParseEnrollToken(bad); err == nil {
-			t.Errorf("ParseEnrollToken(%q) accepted a malformed token", bad)
-		}
-	}
-}
-
 func TestBundleSignatureBindsBytesAndKey(t *testing.T) {
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
 	otherPub, _, _ := ed25519.GenerateKey(rand.Reader)

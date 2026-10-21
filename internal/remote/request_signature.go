@@ -17,15 +17,15 @@ import (
 const (
 	RequestLifetime    = 60 * time.Second
 	RequestClockSkew   = 30 * time.Second
-	DeviceSignatureTag = "agentssh-device-v2"
-	EnrollSignatureTag = "agentssh-enroll-v2"
+	DeviceSignatureTag = "agentssh-device"
+	EnrollSignatureTag = "agentssh-enroll"
 )
 
 // This is a deliberately narrow RFC 9421 profile, not a general Structured
 // Fields parser. The exact covered components and parameter order are required.
 const coveredComponents = `("@method" "@target-uri" "content-digest")`
 
-var signatureInputPattern = regexp.MustCompile(`^agentssh=\("@method" "@target-uri" "content-digest"\);created=([0-9]{1,12});expires=([0-9]{1,12});nonce="([A-Za-z0-9_-]{43})";keyid="([A-Za-z0-9_-]{1,80})";alg="ed25519";tag="(agentssh-device-v2|agentssh-enroll-v2)"$`)
+var signatureInputPattern = regexp.MustCompile(`^agentssh=\("@method" "@target-uri" "content-digest"\);created=([0-9]{1,12});expires=([0-9]{1,12});nonce="([A-Za-z0-9_-]{43})";keyid="([A-Za-z0-9_-]{1,80})";alg="ed25519";tag="(agentssh-device|agentssh-enroll)"$`)
 
 type RequestProof struct {
 	KeyID   string

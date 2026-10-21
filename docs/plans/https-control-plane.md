@@ -1,63 +1,61 @@
-# Execution plan — HTTPS control-plane adapter
+# Execution plan — hosted HTTPS control plane
 
 ## Goal and acceptance
 
-Allow a hosted control plane such as a config-center Worker to serve AgentSSH
-without a separate Go service or private-CA TLS termination. Add an explicit v2
-HTTPS/device-public-key protocol, a Go server reference implementation, client
-support and a language-neutral wire contract. Existing v1 mTLS enrollments remain
-supported; no negotiation or automatic downgrade is allowed.
+Support a single hosted config-center service through one unversioned HTTPS
+control-plane protocol. Remove certificate enrollment, private-CA management,
+protocol selection, compatibility endpoints/tables and numbered wire identifiers.
+Keep signed device requests, one-time enrollment, bundle verification, monotonic
+configuration versions, remote SSH signing, revocation and local deny overlays.
 
-Acceptance: a real enrolled v2 client fetches/verifies its bundle and connects to
-the in-process SSH target using remote signatures; revocation, identity disable,
-tampering, replay, expiry and wrong enrollment pins fail closed. A URL prefix is
-preserved through enrollment and every request. Redirects never forward enrollment
-secrets or signed requests. Public protocol fixtures can be verified independently
-with Web Crypto. Existing SSH/policy/cache behavior remains covered.
+Acceptance: a real client enrolls through a path prefix, verifies configuration
+and connects to an SSH target. Device and identity revocation, replay, expiry,
+tampering, wrong pins and redirects fail closed. Enrollment records have only the
+service URL, device ID, bundle public key and enrollment time. No certificate or
+protocol selector is persisted. Existing enrollment/state is deliberately not
+migrated; operators create a fresh server data directory and re-enroll devices.
 
 ## Approach
 
-1. Define a narrow RFC 9421 Ed25519 request-signature profile and origin/path-bound
-   v2 enrollment token pinning the bundle public key. Reuse existing bundle and
-   SSH signature envelopes.
-2. Add SQLite-backed device public keys, single-use v2 enrollment tokens and
-   durable replay protection; expose a prefix-aware HTTPS handler and optional
-   HTTP origin behind a TLS proxy. Reuse current configuration/signing handlers.
-3. Adapt the client based only on its explicit token/enrollment protocol. Keep
-   v1 mTLS state, native SSH signing and local-only tightening unchanged.
-4. Add behavioral tests, independent interoperability fixtures and protocol/user
-   documentation, then perform one consolidated validation and publish a PR.
+1. Consolidate endpoint/message/token definitions and client/server handlers;
+   remove protocol dispatch and certificate code. Use /enroll, /status, /bundle,
+   /sign, unversioned token and signature tags, and an unversioned bundle envelope.
+2. Retain one device/token/nonce schema and signing-key-only server initialization.
+   The reference server runs a private HTTP origin behind its configured public
+   HTTPS ingress. No certificate or HTTP-mode switches are needed.
+3. Convert all lifecycle tests to the retained protocol, regenerate independent
+   Web Crypto fixtures and rewrite documentation around the final behavior.
+4. Review for obsolete paths, fields, flags and dead code; run consolidated
+   formatting, vet, builds, full race tests, lint and Web Crypto verification.
+   Update the existing PR #10 and inspect CI on the actual final head.
 
 ## Progress
 
-- Inspected current main `6c95ab2`, repository CI and remote-control architecture.
-- Working in `/tmp/agentssh-config-center-adapter`, branch
-  `feat/https-control-plane`; original checkout remains unchanged.
-- Implemented the explicit v2 token/signature profile, prefix-aware reference
-  handler, durable replay store, CLI flags and client protocol dispatch.
-- Added real SSH lifecycle coverage, rejection/concurrency/restart tests and
-  independently generated Web Crypto fixtures. Documented the hosted wire contract.
-- Implementation and consolidated validation complete. Delivery branch:
-  `feat/https-control-plane` in `Praeviso/AgentSSH`.
+- Working in /tmp/agentssh-config-center-adapter, feat/https-control-plane.
+- User requested a clean replacement rather than parallel protocol support.
+- Consolidation complete: one handler/client/token schema; numbered protocol
+  identifiers, certificate lifecycle, mode flags and compatibility storage removed.
+- All original remote lifecycle tests now exercise the single HTTPS protocol.
+- Canonical protocol documentation replaces duplicate and superseded documents;
+  independently signed Web Crypto fixtures use the final unversioned contract.
+- Original local checkouts remain untouched. Updating the existing PR #10.
 
 ## Validation
 
-Passed with Go 1.25.5 and writable `/tmp/agentssh-adapter-go-cache`:
+Passed on the final implementation with Go 1.25.5, a writable /tmp build cache
+and GOFLAGS=-p=2:
 
-- gofmt and `git diff --check`.
-- `go vet ./...` and `go build ./cmd/...`.
-- `go test -race -count=1 -timeout=20m ./...` (with `GOFLAGS=-p=2`).
-- `golangci-lint run --timeout=5m` (local v2.5.0; CI uses v2.12.2).
-- `node scripts/verify_https_vectors.mjs` verifies request, bundle and SSH vectors.
+- gofmt and git diff --check.
+- go vet ./... and go build ./cmd/....
+- go test -race -count=1 -timeout=20m ./... (entire repository).
+- golangci-lint run --timeout=5m (local 2.5.0; GitHub CI uses 2.12.2).
+- node scripts/verify_https_vectors.mjs (request, bundle and SSH signatures).
+- Repository-wide removal scan found no retired protocol identifiers, certificate
+  APIs, mode flags or compatibility tables. State tests require exactly the four
+  retained enrollment fields and reject unexpected fields.
 
-The final race run includes both existing v1 and new v2 paths. V2 tests cover
-real SSH authentication, fresh signing on consecutive connections, device and
-identity revocation, in-flight cancellation, URL and key pins, redirect refusal,
-expiry, altered messages, concurrent replay and durable replay after reopening
-SQLite. An initial name collision and a missing test certificate SAN were fixed
-before the final full pass. The build emitted a nonfatal read-only module metadata
-cache warning; its command exited successfully.
-
-Remote CI is recorded by GitHub Actions on the pull request, separately from these
-local results. No config-center implementation, deployed Worker interoperability
-or production deployment is included in this PR.
+The final full pass follows removal of an unused test import. Build succeeded
+with a nonfatal read-only module metadata cache warning. GitHub Actions on the
+final PR head records remote CI independently of these local results. This run
+supersedes earlier protocol validation; no config-center implementation or
+deployment is included.

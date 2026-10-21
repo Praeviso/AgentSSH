@@ -9,8 +9,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -38,6 +36,7 @@ func init() {
 
 // controlPlane is an in-process agentssh-server plus one enrolled client home.
 type controlPlane struct {
+	base     string
 	dir      string
 	store    *remoteserver.Store
 	keys     *remoteserver.Keys
@@ -50,14 +49,10 @@ type controlPlane struct {
 }
 
 func newControlPlane(t *testing.T) *controlPlane {
-	return newControlPlaneWithProtocol(t, false)
-}
-
-func newControlPlaneWithProtocol(t *testing.T, httpsProtocol bool) *controlPlane {
 	t.Helper()
 	cp := &controlPlane{dir: t.TempDir()}
 	now := time.Now()
-	if err := remoteserver.Init(cp.dir, "master", []string{"127.0.0.1"}, now); err != nil {
+	if err := remoteserver.Init(cp.dir, "master"); err != nil {
 		t.Fatalf("server init: %v", err)
 	}
 	store, err := remoteserver.OpenStore(filepath.Join(cp.dir, remoteserver.FileDatabase))
@@ -73,30 +68,22 @@ func newControlPlaneWithProtocol(t *testing.T, httpsProtocol bool) *controlPlane
 	cp.server = remoteserver.NewServer(store, keys)
 	mux := http.NewServeMux()
 	cp.http = httptest.NewUnstartedServer(mux)
-	cp.http.TLS = cp.server.TLSConfig()
-	cp.http.Config.ErrorLog = log.New(io.Discard, "", 0)
 	cp.http.StartTLS()
 	t.Cleanup(cp.http.Close)
-	base := cp.http.URL
-	if httpsProtocol {
-		base += "/v1/plugins/agentssh"
-		handler, err := cp.server.HTTPSHandler(base)
-		if err != nil {
-			t.Fatal(err)
-		}
-		mux.Handle("/", handler)
-		// Emulate a system-trusted ingress certificate without disabling TLS
-		// verification or installing a device client certificate.
-		original := http.DefaultTransport
-		transport := original.(*http.Transport).Clone()
-		pool := x509.NewCertPool()
-		pool.AddCert(keys.CACert)
-		transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS13, RootCAs: pool}
-		http.DefaultTransport = transport
-		t.Cleanup(func() { http.DefaultTransport = original; transport.CloseIdleConnections() })
-	} else {
-		mux.Handle("/", cp.server.Handler())
+	cp.base = cp.http.URL + "/plugins/agentssh"
+	handler, err := cp.server.Handler(cp.base)
+	if err != nil {
+		t.Fatal(err)
 	}
+	mux.Handle("/", handler)
+	// Emulate an ordinary system-trusted HTTPS ingress, without device certificates.
+	original := http.DefaultTransport
+	transport := original.(*http.Transport).Clone()
+	pool := x509.NewCertPool()
+	pool.AddCert(cp.http.Certificate())
+	transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS13, RootCAs: pool}
+	http.DefaultTransport = transport
+	t.Cleanup(func() { http.DefaultTransport = original; transport.CloseIdleConnections() })
 
 	recipient, err := remoteserver.LoadRecipient(cp.dir)
 	if err != nil {
@@ -115,15 +102,7 @@ func newControlPlaneWithProtocol(t *testing.T, httpsProtocol bool) *controlPlane
 	}
 
 	cp.home = t.TempDir()
-	token := cp.token(t)
-	if httpsProtocol {
-		tok, err := cp.store.CreateHTTPSEnrollToken("laptop", base, remote.PublicKeyFingerprint(keys.BundleKey.Public().(ed25519.PublicKey)), time.Minute, now)
-		if err != nil {
-			t.Fatal(err)
-		}
-		token = tok.String()
-	}
-	state, err := remoteclient.Enroll(context.Background(), cp.home, base, token, now)
+	state, err := remoteclient.Enroll(context.Background(), cp.home, cp.base, cp.token(t), now)
 	if err != nil {
 		t.Fatalf("enroll: %v", err)
 	}
@@ -136,11 +115,11 @@ func newControlPlaneWithProtocol(t *testing.T, httpsProtocol bool) *controlPlane
 
 func (cp *controlPlane) token(t *testing.T) string {
 	t.Helper()
-	id, secret, err := cp.store.CreateEnrollToken("laptop", time.Minute, time.Now())
+	token, err := cp.store.CreateEnrollToken("laptop", cp.base, remote.PublicKeyFingerprint(cp.keys.BundleKey.Public().(ed25519.PublicKey)), time.Minute, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
-	return remote.EnrollToken{ID: id, Secret: secret, CAFingerprint: cp.keys.CAFingerprint()}.String()
+	return token.String()
 }
 
 func (cp *controlPlane) push(t *testing.T, user string, identity string) {
@@ -363,17 +342,17 @@ func TestBundleRollbackAndForeignBundlesAreRejected(t *testing.T) {
 
 	// A correctly signed bundle for another device is refused.
 	forged := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != remote.PathBundle {
-			cp.server.Handler().ServeHTTP(w, r)
+		if r.URL.Path != "/plugins/agentssh"+remote.PathBundle {
+			http.NotFound(w, r)
 			return
 		}
 		raw, sig, _ := remote.SignBundle(remote.Bundle{Version: 100, DeviceID: "dev_someone_else", NotAfter: time.Now().Add(time.Minute)}, cp.keys.BundleKey)
 		_ = json.NewEncoder(w).Encode(remote.BundleResponse{Bundle: raw, Signature: sig})
 	}))
-	forged.TLS = cp.server.TLSConfig()
+	forged.TLS = &tls.Config{MinVersion: tls.VersionTLS13, Certificates: cp.http.TLS.Certificates}
 	forged.StartTLS()
 	defer forged.Close()
-	rewriteServerURL(t, cp.home, forged.URL)
+	rewriteServerURL(t, cp.home, forged.URL+"/plugins/agentssh")
 	if _, err := remoteclient.Open(context.Background(), cp.home, remoteclient.OpenOptions{Refresh: true}); err == nil || !strings.Contains(err.Error(), "not this device") {
 		t.Fatalf("foreign bundle accepted: %v", err)
 	}
@@ -399,20 +378,20 @@ func rewriteServerURL(t *testing.T, home string, url string) {
 func TestEnrollmentTokenChecks(t *testing.T) {
 	cp := newControlPlane(t)
 	token := cp.token(t)
-	if _, err := remoteclient.Enroll(context.Background(), t.TempDir(), cp.http.URL, token, time.Now()); err != nil {
+	if _, err := remoteclient.Enroll(context.Background(), t.TempDir(), cp.base, token, time.Now()); err != nil {
 		t.Fatalf("first enroll: %v", err)
 	}
-	if _, err := remoteclient.Enroll(context.Background(), t.TempDir(), cp.http.URL, token, time.Now()); err == nil {
+	if _, err := remoteclient.Enroll(context.Background(), t.TempDir(), cp.base, token, time.Now()); err == nil {
 		t.Fatal("enrollment token was accepted twice")
 	}
-	if _, err := remoteclient.Enroll(context.Background(), cp.home, cp.http.URL, cp.token(t), time.Now()); err == nil {
+	if _, err := remoteclient.Enroll(context.Background(), cp.home, cp.base, cp.token(t), time.Now()); err == nil {
 		t.Fatal("an already enrolled home enrolled again")
 	}
 	parsed, _ := remote.ParseEnrollToken(cp.token(t))
-	parsed.CAFingerprint = strings.Repeat("00", 32)
+	parsed.BundleFingerprint = strings.Repeat("00", 32)
 	home := t.TempDir()
-	if _, err := remoteclient.Enroll(context.Background(), home, cp.http.URL, parsed.String(), time.Now()); err == nil {
-		t.Fatal("enrollment trusted a server whose CA does not match the token")
+	if _, err := remoteclient.Enroll(context.Background(), home, cp.base, parsed.String(), time.Now()); err == nil {
+		t.Fatal("enrollment trusted a server whose bundle key does not match the token")
 	}
 	if managedmode.Enrolled(home) {
 		t.Fatal("a failed enrollment left the home in remote mode")
