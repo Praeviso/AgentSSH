@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"slices"
 	"strings"
 	"time"
 
@@ -17,6 +16,7 @@ import (
 	"github.com/Praeviso/AgentSSH/internal/inventory"
 	"github.com/Praeviso/AgentSSH/internal/payload"
 	"github.com/Praeviso/AgentSSH/internal/policy"
+	"github.com/Praeviso/AgentSSH/internal/runner"
 	"github.com/Praeviso/AgentSSH/internal/session"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
@@ -127,28 +127,7 @@ func newPlanCommand() *cobra.Command {
 	return cmd
 }
 
-type planSubmitLine struct {
-	Seq         int                      `json:"seq"`
-	Cmd         string                   `json:"cmd"`
-	Status      string                   `json:"status"` // allowed | denied | approval_pending
-	PolicyRule  string                   `json:"policy_rule,omitempty"`
-	ApprovalID  string                   `json:"approval_id,omitempty"`
-	StdinSHA256 string                   `json:"stdin_sha256,omitempty"`
-	StdinBytes  int64                    `json:"stdin_bytes,omitempty"`
-	Task        *approval.TaskPermission `json:"task_permission,omitempty"`
-}
-
-type planSubmitResponse struct {
-	PlanID       string                `json:"plan_id,omitempty"`
-	SessionID    string                `json:"session_id"`
-	Host         string                `json:"host"`
-	Metadata     approval.PlanMetadata `json:"metadata,omitempty"`
-	ReviewSHA256 string                `json:"review_sha256,omitempty"`
-	Commands     []planSubmitLine      `json:"commands"`
-	Allowed      int                   `json:"allowed"`
-	Denied       int                   `json:"denied"`
-	Pending      int                   `json:"pending"`
-}
+type planSubmitResponse = runner.PlanSubmitResponse
 
 type planSubmitOptions struct {
 	Review           approval.PlanReview
@@ -436,7 +415,6 @@ func submitPlanInputs(cmd *cobra.Command, cfg *config.Config, runtime approval.R
 
 func submitPlanInputsWithOptions(cmd *cobra.Command, cfg *config.Config, runtime approval.RuntimeConfig, targetName string, planCommands []planCommand, sessionFlag, sessionLabel string, opts planSubmitOptions) (response planSubmitResponse, resultErr error) {
 	reviewTemplate := opts.Review
-	metadata := reviewTemplate.Metadata
 
 	resolved, err := inventory.NewResolver(cfg.Inventory).Resolve(targetName)
 	if err != nil {
@@ -457,9 +435,6 @@ func submitPlanInputsWithOptions(cmd *cobra.Command, cfg *config.Config, runtime
 		return response, fmt.Errorf("resolve session: %w", err)
 	}
 
-	pendingStore := approvalStore(cfg.Paths)
-	sessionStore := approval.SessionStore{Dir: cfg.Paths.SessionsDir}
-	store := audit.NewStore(cfg.Paths.AuditFile)
 	planID, err := approval.NewPlanID()
 	if err != nil {
 		return response, err
@@ -483,135 +458,36 @@ func submitPlanInputsWithOptions(cmd *cobra.Command, cfg *config.Config, runtime
 		return response, err
 	}
 
-	response = planSubmitResponse{SessionID: sessionCtx.ID, Host: target.Name, Metadata: metadata}
-	memberIDs := make([]string, 0, len(planCommands))
-	requestedRecords := make([]audit.Record, 0, len(planCommands))
-	reviewSteps := make([]approval.PlanReviewStep, 0, len(planCommands))
-	exitCode := exitOK
-	for i, command := range planCommands {
-		line := planSubmitLine{
-			Seq:         i + 1,
-			Cmd:         command.Cmd,
-			StdinSHA256: command.stdin.sha256,
-			StdinBytes:  command.stdin.bytes,
-			Task:        approval.TaskCandidate(command.Cmd, command.stdin.sha256),
-		}
-		auth, err := approval.PreflightAuthorize(cfg.Policy, cfg.Inventory, sessionStore, runtime, sessionCtx.ID, target.Name, command.Cmd, command.stdin.sha256)
-		if err != nil {
-			return response, newUsageError("policy.yaml is invalid: %v\n  fix the rule in ~/.agentssh/policy.yaml (check: agentssh policy show)", err)
-		}
-		line.PolicyRule = auth.Decision.Rule
-		switch auth.Status {
-		case approval.AuthAllow, approval.AuthAllowByGrant:
-			line.Status = "allowed"
-			response.Allowed++
-		case approval.AuthHardDeny:
-			line.Status = "denied"
-			response.Denied++
-			exitCode = mergeExitCode(exitCode, exitPolicyDenied)
-		case approval.AuthNeedsApproval:
-			if !runtime.Enabled {
-				line.Status = "denied"
-				response.Denied++
-				exitCode = mergeExitCode(exitCode, exitPolicyDenied)
-				break
-			}
-			reqID, err := newReqID()
-			if err != nil {
-				return response, err
-			}
-			req, err := pendingStore.Create(approval.PendingRequest{
-				ReqID:       reqID,
-				SessionID:   sessionCtx.ID,
-				Host:        target.Name,
-				Cmd:         command.Cmd,
-				Candidate:   auth.ApprovalMatcher,
-				StdinSHA256: command.stdin.sha256,
-				StdinBytes:  command.stdin.bytes,
-				PlanID:      planID,
-				PlanSeq:     i + 1,
-				PlanTotal:   len(planCommands),
-			})
-			if err != nil {
-				return response, err
-			}
-			line.Status = "approval_pending"
-			line.ApprovalID = req.ID
-			// Two identical lines share one pending request; the manifest must
-			// still list it once.
-			if !slices.Contains(memberIDs, req.ID) {
-				memberIDs = append(memberIDs, req.ID)
-			}
-			exit := exitApprovalRequired
-			record := stampStdin(baseAuditRecord(reqID, sessionCtx, audit.EventApprovalRequested, target.Name, command.Cmd, auth.Decision, &exit, "", 0), command.stdin)
-			record.ApprovalID = req.ID
-			record.ApprovalMatcher = req.Candidate.Regex
-			record.ApprovalChannel = approval.ChannelPlan
-			record.PlanID = planID
-			record.ExecutionID = reviewTemplate.ExecutionID
-			record.StepID = command.ID
-			requestedRecords = append(requestedRecords, record)
-			exitCode = mergeExitCode(exitCode, exitApprovalRequired)
-		default:
-			return response, fmt.Errorf("unknown approval authorization status %q", auth.Status)
-		}
-		response.Commands = append(response.Commands, line)
-		reviewSteps = append(reviewSteps, approval.PlanReviewStep{
-			Seq:               i + 1,
-			ID:                command.ID,
-			Name:              command.Name,
-			Phase:             command.Phase,
-			OnFailure:         command.OnFailure,
-			Cmd:               command.Cmd,
-			Status:            line.Status,
-			PolicyRule:        line.PolicyRule,
-			ApprovalID:        line.ApprovalID,
-			StdinSHA256:       line.StdinSHA256,
-			StdinBytes:        line.StdinBytes,
-			PayloadRef:        command.PayloadRef,
-			PayloadRetained:   command.PayloadRef != "",
-			Task:              line.Task,
-			AlreadyAuthorized: line.Status == "allowed",
+	commands := make([]runner.PlanCommand, 0, len(planCommands))
+	for _, command := range planCommands {
+		commands = append(commands, runner.PlanCommand{
+			ID:         command.ID,
+			Name:       command.Name,
+			Phase:      command.Phase,
+			OnFailure:  command.OnFailure,
+			Cmd:        command.Cmd,
+			Stdin:      command.stdin.runnerStdin(),
+			PayloadRef: command.PayloadRef,
 		})
 	}
-
-	// Identical lines share one pending request, so count distinct members --
-	// otherwise submit reports more approvals than plan status will ever show.
-	response.Pending = len(memberIDs)
-
-	if len(memberIDs) > 0 {
-		finalReviewSteps := mergePlanReviewSteps(reviewTemplate.Steps, reviewSteps)
-		review := approval.PlanReview{
-			Version:     1,
-			PlanID:      planID,
-			ExecutionID: reviewTemplate.ExecutionID,
-			SessionID:   sessionCtx.ID,
-			Host:        target.Name,
-			Metadata:    metadata,
-			Steps:       finalReviewSteps,
-		}
-		manifest, err := pendingStore.CreatePlan(approval.PlanManifest{
-			ID:          planID,
-			SessionID:   sessionCtx.ID,
-			Host:        target.Name,
-			ExecutionID: reviewTemplate.ExecutionID,
-			Metadata:    metadata,
-			Review:      &review,
-			MemberIDs:   memberIDs,
-		})
-		if err != nil {
-			return response, err
-		}
-		response.PlanID = manifest.ID
-		response.ReviewSHA256 = manifest.ReviewSHA256
-		for _, record := range requestedRecords {
-			record.ReviewSHA256 = manifest.ReviewSHA256
-			if _, err := store.Append(record); err != nil {
-				return response, err
-			}
-		}
+	env := runner.Env{
+		Policy:    cfg.Policy,
+		Inventory: cfg.Inventory,
+		Approval:  runtime,
+		Sessions:  approval.SessionStore{Dir: cfg.Paths.SessionsDir},
+		Pending:   approvalStore(cfg.Paths),
+		Audit:     audit.NewStore(cfg.Paths.AuditFile),
 	}
-
+	response, exitCode, err := runner.SubmitPlan(env, runner.PlanSubmitRequest{
+		PlanID:   planID,
+		Host:     target.Name,
+		Session:  sessionCtx,
+		Commands: commands,
+		Review:   reviewTemplate,
+	})
+	if err != nil {
+		return response, err
+	}
 	if exitCode != exitOK {
 		return response, commandExitError{Code: exitCode}
 	}
@@ -642,32 +518,6 @@ func printPlanSubmitHuman(cmd *cobra.Command, response planSubmitResponse) {
 	} else if response.Denied == 0 {
 		_, _ = fmt.Fprintln(out, "✓ all commands already allowed — run them directly")
 	}
-}
-
-func mergePlanReviewSteps(template []approval.PlanReviewStep, current []approval.PlanReviewStep) []approval.PlanReviewStep {
-	if len(template) == 0 {
-		return current
-	}
-	out := append([]approval.PlanReviewStep(nil), template...)
-	index := map[string]int{}
-	for i, step := range out {
-		if step.ID != "" {
-			index[step.ID] = i
-		}
-	}
-	for _, step := range current {
-		if i, ok := index[step.ID]; ok {
-			out[i] = step
-			continue
-		}
-		out = append(out, step)
-	}
-	for i := range out {
-		if out[i].Seq == 0 {
-			out[i].Seq = i + 1
-		}
-	}
-	return out
 }
 
 func runPlanStatus(cmd *cobra.Command, id string, jsonOutput bool) error {

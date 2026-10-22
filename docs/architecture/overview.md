@@ -260,6 +260,7 @@ agentssh/
     output/                # 脱敏 + 截断
     tui/                   # bubbletea:审计查看器
     approval/              # 灰区异步审批:Generalize/Authorize/grant store/裁决(默认关)
+    runner/                # run pipeline shared by the CLI and control planes: session binding, authorize, approval requests, audit, execute, exit-code merge
   skills/                  # AgentSSH 使用手册(SKILL.md):最佳实践,供 Agent 参考
   docs/
 ```
