@@ -112,6 +112,28 @@ protocol refusals end it. On context cancellation it sends `/exec/cancel`
   the oldest run is `run_not_found` and the newest still replays; without the
   eviction the same test keeps 195 KiB.
 
+- [x] PR #26 review (Codex):
+  - P1: with gateway-minted IDs, a connection lost before the run frame left
+    the run unreachable (no ID to attach or cancel) and a retry ran the
+    command twice. The client now mints `run_id` as an idempotency key; the
+    gateway joins a repeat of the same request (body digest in the run's
+    meta, `409 run_conflict` for a different one); before the first run frame
+    the client repeats `/exec`, after it attaches. A cancel for an unseen ID
+    leaves a 10-minute tombstone so an overtaken request is refused
+    (`run_cancelled`). Live runs are keyed by device and ID, since IDs are
+    client-chosen. Tests: the first `/exec` response is dropped after the
+    gateway started the run → the client joins it, gets each chunk once, the
+    command ran once; same ID + same request joins, + different request 409;
+    cancel before request → request refused, command never ran.
+  - P2: a connection that broke after a complete final frame but before the
+    body ended cleanly was reported as a protocol error. Only a well-formed
+    frame after the final one is an error now. Test: "abrupt end after
+    result".
+  - P2: concurrent starts each saw the same free space. Quota enforcement is
+    serialized and runs again when a run finishes. Test: four concurrent
+    capped runs end within a 128 KiB quota; without the finish-time pass the
+    device keeps 195 KiB.
+
 ## Validation
 
 ```

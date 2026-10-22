@@ -72,6 +72,7 @@ func TestExecStreamRead(t *testing.T) {
 		{name: "malformed response", spool: frame(FrameResponse, `{"host":`), err: "malformed execution response"},
 		{name: "malformed result", spool: frame(FrameResult, `{"exit_code":`), err: "malformed execution result"},
 		{name: "output after a response", spool: concat(frame(FrameResponse, response), frame(FrameStdout, "late")), err: "output after a response frame"},
+		{name: "abrupt end after result", spool: concat(frame(FrameResult, `{"exit_code":0}`), []byte{FrameStdout, 0})},
 		{name: "data after result", spool: concat(frame(FrameResult, `{"exit_code":0}`), frame(FrameStdout, "late")), err: "continues after its final frame"},
 		{name: "error frame", spool: frame(FrameError, `{"code":"internal","error":"execution failed"}`), err: "execution failed"},
 		{name: "malformed error frame", spool: frame(FrameError, `{}`), err: "malformed execution error frame"},

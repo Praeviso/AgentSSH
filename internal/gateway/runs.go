@@ -3,8 +3,6 @@ package gateway
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -38,6 +36,9 @@ const (
 	// output, always fits after the cap is reached.
 	runReserveBytes = 16 << 10
 	runSweepEvery   = time.Minute
+	// cancelTombstoneTTL is how long a cancel for a run the gateway has not
+	// seen yet refuses that run's request, should it still arrive.
+	cancelTombstoneTTL = 10 * time.Minute
 
 	dirRuns       = "runs"
 	fileRunMeta   = "meta.json"
@@ -48,6 +49,9 @@ var (
 	errRunNotFound    = errors.New("run not found")
 	errRunInterrupted = errors.New("run interrupted")
 	errRunBroken      = errors.New("run spool broken")
+	errRunExists      = errors.New("run already exists")
+	errRunCancelled   = errors.New("run cancelled before it started")
+	errRunConflict    = errors.New("run id reused for a different request")
 )
 
 // runMeta is a run's durable record; FinishedAt is empty until the result
@@ -57,6 +61,9 @@ type runMeta struct {
 	DeviceID   string `json:"device_id"`
 	CreatedAt  string `json:"created_at"`
 	FinishedAt string `json:"finished_at,omitempty"`
+	// RequestSHA256 identifies the request that started the run, so a
+	// repeated request can join it and a different one is refused.
+	RequestSHA256 string `json:"request_sha256,omitempty"`
 	// Broken means a spool write failed, so the frames file lacks its result.
 	Broken bool `json:"broken,omitempty"`
 }
@@ -68,6 +75,8 @@ type run struct {
 	deviceID string
 	dir      string
 	budget   int64
+	// requestSHA256 is immutable; meta is guarded by mu.
+	requestSHA256 string
 
 	mu        sync.Mutex
 	meta      runMeta
@@ -80,15 +89,11 @@ type run struct {
 	cancel    context.CancelFunc
 }
 
-func newRunID() string {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		panic(fmt.Sprintf("crypto/rand: %v", err))
-	}
-	return "rn_" + hex.EncodeToString(b[:])
-}
-
 func (s *Server) runsDir() string { return filepath.Join(s.Dir, dirRuns) }
+
+// runKey names a run among live runs. Clients choose run IDs, so the same ID
+// from two devices names two runs.
+func runKey(deviceID, id string) string { return deviceID + "/" + id }
 
 // runDir keeps each device's runs apart, so quota and lookups only ever see
 // that device's runs.
@@ -118,10 +123,25 @@ func (s *Server) runMaxBytes() int64 {
 }
 
 // startRun creates a run's spool and registers it; cancel stops its context.
-func (s *Server) startRun(deviceID string, targets int, cancel context.CancelFunc) (*run, error) {
-	id := newRunID()
+// It refuses an ID that already names a run of the device, or that the
+// device cancelled before this request arrived.
+func (s *Server) startRun(deviceID, id, requestSHA256 string, targets int, cancel context.CancelFunc) (*run, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := runKey(deviceID, id)
+	if at, ok := s.cancelled[key]; ok && s.now().Before(at.Add(cancelTombstoneTTL)) {
+		return nil, errRunCancelled
+	}
+	if _, live := s.runs[key]; live {
+		return nil, errRunExists
+	}
 	dir := s.runDir(deviceID, id)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Dir(dir), 0o700); err != nil {
+		return nil, err
+	}
+	if err := os.Mkdir(dir, 0o700); errors.Is(err, os.ErrExist) {
+		return nil, errRunExists
+	} else if err != nil {
 		return nil, err
 	}
 	file, err := os.OpenFile(filepath.Join(dir, fileRunFrames), os.O_CREATE|os.O_EXCL|os.O_WRONLY|os.O_APPEND, 0o600)
@@ -129,22 +149,30 @@ func (s *Server) startRun(deviceID string, targets int, cancel context.CancelFun
 		return nil, err
 	}
 	rn := &run{
-		id: id, deviceID: deviceID, dir: dir,
+		id: id, deviceID: deviceID, dir: dir, requestSHA256: requestSHA256,
 		budget: max(0, s.runMaxBytes()-int64(targets)*runReserveBytes),
-		meta:   runMeta{RunID: id, DeviceID: deviceID, CreatedAt: controlplane.FormatTime(s.now())},
+		meta:   runMeta{RunID: id, DeviceID: deviceID, CreatedAt: controlplane.FormatTime(s.now()), RequestSHA256: requestSHA256},
 		file:   file, wake: make(chan struct{}), cancel: cancel,
 	}
 	if err := rn.writeMeta(); err != nil {
 		_ = file.Close()
 		return nil, err
 	}
-	s.mu.Lock()
 	if s.runs == nil {
 		s.runs = map[string]*run{}
 	}
-	s.runs[id] = rn
-	s.mu.Unlock()
+	s.runs[key] = rn
 	return rn, nil
+}
+
+// tombstone remembers a cancel for a run the gateway has not seen.
+func (s *Server) tombstone(deviceID, id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cancelled == nil {
+		s.cancelled = map[string]time.Time{}
+	}
+	s.cancelled[runKey(deviceID, id)] = s.now()
 }
 
 func (r *run) writeMeta() error {
@@ -248,12 +276,9 @@ func (s *Server) lookupRun(deviceID, id string) (*run, error) {
 		return nil, errRunNotFound
 	}
 	s.mu.Lock()
-	live, ok := s.runs[id]
+	live, ok := s.runs[runKey(deviceID, id)]
 	s.mu.Unlock()
 	if ok {
-		if live.deviceID != deviceID {
-			return nil, errRunNotFound
-		}
 		return live, nil
 	}
 	dir := s.runDir(deviceID, id)
@@ -279,7 +304,7 @@ func (s *Server) lookupRun(deviceID, id string) (*run, error) {
 	if err != nil {
 		return nil, errRunNotFound
 	}
-	return &run{id: id, deviceID: deviceID, dir: dir, meta: meta, size: info.Size(), done: true}, nil
+	return &run{id: id, deviceID: deviceID, dir: dir, requestSHA256: meta.RequestSHA256, meta: meta, size: info.Size(), done: true}, nil
 }
 
 // storedRun is a run on disk that is not running in this process.
@@ -303,7 +328,7 @@ func (s *Server) storedRuns(deviceID string) []storedRun {
 	for _, entry := range entries {
 		id := entry.Name()
 		s.mu.Lock()
-		_, live := s.runs[id]
+		_, live := s.runs[runKey(deviceID, id)]
 		s.mu.Unlock()
 		if live || !remote.ValidRunID(id) {
 			continue
@@ -326,9 +351,13 @@ func (s *Server) storedRuns(deviceID string) []storedRun {
 	return out
 }
 
-// makeRoom evicts deviceID's oldest stored runs until a new run's full spool
-// fits the device's quota.
-func (s *Server) makeRoom(deviceID string) {
+// makeRoom evicts deviceID's oldest stored runs until reserve more bytes fit
+// the device's quota: a full run's worth before a run starts, nothing after
+// one finishes. Calls are serialized so concurrent starts cannot all see the
+// same free space.
+func (s *Server) makeRoom(deviceID string, reserve int64) {
+	s.quotaMu.Lock()
+	defer s.quotaMu.Unlock()
 	runs := s.storedRuns(deviceID)
 	var total int64
 	for _, run := range runs {
@@ -336,7 +365,7 @@ func (s *Server) makeRoom(deviceID string) {
 	}
 	sort.Slice(runs, func(i, j int) bool { return runs[i].at.Before(runs[j].at) })
 	for _, run := range runs {
-		if total+s.runMaxBytes() <= s.runQuotaBytes() {
+		if total+reserve <= s.runQuotaBytes() {
 			return
 		}
 		if err := os.RemoveAll(run.dir); err == nil {
@@ -355,6 +384,11 @@ func (s *Server) sweepRuns() {
 		return
 	}
 	s.nextSweep = now.Add(runSweepEvery)
+	for key, at := range s.cancelled {
+		if !now.Before(at.Add(cancelTombstoneTTL)) {
+			delete(s.cancelled, key)
+		}
+	}
 	s.mu.Unlock()
 	devices, err := os.ReadDir(s.runsDir())
 	if err != nil {
@@ -434,18 +468,18 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request, device con
 
 func (s *Server) handleCancel(w http.ResponseWriter, _ *http.Request, device controlplane.Device, body []byte) {
 	var req remote.ExecCancelRequest
-	if controlplane.DecodeBody(body, &req) != nil {
+	if controlplane.DecodeBody(body, &req) != nil || !remote.ValidRunID(req.RunID) {
 		controlplane.WriteError(w, http.StatusBadRequest, remote.CodeBadRequest, "malformed cancel request")
 		return
 	}
 	rn, err := s.lookupRun(device.ID, req.RunID)
-	if errors.Is(err, errRunInterrupted) || errors.Is(err, errRunBroken) {
-		// Nothing is running; cancelling is a no-op.
-		controlplane.WriteJSON(w, http.StatusOK, remote.ExecCancelResponse{RunID: req.RunID})
-		return
-	}
 	if err != nil {
-		writeRunError(w, err, s.runRetention())
+		// Nothing of this device is running under the ID. Its request may
+		// still be on the way, so refuse it if it arrives.
+		if errors.Is(err, errRunNotFound) {
+			s.tombstone(device.ID, req.RunID)
+		}
+		controlplane.WriteJSON(w, http.StatusOK, remote.ExecCancelResponse{RunID: req.RunID})
 		return
 	}
 	_, done, _, _ := rn.snapshot()
@@ -459,6 +493,10 @@ func writeRunError(w http.ResponseWriter, err error, retention time.Duration) {
 	switch {
 	case errors.Is(err, errRunInterrupted):
 		controlplane.WriteError(w, http.StatusGone, remote.CodeRunInterrupted, "the gateway restarted while this run was in progress; its outcome is unknown (check the gateway audit)")
+	case errors.Is(err, errRunConflict):
+		controlplane.WriteError(w, http.StatusConflict, remote.CodeRunConflict, "this run id was already used for a different request")
+	case errors.Is(err, errRunCancelled):
+		controlplane.WriteError(w, http.StatusConflict, remote.CodeRunCancelled, "this run was cancelled before its request arrived")
 	case errors.Is(err, errRunBroken):
 		controlplane.WriteError(w, http.StatusInternalServerError, remote.CodeInternal, "the gateway could not store this run's output; its outcome is in the gateway audit")
 	default:

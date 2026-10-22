@@ -1,7 +1,9 @@
 package remote
 
 import (
+	"crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -44,6 +46,11 @@ const (
 // device. Stdin is nil for no stdin and non-nil (possibly empty) otherwise; the
 // gateway computes its digest itself.
 type ExecRequest struct {
+	// RunID, when set, is the client's idempotency key: a repeat of the same
+	// request with the same ID joins the existing run instead of starting the
+	// command again, so a client that lost the first response can recover.
+	// The gateway mints one when it is empty.
+	RunID        string `json:"run_id,omitempty"`
 	Host         string `json:"host"`
 	Cmd          string `json:"cmd"`
 	Stdin        []byte `json:"stdin"`
@@ -103,10 +110,23 @@ type ExecCancelResponse struct {
 const (
 	CodeRunNotFound    = "run_not_found"
 	CodeRunInterrupted = "run_interrupted"
+	// CodeRunConflict refuses a run ID reused for a different request.
+	CodeRunConflict = "run_conflict"
+	// CodeRunCancelled refuses a run cancelled before its request arrived.
+	CodeRunCancelled = "run_cancelled"
 )
 
-// ValidRunID reports whether id has the gateway's run ID shape:
-// "rn_" and 32 lowercase hex characters.
+// NewRunID mints a run ID.
+func NewRunID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		panic(fmt.Sprintf("crypto/rand: %v", err))
+	}
+	return "rn_" + hex.EncodeToString(b[:])
+}
+
+// ValidRunID reports whether id has the run ID shape: "rn_" and 32 lowercase
+// hex characters.
 func ValidRunID(id string) bool {
 	hexPart, ok := strings.CutPrefix(id, "rn_")
 	if !ok || len(hexPart) != 32 {
@@ -229,7 +249,10 @@ func FrameSize(payload int) int64 {
 // reattach from Offset delivers every remaining frame exactly once; responses
 // collected before a break are kept.
 type ExecStream struct {
-	RunID     string
+	RunID string
+	// Started is set once a run frame arrived: the gateway has the run, so
+	// the stream is resumed with /exec/attach rather than a repeated /exec.
+	Started   bool
 	Offset    int64
 	responses []runner.Response
 }
@@ -250,7 +273,7 @@ func (s *ExecStream) Read(r io.Reader, stdout, stderr io.Writer) (ExecResult, er
 	if s.RunID != "" && s.RunID != run.RunID {
 		return ExecResult{}, fmt.Errorf("reattached to run %s instead of %s", run.RunID, s.RunID)
 	}
-	s.RunID = run.RunID
+	s.RunID, s.Started = run.RunID, true
 	for {
 		kind, payload, err := ReadFrame(r)
 		if err != nil {
@@ -275,7 +298,10 @@ func (s *ExecStream) Read(r io.Reader, stdout, stderr io.Writer) (ExecResult, er
 			}
 			s.responses = append(s.responses, response)
 		case FrameResult, FrameError:
-			if _, _, err := ReadFrame(r); !errors.Is(err, io.EOF) {
+			// The final frame is complete; only another well-formed frame
+			// after it is a protocol violation. A connection that breaks
+			// before the body ends cleanly loses nothing.
+			if _, _, err := ReadFrame(r); err == nil || errors.Is(err, ErrFrameTooLarge) || errors.Is(err, errUnknownFrame) {
 				return ExecResult{}, errors.New("execution stream continues after its final frame")
 			}
 			s.Offset += FrameSize(len(payload))

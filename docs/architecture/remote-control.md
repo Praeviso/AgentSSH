@@ -90,7 +90,12 @@ an oversized `Content-Length` with 413, and then checks the body against the
 digest. Requests the CLI would reject as usage errors return 400 `usage`; a device over its
 concurrency limit (`serve --max-concurrent`, default 4) gets 429 `busy`.
 
-Each `/exec` is a run with a gateway-minted ID (`rn_` + 32 hex). Its frames,
+Each `/exec` is a run with an ID (`rn_` + 32 hex). The client mints it and
+sends it as `run_id`, an idempotency key: repeating the same request (same body
+digest) with the same ID joins the existing run instead of starting the command
+again, so a client whose first response was lost recovers without running the
+command twice; reusing the ID for a different request is `409 run_conflict`.
+The gateway mints an ID when none is sent. Its frames,
 `type:1 | length:4 big-endian | payload`, are spooled under `runs/<device-id>/<id>/`:
 stdout (1) and stderr (2) data frames of at most 64 KiB, sent only when the
 request asks to stream a single-host run; then one response frame (5) per
@@ -108,7 +113,9 @@ live run until its final frame. The run does not depend on the connection: a
 dropped request only detaches the device, and the client reattaches from the
 byte offset of the complete frames it has consumed, so every frame arrives
 exactly once and the command runs once. Only `POST /exec/cancel {run_id}` or
-`serve --exec-timeout` (default 30m) stops a run; the gateway then sends the
+`serve --exec-timeout` (default 30m) stops a run. A cancel for an ID the
+gateway has not seen answers `cancelled: false` and refuses that request for
+10 minutes (`409 run_cancelled`), since a cancel can overtake its own request; the gateway then sends the
 remote command `SIGTERM` before closing the SSH connection. A device's
 concurrency slot is held until its run finishes.
 
@@ -121,7 +128,8 @@ per target: output beyond it is dropped, responses that no longer fit lose
 their output (`output_truncated`), and the result says `truncated: true` with
 the exit code raised to at least 1, so a partial result never passes for a
 complete one. A device keeps at most `serve --run-quota-bytes` (default
-512 MiB) of finished runs: before a new run starts, its oldest runs are evicted
+512 MiB) of finished runs: before a new run starts and again when one finishes (runs that start
+together each see the same free space), its oldest runs are evicted
 (and then answer `run_not_found`). With the concurrency limit, one device
 occupies at most quota + `--max-concurrent` × `--run-max-bytes` on disk. The request must arrive within the 60 s proof lifetime;
 ingresses must stream responses (the gateway sends `X-Accel-Buffering: no`).

@@ -62,6 +62,13 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, device contr
 		controlplane.WriteError(w, http.StatusBadRequest, remote.CodeUsage, err.Error())
 		return
 	}
+	sum := sha256.Sum256(body)
+	requestSHA256 := hex.EncodeToString(sum[:])
+	// A repeated request for a run that already exists joins it, so a client
+	// that lost the first response neither loses the run nor starts it twice.
+	if req.RunID != "" && s.joinRun(w, r, device.ID, req.RunID, requestSHA256) {
+		return
+	}
 	cfg, err := s.Store.Config(device.ID)
 	if errors.Is(err, controlplane.ErrNotFound) {
 		controlplane.WriteError(w, http.StatusNotFound, remote.CodeNoConfig, "no configuration has been pushed for this device")
@@ -99,16 +106,28 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, device contr
 		return
 	}
 	s.sweepRuns()
-	s.makeRoom(device.ID)
+	s.makeRoom(device.ID, s.runMaxBytes())
 	// The run outlives this request: a dropped connection only detaches the
 	// device, and /exec/cancel or the timeout stops the command.
 	ctx, cancel := context.WithTimeout(context.Background(), s.execTimeout())
-	rn, err := s.startRun(device.ID, len(resolved.Targets), cancel)
+	id := req.RunID
+	if id == "" {
+		id = remote.NewRunID()
+	}
+	rn, err := s.startRun(device.ID, id, requestSHA256, len(resolved.Targets), cancel)
 	if err != nil {
 		cancel()
 		s.release(device.ID)
-		log.Printf("agentssh-gateway: device %s: create run: %v", device.ID, err)
-		controlplane.WriteError(w, http.StatusInternalServerError, remote.CodeInternal, "run storage unavailable")
+		switch {
+		case errors.Is(err, errRunExists):
+			// A concurrent repeat of this request started it first.
+			s.joinRun(w, r, device.ID, id, requestSHA256)
+		case errors.Is(err, errRunCancelled):
+			writeRunError(w, err, s.runRetention())
+		default:
+			log.Printf("agentssh-gateway: device %s: create run: %v", device.ID, err)
+			controlplane.WriteError(w, http.StatusInternalServerError, remote.CodeInternal, "run storage unavailable")
+		}
 		return
 	}
 	exec := s.executor(inv)
@@ -157,8 +176,11 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, device contr
 func (s *Server) execute(ctx context.Context, rn *run, env runner.Env, request runner.Request) {
 	defer func() {
 		s.mu.Lock()
-		delete(s.runs, rn.id)
+		delete(s.runs, runKey(rn.deviceID, rn.id))
 		s.mu.Unlock()
+		// Runs that started together each saw the same free space; enforce
+		// the quota again now that this one is stored.
+		s.makeRoom(rn.deviceID, 0)
 	}()
 	outcome, err := runner.Run(ctx, env, request)
 	if err != nil {
@@ -185,7 +207,35 @@ func (s *Server) execute(ctx context.Context, rn *run, env runner.Env, request r
 	rn.finish(remote.FrameResult, payload, s.now())
 }
 
+// joinRun streams deviceID's existing run id to a repeated request. It
+// reports false when there is no such run, so the caller starts one.
+func (s *Server) joinRun(w http.ResponseWriter, r *http.Request, deviceID, id, requestSHA256 string) bool {
+	s.mu.Lock()
+	at, cancelled := s.cancelled[runKey(deviceID, id)]
+	s.mu.Unlock()
+	if cancelled && s.now().Before(at.Add(cancelTombstoneTTL)) {
+		writeRunError(w, errRunCancelled, s.runRetention())
+		return true
+	}
+	rn, err := s.lookupRun(deviceID, id)
+	if errors.Is(err, errRunNotFound) {
+		return false
+	}
+	if err == nil && rn.requestSHA256 != requestSHA256 {
+		err = errRunConflict
+	}
+	if err != nil {
+		writeRunError(w, err, s.runRetention())
+		return true
+	}
+	s.streamRun(w, r.Context(), rn, 0)
+	return true
+}
+
 func validateExec(req remote.ExecRequest) error {
+	if req.RunID != "" && !remote.ValidRunID(req.RunID) {
+		return errors.New("run id must be rn_ followed by 32 lowercase hex characters")
+	}
 	switch {
 	case strings.TrimSpace(req.Host) == "":
 		return errors.New("a target host or group is required")

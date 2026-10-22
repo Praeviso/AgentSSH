@@ -73,8 +73,13 @@ func TestOnlyTheStartingDeviceCanReattachOrCancel(t *testing.T) {
 	other := f.enroll(t, "other-agent")
 	_, err = other.Attach(context.Background(), result.RunID, io.Discard, io.Discard)
 	runNotFound(t, err)
-	_, err = other.Cancel(context.Background(), result.RunID)
-	runNotFound(t, err)
+	// Another device's cancel reveals nothing and touches nothing.
+	if cancelled, err := other.Cancel(context.Background(), result.RunID); err != nil || cancelled {
+		t.Fatalf("other device cancel: %v %v", cancelled, err)
+	}
+	if _, err := f.client.Attach(context.Background(), result.RunID, io.Discard, io.Discard); err != nil {
+		t.Fatalf("owner's run affected by another device: %v", err)
+	}
 	// The owner still can; the run has finished, so nothing is cancelled.
 	if cancelled, err := f.client.Cancel(context.Background(), result.RunID); err != nil || cancelled {
 		t.Fatalf("owner cancel of a finished run: %v %v", cancelled, err)
@@ -211,5 +216,117 @@ func TestDeviceRunsAreKeptWithinAQuota(t *testing.T) {
 	runNotFound(t, err)
 	if _, err := f.client.Attach(context.Background(), ids[3], io.Discard, io.Discard); err != nil {
 		t.Fatalf("newest run evicted: %v", err)
+	}
+}
+
+// The gateway accepted /exec but the response never arrived: repeating the
+// request with the same run ID joins the run instead of starting it again.
+func TestLostFirstResponseJoinsTheRun(t *testing.T) {
+	f, host := execGateway(t)
+	f.dropNextExec.Store(true)
+	stdout := &chunkWriter{chunks: make(chan string, 8)}
+	done := make(chan error, 1)
+	var result remote.ExecResult
+	go func() {
+		req := execReq("stream")
+		req.Stream = true
+		var err error
+		result, err = f.client.Exec(context.Background(), req, stdout, io.Discard)
+		done <- err
+	}()
+	if chunk := <-stdout.chunks; chunk != "chunk-1\n" {
+		t.Fatalf("first chunk after the lost response = %q", chunk)
+	}
+	close(host.release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if result.ExitCode != 0 || stdout.buf.String() != "chunk-1\nchunk-2\n" {
+		t.Fatalf("result %+v stdout %q", result, stdout.buf.String())
+	}
+	if n := host.runs("stream"); n != 1 {
+		t.Fatalf("remote command ran %d times, want once", n)
+	}
+}
+
+func TestRunIDReuseJoinsTheSameRequestAndRefusesAnother(t *testing.T) {
+	f, host := execGateway(t)
+	req := execReq("uptime")
+	req.RunID = remote.NewRunID()
+	first, err := f.client.Exec(context.Background(), req, io.Discard, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := f.client.Exec(context.Background(), req, io.Discard, io.Discard)
+	if err != nil || again.RunID != first.RunID || again.Responses[0].ReqID != first.Responses[0].ReqID {
+		t.Fatalf("repeat did not join the run: %+v %v", again, err)
+	}
+	if n := host.runs("uptime"); n != 1 {
+		t.Fatalf("uptime ran %d times, want once", n)
+	}
+	other := execReq("cat")
+	other.RunID = req.RunID
+	_, err = f.client.Exec(context.Background(), other, io.Discard, io.Discard)
+	var apiErr *remote.APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != remote.CodeRunConflict || apiErr.Status != 409 {
+		t.Fatalf("different request with a used run id: %v", err)
+	}
+}
+
+// A cancel can overtake its own request; the request is then refused, so the
+// command never starts.
+func TestCancelBeforeTheRequestArrivesRefusesIt(t *testing.T) {
+	f, host := execGateway(t)
+	req := execReq("uptime")
+	req.RunID = remote.NewRunID()
+	if cancelled, err := f.client.Cancel(context.Background(), req.RunID); err != nil || cancelled {
+		t.Fatalf("cancel of a run not yet seen: %v %v", cancelled, err)
+	}
+	_, err := f.client.Exec(context.Background(), req, io.Discard, io.Discard)
+	var apiErr *remote.APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != remote.CodeRunCancelled {
+		t.Fatalf("exec after its cancel: %v", err)
+	}
+	if n := host.runs("uptime"); n != 0 {
+		t.Fatalf("cancelled command ran %d times", n)
+	}
+}
+
+// Runs that start together each see the same free space; the quota still
+// holds once they have all finished.
+func TestConcurrentRunsStayWithinTheQuota(t *testing.T) {
+	f, _ := execGateway(t)
+	f.server.RunMaxBytes = 64 << 10
+	f.server.RunQuotaBytes = 128 << 10
+	req := execReq("flood")
+	req.Stream = true
+	errs := make(chan error, 4)
+	for range 4 {
+		go func() {
+			_, err := f.client.Exec(context.Background(), req, io.Discard, io.Discard)
+			errs <- err
+		}()
+	}
+	for range 4 {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var total int64
+		runs, _ := filepath.Glob(filepath.Join(f.dir, "runs", f.client.State.DeviceID, "rn_*", "frames"))
+		for _, path := range runs {
+			if info, err := os.Stat(path); err == nil {
+				total += info.Size()
+			}
+		}
+		if total <= f.server.RunQuotaBytes {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("device keeps %d bytes of runs after concurrent starts, quota %d", total, f.server.RunQuotaBytes)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }

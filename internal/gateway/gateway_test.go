@@ -1,13 +1,16 @@
 package gateway_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -26,12 +29,15 @@ type fixture struct {
 	base    string
 	ingress *httptest.Server
 	// down makes the ingress answer 503, like a gateway that is unreachable.
-	down   *atomic.Bool
-	dir    string
-	store  *controlplane.Store
-	keys   *controlplane.Keys
-	server *gateway.Server
-	client *remoteclient.Client
+	down *atomic.Bool
+	// dropNextExec lets the gateway handle the next /exec but loses its
+	// whole response, as if the connection died right after the request.
+	dropNextExec *atomic.Bool
+	dir          string
+	store        *controlplane.Store
+	keys         *controlplane.Keys
+	server       *gateway.Server
+	client       *remoteclient.Client
 }
 
 // enrolledGateway runs an in-process gateway behind a TLS ingress and enrolls
@@ -65,10 +71,20 @@ func enrolledGateway(t *testing.T) *fixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	down := new(atomic.Bool)
+	down, dropNextExec := new(atomic.Bool), new(atomic.Bool)
 	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if down.Load() {
 			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, remote.PathExec) && dropNextExec.CompareAndSwap(true, false) {
+			body, _ := io.ReadAll(r.Body)
+			if conn, _, err := http.NewResponseController(w).Hijack(); err == nil {
+				_ = conn.Close()
+			}
+			r = r.WithContext(context.Background())
+			r.Body = io.NopCloser(bytes.NewReader(body))
+			handler.ServeHTTP(httptest.NewRecorder(), r)
 			return
 		}
 		handler.ServeHTTP(w, r)
@@ -81,7 +97,7 @@ func enrolledGateway(t *testing.T) *fixture {
 	http.DefaultTransport = transport
 	t.Cleanup(func() { http.DefaultTransport = original; transport.CloseIdleConnections() })
 
-	f := &fixture{base: base, ingress: ingress, down: down, dir: dir, store: store, keys: keys, server: server}
+	f := &fixture{base: base, ingress: ingress, down: down, dropNextExec: dropNextExec, dir: dir, store: store, keys: keys, server: server}
 	f.client = f.enroll(t, "agent-vm")
 	return f
 }
