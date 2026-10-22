@@ -2,18 +2,37 @@ package gateway_test
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
+	"github.com/Praeviso/AgentSSH/internal/controlplane"
+	"github.com/Praeviso/AgentSSH/internal/gateway"
 	"github.com/Praeviso/AgentSSH/internal/remote"
 	"github.com/Praeviso/AgentSSH/internal/remoteclient"
 )
+
+// spools lists the spool files on disk: one run's, or the device's when runID
+// is empty.
+func spools(t *testing.T, f *fixture, runID string) (paths []string, bytes int64) {
+	t.Helper()
+	pattern := "*.frames"
+	if runID != "" {
+		pattern = runID + ".*.frames"
+	}
+	paths, _ = filepath.Glob(filepath.Join(f.dir, "runs", f.client.State.DeviceID, pattern))
+	for _, path := range paths {
+		if info, err := os.Stat(path); err == nil {
+			bytes += info.Size()
+		}
+	}
+	return paths, bytes
+}
 
 func runNotFound(t *testing.T, err error) {
 	t.Helper()
@@ -102,9 +121,8 @@ func TestReattachAfterRetentionIsRefused(t *testing.T) {
 	if !strings.Contains(err.Error(), "expired") {
 		t.Fatalf("refusal does not explain expiry: %v", err)
 	}
-	dir := filepath.Join(f.dir, "runs", f.client.State.DeviceID, req.RunID)
-	if _, statErr := os.Stat(filepath.Join(dir, "frames")); !os.IsNotExist(statErr) {
-		t.Fatalf("expired output still on disk: %v", statErr)
+	if paths, _ := spools(t, f, req.RunID); len(paths) != 0 {
+		t.Fatalf("expired output still on disk: %v", paths)
 	}
 	// The ID is remembered: repeating the original request (a client
 	// recovering a lost response) must not run the command a second time.
@@ -139,7 +157,7 @@ func TestCancelOfAFinishedRunKeepsItJoinable(t *testing.T) {
 // is non-zero, live and on replay alike.
 func TestRunBeyondItsCapIsTruncatedAndFails(t *testing.T) {
 	f, _ := execGateway(t)
-	f.server.RunMaxBytes = 32 << 10
+	f.server.RunMaxBytes = 48 << 10
 	req := execReq("flood")
 	req.Stream = true
 	var streamed strings.Builder
@@ -154,7 +172,7 @@ func TestRunBeyondItsCapIsTruncatedAndFails(t *testing.T) {
 		}
 	}
 	check("live", result)
-	if streamed.Len() == 0 || streamed.Len() > 32<<10 || streamed.Len()%1024 != 0 {
+	if streamed.Len() == 0 || streamed.Len() > 48<<10 || streamed.Len()%1024 != 0 {
 		t.Fatalf("streamed %d bytes, want whole lines up to the cap", streamed.Len())
 	}
 	replay, err := f.client.Attach(context.Background(), result.RunID, io.Discard, io.Discard)
@@ -162,31 +180,108 @@ func TestRunBeyondItsCapIsTruncatedAndFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	check("replay", replay)
-	if info, err := os.Stat(filepath.Join(f.dir, "runs", f.client.State.DeviceID, result.RunID, "frames")); err != nil || info.Size() > 32<<10 {
-		t.Fatalf("spool size: %v %v", info, err)
+	if paths, size := spools(t, f, result.RunID); len(paths) != 1 || size > f.server.RunMaxBytes {
+		t.Fatalf("spool %v is %d bytes, cap %d", paths, size, f.server.RunMaxBytes)
 	}
 }
 
 func TestRunLostToARestartIsReportedAsInterrupted(t *testing.T) {
-	f, _ := execGateway(t)
-	// What a gateway that died mid-run leaves behind: a record without a
-	// finish time.
-	id := "rn_abcdefabcdefabcdefabcdefabcdefab"
-	dir := filepath.Join(f.dir, "runs", f.client.State.DeviceID, id)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	meta, _ := json.Marshal(map[string]string{"run_id": id, "device_id": f.client.State.DeviceID, "created_at": time.Now().UTC().Format(time.RFC3339Nano)})
-	if err := os.WriteFile(filepath.Join(dir, "meta.json"), meta, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "frames"), nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	_, err := f.client.Attach(context.Background(), id, io.Discard, io.Discard)
+	f, host := execGateway(t)
+	f.server.ExecTimeout = 2 * time.Second // lets the orphaned command end
+	req := execReq("sleep")
+	req.RunID = remote.NewRunID()
+	go func() { _, _ = f.client.Exec(context.Background(), req, io.Discard, io.Discard) }()
+	host.waitEvent(t, "sleep-started")
+	f.restart(t)
+	_, err := f.client.Attach(context.Background(), req.RunID, io.Discard, io.Discard)
 	var apiErr *remote.APIError
 	if !errors.As(err, &apiErr) || apiErr.Code != remote.CodeRunInterrupted || apiErr.Status != 410 {
 		t.Fatalf("err = %v, want 410 %s", err, remote.CodeRunInterrupted)
+	}
+}
+
+// A cancel that overtook its request is remembered on disk, so the request
+// is refused even when it reaches a restarted gateway.
+func TestEarlyCancelSurvivesARestart(t *testing.T) {
+	f, host := execGateway(t)
+	req := execReq("uptime")
+	req.RunID = remote.NewRunID()
+	if cancelled, err := f.client.Cancel(context.Background(), req.RunID); err != nil || cancelled {
+		t.Fatalf("cancel: %v %v", cancelled, err)
+	}
+	f.restart(t)
+	_, err := f.client.Exec(context.Background(), req, io.Discard, io.Discard)
+	var apiErr *remote.APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != remote.CodeRunCancelled {
+		t.Fatalf("exec after cancel and restart: %v", err)
+	}
+	if n := host.runs("uptime"); n != 0 {
+		t.Fatalf("cancelled command ran %d times", n)
+	}
+}
+
+// A run whose claim fails (say, a full disk) leaves nothing behind, so the
+// same request starts it once storage recovers.
+func TestFailedClaimLeavesNothingBehind(t *testing.T) {
+	f, host := execGateway(t)
+	restore := gateway.FailNextClaim(syscall.ENOSPC)
+	defer restore()
+	req := execReq("uptime")
+	req.RunID = remote.NewRunID()
+	_, err := f.client.Exec(context.Background(), req, io.Discard, io.Discard)
+	var apiErr *remote.APIError
+	if !errors.As(err, &apiErr) || apiErr.Status != 500 {
+		t.Fatalf("exec with storage failing: %v", err)
+	}
+	if paths, _ := spools(t, f, req.RunID); len(paths) != 0 {
+		t.Fatalf("failed attempt left %v", paths)
+	}
+	if _, err := os.Stat(filepath.Join(f.dir, "runs", f.client.State.DeviceID, req.RunID+".json")); !os.IsNotExist(err) {
+		t.Fatalf("failed attempt left a record: %v", err)
+	}
+	result, err := f.client.Exec(context.Background(), req, io.Discard, io.Discard)
+	if err != nil || result.ExitCode != 0 {
+		t.Fatalf("retry after storage recovered: %+v %v", result, err)
+	}
+	if n := host.runs("uptime"); n != 1 {
+		t.Fatalf("uptime ran %d times, want once", n)
+	}
+}
+
+// The per-run cap is hard: when even a response without its output does not
+// fit, a minimal one does, and the spool stays within the cap.
+func TestRunCapHoldsWhenResponseMetadataIsLarge(t *testing.T) {
+	f, _ := execGateway(t)
+	f.server.RunMaxBytes = 40 << 10
+	// A gray-zone command whose approval matcher alone is far larger than
+	// the cap.
+	cmd := strings.Repeat("<", 100<<10)
+	result, err := f.client.Exec(context.Background(), execReq(cmd), io.Discard, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := result.Responses[0]
+	if !result.Truncated || result.ExitCode != 7 || got.Status != "approval_pending" || got.ApprovalID == "" || !got.OutputTruncated {
+		t.Fatalf("result = %+v", result)
+	}
+	if _, size := spools(t, f, result.RunID); size > f.server.RunMaxBytes {
+		t.Fatalf("spool is %d bytes, cap %d", size, f.server.RunMaxBytes)
+	}
+	// A group whose minimal responses cannot fit is refused up front.
+	inv := `host_key_policy: accept-new
+hosts:
+  web-1: {addr: 127.0.0.1, port: 22, user: deploy, identity: web, tags: [web]}
+  web-2: {addr: 127.0.0.1, port: 22, user: deploy, identity: web, tags: [web]}
+groups:
+  web: {tags: [web]}
+`
+	if _, err := controlplane.PushConfig(f.store, f.client.State.DeviceID, inv, testPolicy, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	_, err = f.client.Exec(context.Background(), remote.ExecRequest{Host: "web", Cmd: "uptime", Session: "s_test"}, io.Discard, io.Discard)
+	var apiErr *remote.APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != remote.CodeUsage || !strings.Contains(apiErr.Message, "--run-max-bytes") {
+		t.Fatalf("oversized group: %v", err)
 	}
 }
 
@@ -229,16 +324,7 @@ func TestDeviceRunsAreKeptWithinAQuota(t *testing.T) {
 		}
 		ids = append(ids, result.RunID)
 	}
-	var total int64
-	runs, _ := filepath.Glob(filepath.Join(f.dir, "runs", f.client.State.DeviceID, "rn_*", "frames"))
-	for _, path := range runs {
-		info, err := os.Stat(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		total += info.Size()
-	}
-	if total > f.server.RunQuotaBytes {
+	if _, total := spools(t, f, ""); total > f.server.RunQuotaBytes {
 		t.Fatalf("device keeps %d bytes of runs, quota %d", total, f.server.RunQuotaBytes)
 	}
 	_, err := f.client.Attach(context.Background(), ids[0], io.Discard, io.Discard)
@@ -352,13 +438,7 @@ func TestConcurrentRunsStayWithinTheQuota(t *testing.T) {
 	}
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		var total int64
-		runs, _ := filepath.Glob(filepath.Join(f.dir, "runs", f.client.State.DeviceID, "rn_*", "frames"))
-		for _, path := range runs {
-			if info, err := os.Stat(path); err == nil {
-				total += info.Size()
-			}
-		}
+		_, total := spools(t, f, "")
 		if total <= f.server.RunQuotaBytes {
 			return
 		}

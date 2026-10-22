@@ -120,10 +120,13 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, device contr
 		s.release(device.ID)
 		switch {
 		case errors.Is(err, errRunExists):
-			// A concurrent repeat of this request started it first.
-			s.joinRun(w, r, device.ID, id, requestSHA256)
-		case errors.Is(err, errRunCancelled):
-			writeRunError(w, err, s.runRetention())
+			// The ID was claimed meanwhile: by a concurrent repeat of this
+			// request, a different request, or a cancel that overtook it.
+			if !s.joinRun(w, r, device.ID, id, requestSHA256) {
+				controlplane.WriteError(w, http.StatusInternalServerError, remote.CodeInternal, "run record changed while starting; retry")
+			}
+		case errors.Is(err, errRunTooLarge):
+			controlplane.WriteError(w, http.StatusBadRequest, remote.CodeUsage, fmt.Sprintf("%s has %d hosts; --run-max-bytes on the gateway allows at most %d per run", req.Host, len(resolved.Targets), s.maxRunTargets()))
 		default:
 			log.Printf("agentssh-gateway: device %s: create run: %v", device.ID, err)
 			controlplane.WriteError(w, http.StatusInternalServerError, remote.CodeInternal, "run storage unavailable")
@@ -175,11 +178,8 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, device contr
 // result frame (or an error frame).
 func (s *Server) execute(ctx context.Context, rn *run, env runner.Env, request runner.Request) {
 	defer func() {
-		s.mu.Lock()
-		delete(s.runs, runKey(rn.deviceID, rn.id))
-		s.mu.Unlock()
-		// Runs that started together each saw the same free space; enforce
-		// the quota again now that this one is stored.
+		s.endRun(rn)
+		// Settle any quota overshoot now that this run is stored.
 		s.makeRoom(rn.deviceID, 0)
 	}()
 	outcome, err := runner.Run(ctx, env, request)
@@ -207,20 +207,14 @@ func (s *Server) execute(ctx context.Context, rn *run, env runner.Env, request r
 	rn.finish(remote.FrameResult, payload, s.now())
 }
 
-// joinRun streams deviceID's existing run id to a repeated request. It
-// reports false when there is no such run, so the caller starts one.
+// joinRun answers a request whose run ID is already claimed: it streams the
+// run to a repeat of the same request, and refuses a different request, an
+// ID cancelled before its request arrived, and an expired or interrupted
+// run. It reports false only when the ID was never claimed, so the caller
+// starts the run.
 func (s *Server) joinRun(w http.ResponseWriter, r *http.Request, deviceID, id, requestSHA256 string) bool {
-	s.mu.Lock()
-	at, cancelled := s.cancelled[runKey(deviceID, id)]
-	s.mu.Unlock()
-	if cancelled && s.now().Before(at.Add(cancelTombstoneTTL)) {
-		writeRunError(w, errRunCancelled, s.runRetention())
-		return true
-	}
 	rn, err := s.lookupRun(deviceID, id)
 	if errors.Is(err, errRunNotFound) {
-		// Never seen. An evicted or expired ID is not "not found": it
-		// answers expired below and never runs the command again.
 		return false
 	}
 	if err == nil && rn.requestSHA256 != requestSHA256 {

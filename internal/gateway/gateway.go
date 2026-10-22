@@ -65,9 +65,7 @@ type Server struct {
 	running   map[string]int
 	signers   map[string]ssh.Signer
 	runs      map[string]*run
-	cancelled map[string]time.Time
 	nextSweep time.Time
-	quotaMu   sync.Mutex
 }
 
 // NewServer wires a data directory, its store and unlocked keys into an API

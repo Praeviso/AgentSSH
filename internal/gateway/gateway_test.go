@@ -28,6 +28,7 @@ func init() {
 type fixture struct {
 	base    string
 	ingress *httptest.Server
+	handler *atomic.Pointer[http.Handler]
 	// down makes the ingress answer 503, like a gateway that is unreachable.
 	down *atomic.Bool
 	// dropNextExec lets the gateway handle the next /exec but loses its
@@ -67,12 +68,15 @@ func enrolledGateway(t *testing.T) *fixture {
 	t.Cleanup(ingress.Close)
 	base := ingress.URL + "/agentssh"
 	server := gateway.NewServer(dir, store, keys)
-	handler, err := server.Handler(base)
+	first, err := server.Handler(base)
 	if err != nil {
 		t.Fatal(err)
 	}
+	current := new(atomic.Pointer[http.Handler])
+	current.Store(&first)
 	down, dropNextExec := new(atomic.Bool), new(atomic.Bool)
 	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handler := *current.Load()
 		if down.Load() {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
@@ -97,9 +101,22 @@ func enrolledGateway(t *testing.T) *fixture {
 	http.DefaultTransport = transport
 	t.Cleanup(func() { http.DefaultTransport = original; transport.CloseIdleConnections() })
 
-	f := &fixture{base: base, ingress: ingress, down: down, dropNextExec: dropNextExec, dir: dir, store: store, keys: keys, server: server}
+	f := &fixture{base: base, ingress: ingress, handler: current, down: down, dropNextExec: dropNextExec, dir: dir, store: store, keys: keys, server: server}
 	f.client = f.enroll(t, "agent-vm")
 	return f
+}
+
+// restart replaces the gateway with a new process over the same data
+// directory: nothing in memory survives, the old process's runs are left to
+// finish on their own.
+func (f *fixture) restart(t *testing.T) {
+	t.Helper()
+	f.server = gateway.NewServer(f.dir, f.store, f.keys)
+	handler, err := f.server.Handler(f.base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.handler.Store(&handler)
 }
 
 // enroll enrolls another device home with the real client.

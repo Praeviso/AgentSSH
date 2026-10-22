@@ -95,45 +95,60 @@ sends it as `run_id`, an idempotency key: repeating the same request (same body
 digest) with the same ID joins the existing run instead of starting the command
 again, so a client whose first response was lost recovers without running the
 command twice; reusing the ID for a different request is `409 run_conflict`.
-The gateway mints an ID when none is sent. Its frames,
-`type:1 | length:4 big-endian | payload`, are spooled under `runs/<device-id>/<id>/`:
-stdout (1) and stderr (2) data frames of at most 64 KiB, sent only when the
-request asks to stream a single-host run; then one response frame (5) per
-target with its `run --json` object; then a result frame (3,
-`{exit_code, truncated}`). An error frame (4, `ErrorResponse`) may replace
-everything after the data frames. Response, result and error frames are at most
-16 MiB: the gateway caps each stream's output at 1 MiB unless the policy's
-`output.max_bytes` is lower (applied before auditing, so the audit hash covers
-what is returned), which keeps a response within one frame even when JSON
-escapes every byte.
+The gateway mints an ID when none is sent.
+
+A run's frames, `type:1 | length:4 big-endian | payload`, are: stdout (1) and
+stderr (2) data frames of at most 64 KiB, sent only when the request asks to
+stream a single-host run; then one response frame (5) per target with its
+`run --json` object; then a result frame (3, `{exit_code, truncated}`). An
+error frame (4, `ErrorResponse`) may replace everything after the data frames.
+Response, result and error frames are at most 16 MiB: the gateway caps each
+stream's output at 1 MiB unless the policy's `output.max_bytes` is lower
+(applied before auditing, so the audit hash covers what is returned), which
+keeps a response within one frame even when JSON escapes every byte.
 
 Every `/exec` and `POST /exec/attach {run_id, offset}` response starts with a
-run frame (6, `{run_id}`) followed by the spool from the offset, following a
-live run until its final frame. The run does not depend on the connection: a
-dropped request only detaches the device, and the client reattaches from the
-byte offset of the complete frames it has consumed, so every frame arrives
-exactly once and the command runs once. Only `POST /exec/cancel {run_id}` or
-`serve --exec-timeout` (default 30m) stops a run. A cancel for an ID the
-gateway has not seen answers `cancelled: false` and refuses that request for
-10 minutes (`409 run_cancelled`), since a cancel can overtake its own request; the gateway then sends the
-remote command `SIGTERM` before closing the SSH connection. A device's
-concurrency slot is held until its run finishes.
+run frame (6, `{run_id}`) followed by the run's frames from the offset,
+following a live run until its final frame. The run does not depend on the
+connection: a dropped request only detaches the device, and the client
+reattaches from the byte offset of the complete frames it has consumed, so
+every frame arrives exactly once and the command runs once. Only
+`POST /exec/cancel {run_id}` or `serve --exec-timeout` (default 30m) stops a
+run; the gateway then sends the remote command `SIGTERM` before closing the SSH
+connection. A device's concurrency slot is held until its run finishes.
 
-Runs belong to the device that started them; another device's, unknown, and
-expired runs are all `404 run_not_found`. Finished runs stay reattachable for
-`serve --run-retention` (default 24h); a run left unfinished by a gateway
-restart is `410 run_interrupted` (its outcome is in the audit). Each run keeps
-at most `serve --run-max-bytes` (default 64 MiB) of frames, holding back 16 KiB
-per target: output beyond it is dropped, responses that no longer fit lose
-their output (`output_truncated`), and the result says `truncated: true` with
-the exit code raised to at least 1, so a partial result never passes for a
-complete one. A device keeps at most `serve --run-quota-bytes` (default
-512 MiB) of finished runs: before a new run starts and again when one finishes (runs that start
-together each see the same free space), its oldest runs are evicted
-(and then answer `run_not_found`). Expiry and eviction delete a run's output
-but keep its small record for another retention period, so a repeat of its
-request is refused rather than running the command a second time. With the concurrency limit, one device
-occupies at most quota + `--max-concurrent` × `--run-max-bytes` on disk. The request must arrive within the 60 s proof lifetime;
+**Run records.** Each run ID has one record, `runs/<device-id>/<run-id>.json`,
+which is the single source of truth; the frames live beside it in a spool the
+record names. A record appears whole or not at all, and publishing it
+exclusively is the only way to claim an ID, so a start and a cancel that
+overtook its own request race on the same publish and the first wins, durably
+across restarts. Everything an attempt writes before its claim is private and
+removed if the claim fails. States:
+
+| State | Meaning | Answer to attach / a repeated `/exec` |
+| --- | --- | --- |
+| `running` (live) | in progress | streams it |
+| `running` (not live after a restart) | outcome unknown, see the audit | `410 run_interrupted` |
+| `finished` | output kept for `serve --run-retention` (default 24h) | streams it |
+| `evicted` | output deleted (retention or quota); record kept another retention period | `404 run_not_found`, never re-run |
+| `cancelled` | a cancel arrived first; kept 10 minutes | `409 run_cancelled` |
+
+Runs belong to the device that started them; another device's and unknown IDs
+are `404 run_not_found` too, and a cancel of an ID that is not live answers
+`cancelled: false` either way.
+
+**Space.** A run's spool is hard-capped at `serve --run-max-bytes` (default
+64 MiB). Space is reserved up front for each target's response in a minimal
+form (32 KiB, a proven bound) and for the result frame, so a group with more
+targets than the cap can hold is refused as a usage error. Output beyond the
+cap is dropped; a response that no longer fits is sent without its output, or
+in its minimal form (`output_truncated`); the result then says
+`truncated: true` with the exit code raised to at least 1, so a partial result
+never passes for a complete one. A device keeps at most
+`serve --run-quota-bytes` (default 512 MiB) of finished output: before a run
+starts and again when one finishes, its oldest finished runs are evicted. One
+device therefore occupies at most quota + `--max-concurrent` ×
+`--run-max-bytes`. The request must arrive within the 60 s proof lifetime;
 ingresses must stream responses (the gateway sends `X-Accel-Buffering: no`).
 
 Every run is recorded in one hash chain per gateway, `audit.jsonl`, with

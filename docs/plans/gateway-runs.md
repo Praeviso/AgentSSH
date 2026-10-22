@@ -149,6 +149,30 @@ protocol refusals end it. On context cancellation it sends `/exec/cancel`
     quota eviction, repeating the original request does not run the command;
     with the old delete-everything eviction both tests see a second run.
 
+- [x] Root-cause rework after the third review round (a6b5c7d): durable
+  in-memory-only tombstones, stripped responses not rechecked against the cap,
+  and a partial run directory wedging its ID. Like the earlier findings (lost
+  first response, cancel TOCTOU, evicted IDs forgotten, and the approval
+  create-then-write race fixed in #27), each came from run state being spread
+  over pieces created and updated separately: a memory map, a tombstone map, a
+  directory, `meta.json`, the spool. Storage (`internal/gateway/runstore.go`)
+  now has one record per run ID, published whole and exclusively as the only
+  way to claim the ID; a cancel that overtakes its request claims it as
+  `cancelled`, so the race is decided on disk and survives restarts; the
+  spool is private to its attempt (`<id>.<nonce>.frames`) until the record
+  names it, and removed on a failed claim; later transitions rewrite the
+  record atomically; memory only caches live runs. The cap is enforced at the
+  single write point, with a reserve per target equal to the proven size
+  bound of a minimal response (`TestMinimalResponseFitsItsReserve`), falling
+  back whole → without output → minimal. Tests: early cancel then restart
+  refuses the request; a failed claim (injected ENOSPC) leaves no record or
+  spool and the same request then runs once; a gray-zone command with a
+  matcher far larger than the cap still yields a minimal pending response and
+  a spool within the cap; an oversized group is a usage error; a real restart
+  mid-run is `run_interrupted`. Mutation checks: dropping the durable
+  tombstone, the cleanup on claim failure, or the minimal fallback each fails
+  exactly its test.
+
 ## Validation
 
 ```
