@@ -1,4 +1,4 @@
-package remoteserver
+package controlplane
 
 import (
 	"crypto/rand"
@@ -21,13 +21,13 @@ func (s *Store) CreateEnrollToken(name, publicURL, fingerprint string, ttl time.
 	if _, err := rand.Read(secret); err != nil {
 		return remote.EnrollToken{}, err
 	}
-	token := remote.EnrollToken{ID: "et_" + randomHex(6), Secret: base64.RawURLEncoding.EncodeToString(secret),
+	token := remote.EnrollToken{ID: "et_" + RandomHex(6), Secret: base64.RawURLEncoding.EncodeToString(secret),
 		ServerURL: base, BundleFingerprint: fingerprint}
 	if _, err := remote.ParseEnrollToken(token.String()); err != nil {
 		return remote.EnrollToken{}, err
 	}
 	_, err = s.db.Exec(`INSERT INTO enroll_tokens (id,name,secret_sha256,public_url,expires_at) VALUES (?,?,?,?,?)`,
-		token.ID, name, secretDigest(token.Secret), base, formatTime(now.Add(ttl)))
+		token.ID, name, secretDigest(token.Secret), base, FormatTime(now.Add(ttl)))
 	return token, err
 }
 
@@ -51,19 +51,19 @@ func (s *Store) RedeemEnrollToken(id, secret, publicURL, publicKey string, now t
 	if err != nil {
 		return Device{}, err
 	}
-	if used != "" || !now.Before(parseTime(expires)) || base != publicURL ||
+	if used != "" || !now.Before(ParseTime(expires)) || base != publicURL ||
 		subtle.ConstantTimeCompare([]byte(digest), []byte(secretDigest(secret))) != 1 {
 		return Device{}, ErrTokenInvalid
 	}
-	res, err := tx.Exec(`UPDATE enroll_tokens SET used_at=? WHERE id=? AND used_at=''`, formatTime(now), id)
+	res, err := tx.Exec(`UPDATE enroll_tokens SET used_at=? WHERE id=? AND used_at=''`, FormatTime(now), id)
 	if err != nil {
 		return Device{}, err
 	}
 	if n, _ := res.RowsAffected(); n != 1 {
 		return Device{}, ErrTokenInvalid
 	}
-	d := Device{ID: "dev_" + randomHex(8), Name: name, PublicKey: publicKey, Status: remote.DeviceActive, CreatedAt: now}
-	if _, err := tx.Exec(`INSERT INTO devices (id,name,public_key,status,created_at) VALUES (?,?,?,?,?)`, d.ID, d.Name, d.PublicKey, d.Status, formatTime(now)); err != nil {
+	d := Device{ID: "dev_" + RandomHex(8), Name: name, PublicKey: publicKey, Status: remote.DeviceActive, CreatedAt: now}
+	if _, err := tx.Exec(`INSERT INTO devices (id,name,public_key,status,created_at) VALUES (?,?,?,?,?)`, d.ID, d.Name, d.PublicKey, d.Status, FormatTime(now)); err != nil {
 		return Device{}, err
 	}
 	if err := tx.Commit(); err != nil {

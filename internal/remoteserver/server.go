@@ -3,14 +3,13 @@ package remoteserver
 import (
 	"bytes"
 	"crypto/rand"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"sync"
 	"time"
 
+	"github.com/Praeviso/AgentSSH/internal/controlplane"
 	"github.com/Praeviso/AgentSSH/internal/inventory"
 	"github.com/Praeviso/AgentSSH/internal/remote"
 	"golang.org/x/crypto/ssh"
@@ -21,9 +20,8 @@ import (
 // longer refresh.
 const DefaultBundleTTL = 10 * time.Minute
 
-const maxRequestBytes = 64 << 10
-
-// Server is the control plane HTTP API.
+// Server is the managed control plane HTTP API: the shared enrollment and
+// device authentication, plus configuration bundles and remote SSH signing.
 type Server struct {
 	Store     *Store
 	Keys      *Keys
@@ -46,35 +44,13 @@ func (s *Server) now() time.Time {
 	return time.Now()
 }
 
-func writeJSON(w http.ResponseWriter, status int, value any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(value)
-}
+var (
+	writeJSON  = controlplane.WriteJSON
+	writeError = controlplane.WriteError
+	decodeBody = controlplane.DecodeBody
+)
 
-func writeError(w http.ResponseWriter, status int, code string, message string) {
-	writeJSON(w, status, remote.ErrorResponse{Code: code, Error: message})
-}
-
-func decodeBody(data []byte, value any) error {
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(value); err != nil {
-		return err
-	}
-	if err := dec.Decode(new(any)); err != io.EOF {
-		return errors.New("request must contain exactly one JSON value")
-	}
-	return nil
-}
-
-type deviceHandler func(http.ResponseWriter, *http.Request, Device, []byte)
-
-func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request, device Device, _ []byte) {
-	writeJSON(w, http.StatusOK, remote.StatusResponse{DeviceID: device.ID, Status: device.Status})
-}
-
-func (s *Server) handleBundle(w http.ResponseWriter, _ *http.Request, device Device, _ []byte) {
+func (s *Server) handleBundle(w http.ResponseWriter, _ *http.Request, device controlplane.Device, _ []byte) {
 	cfg, err := s.Store.Config(device.ID)
 	if errors.Is(err, ErrNotFound) {
 		writeError(w, http.StatusNotFound, remote.CodeNoConfig, "no configuration has been pushed for this device")
@@ -125,13 +101,13 @@ func (s *Server) handleBundle(w http.ResponseWriter, _ *http.Request, device Dev
 	writeJSON(w, http.StatusOK, remote.BundleResponse{Bundle: raw, Signature: sig})
 }
 
-func (s *Server) handleSign(w http.ResponseWriter, _ *http.Request, device Device, body []byte) {
+func (s *Server) handleSign(w http.ResponseWriter, _ *http.Request, device controlplane.Device, body []byte) {
 	var req remote.SignRequest
 	if err := decodeBody(body, &req); err != nil {
 		writeError(w, http.StatusBadRequest, remote.CodeBadRequest, "malformed sign request")
 		return
 	}
-	entry := SignEntry{SignID: "sg_" + randomHex(8), TS: s.now(), DeviceID: device.ID, Host: req.Host}
+	entry := SignEntry{SignID: "sg_" + controlplane.RandomHex(8), TS: s.now(), DeviceID: device.ID, Host: req.Host}
 	reject := func(status int, code string, reason string) {
 		entry.Result, entry.Reason = SignRejected, reason
 		if err := s.Store.AppendSign(entry); err != nil {
@@ -235,18 +211,5 @@ func decodeInventory(data string) (inventory.Inventory, error) {
 
 // PushConfig validates and stores a device's managed inventory and policy.
 func PushConfig(store *Store, deviceID string, inventoryYAML string, policyYAML string, now time.Time) (int64, error) {
-	if _, err := store.Device(deviceID); err != nil {
-		if errors.Is(err, ErrNotFound) {
-			return 0, fmt.Errorf("unknown device %q", deviceID)
-		}
-		return 0, err
-	}
-	identityExists := func(name string) bool {
-		_, err := store.Identity(name)
-		return err == nil
-	}
-	if _, _, err := remote.ParseManaged(inventoryYAML, policyYAML, identityExists); err != nil {
-		return 0, err
-	}
-	return store.PutConfig(deviceID, inventoryYAML, policyYAML, now)
+	return controlplane.PushConfig(store.Store, deviceID, inventoryYAML, policyYAML, now)
 }

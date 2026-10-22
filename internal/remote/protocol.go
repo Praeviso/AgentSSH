@@ -13,6 +13,16 @@ const (
 	PathSign   = "/sign"
 )
 
+// Control-plane modes reported by /status. A control plane runs exactly one.
+const (
+	// ModeManaged hands devices signed configuration bundles and SSH
+	// signatures; the device enforces policy (agentssh-server).
+	ModeManaged = "managed"
+	// ModeGateway keeps inventory, policy, identities and SSH on the control
+	// plane; the device only forwards commands (agentssh-gateway).
+	ModeGateway = "gateway"
+)
+
 // Device status values.
 const (
 	DeviceActive  = "active"
@@ -33,10 +43,12 @@ const (
 	CodeInternal         = "internal"
 )
 
-// StatusResponse reports the calling device's standing.
+// StatusResponse reports the calling device's standing and the control
+// plane's mode.
 type StatusResponse struct {
 	DeviceID string `json:"device_id"`
 	Status   string `json:"status"`
+	Mode     string `json:"mode,omitempty"`
 }
 
 // BundleResponse carries the raw signed bundle bytes and their signature.
