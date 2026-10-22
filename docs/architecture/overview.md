@@ -250,6 +250,8 @@ export AGENTSSH_SESSION=$(agentssh session new)   # 形如 s_1a2b3c4d
 ```
 agentssh/
   cmd/agentssh/            # main:cobra 根命令,装配各子命令
+  cmd/agentssh-server/     # managed control plane: enrollment, signed config bundles, remote SSH signing
+  cmd/agentssh-gateway/    # gateway control plane: enrollment and server-side inventory/policy/identities; no signing or bundle endpoint
   internal/
     config/                # ~/.agentssh 载入、$AGENTSSH_HOME
     inventory/             # 主机/分组解析
@@ -260,6 +262,10 @@ agentssh/
     output/                # 脱敏 + 截断
     tui/                   # bubbletea:审计查看器
     approval/              # 灰区异步审批:Generalize/Authorize/grant store/裁决(默认关)
+    controlplane/          # shared by both control planes: keys, device/token/identity/config store, enrollment and signed-request auth, /status
+      admin/               # shared operator commands: init, device, identity, config push, serve loop
+    remoteserver/          # managed mode: bundle and sign endpoints, signing log
+    gateway/               # gateway mode: API server over the shared control plane
     runner/                # run pipeline shared by the CLI and control planes: session binding, authorize, approval requests, audit, execute, exit-code merge
   skills/                  # AgentSSH 使用手册(SKILL.md):最佳实践,供 Agent 参考
   docs/

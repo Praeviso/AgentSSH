@@ -35,7 +35,7 @@ Append these literal endpoint paths:
 | Method | Suffix | Authentication / response |
 | --- | --- | --- |
 | POST | `/enroll` | Single-use token and the new device key's proof of possession |
-| GET | `/status` | Device proof; device ID and active/revoked standing |
+| GET | `/status` | Device proof; device ID, active/revoked standing and control-plane mode (`managed`) |
 | GET | `/bundle` | Device proof; signed configuration bundle |
 | POST | `/sign` | Device proof; SSH authentication signature and signing-log ID |
 
@@ -59,10 +59,23 @@ agentssh-server log
 ```
 
 The reference server owns encrypted signing keys and SQLite state. Its initialization
-creates `master.age`, `recipient`, `bundle.pub`, `bundle.key.age` and `server.db`.
+creates `master.age`, `recipient`, `bundle.pub`, `bundle.key.age`, `mode` and
+`server.db`. `mode` records which control plane owns the directory (a missing file
+means `managed`); `agentssh-server` and `agentssh-gateway` each refuse the other's
+directory.
 The master passphrase protects an age X25519 identity; bundle and SSH identity
 private keys are encrypted to that identity. Creating SSH identities needs only
 the public age recipient. The public HTTPS ingress owns transport certificates.
+
+### Gateway mode
+
+`agentssh-gateway` shares this enrollment, request-signature, revocation, identity
+and configuration machinery (`internal/controlplane`), but registers only
+`/enroll` and `/status` (mode `gateway`) from the table above: `/bundle` and
+`/sign` return 404, and the binary does not link `internal/remoteserver`. Its
+database is `gateway.db`, so a managed binary pointed at a gateway directory has no
+devices or identities to sign for. Remote execution and the client side follow in
+#15 and #17; the full design will live in `docs/architecture/gateway-mode.md`.
 
 ## Enrollment
 
