@@ -126,6 +126,23 @@ integration test exercises the real signed transport; #17 builds on it.
   request whose body never arrives is refused at once (401 unsigned, 413
   oversized); against the previous handler it hangs until the read timeout.
 
+- [x] PR #24 review (Codex):
+  - P1: commands were bounded only by the ~45 MiB body cap, and every outcome
+    audits the full command, so one request could write a record the audit
+    reader (8 MiB lines) rejects, breaking appends and `audit verify` for the
+    whole gateway. Now commands are capped at 128 KiB (the local argv limit),
+    host/session/plan ids at 256 bytes, labels at 1 KiB. Test: a max-length
+    command of `<` (6x JSON escaping) plus a max label of control bytes; the
+    chain still verifies and the next run succeeds; one byte over is `usage`.
+  - P2: with `output.max_bytes` unset, a result could exceed the 16 MiB frame
+    limit after HTTP 200 was sent, so the device saw `ErrNoResult` for a run
+    that finished. Now each target's response is its own frame, the gateway
+    caps output at 1 MiB per stream in the filter (before auditing), and the
+    result is size-checked before any of it is written (explicit error frame
+    as a backstop). Test: a two-host group with no `max_bytes` printing 3 MiB of
+    `<` each returns both responses capped and truncated; with the cap removed
+    the same test gets the error frame instead of a silent cut.
+
 ## Validation
 
 ```

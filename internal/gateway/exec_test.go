@@ -35,7 +35,7 @@ approval:
   enabled: true
 rules:
   - {name: deny-reboot, match: {cmd_regex: '^reboot$'}, action: deny}
-  - {name: allow-test, match: {cmd_regex: '^(stream|cat|secret|sleep|uptime)$'}, action: allow}
+  - {name: allow-test, match: {cmd_regex: '^(stream|cat|secret|sleep|uptime|flood)$'}, action: allow}
 output:
   redact: ['hunter2']
 `
@@ -178,6 +178,9 @@ func (h *targetHost) run(channel ssh.Channel, command string, signals <-chan str
 		_, _ = io.WriteString(channel, "up 3 days\n")
 	case "secret":
 		_, _ = io.WriteString(channel, "token=hunter2\n")
+	case "flood":
+		// Three times the gateway's output cap, in a byte JSON must escape.
+		_, _ = channel.Write(bytes.Repeat([]byte("<"), 3*remote.MaxExecOutputBytes))
 	case "stream":
 		_, _ = io.WriteString(channel, "chunk-1\n")
 		<-h.release
@@ -517,5 +520,62 @@ func TestExecRefusesUnauthenticatedUploadBeforeReadingIt(t *testing.T) {
 				t.Fatalf("status = %d, want %d", resp.StatusCode, tc.status)
 			}
 		})
+	}
+}
+
+// The audit reader caps one record at 8 MiB; a command at the request limit,
+// in bytes JSON must escape, still leaves the chain readable.
+func TestExecBoundsWhatReachesTheAudit(t *testing.T) {
+	f, _ := execGateway(t)
+	longest := execReq(strings.Repeat("<", remote.MaxExecCommandBytes))
+	longest.SessionLabel = strings.Repeat("\x01", remote.MaxExecLabelBytes)
+	result, err := f.client.Exec(context.Background(), longest, io.Discard, io.Discard)
+	if err != nil || result.ExitCode != 7 {
+		t.Fatalf("longest command: exit=%d err=%v, want approval pending", result.ExitCode, err)
+	}
+	for name, req := range map[string]remote.ExecRequest{
+		"command": execReq(strings.Repeat("x", remote.MaxExecCommandBytes+1)),
+		"label":   {Host: "web-1", Cmd: "uptime", Session: "s_test", SessionLabel: strings.Repeat("x", remote.MaxExecLabelBytes+1)},
+		"step id": {Host: "web-1", Cmd: "uptime", Session: "s_test", StepID: strings.Repeat("x", remote.MaxExecFieldBytes+1)},
+	} {
+		_, err := f.client.Exec(context.Background(), req, io.Discard, io.Discard)
+		var apiErr *remote.APIError
+		if !errors.As(err, &apiErr) || apiErr.Code != remote.CodeUsage {
+			t.Errorf("oversized %s: %v, want usage refusal", name, err)
+		}
+	}
+	if _, err := f.client.Exec(context.Background(), execReq("uptime"), io.Discard, io.Discard); err != nil {
+		t.Fatalf("run after the longest command: %v", err)
+	}
+	if result, err := audit.NewStore(filepath.Join(f.dir, gateway.FileAudit)).Verify(); err != nil || !result.OK || result.Count != 3 {
+		t.Fatalf("audit = %+v, %v; want approval_requested, started, completed", result, err)
+	}
+}
+
+// A policy without output.max_bytes must not let a group's output outgrow the
+// stream: each target is capped and arrives in its own frame.
+func TestExecCapsUnboundedGroupOutput(t *testing.T) {
+	f, host := execGateway(t)
+	inv := fmt.Sprintf(`host_key_policy: accept-new
+hosts:
+  web-1: {addr: 127.0.0.1, port: %d, user: deploy, identity: web, tags: [web]}
+  web-2: {addr: 127.0.0.1, port: %d, user: deploy, identity: web, tags: [web]}
+groups:
+  web: {tags: [web]}
+`, host.port(), host.port())
+	if _, err := controlplane.PushConfig(f.store, f.client.State.DeviceID, inv, testPolicy, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	result, err := f.client.Exec(context.Background(), remote.ExecRequest{Host: "web", Cmd: "flood", Session: "s_test"}, io.Discard, io.Discard)
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if result.ExitCode != 0 || len(result.Responses) != 2 {
+		t.Fatalf("result exit=%d responses=%d", result.ExitCode, len(result.Responses))
+	}
+	for _, got := range result.Responses {
+		if len(got.Stdout) != remote.MaxExecOutputBytes || !got.OutputTruncated {
+			t.Fatalf("%s: %d bytes, truncated=%v", got.Host, len(got.Stdout), got.OutputTruncated)
+		}
 	}
 }

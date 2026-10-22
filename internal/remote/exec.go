@@ -13,9 +13,24 @@ import (
 // PathExec runs one command on a gateway (gateway mode only).
 const PathExec = "/exec"
 
-// MaxExecStdinBytes caps the stdin a device may send with a command; it matches
-// the CLI's --stdin-file limit.
-const MaxExecStdinBytes = 32 << 20
+// Execution request limits. Every field lands in the audit chain, whose reader
+// caps one record at 8 MiB; these keep a record far below that even when JSON
+// escapes every byte.
+const (
+	// MaxExecStdinBytes matches the CLI's --stdin-file limit.
+	MaxExecStdinBytes = 32 << 20
+	// MaxExecCommandBytes matches what a local run can pass: Linux caps one
+	// argv string at 128 KiB.
+	MaxExecCommandBytes = 128 << 10
+	// MaxExecFieldBytes bounds the host, session and plan identifiers.
+	MaxExecFieldBytes = 256
+	// MaxExecLabelBytes bounds the human-readable session label.
+	MaxExecLabelBytes = 1 << 10
+	// MaxExecOutputBytes is the gateway's per-stream output cap, applied when
+	// the policy sets no lower output.max_bytes. With JSON's worst-case 6x
+	// escaping, one target's response stays within MaxMessageFrameBytes.
+	MaxExecOutputBytes = 1 << 20
+)
 
 // ExecRequest asks a gateway to authorize and run one command for the calling
 // device. Stdin is nil for no stdin and non-nil (possibly empty) otherwise; the
@@ -34,23 +49,31 @@ type ExecRequest struct {
 	Stream bool `json:"stream,omitempty"`
 }
 
-// ExecResult is the final frame of an execution: the merged exit code (the
-// CLI contract: 0, 1, 6, 7, 9) and one `run --json` object per target.
+// ExecResult is the outcome of an execution: the merged exit code (the CLI
+// contract: 0, 1, 6, 7, 9) and one `run --json` object per target. On the
+// wire each response is its own frame, followed by a result frame with the
+// exit code, so a group's size never adds up into one frame.
 type ExecResult struct {
 	ExitCode  int               `json:"exit_code"`
 	Responses []runner.Response `json:"responses"`
 }
 
+type execFinal struct {
+	ExitCode int `json:"exit_code"`
+}
+
 // ExecContentType labels an /exec response body made of frames.
 const ExecContentType = "application/vnd.agentssh.exec-frames"
 
-// Frame types. A stream holds any number of stdout/stderr frames followed by
-// exactly one result or error frame.
+// Frame types. A stream holds any number of stdout/stderr frames, then one
+// response frame per target, then exactly one result frame. An error frame
+// may replace everything after the data frames.
 const (
-	FrameStdout byte = 1
-	FrameStderr byte = 2
-	FrameResult byte = 3
-	FrameError  byte = 4
+	FrameStdout   byte = 1
+	FrameStderr   byte = 2
+	FrameResult   byte = 3
+	FrameError    byte = 4
+	FrameResponse byte = 5
 )
 
 const (
@@ -58,8 +81,8 @@ const (
 	// MaxDataFrameBytes bounds one stdout/stderr frame; writers split larger
 	// chunks.
 	MaxDataFrameBytes = 64 << 10
-	// MaxFinalFrameBytes bounds a result or error frame.
-	MaxFinalFrameBytes = 16 << 20
+	// MaxMessageFrameBytes bounds a response, result or error frame.
+	MaxMessageFrameBytes = 16 << 20
 )
 
 var (
@@ -72,7 +95,7 @@ var (
 
 // WriteFrame writes one frame. Data payloads above MaxDataFrameBytes are split.
 func WriteFrame(w io.Writer, kind byte, payload []byte) error {
-	limit := MaxFinalFrameBytes
+	limit := MaxMessageFrameBytes
 	if kind == FrameStdout || kind == FrameStderr {
 		limit = MaxDataFrameBytes
 		for len(payload) > limit {
@@ -81,7 +104,7 @@ func WriteFrame(w io.Writer, kind byte, payload []byte) error {
 			}
 			payload = payload[limit:]
 		}
-	} else if kind != FrameResult && kind != FrameError {
+	} else if kind != FrameResult && kind != FrameError && kind != FrameResponse {
 		return fmt.Errorf("unknown execution frame type %d", kind)
 	}
 	if len(payload) > limit {
@@ -116,8 +139,8 @@ func ReadFrame(r io.Reader) (byte, []byte, error) {
 		if size > MaxDataFrameBytes {
 			return 0, nil, ErrFrameTooLarge
 		}
-	case FrameResult, FrameError:
-		if size > MaxFinalFrameBytes {
+	case FrameResult, FrameError, FrameResponse:
+		if size > MaxMessageFrameBytes {
 			return 0, nil, ErrFrameTooLarge
 		}
 	default:
@@ -135,10 +158,52 @@ func ReadFrame(r io.Reader) (byte, []byte, error) {
 	return kind, payload, nil
 }
 
-// ReadExecStream copies data frames to stdout and stderr until the final frame.
-// An error frame is returned as an *APIError. Anything after the final frame,
-// or a stream without one, is an error.
+// EncodeExecResult renders result as response frames and a result frame,
+// checking every size before the first frame is emitted, so an oversized
+// response never leaves a stream half written.
+func EncodeExecResult(result ExecResult) ([][]byte, error) {
+	payloads := make([][]byte, 0, len(result.Responses)+1)
+	for _, response := range result.Responses {
+		payload, err := json.Marshal(response)
+		if err != nil {
+			return nil, err
+		}
+		if len(payload) > MaxMessageFrameBytes {
+			return nil, ErrFrameTooLarge
+		}
+		payloads = append(payloads, payload)
+	}
+	final, err := json.Marshal(execFinal{ExitCode: result.ExitCode})
+	if err != nil {
+		return nil, err
+	}
+	return append(payloads, final), nil
+}
+
+// WriteExecResult writes EncodeExecResult's frames through write.
+func WriteExecResult(write func(kind byte, payload []byte) error, result ExecResult) error {
+	payloads, err := EncodeExecResult(result)
+	if err != nil {
+		return err
+	}
+	for i, payload := range payloads {
+		kind := FrameResponse
+		if i == len(payloads)-1 {
+			kind = FrameResult
+		}
+		if err := write(kind, payload); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ReadExecStream copies data frames to stdout and stderr, collects response
+// frames, and returns at the result frame. An error frame is returned as an
+// *APIError. Data after a response, anything after the final frame, or a
+// stream without one, is an error.
 func ReadExecStream(r io.Reader, stdout, stderr io.Writer) (ExecResult, error) {
+	var result ExecResult
 	for {
 		kind, payload, err := ReadFrame(r)
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
@@ -148,14 +213,23 @@ func ReadExecStream(r io.Reader, stdout, stderr io.Writer) (ExecResult, error) {
 			return ExecResult{}, err
 		}
 		switch kind {
-		case FrameStdout:
-			if _, err := stdout.Write(payload); err != nil {
+		case FrameStdout, FrameStderr:
+			if result.Responses != nil {
+				return ExecResult{}, errors.New("execution output after a response frame")
+			}
+			dst := stdout
+			if kind == FrameStderr {
+				dst = stderr
+			}
+			if _, err := dst.Write(payload); err != nil {
 				return ExecResult{}, err
 			}
-		case FrameStderr:
-			if _, err := stderr.Write(payload); err != nil {
-				return ExecResult{}, err
+		case FrameResponse:
+			var response runner.Response
+			if err := json.Unmarshal(payload, &response); err != nil {
+				return ExecResult{}, fmt.Errorf("malformed execution response: %w", err)
 			}
+			result.Responses = append(result.Responses, response)
 		case FrameResult, FrameError:
 			if _, _, err := ReadFrame(r); !errors.Is(err, io.EOF) {
 				return ExecResult{}, errors.New("execution stream continues after its final frame")
@@ -167,10 +241,11 @@ func ReadExecStream(r io.Reader, stdout, stderr io.Writer) (ExecResult, error) {
 				}
 				return ExecResult{}, &APIError{Code: refusal.Code, Message: refusal.Error}
 			}
-			var result ExecResult
-			if err := json.Unmarshal(payload, &result); err != nil {
+			var final execFinal
+			if err := json.Unmarshal(payload, &final); err != nil {
 				return ExecResult{}, fmt.Errorf("malformed execution result: %w", err)
 			}
+			result.ExitCode = final.ExitCode
 			return result, nil
 		}
 	}

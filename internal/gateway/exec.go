@@ -40,9 +40,9 @@ const (
 	// FileKnownHosts holds the target host keys the gateway trusts.
 	FileKnownHosts = "known_hosts"
 
-	maxSessionBytes = 256
-	// Stdin travels base64 encoded inside the JSON body.
-	maxExecBody = (remote.MaxExecStdinBytes+2)/3*4 + 1<<20
+	// Stdin travels base64 encoded inside the JSON body, and JSON may escape
+	// each command byte as six.
+	maxExecBody = (remote.MaxExecStdinBytes+2)/3*4 + 6*remote.MaxExecCommandBytes + 64<<10
 )
 
 func (s *Server) execRoute() controlplane.Route {
@@ -80,7 +80,13 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, device contr
 		controlplane.WriteError(w, http.StatusBadRequest, remote.CodeUsage, fmt.Sprintf("%v\n  list all hosts: agentssh hosts", err))
 		return
 	}
-	filter, err := output.NewFilter(pol.Output)
+	// Cap output so each target's response fits one frame; the cap applies in
+	// the filter, so the audit hash still covers exactly what is returned.
+	outputCfg := pol.Output
+	if outputCfg.MaxBytes <= 0 || outputCfg.MaxBytes > remote.MaxExecOutputBytes {
+		outputCfg.MaxBytes = remote.MaxExecOutputBytes
+	}
+	filter, err := output.NewFilter(outputCfg)
 	if err != nil {
 		controlplane.WriteError(w, http.StatusBadRequest, remote.CodeUsage, fmt.Sprintf("invalid output filter in the gateway policy: %v", err))
 		return
@@ -138,12 +144,15 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, device contr
 		frames.fail(http.StatusInternalServerError, remote.CodeInternal, "execution failed")
 		return
 	}
-	payload, err := json.Marshal(remote.ExecResult{ExitCode: outcome.ExitCode, Responses: outcome.Responses})
-	if err != nil {
-		frames.fail(http.StatusInternalServerError, remote.CodeInternal, "encode execution result")
+	result := remote.ExecResult{ExitCode: outcome.ExitCode, Responses: outcome.Responses}
+	if _, err := remote.EncodeExecResult(result); err != nil {
+		// Unreachable with the output cap; say so rather than end the stream
+		// without a result.
+		log.Printf("agentssh-gateway: device %s: encode execution result: %v", device.ID, err)
+		frames.fail(http.StatusInternalServerError, remote.CodeInternal, "execution finished but its result could not be encoded; see the gateway audit")
 		return
 	}
-	if err := frames.write(remote.FrameResult, payload); err != nil {
+	if err := remote.WriteExecResult(frames.write, result); err != nil {
 		// The device is gone; the audit already holds the outcome.
 		log.Printf("agentssh-gateway: device %s: result not delivered: %v", device.ID, err)
 	}
@@ -157,10 +166,19 @@ func validateExec(req remote.ExecRequest) error {
 		return errors.New("a command is required")
 	case req.Session == "":
 		return errors.New("a session must be declared for run\n  mint one id per task: agentssh session new, then pass --session <id> on every run in the task")
-	case len(req.Session) > maxSessionBytes || strings.IndexFunc(req.Session, unicode.IsControl) >= 0:
-		return fmt.Errorf("session id must be at most %d bytes without control characters", maxSessionBytes)
+	case len(req.Session) > remote.MaxExecFieldBytes || strings.IndexFunc(req.Session, unicode.IsControl) >= 0:
+		return fmt.Errorf("session id must be at most %d bytes without control characters", remote.MaxExecFieldBytes)
 	case len(req.Stdin) > remote.MaxExecStdinBytes:
 		return fmt.Errorf("stdin is %d bytes; the limit is %d bytes (32 MiB)", len(req.Stdin), remote.MaxExecStdinBytes)
+	case len(req.Cmd) > remote.MaxExecCommandBytes:
+		return fmt.Errorf("command is %d bytes; the limit is %d bytes (128 KiB)", len(req.Cmd), remote.MaxExecCommandBytes)
+	case len(req.SessionLabel) > remote.MaxExecLabelBytes:
+		return fmt.Errorf("session label must be at most %d bytes", remote.MaxExecLabelBytes)
+	}
+	for name, value := range map[string]string{"host": req.Host, "execution id": req.ExecutionID, "step id": req.StepID, "review sha256": req.ReviewSHA256} {
+		if len(value) > remote.MaxExecFieldBytes {
+			return fmt.Errorf("%s must be at most %d bytes", name, remote.MaxExecFieldBytes)
+		}
 	}
 	return nil
 }

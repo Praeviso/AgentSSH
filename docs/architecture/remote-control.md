@@ -76,11 +76,14 @@ registers only `/enroll` and `/status` (mode `gateway`), plus its own `/exec`:
 `internal/remoteserver`. Its database is `gateway.db`, so a managed binary pointed
 at a gateway directory has no devices or identities to sign for.
 
-`POST /exec` carries one signed JSON body: target, command, session and optional
-stdin (base64, at most 32 MiB). The gateway runs it through the same pipeline as
-the CLI (`internal/runner`) against the device's pushed inventory and policy,
-connecting with its own identities in-process (no agent, local keys or
-ssh_config; no connection reuse; `known_hosts` in the data directory). Because its body is
+`POST /exec` carries one signed JSON body: target, command (at most 128 KiB, the
+local argv limit), session and optional stdin (base64, at most 32 MiB); host,
+session and plan identifiers are at most 256 bytes and the session label 1 KiB,
+so no audit record nears the reader's 8 MiB line limit. The gateway runs it
+through the same pipeline as the CLI (`internal/runner`) against the device's
+pushed inventory and policy, connecting with its own identities in-process (no
+agent, local keys or ssh_config; no connection reuse; `known_hosts` in the data
+directory). Because its body is
 larger than other endpoints', the gateway verifies the signature over the
 request headers (which cover `Content-Digest`) before reading the body, refuses
 an oversized `Content-Length` with 413, and then checks the body against the
@@ -89,10 +92,14 @@ concurrency limit (`serve --max-concurrent`, default 4) gets 429 `busy`.
 
 The response is a stream of frames, `type:1 | length:4 big-endian | payload`:
 stdout (1) and stderr (2) data frames of at most 64 KiB, sent only when the
-request asks to stream a single-host run, then exactly one result (3,
-`{exit_code, responses}` with `run --json` objects) or error (4,
-`ErrorResponse`) frame. A stream that ends without its final frame means the
-outcome is unknown. There is no cancel frame: dropping the request cancels the
+request asks to stream a single-host run; then one response frame (5) per
+target with its `run --json` object; then a result frame (3, `{exit_code}`).
+An error frame (4, `ErrorResponse`) may replace everything after the data
+frames. Response, result and error frames are at most 16 MiB: the gateway caps
+each stream's output at 1 MiB unless the policy's `output.max_bytes` is lower
+(applied before auditing, so the audit hash covers what is returned), which
+keeps a response within one frame even when JSON escapes every byte. A stream
+that ends without its final frame means the outcome is unknown. There is no cancel frame: dropping the request cancels the
 run, and the gateway sends the remote command `SIGTERM` before closing the SSH
 connection; `serve --exec-timeout` (default 30m) does the same. The request
 must arrive within the 60 s proof lifetime; ingresses must stream responses
