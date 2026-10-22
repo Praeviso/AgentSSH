@@ -49,6 +49,16 @@ type targetHost struct {
 	release  chan struct{}
 	events   chan string
 	wg       sync.WaitGroup
+
+	mu  sync.Mutex
+	ran map[string]int
+}
+
+// runs reports how many times command was executed.
+func (h *targetHost) runs(command string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.ran[command]
 }
 
 func newTargetHost(t *testing.T, allowed ssh.PublicKey) *targetHost {
@@ -171,6 +181,12 @@ func (h *targetHost) session(channel ssh.Channel, requests <-chan *ssh.Request) 
 }
 
 func (h *targetHost) run(channel ssh.Channel, command string, signals <-chan string) uint32 {
+	h.mu.Lock()
+	if h.ran == nil {
+		h.ran = map[string]int{}
+	}
+	h.ran[command]++
+	h.mu.Unlock()
 	switch command {
 	case "uname -s":
 		_, _ = io.WriteString(channel, "Linux\n")
@@ -179,8 +195,10 @@ func (h *targetHost) run(channel ssh.Channel, command string, signals <-chan str
 	case "secret":
 		_, _ = io.WriteString(channel, "token=hunter2\n")
 	case "flood":
-		// Three times the gateway's output cap, in a byte JSON must escape.
-		_, _ = channel.Write(bytes.Repeat([]byte("<"), 3*remote.MaxExecOutputBytes))
+		// Three times the gateway's output cap, in 1 KiB lines of a byte JSON
+		// must escape.
+		line := append(bytes.Repeat([]byte("<"), 1023), '\n')
+		_, _ = channel.Write(bytes.Repeat(line, 3*remote.MaxExecOutputBytes/len(line)))
 	case "stream":
 		_, _ = io.WriteString(channel, "chunk-1\n")
 		<-h.release

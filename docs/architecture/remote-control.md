@@ -90,20 +90,78 @@ an oversized `Content-Length` with 413, and then checks the body against the
 digest. Requests the CLI would reject as usage errors return 400 `usage`; a device over its
 concurrency limit (`serve --max-concurrent`, default 4) gets 429 `busy`.
 
-The response is a stream of frames, `type:1 | length:4 big-endian | payload`:
-stdout (1) and stderr (2) data frames of at most 64 KiB, sent only when the
-request asks to stream a single-host run; then one response frame (5) per
-target with its `run --json` object; then a result frame (3, `{exit_code}`).
-An error frame (4, `ErrorResponse`) may replace everything after the data
-frames. Response, result and error frames are at most 16 MiB: the gateway caps
-each stream's output at 1 MiB unless the policy's `output.max_bytes` is lower
+Each `/exec` is a run with an ID (`rn_` + 32 hex). The client mints it and
+sends it as `run_id`, an idempotency key: repeating the same request (same body
+digest) with the same ID joins the existing run instead of starting the command
+again, so a client whose first response was lost recovers without running the
+command twice; reusing the ID for a different request is `409 run_conflict`.
+The gateway mints an ID when none is sent.
+
+A run's frames, `type:1 | length:4 big-endian | payload`, are: stdout (1) and
+stderr (2) data frames of at most 64 KiB, sent only when the request asks to
+stream a single-host run; then one response frame (5) per target with its
+`run --json` object; then a result frame (3, `{exit_code, truncated}`). An
+error frame (4, `ErrorResponse`) may replace everything after the data frames.
+Response, result and error frames are at most 16 MiB: the gateway caps each
+stream's output at 1 MiB unless the policy's `output.max_bytes` is lower
 (applied before auditing, so the audit hash covers what is returned), which
-keeps a response within one frame even when JSON escapes every byte. A stream
-that ends without its final frame means the outcome is unknown. There is no cancel frame: dropping the request cancels the
-run, and the gateway sends the remote command `SIGTERM` before closing the SSH
-connection; `serve --exec-timeout` (default 30m) does the same. The request
-must arrive within the 60 s proof lifetime; ingresses must stream responses
-(the gateway sends `X-Accel-Buffering: no`).
+keeps a response within one frame even when JSON escapes every byte.
+
+Every `/exec` and `POST /exec/attach {run_id, offset}` response starts with a
+run frame (6, `{run_id}`) followed by the run's frames from the offset,
+following a live run until its final frame. The run does not depend on the
+connection: a dropped request only detaches the device, and the client
+reattaches from the byte offset of the complete frames it has consumed, so
+every frame arrives exactly once and the command runs once. Only
+`POST /exec/cancel {run_id}` or `serve --exec-timeout` (default 30m) stops a
+run; the gateway then sends the remote command `SIGTERM` before closing the SSH
+connection. A device's concurrency slot is held until its run finishes.
+
+**Run records.** Each run ID has one record, `runs/<device-id>/<run-id>.json`,
+which is the single source of truth; the frames live beside it in a spool the
+record names. A record appears whole or not at all, and publishing it
+exclusively is the only way to claim an ID, so a start and a cancel that
+overtook its own request race on the same publish and the first wins, durably
+across restarts. Everything an attempt writes before its claim is private and
+removed if the claim fails. States:
+
+| State | Meaning | Answer to attach / a repeated `/exec` |
+| --- | --- | --- |
+| `running` (live) | in progress | streams it |
+| `running` (not live after a restart) | outcome unknown, see the audit | `410 run_interrupted` |
+| `finished` | output kept for `serve --run-retention` (default 24h) | streams it |
+| `evicted` | output deleted (retention or quota); record kept for the idempotency window | `404 run_not_found`, never re-run |
+| `cancelled` | a cancel arrived first; kept 10 minutes | `409 run_cancelled` |
+
+Runs belong to the device that started them; another device's and unknown IDs
+are `404 run_not_found` too, and a cancel of an ID that is not live answers
+`cancelled: false` either way.
+
+A run ID deduplicates repeats of its request for at least the idempotency
+window, one hour after the run starts (clients repeat a request only while
+recovering a lost first response). Records are a resource of their own: a
+device keeps at most `serve --run-records` (default 10000) in any state. Every
+new record, a run's or a cancel's, is admitted against that limit; when the
+device is at it, the oldest finished or evicted runs past the window are
+reclaimed, and if none are, the start or the cancel is refused with
+`429 busy` (a refused cancel was not recorded, so the client reports that the
+run may still be running). Each device's records are aged out at least once a
+minute, by whichever request needs a record.
+
+**Space.** A run's spool is hard-capped at `serve --run-max-bytes` (default
+64 MiB). Space is reserved up front for each target's response in a minimal
+form (32 KiB, a proven bound) and for the result frame, so a group with more
+targets than the cap can hold is refused as a usage error, before any room is
+made for it. Output beyond the
+cap is dropped; a response that no longer fits is sent without its output, or
+in its minimal form (`output_truncated`); the result then says
+`truncated: true` with the exit code raised to at least 1, so a partial result
+never passes for a complete one. A device keeps at most
+`serve --run-quota-bytes` (default 512 MiB) of finished output: before a run
+starts and again when one finishes, its oldest finished runs are evicted. One
+device therefore occupies at most quota + `--max-concurrent` ×
+`--run-max-bytes`. The request must arrive within the 60 s proof lifetime;
+ingresses must stream responses (the gateway sends `X-Accel-Buffering: no`).
 
 Every run is recorded in one hash chain per gateway, `audit.jsonl`, with
 `device_id` on each record (`agentssh-gateway audit verify`). Pending approval

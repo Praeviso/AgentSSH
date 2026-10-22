@@ -130,15 +130,104 @@ func (c *Client) Sign(ctx context.Context, host string, data []byte) (remote.Sig
 	return out, err
 }
 
-// Exec runs one command on a gateway, copying streamed output to stdout and
-// stderr. Cancelling ctx drops the request, which ends the remote command. An
-// ErrNoResult error means the connection ended before the outcome was known.
+// ReattachTimeout bounds how long Exec keeps reattaching to a run without
+// making progress after its stream breaks.
+var ReattachTimeout = 2 * time.Minute
+
+// cancelTimeout bounds the explicit cancel sent when Exec's context ends.
+const cancelTimeout = 5 * time.Second
+
+// Exec starts one command on a gateway, copying streamed output to stdout and
+// stderr. A broken connection does not stop the command: Exec reattaches and
+// continues where it left off. The run ID is chosen here, so even a lost first
+// response is recovered by repeating the request, which joins the run rather
+// than starting it twice. Cancelling ctx sends an explicit cancel, which ends
+// the remote command, and returns the context's error.
 func (c *Client) Exec(ctx context.Context, req remote.ExecRequest, stdout, stderr io.Writer) (remote.ExecResult, error) {
-	data, err := json.Marshal(req)
+	if req.RunID == "" {
+		req.RunID = remote.NewRunID()
+	}
+	stream := remote.ExecStream{RunID: req.RunID}
+	start := func() (remote.ExecResult, error) {
+		return c.openStream(ctx, remote.PathExec, req, &stream, stdout, stderr)
+	}
+	result, err := start()
+	return c.follow(ctx, &stream, start, result, err, stdout, stderr)
+}
+
+// Attach replays a run of this device from the start and follows it to its
+// result, reattaching like Exec.
+func (c *Client) Attach(ctx context.Context, runID string, stdout, stderr io.Writer) (remote.ExecResult, error) {
+	stream := remote.ExecStream{RunID: runID}
+	start := func() (remote.ExecResult, error) {
+		return c.openStream(ctx, remote.PathExecAttach, remote.ExecAttachRequest{RunID: runID}, &stream, stdout, stderr)
+	}
+	result, err := start()
+	return c.follow(ctx, &stream, start, result, err, stdout, stderr)
+}
+
+// Cancel stops a run of this device. It reports false when nothing was
+// running under the ID; a request with that ID that has not arrived yet is
+// then refused.
+func (c *Client) Cancel(ctx context.Context, runID string) (bool, error) {
+	var out remote.ExecCancelResponse
+	err := c.call(ctx, http.MethodPost, remote.PathExecCancel, remote.ExecCancelRequest{RunID: runID}, &out)
+	return out.Cancelled, err
+}
+
+// follow retries a broken stream: start again until a run frame has arrived,
+// then reattach from the offset of the frames already consumed.
+func (c *Client) follow(ctx context.Context, stream *remote.ExecStream, start func() (remote.ExecResult, error), result remote.ExecResult, err error, stdout, stderr io.Writer) (remote.ExecResult, error) {
+	backoff := 200 * time.Millisecond
+	deadline := time.Now().Add(ReattachTimeout)
+	offset := stream.Offset
+	for err != nil {
+		if ctx.Err() != nil {
+			return remote.ExecResult{}, c.cancelRun(stream.RunID, ctx.Err())
+		}
+		var unreachable *UnreachableError
+		if !errors.Is(err, remote.ErrNoResult) && !errors.As(err, &unreachable) {
+			return remote.ExecResult{}, err
+		}
+		if stream.Offset != offset {
+			// Progress since the last break: restart the patience window.
+			offset, backoff, deadline = stream.Offset, 200*time.Millisecond, time.Now().Add(ReattachTimeout)
+		}
+		if time.Now().After(deadline) {
+			return remote.ExecResult{}, fmt.Errorf("lost run %s and could not reattach within %s; it may still be running: %w", stream.RunID, ReattachTimeout, err)
+		}
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			return remote.ExecResult{}, c.cancelRun(stream.RunID, ctx.Err())
+		}
+		backoff = min(2*backoff, 5*time.Second)
+		if !stream.Started {
+			result, err = start()
+			continue
+		}
+		result, err = c.openStream(ctx, remote.PathExecAttach, remote.ExecAttachRequest{RunID: stream.RunID, Offset: stream.Offset}, stream, stdout, stderr)
+	}
+	return result, nil
+}
+
+// cancelRun turns a cancelled context into an explicit cancel of the run, so a
+// local Ctrl-C still stops the remote command.
+func (c *Client) cancelRun(runID string, cause error) error {
+	ctx, done := context.WithTimeout(context.Background(), cancelTimeout)
+	defer done()
+	if _, err := c.Cancel(ctx, runID); err != nil {
+		return fmt.Errorf("%w; run %s may still be running (cancel failed: %v)", cause, runID, err)
+	}
+	return cause
+}
+
+func (c *Client) openStream(ctx context.Context, path string, body any, stream *remote.ExecStream, stdout, stderr io.Writer) (remote.ExecResult, error) {
+	data, err := json.Marshal(body)
 	if err != nil {
 		return remote.ExecResult{}, err
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.State.ServerURL+remote.PathExec, bytes.NewReader(data))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.State.ServerURL+path, bytes.NewReader(data))
 	if err != nil {
 		return remote.ExecResult{}, err
 	}
@@ -160,9 +249,9 @@ func (c *Client) Exec(ctx context.Context, req remote.ExecRequest, stdout, stder
 		return remote.ExecResult{}, statusError(resp.StatusCode, data)
 	}
 	if resp.Header.Get("Content-Type") != remote.ExecContentType {
-		return remote.ExecResult{}, fmt.Errorf("control plane answered /exec with %q, not an execution stream", resp.Header.Get("Content-Type"))
+		return remote.ExecResult{}, fmt.Errorf("control plane answered %s with %q, not an execution stream", path, resp.Header.Get("Content-Type"))
 	}
-	return remote.ReadExecStream(resp.Body, stdout, stderr)
+	return stream.Read(resp.Body, stdout, stderr)
 }
 
 func (c *Client) call(ctx context.Context, method string, path string, body any, out any) error {

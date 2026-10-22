@@ -3,6 +3,7 @@ package remote
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -31,37 +32,58 @@ func concat(parts ...[]byte) []byte {
 	return bytes.Join(parts, nil)
 }
 
-func TestReadExecStream(t *testing.T) {
+const testRunID = "rn_0123456789abcdef0123456789abcdef"
+
+// runFrame starts every /exec and /exec/attach body.
+var runFrame = frame(FrameRun, `{"run_id":"`+testRunID+`"}`)
+
+func read(stream *ExecStream, body []byte) (ExecResult, string, string, error) {
+	var stdout, stderr bytes.Buffer
+	result, err := stream.Read(bytes.NewReader(body), &stdout, &stderr)
+	return result, stdout.String(), stderr.String(), err
+}
+
+func TestExecStreamRead(t *testing.T) {
 	response := `{"execution_state":"finished","req_id":"r1","session_id":"s","host":"web-1","status":"failed","exit_code":3,"duration_ms":5,"stdout":"","stderr":"","output_truncated":false,"redactions":0}`
 	for _, tc := range []struct {
 		name           string
-		stream         []byte
+		spool          []byte
+		noRunFrame     bool
 		stdout, stderr string
 		exit           int
 		hosts          int
+		truncated      bool
 		err            string
 	}{
-		{name: "output, responses, result", stream: concat(frame(FrameStdout, "a"), frame(FrameStderr, "b"), frame(FrameStdout, "c"), frame(FrameResponse, response), frame(FrameResponse, response), frame(FrameResult, `{"exit_code":1}`)), stdout: "ac", stderr: "b", exit: 1, hosts: 2},
-		{name: "result only", stream: frame(FrameResult, `{"exit_code":0}`)},
-		{name: "empty stream", stream: nil, err: ErrNoResult.Error()},
-		{name: "disconnect before result", stream: frame(FrameStdout, "partial"), stdout: "partial", err: ErrNoResult.Error()},
-		{name: "disconnect between responses", stream: frame(FrameResponse, response), err: ErrNoResult.Error()},
-		{name: "truncated header", stream: concat(frame(FrameStdout, "x"), []byte{FrameResult, 0, 0}), stdout: "x", err: ErrNoResult.Error()},
-		{name: "truncated payload", stream: concat(header(FrameResult, 10), []byte(`{"exit`)), err: ErrNoResult.Error()},
-		{name: "unknown type", stream: frame(9, "x"), err: "unknown execution frame type 9"},
-		{name: "oversized data frame", stream: header(FrameStdout, MaxDataFrameBytes+1), err: ErrFrameTooLarge.Error()},
-		{name: "oversized response frame", stream: header(FrameResponse, MaxMessageFrameBytes+1), err: ErrFrameTooLarge.Error()},
-		{name: "oversized result frame", stream: header(FrameResult, MaxMessageFrameBytes+1), err: ErrFrameTooLarge.Error()},
-		{name: "malformed response", stream: frame(FrameResponse, `{"host":`), err: "malformed execution response"},
-		{name: "malformed result", stream: frame(FrameResult, `{"exit_code":`), err: "malformed execution result"},
-		{name: "output after a response", stream: concat(frame(FrameResponse, response), frame(FrameStdout, "late")), err: "output after a response frame"},
-		{name: "data after result", stream: concat(frame(FrameResult, `{"exit_code":0}`), frame(FrameStdout, "late")), err: "continues after its final frame"},
-		{name: "error frame", stream: frame(FrameError, `{"code":"internal","error":"execution failed"}`), err: "execution failed"},
-		{name: "malformed error frame", stream: frame(FrameError, `{}`), err: "malformed execution error frame"},
+		{name: "output, responses, result", spool: concat(frame(FrameStdout, "a"), frame(FrameStderr, "b"), frame(FrameStdout, "c"), frame(FrameResponse, response), frame(FrameResponse, response), frame(FrameResult, `{"exit_code":1}`)), stdout: "ac", stderr: "b", exit: 1, hosts: 2},
+		{name: "result only", spool: frame(FrameResult, `{"exit_code":0}`)},
+		{name: "truncated result", spool: concat(frame(FrameResponse, response), frame(FrameResult, `{"exit_code":1,"truncated":true}`)), exit: 1, hosts: 1, truncated: true},
+		{name: "no run frame", spool: frame(FrameResult, `{"exit_code":0}`), noRunFrame: true, err: "does not start with a run frame"},
+		{name: "empty body", noRunFrame: true, err: ErrNoResult.Error()},
+		{name: "run frame only", err: ErrNoResult.Error()},
+		{name: "disconnect before result", spool: frame(FrameStdout, "partial"), stdout: "partial", err: ErrNoResult.Error()},
+		{name: "disconnect between responses", spool: frame(FrameResponse, response), err: ErrNoResult.Error()},
+		{name: "truncated header", spool: concat(frame(FrameStdout, "x"), []byte{FrameResult, 0, 0}), stdout: "x", err: ErrNoResult.Error()},
+		{name: "truncated payload", spool: concat(header(FrameResult, 10), []byte(`{"exit`)), err: ErrNoResult.Error()},
+		{name: "unknown type", spool: frame(9, "x"), err: "unknown execution frame type 9"},
+		{name: "second run frame", spool: runFrame, err: "unexpected run frame"},
+		{name: "oversized data frame", spool: header(FrameStdout, MaxDataFrameBytes+1), err: ErrFrameTooLarge.Error()},
+		{name: "oversized response frame", spool: header(FrameResponse, MaxMessageFrameBytes+1), err: ErrFrameTooLarge.Error()},
+		{name: "malformed response", spool: frame(FrameResponse, `{"host":`), err: "malformed execution response"},
+		{name: "malformed result", spool: frame(FrameResult, `{"exit_code":`), err: "malformed execution result"},
+		{name: "output after a response", spool: concat(frame(FrameResponse, response), frame(FrameStdout, "late")), err: "output after a response frame"},
+		{name: "abrupt end after result", spool: concat(frame(FrameResult, `{"exit_code":0}`), []byte{FrameStdout, 0})},
+		{name: "data after result", spool: concat(frame(FrameResult, `{"exit_code":0}`), frame(FrameStdout, "late")), err: "continues after its final frame"},
+		{name: "error frame", spool: frame(FrameError, `{"code":"internal","error":"execution failed"}`), err: "execution failed"},
+		{name: "malformed error frame", spool: frame(FrameError, `{}`), err: "malformed execution error frame"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			var stdout, stderr bytes.Buffer
-			got, err := ReadExecStream(bytes.NewReader(tc.stream), &stdout, &stderr)
+			body := concat(runFrame, tc.spool)
+			if tc.noRunFrame {
+				body = tc.spool
+			}
+			var stream ExecStream
+			got, stdout, stderr, err := read(&stream, body)
 			if tc.err != "" {
 				if err == nil || !strings.Contains(err.Error(), tc.err) {
 					t.Fatalf("err = %v, want %q", err, tc.err)
@@ -69,41 +91,66 @@ func TestReadExecStream(t *testing.T) {
 			} else if err != nil {
 				t.Fatalf("err = %v", err)
 			}
-			if stdout.String() != tc.stdout || stderr.String() != tc.stderr {
-				t.Fatalf("stdout %q stderr %q, want %q %q", stdout.String(), stderr.String(), tc.stdout, tc.stderr)
+			if stdout != tc.stdout || stderr != tc.stderr {
+				t.Fatalf("stdout %q stderr %q, want %q %q", stdout, stderr, tc.stdout, tc.stderr)
 			}
-			if got.ExitCode != tc.exit || len(got.Responses) != tc.hosts {
-				t.Fatalf("exit = %d with %d responses, want %d with %d", got.ExitCode, len(got.Responses), tc.exit, tc.hosts)
+			if got.ExitCode != tc.exit || len(got.Responses) != tc.hosts || got.Truncated != tc.truncated {
+				t.Fatalf("result = %+v, want exit %d with %d responses, truncated %v", got, tc.exit, tc.hosts, tc.truncated)
+			}
+			if tc.err == "" && got.RunID != testRunID {
+				t.Fatalf("run id = %q", got.RunID)
 			}
 		})
 	}
 }
 
+// A broken stream resumes from Offset: no frame is delivered twice and the
+// responses received before the break are kept.
+func TestExecStreamResumesFromOffset(t *testing.T) {
+	response := `{"host":"web-1","status":"completed"}`
+	spool := concat(frame(FrameStdout, "one\n"), frame(FrameStdout, "two\n"), frame(FrameResponse, response), frame(FrameResponse, response), frame(FrameResult, `{"exit_code":0}`))
+	// The first connection breaks inside the second response frame.
+	cut := len(frame(FrameStdout, "one\n")) + len(frame(FrameStdout, "two\n")) + len(frame(FrameResponse, response)) + 3
+	var stream ExecStream
+	_, out1, _, err := read(&stream, concat(runFrame, spool[:cut]))
+	if !errors.Is(err, ErrNoResult) || out1 != "one\ntwo\n" {
+		t.Fatalf("first read: %q %v", out1, err)
+	}
+	if want := int64(cut - 3); stream.Offset != want {
+		t.Fatalf("offset = %d, want %d (complete frames only)", stream.Offset, want)
+	}
+	result, out2, _, err := read(&stream, concat(runFrame, spool[stream.Offset:]))
+	if err != nil || out2 != "" || len(result.Responses) != 2 || stream.Offset != int64(len(spool)) {
+		t.Fatalf("resumed read: out=%q responses=%d offset=%d err=%v", out2, len(result.Responses), stream.Offset, err)
+	}
+	other := ExecStream{RunID: "rn_ffffffffffffffffffffffffffffffff"}
+	if _, _, _, err := read(&other, concat(runFrame, spool)); err == nil || !strings.Contains(err.Error(), "instead of") {
+		t.Fatalf("attached to the wrong run: %v", err)
+	}
+}
+
 func TestErrorFrameIsAPIError(t *testing.T) {
-	_, err := ReadExecStream(bytes.NewReader(frame(FrameError, `{"code":"usage","error":"no such host"}`)), &bytes.Buffer{}, &bytes.Buffer{})
+	var stream ExecStream
+	_, _, _, err := read(&stream, concat(runFrame, frame(FrameError, `{"code":"usage","error":"no such host"}`)))
 	var apiErr *APIError
 	if !errors.As(err, &apiErr) || apiErr.Code != CodeUsage {
 		t.Fatalf("err = %v, want usage APIError", err)
 	}
 }
 
-func TestWriteFrameSplitsDataAndRoundTrips(t *testing.T) {
+func TestWriteFrameSplitsData(t *testing.T) {
 	big := bytes.Repeat([]byte("x"), 2*MaxDataFrameBytes+7)
 	var buf bytes.Buffer
 	if err := WriteFrame(&buf, FrameStdout, big); err != nil {
 		t.Fatal(err)
 	}
-	if buf.Len() != 3*frameHeaderBytes+len(big) {
+	if int64(buf.Len()) != 3*FrameSize(0)+int64(len(big)) {
 		t.Fatalf("encoded %d bytes, want three data frames", buf.Len())
 	}
-	result := ExecResult{ExitCode: 6, Responses: []runner.Response{{Host: "web-1", Status: "denied"}, {Host: "web-2", Status: "completed"}}}
-	if err := WriteExecResult(func(kind byte, payload []byte) error { return WriteFrame(&buf, kind, payload) }, result); err != nil {
-		t.Fatal(err)
-	}
-	var stdout bytes.Buffer
-	got, err := ReadExecStream(&buf, &stdout, &bytes.Buffer{})
-	if err != nil || !bytes.Equal(stdout.Bytes(), big) || got.ExitCode != 6 || len(got.Responses) != 2 || got.Responses[1].Host != "web-2" {
-		t.Fatalf("round trip: %v %+v", err, got)
+	buf.Write(frame(FrameResult, `{"exit_code":0}`))
+	var stream ExecStream
+	if _, stdout, _, err := read(&stream, concat(runFrame, buf.Bytes())); err != nil || stdout != string(big) {
+		t.Fatalf("round trip: %v", err)
 	}
 	if err := WriteFrame(&buf, FrameResult, make([]byte, MaxMessageFrameBytes+1)); !errors.Is(err, ErrFrameTooLarge) {
 		t.Fatalf("oversized result: %v", err)
@@ -113,38 +160,47 @@ func TestWriteFrameSplitsDataAndRoundTrips(t *testing.T) {
 	}
 }
 
-// A target's response at the gateway's output cap fits one frame even when
-// JSON escapes every output byte, and an oversized response is refused before
-// anything is written.
-func TestEncodeExecResultBoundsEachResponse(t *testing.T) {
+// One target's response at the gateway's output cap fits a frame even when
+// JSON escapes every output byte.
+func TestCappedResponseFitsOneFrame(t *testing.T) {
 	worst := strings.Repeat("<", MaxExecOutputBytes) // JSON escapes '<' as \u003c
-	fits := ExecResult{Responses: []runner.Response{{Host: "web-1", Cmd: strings.Repeat("<", 2048), Stdout: worst, Stderr: worst}}}
-	if _, err := EncodeExecResult(fits); err != nil {
-		t.Fatalf("capped response does not fit a frame: %v", err)
+	payload, err := json.Marshal(runner.Response{Host: "web-1", Cmd: strings.Repeat("<", 2048), Stdout: worst, Stderr: worst})
+	if err != nil || len(payload) > MaxMessageFrameBytes {
+		t.Fatalf("capped response is %d bytes (limit %d): %v", len(payload), MaxMessageFrameBytes, err)
 	}
-	tooBig := ExecResult{Responses: []runner.Response{{Host: "web-1", Stdout: strings.Repeat("<", MaxMessageFrameBytes)}}}
-	wrote := false
-	err := WriteExecResult(func(byte, []byte) error { wrote = true; return nil }, tooBig)
-	if !errors.Is(err, ErrFrameTooLarge) || wrote {
-		t.Fatalf("oversized response: err=%v wrote=%v", err, wrote)
+}
+
+func TestValidRunID(t *testing.T) {
+	for id, want := range map[string]bool{
+		testRunID:                             true,
+		"rn_0123456789ABCDEF0123456789abcdef": false,
+		"rn_0123":                             false,
+		"../../etc/passwd":                    false,
+		"rn_0123456789abcdef0123456789abcdeg": false,
+	} {
+		if ValidRunID(id) != want {
+			t.Errorf("ValidRunID(%q) = %v", id, !want)
+		}
 	}
 }
 
 func FuzzReadExecStream(f *testing.F) {
-	f.Add(concat(frame(FrameStdout, "out"), frame(FrameStderr, "err"), frame(FrameResponse, `{"host":"web-1","status":"completed"}`), frame(FrameResult, `{"exit_code":0}`)))
-	f.Add(frame(FrameError, `{"code":"busy","error":"x"}`))
-	f.Add(header(FrameResponse, MaxMessageFrameBytes))
+	f.Add(concat(runFrame, frame(FrameStdout, "out"), frame(FrameStderr, "err"), frame(FrameResponse, `{"host":"web-1","status":"completed"}`), frame(FrameResult, `{"exit_code":0}`)))
+	f.Add(concat(runFrame, frame(FrameError, `{"code":"busy","error":"x"}`)))
+	f.Add(concat(runFrame, header(FrameResponse, MaxMessageFrameBytes)))
 	f.Add([]byte{FrameStdout, 0xff, 0xff, 0xff, 0xff})
 	f.Fuzz(func(t *testing.T, data []byte) {
+		var stream ExecStream
 		var stdout, stderr bytes.Buffer
-		_, err := ReadExecStream(bytes.NewReader(data), &stdout, &stderr)
-		// A decoded result needs at least one complete frame.
-		if err == nil && len(data) < frameHeaderBytes {
+		_, err := stream.Read(bytes.NewReader(data), &stdout, &stderr)
+		// A decoded result needs at least a run frame and a result frame.
+		if err == nil && len(data) < 2*frameHeaderBytes {
 			t.Fatalf("decoded a result from %d bytes", len(data))
 		}
-		// Output is only ever a copy of data frames from the input.
-		if stdout.Len()+stderr.Len() > len(data) {
-			t.Fatalf("emitted %d bytes from a %d byte stream", stdout.Len()+stderr.Len(), len(data))
+		// Output is only ever a copy of data frames from the input, and the
+		// offset never passes the bytes read.
+		if stdout.Len()+stderr.Len() > len(data) || stream.Offset > int64(len(data)) {
+			t.Fatalf("emitted %d bytes, offset %d, from a %d byte stream", stdout.Len()+stderr.Len(), stream.Offset, len(data))
 		}
 	})
 }

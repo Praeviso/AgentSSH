@@ -1,13 +1,17 @@
 package gateway_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,12 +26,19 @@ func init() {
 }
 
 type fixture struct {
-	base   string
-	dir    string
-	store  *controlplane.Store
-	keys   *controlplane.Keys
-	server *gateway.Server
-	client *remoteclient.Client
+	base    string
+	ingress *httptest.Server
+	handler *atomic.Pointer[http.Handler]
+	// down makes the ingress answer 503, like a gateway that is unreachable.
+	down *atomic.Bool
+	// dropNextExec lets the gateway handle the next /exec but loses its
+	// whole response, as if the connection died right after the request.
+	dropNextExec *atomic.Bool
+	dir          string
+	store        *controlplane.Store
+	keys         *controlplane.Keys
+	server       *gateway.Server
+	client       *remoteclient.Client
 }
 
 // enrolledGateway runs an in-process gateway behind a TLS ingress and enrolls
@@ -57,11 +68,31 @@ func enrolledGateway(t *testing.T) *fixture {
 	t.Cleanup(ingress.Close)
 	base := ingress.URL + "/agentssh"
 	server := gateway.NewServer(dir, store, keys)
-	handler, err := server.Handler(base)
+	first, err := server.Handler(base)
 	if err != nil {
 		t.Fatal(err)
 	}
-	mux.Handle("/", handler)
+	current := new(atomic.Pointer[http.Handler])
+	current.Store(&first)
+	down, dropNextExec := new(atomic.Bool), new(atomic.Bool)
+	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handler := *current.Load()
+		if down.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, remote.PathExec) && dropNextExec.CompareAndSwap(true, false) {
+			body, _ := io.ReadAll(r.Body)
+			if conn, _, err := http.NewResponseController(w).Hijack(); err == nil {
+				_ = conn.Close()
+			}
+			r = r.WithContext(context.Background())
+			r.Body = io.NopCloser(bytes.NewReader(body))
+			handler.ServeHTTP(httptest.NewRecorder(), r)
+			return
+		}
+		handler.ServeHTTP(w, r)
+	}))
 	original := http.DefaultTransport
 	transport := original.(*http.Transport).Clone()
 	pool := x509.NewCertPool()
@@ -70,23 +101,44 @@ func enrolledGateway(t *testing.T) *fixture {
 	http.DefaultTransport = transport
 	t.Cleanup(func() { http.DefaultTransport = original; transport.CloseIdleConnections() })
 
-	pub, err := controlplane.LoadBundlePublicKey(dir)
+	f := &fixture{base: base, ingress: ingress, handler: current, down: down, dropNextExec: dropNextExec, dir: dir, store: store, keys: keys, server: server}
+	f.client = f.enroll(t, "agent-vm")
+	return f
+}
+
+// restart replaces the gateway with a new process over the same data
+// directory: nothing in memory survives, the old process's runs are left to
+// finish on their own.
+func (f *fixture) restart(t *testing.T) {
+	t.Helper()
+	f.server = gateway.NewServer(f.dir, f.store, f.keys)
+	handler, err := f.server.Handler(f.base)
 	if err != nil {
 		t.Fatal(err)
 	}
-	token, err := store.CreateEnrollToken("agent-vm", base, remote.PublicKeyFingerprint(pub), time.Minute, time.Now())
+	f.handler.Store(&handler)
+}
+
+// enroll enrolls another device home with the real client.
+func (f *fixture) enroll(t *testing.T, name string) *remoteclient.Client {
+	t.Helper()
+	pub, err := controlplane.LoadBundlePublicKey(f.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := f.store.CreateEnrollToken(name, f.base, remote.PublicKeyFingerprint(pub), time.Minute, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
 	home := t.TempDir()
-	if _, err := remoteclient.Enroll(context.Background(), home, base, token.String(), time.Now()); err != nil {
+	if _, err := remoteclient.Enroll(context.Background(), home, f.base, token.String(), time.Now()); err != nil {
 		t.Fatalf("enroll: %v", err)
 	}
 	client, err := remoteclient.NewClient(home)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &fixture{base: base, dir: dir, store: store, keys: keys, server: server, client: client}
+	return client
 }
 
 func TestEnrolledDeviceIsRefusedAfterRevocation(t *testing.T) {

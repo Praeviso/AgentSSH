@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 	"unicode"
 
@@ -45,8 +44,12 @@ const (
 	maxExecBody = (remote.MaxExecStdinBytes+2)/3*4 + 6*remote.MaxExecCommandBytes + 64<<10
 )
 
-func (s *Server) execRoute() controlplane.Route {
-	return controlplane.Route{Method: "POST", Path: remote.PathExec, Handler: s.handleExec, MaxBody: maxExecBody, Streaming: true}
+func (s *Server) execRoutes() []controlplane.Route {
+	return []controlplane.Route{
+		{Method: "POST", Path: remote.PathExec, Handler: s.handleExec, MaxBody: maxExecBody, Streaming: true},
+		{Method: "POST", Path: remote.PathExecAttach, Handler: s.handleAttach, Streaming: true},
+		{Method: "POST", Path: remote.PathExecCancel, Handler: s.handleCancel},
+	}
 }
 
 func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, device controlplane.Device, body []byte) {
@@ -57,6 +60,13 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, device contr
 	}
 	if err := validateExec(req); err != nil {
 		controlplane.WriteError(w, http.StatusBadRequest, remote.CodeUsage, err.Error())
+		return
+	}
+	sum := sha256.Sum256(body)
+	requestSHA256 := hex.EncodeToString(sum[:])
+	// A repeated request for a run that already exists joins it, so a client
+	// that lost the first response neither loses the run nor starts it twice.
+	if req.RunID != "" && s.joinRun(w, r, device.ID, req.RunID, requestSHA256) {
 		return
 	}
 	cfg, err := s.Store.Config(device.ID)
@@ -95,12 +105,42 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, device contr
 		controlplane.WriteError(w, http.StatusTooManyRequests, remote.CodeBusy, fmt.Sprintf("this device already has %d executions running", s.maxConcurrent()))
 		return
 	}
-	defer s.release(device.ID)
-
-	ctx, cancel := context.WithTimeout(r.Context(), s.execTimeout())
-	defer cancel()
+	// Refuse a run that cannot start before making room for it, so a
+	// refused request never evicts retained output.
+	if int64(len(resolved.Targets)) > s.maxRunTargets() {
+		s.release(device.ID)
+		controlplane.WriteError(w, http.StatusBadRequest, remote.CodeUsage, fmt.Sprintf("%s has %d hosts; --run-max-bytes on the gateway allows at most %d per run", req.Host, len(resolved.Targets), s.maxRunTargets()))
+		return
+	}
+	s.sweepRuns()
+	s.makeRoom(device.ID, s.runMaxBytes())
+	// The run outlives this request: a dropped connection only detaches the
+	// device, and /exec/cancel or the timeout stops the command.
+	ctx, cancel := context.WithTimeout(context.Background(), s.execTimeout())
+	id := req.RunID
+	if id == "" {
+		id = remote.NewRunID()
+	}
+	rn, err := s.startRun(device.ID, id, requestSHA256, len(resolved.Targets), cancel)
+	if err != nil {
+		cancel()
+		s.release(device.ID)
+		switch {
+		case errors.Is(err, errRunExists):
+			// The ID was claimed meanwhile: by a concurrent repeat of this
+			// request, a different request, or a cancel that overtook it.
+			if !s.joinRun(w, r, device.ID, id, requestSHA256) {
+				controlplane.WriteError(w, http.StatusInternalServerError, remote.CodeInternal, "run record changed while starting; retry")
+			}
+		case errors.Is(err, errTooManyRecords):
+			writeRunError(w, err, s.runRetention())
+		default:
+			log.Printf("agentssh-gateway: device %s: create run: %v", device.ID, err)
+			controlplane.WriteError(w, http.StatusInternalServerError, remote.CodeInternal, "run storage unavailable")
+		}
+		return
+	}
 	exec := s.executor(inv)
-	defer func() { _ = exec.Close() }()
 	approvalDir := filepath.Join(s.Dir, "devices", device.ID, "approval")
 	env := runner.Env{
 		Policy:    pol,
@@ -116,8 +156,7 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, device contr
 		Executor: exec,
 		Output:   filter,
 	}
-	frames := &frameWriter{w: w, rc: http.NewResponseController(w)}
-	run := runner.Request{
+	request := runner.Request{
 		Target:       resolved,
 		Command:      req.Cmd,
 		Stdin:        execStdin(req.Stdin),
@@ -129,36 +168,77 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, device contr
 		Observer:     logObserver{deviceID: device.ID},
 	}
 	if req.Stream {
-		run.Stream = func(string, string) (io.Writer, io.Writer) {
-			return frameStream{frames, remote.FrameStdout}, frameStream{frames, remote.FrameStderr}
+		request.Stream = func(string, string) (io.Writer, io.Writer) {
+			return spoolStream{rn, remote.FrameStdout}, spoolStream{rn, remote.FrameStderr}
 		}
 	}
-	outcome, err := runner.Run(ctx, env, run)
+	go func() {
+		defer s.release(device.ID)
+		defer cancel()
+		defer func() { _ = exec.Close() }()
+		s.execute(ctx, rn, env, request)
+	}()
+	s.streamRun(w, r.Context(), rn, 0)
+}
+
+// execute runs the pipeline and spools its outcome as response frames and a
+// result frame (or an error frame).
+func (s *Server) execute(ctx context.Context, rn *run, env runner.Env, request runner.Request) {
+	defer func() {
+		s.endRun(rn)
+		// Settle any quota overshoot now that this run is stored.
+		s.makeRoom(rn.deviceID, 0)
+	}()
+	outcome, err := runner.Run(ctx, env, request)
 	if err != nil {
+		code, message := remote.CodeInternal, "execution failed"
 		var usage runner.UsageError
 		if errors.As(err, &usage) {
-			frames.fail(http.StatusBadRequest, remote.CodeUsage, usage.Error())
-			return
+			code, message = remote.CodeUsage, usage.Error()
+		} else {
+			log.Printf("agentssh-gateway: run %s: execution failed: %v", rn.id, err)
 		}
-		log.Printf("agentssh-gateway: device %s: execution failed: %v", device.ID, err)
-		frames.fail(http.StatusInternalServerError, remote.CodeInternal, "execution failed")
+		payload, _ := json.Marshal(remote.ErrorResponse{Code: code, Error: message})
+		rn.finish(remote.FrameError, payload, s.now())
 		return
 	}
-	result := remote.ExecResult{ExitCode: outcome.ExitCode, Responses: outcome.Responses}
-	if _, err := remote.EncodeExecResult(result); err != nil {
-		// Unreachable with the output cap; say so rather than end the stream
-		// without a result.
-		log.Printf("agentssh-gateway: device %s: encode execution result: %v", device.ID, err)
-		frames.fail(http.StatusInternalServerError, remote.CodeInternal, "execution finished but its result could not be encoded; see the gateway audit")
-		return
+	for _, response := range outcome.Responses {
+		rn.response(response)
 	}
-	if err := remote.WriteExecResult(frames.write, result); err != nil {
-		// The device is gone; the audit already holds the outcome.
-		log.Printf("agentssh-gateway: device %s: result not delivered: %v", device.ID, err)
+	final := remote.ExecFinal{ExitCode: outcome.ExitCode, Truncated: rn.isTruncated()}
+	if final.Truncated {
+		// A partial result must never pass for a complete one.
+		final.ExitCode = runner.MergeExitCode(final.ExitCode, runner.ExitRemoteFailed)
 	}
+	payload, _ := json.Marshal(final)
+	rn.finish(remote.FrameResult, payload, s.now())
+}
+
+// joinRun answers a request whose run ID is already claimed: it streams the
+// run to a repeat of the same request, and refuses a different request, an
+// ID cancelled before its request arrived, and an expired or interrupted
+// run. It reports false only when the ID was never claimed, so the caller
+// starts the run.
+func (s *Server) joinRun(w http.ResponseWriter, r *http.Request, deviceID, id, requestSHA256 string) bool {
+	rn, err := s.lookupRun(deviceID, id)
+	if errors.Is(err, errRunNotFound) {
+		return false
+	}
+	if err == nil && rn.requestSHA256 != requestSHA256 {
+		err = errRunConflict
+	}
+	if err != nil {
+		writeRunError(w, err, s.runRetention())
+		return true
+	}
+	s.streamRun(w, r.Context(), rn, 0)
+	return true
 }
 
 func validateExec(req remote.ExecRequest) error {
+	if req.RunID != "" && !remote.ValidRunID(req.RunID) {
+		return errors.New("run id must be rn_ followed by 32 lowercase hex characters")
+	}
 	switch {
 	case strings.TrimSpace(req.Host) == "":
 		return errors.New("a target host or group is required")
@@ -299,60 +379,14 @@ func (a deviceAudit) Append(record audit.Record) (audit.Record, error) {
 	return a.log.Append(record)
 }
 
-// frameWriter commits the response on its first frame, so a failure before
-// any output is an ordinary HTTP error. Writes are serialized because stdout
-// and stderr are copied concurrently.
-type frameWriter struct {
-	mu      sync.Mutex
-	w       http.ResponseWriter
-	rc      *http.ResponseController
-	started bool
-	err     error
+// spoolStream feeds a running command's output into its run's spool.
+type spoolStream struct {
+	run  *run
+	kind byte
 }
 
-func (f *frameWriter) write(kind byte, payload []byte) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.err != nil {
-		return f.err
-	}
-	if !f.started {
-		f.started = true
-		f.w.Header().Set("Content-Type", remote.ExecContentType)
-		// Ask buffering reverse proxies to pass frames through as they arrive.
-		f.w.Header().Set("X-Accel-Buffering", "no")
-		f.w.WriteHeader(http.StatusOK)
-	}
-	if f.err = remote.WriteFrame(f.w, kind, payload); f.err == nil {
-		f.err = f.rc.Flush()
-	}
-	return f.err
-}
-
-func (f *frameWriter) fail(status int, code string, message string) {
-	f.mu.Lock()
-	started := f.started
-	f.mu.Unlock()
-	if !started {
-		controlplane.WriteError(f.w, status, code, message)
-		return
-	}
-	payload, _ := json.Marshal(remote.ErrorResponse{Code: code, Error: message})
-	_ = f.write(remote.FrameError, payload)
-}
-
-type frameStream struct {
-	frames *frameWriter
-	kind   byte
-}
-
-func (s frameStream) Write(p []byte) (int, error) {
-	if len(p) == 0 {
-		return 0, nil
-	}
-	if err := s.frames.write(s.kind, p); err != nil {
-		return 0, err
-	}
+func (s spoolStream) Write(p []byte) (int, error) {
+	s.run.data(s.kind, p)
 	return len(p), nil
 }
 
