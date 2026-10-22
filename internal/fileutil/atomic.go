@@ -40,6 +40,35 @@ func WriteFileAtomic(path string, data []byte, perm os.FileMode, tempPattern str
 	return nil
 }
 
+// CreateFileExclusive publishes data at path only if nothing is there yet. The
+// content is written to a temporary file in path's directory first and then
+// hard-linked into place, so a reader sees either no file or the complete
+// file, never an empty or partial one. An existing path is reported with an
+// error wrapping os.ErrExist.
+func CreateFileExclusive(path string, data []byte, perm os.FileMode, tempPattern string) error {
+	file, err := os.CreateTemp(filepath.Dir(path), tempPattern)
+	if err != nil {
+		return fmt.Errorf("create temporary file: %w", err)
+	}
+	tempName := file.Name()
+	defer func() { _ = os.Remove(tempName) }()
+	if err := file.Chmod(perm); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("chmod temporary file: %w", err)
+	}
+	if _, err := file.Write(data); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("write temporary file: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close temporary file: %w", err)
+	}
+	if err := os.Link(tempName, path); err != nil {
+		return fmt.Errorf("publish file: %w", err)
+	}
+	return nil
+}
+
 // LabelAtomicError rewrites WriteFileAtomic's generic operation names with the
 // caller's file label, preserving package-specific error text.
 func LabelAtomicError(err error, label string) error {

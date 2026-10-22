@@ -12,6 +12,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/Praeviso/AgentSSH/internal/fileutil"
 )
 
 type PendingStore struct {
@@ -128,20 +130,14 @@ func (s PendingStore) Create(req PendingRequest) (PendingRequest, error) {
 	if err != nil {
 		return PendingRequest{}, fmt.Errorf("marshal pending approval: %w", err)
 	}
-	path := pendingPath(s.PendingDir, req.ID)
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	// Published whole: concurrent readers (findUnresolved, approval ls) never
+	// see a half-written request.
+	err = fileutil.CreateFileExclusive(pendingPath(s.PendingDir, req.ID), append(data, '\n'), 0o600, ".publish-*.tmp")
 	if errors.Is(err, os.ErrExist) {
 		return PendingRequest{}, fmt.Errorf("approval id collision %s: %w", req.ID, err)
 	}
 	if err != nil {
 		return PendingRequest{}, fmt.Errorf("create pending approval: %w", err)
-	}
-	if _, err := file.Write(append(data, '\n')); err != nil {
-		_ = file.Close()
-		return PendingRequest{}, fmt.Errorf("write pending approval: %w", err)
-	}
-	if err := file.Close(); err != nil {
-		return PendingRequest{}, fmt.Errorf("close pending approval: %w", err)
 	}
 	return req, nil
 }
@@ -219,20 +215,15 @@ func (s PendingStore) Resolve(req PendingRequest, verdict Verdict, scope Scope) 
 	if err != nil {
 		return Resolution{}, fmt.Errorf("marshal approval response: %w", err)
 	}
-	path := responsePath(s.ResponsesDir, req.ID)
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	// Published whole: a concurrent decision or `approval wait` sees either
+	// no resolution or the complete one, never an empty file it would report
+	// as corrupt. The first publisher wins.
+	err = fileutil.CreateFileExclusive(responsePath(s.ResponsesDir, req.ID), append(data, '\n'), 0o600, ".publish-*.tmp")
 	if errors.Is(err, os.ErrExist) {
 		return Resolution{}, ErrAlreadyResolved
 	}
 	if err != nil {
 		return Resolution{}, fmt.Errorf("create approval response: %w", err)
-	}
-	if _, err := file.Write(append(data, '\n')); err != nil {
-		_ = file.Close()
-		return Resolution{}, fmt.Errorf("write approval response: %w", err)
-	}
-	if err := file.Close(); err != nil {
-		return Resolution{}, fmt.Errorf("close approval response: %w", err)
 	}
 	return resolution, nil
 }
