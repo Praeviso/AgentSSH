@@ -342,10 +342,13 @@ func TestNativeExecutorNewSessionTimesOutAndClosesPooledClient(t *testing.T) {
 
 	writeKnownHosts(t, home, server.Addr(), server.HostSigner.PublicKey())
 
+	// ConnectTimeout bounds both the handshake and NewSession. It must leave the
+	// handshake room under -race and full-suite load (30 ms did not), so only
+	// the hung NewSession can time out.
 	exec := NewNativeExecutor(NativeOptions{
 		KnownHostsPath:    filepath.Join(home, ".ssh", "known_hosts"),
 		ConfigPath:        filepath.Join(home, ".ssh", "config"),
-		ConnectTimeout:    30 * time.Millisecond,
+		ConnectTimeout:    500 * time.Millisecond,
 		KeepAliveInterval: -1,
 	})
 	defer func() { _ = exec.Close() }()
@@ -357,7 +360,9 @@ func TestNativeExecutorNewSessionTimesOutAndClosesPooledClient(t *testing.T) {
 	if !errors.Is(result.Err, context.DeadlineExceeded) {
 		t.Fatalf("result err = %v, want context deadline exceeded", result.Err)
 	}
-	if elapsed := time.Since(start); elapsed > time.Second {
+	// The server never answers the channel open, so only the timeout ends
+	// NewSession: well before this bound, but after its own budget.
+	if elapsed := time.Since(start); elapsed < 500*time.Millisecond || elapsed > 5*time.Second {
 		t.Fatalf("NewSession timeout took %s", elapsed)
 	}
 	waitForAtomic(t, &server.closed, 1)
