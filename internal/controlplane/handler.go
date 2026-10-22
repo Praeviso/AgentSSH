@@ -34,9 +34,10 @@ type Route struct {
 	Revoked func(deviceID string, body []byte, now time.Time) error
 	// MaxBody caps the request body; zero means 64 KiB.
 	MaxBody int64
-	// Streaming routes get streamingBodyTimeout to upload their body and then
-	// no read or write deadline, so a long-running response is not cut off by
-	// the server's per-request timeouts.
+	// Streaming routes get streamingBodyTimeout to upload their body once the
+	// request headers authenticate, and no read or write deadline after
+	// authentication, so a long-running response is not cut off by the
+	// server's per-request timeouts.
 	Streaming bool
 }
 
@@ -163,13 +164,23 @@ func (a API) device(base string, route Route) http.HandlerFunc {
 	if limit <= 0 {
 		limit = maxRequestBytes
 	}
+	// A route that admits more than the default body authenticates the
+	// request headers first, so unauthenticated clients cannot hold its larger
+	// body cap or upload deadline.
+	large := limit > maxRequestBytes
 	return func(w http.ResponseWriter, r *http.Request) {
 		rc := http.NewResponseController(w)
-		if route.Streaming {
-			_ = rc.SetReadDeadline(time.Now().Add(streamingBodyTimeout))
-		}
-		body, err := requestBytesLimit(r, limit)
-		if err != nil {
+		var body []byte
+		var err error
+		if large {
+			// Until the headers authenticate, a refusal closes the connection
+			// instead of draining the unread body first.
+			w.Header().Set("Connection", "close")
+			if r.ContentLength > limit {
+				WriteError(w, http.StatusRequestEntityTooLarge, remote.CodeBadRequest, "request body too large")
+				return
+			}
+		} else if body, err = requestBytesLimit(r, limit); err != nil {
 			WriteError(w, 400, remote.CodeBadRequest, "request body too large or unreadable")
 			return
 		}
@@ -190,10 +201,31 @@ func (a API) device(base string, route Route) http.HandlerFunc {
 			return
 		}
 		now := a.Now()
-		proof, err := remote.VerifyHTTPRequest(r, body, base+route.Path, id, remote.DeviceSignatureTag, key, now)
-		if err != nil {
-			writeProofError(w, err, now)
-			return
+		var proof remote.RequestProof
+		if large {
+			proof, err = remote.VerifyHTTPRequestHeaders(r, base+route.Path, id, remote.DeviceSignatureTag, key, now)
+			if err != nil {
+				writeProofError(w, err, now)
+				return
+			}
+			w.Header().Del("Connection")
+			if route.Streaming {
+				_ = rc.SetReadDeadline(time.Now().Add(streamingBodyTimeout))
+			}
+			if body, err = requestBytesLimit(r, limit); err != nil {
+				WriteError(w, 400, remote.CodeBadRequest, "request body too large or unreadable")
+				return
+			}
+			if !remote.ContentDigestMatches(r, body) {
+				writeProofError(w, errors.New("content digest mismatch"), now)
+				return
+			}
+		} else {
+			proof, err = remote.VerifyHTTPRequest(r, body, base+route.Path, id, remote.DeviceSignatureTag, key, now)
+			if err != nil {
+				writeProofError(w, err, now)
+				return
+			}
 		}
 		err = store.consumeNonce(id, proof.Nonce, proof.Expires, a.Now)
 		switch {

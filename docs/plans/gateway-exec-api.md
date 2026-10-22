@@ -114,6 +114,18 @@ integration test exercises the real signed transport; #17 builds on it.
 - [x] Docs: `docs/architecture/remote-control.md` (gateway execution),
   `docs/architecture/overview.md` (§6 `error` and `device_id`).
 
+- [x] Security review follow-up (PR #24): the first version granted `/exec`'s
+  5-minute upload deadline and ~44 MiB body cap before authenticating, so an
+  unauthenticated client could hold both. Routes above the default body size
+  now verify the signature over the headers first
+  (`remote.VerifyHTTPRequestHeaders`; the signature covers `Content-Digest`),
+  refuse a declared `Content-Length` above the cap with 413, answer pre-auth
+  refusals with `Connection: close` so Go's server does not drain the unread
+  body first, and only then extend the deadline, read the body and check it
+  against the digest (`remote.ContentDigestMatches`). Test: a hand-written
+  request whose body never arrives is refused at once (401 unsigned, 413
+  oversized); against the previous handler it hangs until the read timeout.
+
 ## Validation
 
 ```

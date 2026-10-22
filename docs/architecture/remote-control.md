@@ -80,8 +80,11 @@ at a gateway directory has no devices or identities to sign for.
 stdin (base64, at most 32 MiB). The gateway runs it through the same pipeline as
 the CLI (`internal/runner`) against the device's pushed inventory and policy,
 connecting with its own identities in-process (no agent, local keys or
-ssh_config; no connection reuse; `known_hosts` in the data directory). Requests
-the CLI would reject as usage errors return 400 `usage`; a device over its
+ssh_config; no connection reuse; `known_hosts` in the data directory). Because its body is
+larger than other endpoints', the gateway verifies the signature over the
+request headers (which cover `Content-Digest`) before reading the body, refuses
+an oversized `Content-Length` with 413, and then checks the body against the
+digest. Requests the CLI would reject as usage errors return 400 `usage`; a device over its
 concurrency limit (`serve --max-concurrent`, default 4) gets 429 `busy`.
 
 The response is a stream of frames, `type:1 | length:4 big-endian | payload`:

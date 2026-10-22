@@ -22,6 +22,7 @@ func init() {
 }
 
 type fixture struct {
+	base   string
 	dir    string
 	store  *controlplane.Store
 	keys   *controlplane.Keys
@@ -85,7 +86,7 @@ func enrolledGateway(t *testing.T) *fixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &fixture{dir: dir, store: store, keys: keys, server: server, client: client}
+	return &fixture{base: base, dir: dir, store: store, keys: keys, server: server, client: client}
 }
 
 func TestEnrolledDeviceIsRefusedAfterRevocation(t *testing.T) {

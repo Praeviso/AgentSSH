@@ -1,17 +1,21 @@
 package gateway_test
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -473,5 +477,45 @@ func TestDisabledIdentityStopsConnecting(t *testing.T) {
 	}
 	if result.ExitCode != 9 || result.Responses[0].Status != "ssh_error" {
 		t.Fatalf("disabled identity run = %+v", result)
+	}
+}
+
+// An unauthenticated client must not get /exec's larger body cap or upload
+// deadline: the refusal comes before the body is read. The request is written
+// by hand so the headers reach the server while the body is still pending.
+func TestExecRefusesUnauthenticatedUploadBeforeReadingIt(t *testing.T) {
+	f, _ := execGateway(t)
+	u, err := url.Parse(f.base + remote.PathExec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tlsConfig := http.DefaultTransport.(*http.Transport).TLSClientConfig.Clone()
+	for name, tc := range map[string]struct {
+		framing string
+		status  int
+	}{
+		"unsigned stream":    {"Transfer-Encoding: chunked\r\n\r\n10\r\n{\"host\":\"web-1\",\r\n", 401},
+		"declared too large": {"Content-Length: 67108864\r\n\r\n{\"host\":\"web-1\",", 413},
+	} {
+		t.Run(name, func(t *testing.T) {
+			conn, err := tls.Dial("tcp", u.Host, tlsConfig)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = conn.Close() }()
+			_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+			// Headers and the start of a body, then nothing more.
+			if _, err := fmt.Fprintf(conn, "POST %s HTTP/1.1\r\nHost: %s\r\nContent-Type: application/json\r\n%s", u.Path, u.Host, tc.framing); err != nil {
+				t.Fatal(err)
+			}
+			resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+			if err != nil {
+				t.Fatalf("no refusal before the body was sent: %v", err)
+			}
+			_ = resp.Body.Close()
+			if resp.StatusCode != tc.status {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, tc.status)
+			}
+		})
 	}
 }
