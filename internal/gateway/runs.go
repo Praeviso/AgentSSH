@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"time"
@@ -81,7 +82,14 @@ func (s *Server) handleCancel(w http.ResponseWriter, _ *http.Request, device con
 		controlplane.WriteError(w, http.StatusBadRequest, remote.CodeBadRequest, "malformed cancel request")
 		return
 	}
-	controlplane.WriteJSON(w, http.StatusOK, remote.ExecCancelResponse{RunID: req.RunID, Cancelled: s.cancelRun(device.ID, req.RunID)})
+	cancelled, err := s.cancelRun(device.ID, req.RunID)
+	if err != nil {
+		// The cancel could not be recorded, so the device must not assume an
+		// overtaken request will be refused.
+		writeRunError(w, err, s.runRetention())
+		return
+	}
+	controlplane.WriteJSON(w, http.StatusOK, remote.ExecCancelResponse{RunID: req.RunID, Cancelled: cancelled})
 }
 
 func writeRunError(w http.ResponseWriter, err error, retention time.Duration) {
@@ -92,11 +100,16 @@ func writeRunError(w http.ResponseWriter, err error, retention time.Duration) {
 		controlplane.WriteError(w, http.StatusConflict, remote.CodeRunConflict, "this run id was already used for a different request")
 	case errors.Is(err, errRunCancelled):
 		controlplane.WriteError(w, http.StatusConflict, remote.CodeRunCancelled, "this run was cancelled before its request arrived")
+	case errors.Is(err, errTooManyRecords):
+		controlplane.WriteError(w, http.StatusTooManyRequests, remote.CodeBusy, "this device keeps too many runs on the gateway (serve --run-records); retry later")
 	case errors.Is(err, errRunTooLarge):
 		controlplane.WriteError(w, http.StatusBadRequest, remote.CodeUsage, err.Error())
 	case errors.Is(err, errRunBroken):
 		controlplane.WriteError(w, http.StatusInternalServerError, remote.CodeInternal, "the gateway could not store this run's output; its outcome is in the gateway audit")
-	default:
+	case errors.Is(err, errRunNotFound), errors.Is(err, errRunExpired):
 		controlplane.WriteError(w, http.StatusNotFound, remote.CodeRunNotFound, fmt.Sprintf("no such run for this device, or its output expired (kept %s after a run finishes)", retention))
+	default:
+		log.Printf("agentssh-gateway: run storage: %v", err)
+		controlplane.WriteError(w, http.StatusInternalServerError, remote.CodeInternal, "run storage unavailable")
 	}
 }

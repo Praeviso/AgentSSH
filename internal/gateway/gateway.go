@@ -60,12 +60,18 @@ type Server struct {
 	RunRetention           time.Duration
 	RunMaxBytes            int64
 	RunQuotaBytes          int64
+	// RunRecords caps the run records one device keeps.
+	RunRecords int
 
 	mu        sync.Mutex
 	running   map[string]int
 	signers   map[string]ssh.Signer
 	runs      map[string]*run
 	nextSweep time.Time
+	// deviceRecords counts each device's records (live and stored) since its
+	// last sweep; deviceSweeps says when that device is next aged out.
+	deviceRecords map[string]int
+	deviceSweeps  map[string]time.Time
 }
 
 // NewServer wires a data directory, its store and unlocked keys into an API

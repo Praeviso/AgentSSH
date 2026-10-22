@@ -105,6 +105,13 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, device contr
 		controlplane.WriteError(w, http.StatusTooManyRequests, remote.CodeBusy, fmt.Sprintf("this device already has %d executions running", s.maxConcurrent()))
 		return
 	}
+	// Refuse a run that cannot start before making room for it, so a
+	// refused request never evicts retained output.
+	if int64(len(resolved.Targets)) > s.maxRunTargets() {
+		s.release(device.ID)
+		controlplane.WriteError(w, http.StatusBadRequest, remote.CodeUsage, fmt.Sprintf("%s has %d hosts; --run-max-bytes on the gateway allows at most %d per run", req.Host, len(resolved.Targets), s.maxRunTargets()))
+		return
+	}
 	s.sweepRuns()
 	s.makeRoom(device.ID, s.runMaxBytes())
 	// The run outlives this request: a dropped connection only detaches the
@@ -125,8 +132,8 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, device contr
 			if !s.joinRun(w, r, device.ID, id, requestSHA256) {
 				controlplane.WriteError(w, http.StatusInternalServerError, remote.CodeInternal, "run record changed while starting; retry")
 			}
-		case errors.Is(err, errRunTooLarge):
-			controlplane.WriteError(w, http.StatusBadRequest, remote.CodeUsage, fmt.Sprintf("%s has %d hosts; --run-max-bytes on the gateway allows at most %d per run", req.Host, len(resolved.Targets), s.maxRunTargets()))
+		case errors.Is(err, errTooManyRecords):
+			writeRunError(w, err, s.runRetention())
 		default:
 			log.Printf("agentssh-gateway: device %s: create run: %v", device.ID, err)
 			controlplane.WriteError(w, http.StatusInternalServerError, remote.CodeInternal, "run storage unavailable")

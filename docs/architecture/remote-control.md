@@ -130,17 +130,29 @@ removed if the claim fails. States:
 | `running` (live) | in progress | streams it |
 | `running` (not live after a restart) | outcome unknown, see the audit | `410 run_interrupted` |
 | `finished` | output kept for `serve --run-retention` (default 24h) | streams it |
-| `evicted` | output deleted (retention or quota); record kept another retention period | `404 run_not_found`, never re-run |
+| `evicted` | output deleted (retention or quota); record kept for the idempotency window | `404 run_not_found`, never re-run |
 | `cancelled` | a cancel arrived first; kept 10 minutes | `409 run_cancelled` |
 
 Runs belong to the device that started them; another device's and unknown IDs
 are `404 run_not_found` too, and a cancel of an ID that is not live answers
 `cancelled: false` either way.
 
+A run ID deduplicates repeats of its request for at least the idempotency
+window, one hour after the run starts (clients repeat a request only while
+recovering a lost first response). Records are a resource of their own: a
+device keeps at most `serve --run-records` (default 10000) in any state. Every
+new record, a run's or a cancel's, is admitted against that limit; when the
+device is at it, the oldest finished or evicted runs past the window are
+reclaimed, and if none are, the start or the cancel is refused with
+`429 busy` (a refused cancel was not recorded, so the client reports that the
+run may still be running). Each device's records are aged out at least once a
+minute, by whichever request needs a record.
+
 **Space.** A run's spool is hard-capped at `serve --run-max-bytes` (default
 64 MiB). Space is reserved up front for each target's response in a minimal
 form (32 KiB, a proven bound) and for the result frame, so a group with more
-targets than the cap can hold is refused as a usage error. Output beyond the
+targets than the cap can hold is refused as a usage error, before any room is
+made for it. Output beyond the
 cap is dropped; a response that no longer fits is sent without its output, or
 in its minimal form (`output_truncated`); the result then says
 `truncated: true` with the exit code raised to at least 1, so a partial result

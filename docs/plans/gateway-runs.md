@@ -173,6 +173,23 @@ protocol refusals end it. On context cancellation it sends `/exec/cancel`
   tombstone, the cleanup on claim failure, or the minimal fallback each fails
   exactly its test.
 
+- [x] Fourth review round (e5f540b), same root as the third: records were a
+  resource nobody bounded. Cancel-only traffic created durable cancel records
+  without ever triggering a sweep (sweeps ran on `/exec` and `/exec/attach`
+  only), and the byte quota ignored records. Now every record (a run's or a
+  cancel's) is admitted against a per-device limit (`--run-records`, default
+  10000); admission ages that device's records out when due (per-device sweep,
+  so cancels sweep too), then reclaims the oldest finished or evicted runs
+  past an explicit idempotency window (1 h after start); if nothing is
+  reclaimable the start or cancel is `429 busy`. Evicted records now live for
+  the window rather than another retention period. Also, the target-count
+  check runs before `makeRoom`, so a refused oversized group evicts nothing.
+  Tests: cancels beyond the limit are 429 and age out after their TTL; within
+  the window the limit refuses rather than forgetting IDs, past it the oldest
+  run makes room; a refused oversized group leaves retained runs
+  reattachable. Mutation checks: removing cancel admission, the precheck, or
+  the window condition each fails exactly its test.
+
 ## Validation
 
 ```

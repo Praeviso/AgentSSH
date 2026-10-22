@@ -63,11 +63,10 @@ const (
 	// minimalFieldBytes clips each text field of a minimal response.
 	minimalFieldBytes = 256
 
-	runSweepEvery = time.Minute
-	// cancelTombstoneTTL is how long a cancel for a run the gateway has not
-	// seen refuses that run's request. It outlasts the request proof lifetime
-	// plus the upload deadline, the longest an overtaken request can be late.
-	cancelTombstoneTTL = 10 * time.Minute
+	// DefaultRunRecords caps the run records one device keeps, whatever their
+	// state; records are a resource of their own, beside the output bytes.
+	DefaultRunRecords = 10000
+
 	// orphanAge is when an unreferenced spool (an attempt that crashed before
 	// its claim) is certainly abandoned.
 	orphanAge = time.Hour
@@ -80,6 +79,21 @@ const (
 	stateEvicted   = "evicted"
 )
 
+// Record lifetimes; variables so tests can shorten them.
+var (
+	// runSweepEvery is how often a device's records are aged out.
+	runSweepEvery = time.Minute
+	// cancelTombstoneTTL is how long a cancel for a run the gateway has not
+	// seen refuses that run's request. It outlasts the request proof lifetime
+	// plus the upload deadline, the longest an overtaken request can be late.
+	cancelTombstoneTTL = 10 * time.Minute
+	// idempotencyWindow is how long after a run starts its ID is guaranteed to
+	// keep deduplicating repeats of its request. Clients repeat a request
+	// only while recovering a lost first response, within minutes; beyond
+	// the window a record without output may be reclaimed.
+	idempotencyWindow = time.Hour
+)
+
 var (
 	errRunNotFound    = errors.New("run not found")
 	errRunInterrupted = errors.New("run interrupted")
@@ -89,6 +103,7 @@ var (
 	errRunCancelled   = errors.New("run cancelled before it started")
 	errRunConflict    = errors.New("run id reused for a different request")
 	errRunTooLarge    = errors.New("too many targets for the per-run cap")
+	errTooManyRecords = errors.New("too many runs kept for this device")
 )
 
 // runRecord is a run's durable state.
@@ -164,6 +179,13 @@ func (s *Server) runMaxBytes() int64 {
 	return DefaultRunMaxBytes
 }
 
+func (s *Server) runRecords() int {
+	if s.RunRecords > 0 {
+		return s.RunRecords
+	}
+	return DefaultRunRecords
+}
+
 func (s *Server) runQuotaBytes() int64 {
 	if s.RunQuotaBytes > 0 {
 		return s.RunQuotaBytes
@@ -218,6 +240,9 @@ func (s *Server) startRun(deviceID, id, requestSHA256 string, targets int, cance
 	if _, live := s.runs[key]; live {
 		return nil, errRunExists
 	}
+	if err := s.admitLocked(deviceID); err != nil {
+		return nil, err
+	}
 	dir := s.deviceRunsDir(deviceID)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
@@ -254,6 +279,7 @@ func (s *Server) startRun(deviceID, id, requestSHA256 string, targets int, cance
 		s.runs = map[string]*run{}
 	}
 	s.runs[key] = rn
+	s.deviceRecords[deviceID]++
 	return rn, nil
 }
 
@@ -314,8 +340,10 @@ func (s *Server) lookupRun(deviceID, id string) (*run, error) {
 
 // cancelRun stops deviceID's live run id. When the ID was never claimed, it
 // claims it as cancelled, so the request it overtook is refused even after a
-// restart. A claimed ID that is not live has nothing left to stop.
-func (s *Server) cancelRun(deviceID, id string) bool {
+// restart; that claim counts against the device's records like any other,
+// and fails when they are exhausted. A claimed ID that is not live has
+// nothing left to stop.
+func (s *Server) cancelRun(deviceID, id string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if rn, live := s.runs[runKey(deviceID, id)]; live {
@@ -323,17 +351,72 @@ func (s *Server) cancelRun(deviceID, id string) bool {
 		if !done && rn.cancel != nil {
 			rn.cancel()
 		}
-		return !done
+		return !done, nil
+	}
+	if _, err := os.Stat(s.recordPath(deviceID, id)); err == nil {
+		return false, nil
+	}
+	if err := s.admitLocked(deviceID); err != nil {
+		return false, err
 	}
 	if err := os.MkdirAll(s.deviceRunsDir(deviceID), 0o700); err != nil {
-		log.Printf("agentssh-gateway: device %s: record cancel of %s: %v", deviceID, id, err)
-		return false
+		return false, err
 	}
 	data, _ := json.Marshal(runRecord{RunID: id, DeviceID: deviceID, State: stateCancelled, CreatedAt: controlplane.FormatTime(s.now())})
-	if err := claimRecord(s.recordPath(deviceID, id), data); err != nil && !errors.Is(err, os.ErrExist) {
-		log.Printf("agentssh-gateway: device %s: record cancel of %s: %v", deviceID, id, err)
+	switch err := claimRecord(s.recordPath(deviceID, id), data); {
+	case err == nil:
+		s.deviceRecords[deviceID]++
+	case !errors.Is(err, os.ErrExist):
+		return false, err
 	}
-	return false
+	return false, nil
+}
+
+// admitLocked makes room for one more of deviceID's records. It ages the
+// device's records out when due, then, if the device is still at its limit,
+// reclaims the oldest finished or evicted runs past the idempotency window.
+// Records still guarding an ID are never reclaimed: then the claim is
+// refused. The caller holds s.mu.
+func (s *Server) admitLocked(deviceID string) error {
+	now := s.now()
+	if s.deviceRecords == nil {
+		s.deviceRecords, s.deviceSweeps = map[string]int{}, map[string]time.Time{}
+	}
+	if _, known := s.deviceRecords[deviceID]; !known || !now.Before(s.deviceSweeps[deviceID]) {
+		s.sweepDeviceLocked(deviceID, now)
+	}
+	if s.deviceRecords[deviceID] < s.runRecords() {
+		return nil
+	}
+	var reclaimable []storedRun
+	for _, run := range s.storedRunsLocked(deviceID) {
+		state := run.rec.State
+		if (state == stateFinished || state == stateEvicted) && now.After(controlplane.ParseTime(run.rec.CreatedAt).Add(idempotencyWindow)) {
+			reclaimable = append(reclaimable, run)
+		}
+	}
+	sort.Slice(reclaimable, func(i, j int) bool {
+		return controlplane.ParseTime(reclaimable[i].rec.CreatedAt).Before(controlplane.ParseTime(reclaimable[j].rec.CreatedAt))
+	})
+	for _, run := range reclaimable {
+		if s.deviceRecords[deviceID] < s.runRecords() {
+			break
+		}
+		s.deleteRecordLocked(deviceID, run)
+	}
+	if s.deviceRecords[deviceID] >= s.runRecords() {
+		return errTooManyRecords
+	}
+	return nil
+}
+
+func (s *Server) deleteRecordLocked(deviceID string, run storedRun) {
+	if run.rec.Frames != "" {
+		_ = os.Remove(filepath.Join(filepath.Dir(run.path), run.rec.Frames))
+	}
+	if err := os.Remove(run.path); err == nil {
+		s.deviceRecords[deviceID]--
+	}
 }
 
 // evictLocked deletes a finished run's output and keeps its record, so the
@@ -419,10 +502,7 @@ func (s *Server) makeRoom(deviceID string, reserve int64) {
 	}
 }
 
-// sweepRuns ages records out, at most once a minute: output past retention
-// is evicted, evicted and cancel records are deleted once they no longer
-// guard anything, a restart's unfinished runs once they cannot be running,
-// and spools of attempts that crashed before their claim.
+// sweepRuns ages every device's records out, at most once a minute.
 func (s *Server) sweepRuns() {
 	now := s.now()
 	s.mu.Lock()
@@ -436,40 +516,60 @@ func (s *Server) sweepRuns() {
 		return
 	}
 	for _, device := range devices {
-		dir := s.deviceRunsDir(device.Name())
-		referenced := map[string]bool{}
-		for _, run := range s.storedRunsLocked(device.Name()) {
-			rec := run.rec
-			switch {
-			case rec.State == stateFinished && now.After(controlplane.ParseTime(rec.FinishedAt).Add(s.runRetention())):
-				s.evictLocked(run.path, rec)
-				continue
-			case rec.State == stateEvicted && now.After(controlplane.ParseTime(rec.EvictedAt).Add(s.runRetention())),
-				rec.State == stateCancelled && now.After(controlplane.ParseTime(rec.CreatedAt).Add(cancelTombstoneTTL)),
-				rec.State == stateRunning && now.After(controlplane.ParseTime(rec.CreatedAt).Add(s.runRetention()+s.execTimeout())):
-				if rec.Frames != "" {
-					_ = os.Remove(filepath.Join(dir, rec.Frames))
-				}
-				_ = os.Remove(run.path)
-				continue
-			}
-			referenced[rec.Frames] = true
-		}
-		for key, live := range s.runs {
-			if strings.HasPrefix(key, device.Name()+"/") {
-				referenced[filepath.Base(live.framesPath)] = true
-			}
-		}
-		entries, _ := os.ReadDir(dir)
-		for _, entry := range entries {
-			if !strings.HasSuffix(entry.Name(), ".frames") || referenced[entry.Name()] {
-				continue
-			}
-			if info, err := entry.Info(); err == nil && now.Sub(info.ModTime()) > orphanAge {
-				_ = os.Remove(filepath.Join(dir, entry.Name()))
-			}
+		s.sweepDeviceLocked(device.Name(), now)
+	}
+}
+
+// sweepDeviceLocked ages deviceID's records out and recounts them: output
+// past retention is evicted; evicted records past the idempotency window,
+// cancel records past their TTL, and a restart's unfinished runs once they
+// cannot be running are deleted; so are spools of attempts that crashed
+// before their claim. The caller holds s.mu.
+func (s *Server) sweepDeviceLocked(deviceID string, now time.Time) {
+	if s.deviceRecords == nil {
+		s.deviceRecords, s.deviceSweeps = map[string]int{}, map[string]time.Time{}
+	}
+	dir := s.deviceRunsDir(deviceID)
+	referenced := map[string]bool{}
+	count := 0
+	for key, live := range s.runs {
+		if strings.HasPrefix(key, deviceID+"/") {
+			referenced[filepath.Base(live.framesPath)] = true
+			count++
 		}
 	}
+	for _, run := range s.storedRunsLocked(deviceID) {
+		rec := run.rec
+		created := controlplane.ParseTime(rec.CreatedAt)
+		switch {
+		case rec.State == stateEvicted && now.After(created.Add(idempotencyWindow)),
+			rec.State == stateCancelled && now.After(created.Add(cancelTombstoneTTL)),
+			rec.State == stateRunning && now.After(created.Add(s.runRetention()+s.execTimeout())):
+			if rec.Frames != "" {
+				_ = os.Remove(filepath.Join(dir, rec.Frames))
+			}
+			if os.Remove(run.path) != nil {
+				count++
+			}
+			continue
+		case rec.State == stateFinished && now.After(controlplane.ParseTime(rec.FinishedAt).Add(s.runRetention())):
+			s.evictLocked(run.path, rec)
+		default:
+			referenced[rec.Frames] = true
+		}
+		count++
+	}
+	entries, _ := os.ReadDir(dir)
+	for _, entry := range entries {
+		if !strings.HasSuffix(entry.Name(), ".frames") || referenced[entry.Name()] {
+			continue
+		}
+		if info, err := entry.Info(); err == nil && now.Sub(info.ModTime()) > orphanAge {
+			_ = os.Remove(filepath.Join(dir, entry.Name()))
+		}
+	}
+	s.deviceRecords[deviceID] = count
+	s.deviceSweeps[deviceID] = now.Add(runSweepEvery)
 }
 
 // roomLocked is what the run may still spend while keeping space for the

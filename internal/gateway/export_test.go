@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Praeviso/AgentSSH/internal/remote"
 	"github.com/Praeviso/AgentSSH/internal/runner"
@@ -17,6 +18,14 @@ func FailNextClaim(err error) (restore func()) {
 		return err
 	}
 	return func() { claimRecord = original }
+}
+
+// SetRecordLifetimes shortens how often records are aged out and how long
+// cancel records and the idempotency window last.
+func SetRecordLifetimes(sweep, cancelTTL, window time.Duration) (restore func()) {
+	oldSweep, oldCancel, oldWindow := runSweepEvery, cancelTombstoneTTL, idempotencyWindow
+	runSweepEvery, cancelTombstoneTTL, idempotencyWindow = sweep, cancelTTL, window
+	return func() { runSweepEvery, cancelTombstoneTTL, idempotencyWindow = oldSweep, oldCancel, oldWindow }
 }
 
 // The reserve held per target must cover a minimal response in the worst

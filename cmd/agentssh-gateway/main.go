@@ -75,6 +75,7 @@ func newServeCommand(dir func() (string, error)) *cobra.Command {
 	var runRetention time.Duration
 	var runMaxBytes int64
 	var runQuotaBytes int64
+	var runRecords int
 	cmd := &cobra.Command{
 		Use:   "serve --public-url <https-base> [--listen 127.0.0.1:8080]",
 		Short: "Run the gateway API.",
@@ -106,6 +107,7 @@ func newServeCommand(dir func() (string, error)) *cobra.Command {
 			server.RunRetention = runRetention
 			server.RunMaxBytes = runMaxBytes
 			server.RunQuotaBytes = runQuotaBytes
+			server.RunRecords = runRecords
 			handler, err := server.Handler(publicURL)
 			if err != nil {
 				return err
@@ -120,6 +122,7 @@ func newServeCommand(dir func() (string, error)) *cobra.Command {
 	cmd.Flags().DurationVar(&runRetention, "run-retention", gateway.DefaultRunRetention, "how long a finished run's output stays reattachable")
 	cmd.Flags().Int64Var(&runMaxBytes, "run-max-bytes", gateway.DefaultRunMaxBytes, "spooled output kept per run; beyond it the result is marked truncated")
 	cmd.Flags().Int64Var(&runQuotaBytes, "run-quota-bytes", gateway.DefaultRunQuotaBytes, "finished-run output kept per device; the oldest runs are evicted first")
+	cmd.Flags().IntVar(&runRecords, "run-records", gateway.DefaultRunRecords, "run records (any state) kept per device; beyond it new runs and cancels are refused")
 	return cmd
 }
 

@@ -448,3 +448,113 @@ func TestConcurrentRunsStayWithinTheQuota(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 }
+
+func records(t *testing.T, f *fixture) int {
+	t.Helper()
+	paths, _ := filepath.Glob(filepath.Join(f.dir, "runs", f.client.State.DeviceID, "rn_*.json"))
+	return len(paths)
+}
+
+func busy(t *testing.T, err error) {
+	t.Helper()
+	var apiErr *remote.APIError
+	if !errors.As(err, &apiErr) || apiErr.Status != 429 || apiErr.Code != remote.CodeBusy {
+		t.Fatalf("err = %v, want 429 busy", err)
+	}
+}
+
+// Cancel-only traffic cannot grow a device's records without bound: cancel
+// records count against the device's limit, and age out after their TTL.
+func TestCancelRecordsCountAgainstTheDeviceLimit(t *testing.T) {
+	f, _ := execGateway(t)
+	defer gateway.SetRecordLifetimes(0, 100*time.Millisecond, time.Hour)()
+	f.server.RunRecords = 3
+	for range 3 {
+		if _, err := f.client.Cancel(context.Background(), remote.NewRunID()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, err := f.client.Cancel(context.Background(), remote.NewRunID())
+	busy(t, err)
+	if n := records(t, f); n != 3 {
+		t.Fatalf("device keeps %d records, limit 3", n)
+	}
+	time.Sleep(150 * time.Millisecond)
+	if _, err := f.client.Cancel(context.Background(), remote.NewRunID()); err != nil {
+		t.Fatalf("cancel after the old records aged out: %v", err)
+	}
+	if n := records(t, f); n != 1 {
+		t.Fatalf("device keeps %d records, want only the new one", n)
+	}
+}
+
+// Within the idempotency window a run's record is never reclaimed, so the
+// limit refuses new runs instead of forgetting IDs; past it, the oldest
+// finished runs make room.
+func TestRunRecordsAreReclaimedOnlyPastTheIdempotencyWindow(t *testing.T) {
+	f, host := execGateway(t)
+	restore := gateway.SetRecordLifetimes(0, time.Minute, time.Hour)
+	defer restore()
+	f.server.RunRecords = 2
+	var ids []string
+	for range 2 {
+		result, err := f.client.Exec(context.Background(), execReq("uptime"), io.Discard, io.Discard)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, result.RunID)
+	}
+	_, err := f.client.Exec(context.Background(), execReq("uptime"), io.Discard, io.Discard)
+	busy(t, err)
+	if n := host.runs("uptime"); n != 2 {
+		t.Fatalf("uptime ran %d times, want 2", n)
+	}
+	restore()
+	defer gateway.SetRecordLifetimes(0, time.Minute, 50*time.Millisecond)()
+	time.Sleep(100 * time.Millisecond)
+	if _, err := f.client.Exec(context.Background(), execReq("uptime"), io.Discard, io.Discard); err != nil {
+		t.Fatalf("run after the window passed: %v", err)
+	}
+	if n := records(t, f); n != 2 {
+		t.Fatalf("device keeps %d records, limit 2", n)
+	}
+	_, err = f.client.Attach(context.Background(), ids[0], io.Discard, io.Discard)
+	runNotFound(t, err)
+}
+
+// A request refused for its size must not evict a device's retained runs.
+func TestRefusedOversizedGroupEvictsNothing(t *testing.T) {
+	f, _ := execGateway(t)
+	f.server.RunMaxBytes = 64 << 10 // room for one target
+	f.server.RunQuotaBytes = 128 << 10
+	req := execReq("flood")
+	req.Stream = true
+	var ids []string
+	for range 2 {
+		result, err := f.client.Exec(context.Background(), req, io.Discard, io.Discard)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, result.RunID)
+	}
+	inv := `host_key_policy: accept-new
+hosts:
+  web-1: {addr: 127.0.0.1, port: 22, user: deploy, identity: web, tags: [web]}
+  web-2: {addr: 127.0.0.1, port: 22, user: deploy, identity: web, tags: [web]}
+groups:
+  web: {tags: [web]}
+`
+	if _, err := controlplane.PushConfig(f.store, f.client.State.DeviceID, inv, testPolicy, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	_, err := f.client.Exec(context.Background(), remote.ExecRequest{Host: "web", Cmd: "uptime", Session: "s_test"}, io.Discard, io.Discard)
+	var apiErr *remote.APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != remote.CodeUsage {
+		t.Fatalf("oversized group: %v", err)
+	}
+	for _, id := range ids {
+		if _, err := f.client.Attach(context.Background(), id, io.Discard, io.Discard); err != nil {
+			t.Fatalf("retained run %s evicted by a refused request: %v", id, err)
+		}
+	}
+}
