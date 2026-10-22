@@ -134,6 +134,21 @@ protocol refusals end it. On context cancellation it sends `/exec/cancel`
     capped runs end within a 128 KiB quota; without the finish-time pass the
     device keeps 195 KiB.
 
+- [x] Security review follow-up (after a03ae4e):
+  - A cancel's "not found" check and its tombstone were separate steps, so a
+    run registered in between was neither cancelled nor refused. Cancel now
+    checks live runs, the disk, and writes the tombstone under `s.mu`, the
+    lock `startRun` registers under; a run already on disk gets no
+    tombstone, so a recovery repeat of its request still joins it. Test:
+    cancel of a finished run, then a repeat joins it and the command ran once.
+  - Before its first run frame a client repeats `/exec`. If the run had
+    finished and been evicted (quota) or expired meanwhile, the repeat used to
+    start the command again. Eviction and expiry now delete the output but
+    keep the run's record (`evicted_at`) for another retention period, and a
+    repeat of that ID answers `run_not_found`. Tests: after expiry and after
+    quota eviction, repeating the original request does not run the command;
+    with the old delete-everything eviction both tests see a second run.
+
 ## Validation
 
 ```

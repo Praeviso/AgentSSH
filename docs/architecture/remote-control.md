@@ -130,7 +130,9 @@ the exit code raised to at least 1, so a partial result never passes for a
 complete one. A device keeps at most `serve --run-quota-bytes` (default
 512 MiB) of finished runs: before a new run starts and again when one finishes (runs that start
 together each see the same free space), its oldest runs are evicted
-(and then answer `run_not_found`). With the concurrency limit, one device
+(and then answer `run_not_found`). Expiry and eviction delete a run's output
+but keep its small record for another retention period, so a repeat of its
+request is refused rather than running the command a second time. With the concurrency limit, one device
 occupies at most quota + `--max-concurrent` × `--run-max-bytes` on disk. The request must arrive within the 60 s proof lifetime;
 ingresses must stream responses (the gateway sends `X-Accel-Buffering: no`).
 

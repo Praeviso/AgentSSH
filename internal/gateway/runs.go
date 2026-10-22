@@ -50,6 +50,7 @@ var (
 	errRunInterrupted = errors.New("run interrupted")
 	errRunBroken      = errors.New("run spool broken")
 	errRunExists      = errors.New("run already exists")
+	errRunExpired     = errors.New("run output expired")
 	errRunCancelled   = errors.New("run cancelled before it started")
 	errRunConflict    = errors.New("run id reused for a different request")
 )
@@ -66,6 +67,10 @@ type runMeta struct {
 	RequestSHA256 string `json:"request_sha256,omitempty"`
 	// Broken means a spool write failed, so the frames file lacks its result.
 	Broken bool `json:"broken,omitempty"`
+	// EvictedAt is set once the output is deleted (expiry or quota). The
+	// record stays for another retention period so the run ID cannot start
+	// the command again.
+	EvictedAt string `json:"evicted_at,omitempty"`
 }
 
 // run is one execution's spool. The runner writes frames; any number of
@@ -163,16 +168,6 @@ func (s *Server) startRun(deviceID, id, requestSHA256 string, targets int, cance
 	}
 	s.runs[key] = rn
 	return rn, nil
-}
-
-// tombstone remembers a cancel for a run the gateway has not seen.
-func (s *Server) tombstone(deviceID, id string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.cancelled == nil {
-		s.cancelled = map[string]time.Time{}
-	}
-	s.cancelled[runKey(deviceID, id)] = s.now()
 }
 
 func (r *run) writeMeta() error {
@@ -290,12 +285,15 @@ func (s *Server) lookupRun(deviceID, id string) (*run, error) {
 	if json.Unmarshal(data, &meta) != nil || meta.RunID != id || meta.DeviceID != deviceID {
 		return nil, errRunNotFound
 	}
+	if meta.EvictedAt != "" {
+		return nil, errRunExpired
+	}
 	if meta.FinishedAt == "" {
 		return nil, errRunInterrupted
 	}
 	if s.now().After(controlplane.ParseTime(meta.FinishedAt).Add(s.runRetention())) {
-		_ = os.RemoveAll(dir)
-		return nil, errRunNotFound
+		s.evict(storedRun{dir: dir, meta: meta})
+		return nil, errRunExpired
 	}
 	if meta.Broken {
 		return nil, errRunBroken
@@ -351,6 +349,20 @@ func (s *Server) storedRuns(deviceID string) []storedRun {
 	return out
 }
 
+// evict deletes a stored run's output but keeps its record, so the ID still
+// answers "expired" and a repeat of its request cannot run the command again.
+func (s *Server) evict(run storedRun) {
+	if err := os.Remove(filepath.Join(run.dir, fileRunFrames)); err != nil && !os.IsNotExist(err) {
+		return
+	}
+	run.meta.EvictedAt = controlplane.FormatTime(s.now())
+	data, err := json.Marshal(run.meta)
+	if err != nil {
+		return
+	}
+	_ = fileutil.WriteFileAtomic(filepath.Join(run.dir, fileRunMeta), data, 0o600, fileRunMeta+"-*")
+}
+
 // makeRoom evicts deviceID's oldest stored runs until reserve more bytes fit
 // the device's quota: a full run's worth before a run starts, nothing after
 // one finishes. Calls are serialized so concurrent starts cannot all see the
@@ -368,9 +380,11 @@ func (s *Server) makeRoom(deviceID string, reserve int64) {
 		if total+reserve <= s.runQuotaBytes() {
 			return
 		}
-		if err := os.RemoveAll(run.dir); err == nil {
-			total -= run.bytes
+		if run.meta.EvictedAt != "" || run.bytes == 0 {
+			continue
 		}
+		s.evict(run)
+		total -= run.bytes
 	}
 }
 
@@ -396,9 +410,15 @@ func (s *Server) sweepRuns() {
 	}
 	for _, device := range devices {
 		for _, run := range s.storedRuns(device.Name()) {
-			expired := run.meta.FinishedAt != "" && now.After(run.at.Add(s.runRetention()))
-			abandoned := run.meta.FinishedAt == "" && now.After(run.at.Add(s.runRetention()+s.execTimeout()))
-			if expired || abandoned {
+			switch {
+			case run.meta.EvictedAt != "":
+				// The record has guarded its ID for a retention period.
+				if now.After(controlplane.ParseTime(run.meta.EvictedAt).Add(s.runRetention())) {
+					_ = os.RemoveAll(run.dir)
+				}
+			case run.meta.FinishedAt != "" && now.After(run.at.Add(s.runRetention())):
+				s.evict(run)
+			case run.meta.FinishedAt == "" && now.After(run.at.Add(s.runRetention()+s.execTimeout())):
 				_ = os.RemoveAll(run.dir)
 			}
 		}
@@ -472,21 +492,32 @@ func (s *Server) handleCancel(w http.ResponseWriter, _ *http.Request, device con
 		controlplane.WriteError(w, http.StatusBadRequest, remote.CodeBadRequest, "malformed cancel request")
 		return
 	}
-	rn, err := s.lookupRun(device.ID, req.RunID)
-	if err != nil {
-		// Nothing of this device is running under the ID. Its request may
-		// still be on the way, so refuse it if it arrives.
-		if errors.Is(err, errRunNotFound) {
-			s.tombstone(device.ID, req.RunID)
+	controlplane.WriteJSON(w, http.StatusOK, remote.ExecCancelResponse{RunID: req.RunID, Cancelled: s.cancelRun(device.ID, req.RunID)})
+}
+
+// cancelRun stops deviceID's live run id, or, when the gateway has never seen
+// that ID, refuses its request should it still arrive. It holds s.mu, the lock
+// startRun registers runs under, so a run cannot start between the check and
+// the tombstone. A run already on disk has finished; there is nothing to stop.
+func (s *Server) cancelRun(deviceID, id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := runKey(deviceID, id)
+	if rn, live := s.runs[key]; live {
+		_, done, _, _ := rn.snapshot()
+		if !done && rn.cancel != nil {
+			rn.cancel()
 		}
-		controlplane.WriteJSON(w, http.StatusOK, remote.ExecCancelResponse{RunID: req.RunID})
-		return
+		return !done
 	}
-	_, done, _, _ := rn.snapshot()
-	if !done && rn.cancel != nil {
-		rn.cancel()
+	if _, err := os.Stat(s.runDir(deviceID, id)); err == nil {
+		return false
 	}
-	controlplane.WriteJSON(w, http.StatusOK, remote.ExecCancelResponse{RunID: rn.id, Cancelled: !done})
+	if s.cancelled == nil {
+		s.cancelled = map[string]time.Time{}
+	}
+	s.cancelled[key] = s.now()
+	return false
 }
 
 func writeRunError(w http.ResponseWriter, err error, retention time.Duration) {

@@ -219,6 +219,8 @@ func (s *Server) joinRun(w http.ResponseWriter, r *http.Request, deviceID, id, r
 	}
 	rn, err := s.lookupRun(deviceID, id)
 	if errors.Is(err, errRunNotFound) {
+		// Never seen. An evicted or expired ID is not "not found": it
+		// answers expired below and never runs the command again.
 		return false
 	}
 	if err == nil && rn.requestSHA256 != requestSHA256 {

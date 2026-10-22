@@ -89,20 +89,49 @@ func TestOnlyTheStartingDeviceCanReattachOrCancel(t *testing.T) {
 }
 
 func TestReattachAfterRetentionIsRefused(t *testing.T) {
-	f, _ := execGateway(t)
+	f, host := execGateway(t)
 	f.server.RunRetention = 50 * time.Millisecond
-	result, err := f.client.Exec(context.Background(), execReq("uptime"), io.Discard, io.Discard)
-	if err != nil {
+	req := execReq("uptime")
+	req.RunID = remote.NewRunID()
+	if _, err := f.client.Exec(context.Background(), req, io.Discard, io.Discard); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(100 * time.Millisecond)
-	_, err = f.client.Attach(context.Background(), result.RunID, io.Discard, io.Discard)
+	_, err := f.client.Attach(context.Background(), req.RunID, io.Discard, io.Discard)
 	runNotFound(t, err)
 	if !strings.Contains(err.Error(), "expired") {
 		t.Fatalf("refusal does not explain expiry: %v", err)
 	}
-	if _, statErr := os.Stat(filepath.Join(f.dir, "runs", f.client.State.DeviceID, result.RunID)); !os.IsNotExist(statErr) {
-		t.Fatalf("expired run still on disk: %v", statErr)
+	dir := filepath.Join(f.dir, "runs", f.client.State.DeviceID, req.RunID)
+	if _, statErr := os.Stat(filepath.Join(dir, "frames")); !os.IsNotExist(statErr) {
+		t.Fatalf("expired output still on disk: %v", statErr)
+	}
+	// The ID is remembered: repeating the original request (a client
+	// recovering a lost response) must not run the command a second time.
+	_, err = f.client.Exec(context.Background(), req, io.Discard, io.Discard)
+	runNotFound(t, err)
+	if n := host.runs("uptime"); n != 1 {
+		t.Fatalf("expired run's command ran %d times, want once", n)
+	}
+}
+
+// Cancelling a finished run changes nothing: a repeat of its request still
+// joins it rather than being refused as cancelled.
+func TestCancelOfAFinishedRunKeepsItJoinable(t *testing.T) {
+	f, host := execGateway(t)
+	req := execReq("uptime")
+	req.RunID = remote.NewRunID()
+	if _, err := f.client.Exec(context.Background(), req, io.Discard, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if cancelled, err := f.client.Cancel(context.Background(), req.RunID); err != nil || cancelled {
+		t.Fatalf("cancel of a finished run: %v %v", cancelled, err)
+	}
+	if result, err := f.client.Exec(context.Background(), req, io.Discard, io.Discard); err != nil || result.ExitCode != 0 {
+		t.Fatalf("repeat after cancel: %+v %v", result, err)
+	}
+	if n := host.runs("uptime"); n != 1 {
+		t.Fatalf("uptime ran %d times, want once", n)
 	}
 }
 
@@ -187,7 +216,7 @@ func TestExecGivesUpReattachingWithoutClaimingAnOutcome(t *testing.T) {
 // An enrolled device cannot fill the gateway's disk with runs: its finished
 // runs are kept within a quota, oldest evicted first.
 func TestDeviceRunsAreKeptWithinAQuota(t *testing.T) {
-	f, _ := execGateway(t)
+	f, host := execGateway(t)
 	f.server.RunMaxBytes = 64 << 10
 	f.server.RunQuotaBytes = 128 << 10
 	req := execReq("flood")
@@ -214,6 +243,15 @@ func TestDeviceRunsAreKeptWithinAQuota(t *testing.T) {
 	}
 	_, err := f.client.Attach(context.Background(), ids[0], io.Discard, io.Discard)
 	runNotFound(t, err)
+	// An evicted run's ID is remembered: repeating its request does not run
+	// the command again.
+	again := req
+	again.RunID = ids[0]
+	_, err = f.client.Exec(context.Background(), again, io.Discard, io.Discard)
+	runNotFound(t, err)
+	if n := host.runs("flood"); n != 4 {
+		t.Fatalf("flood ran %d times, want 4", n)
+	}
 	if _, err := f.client.Attach(context.Background(), ids[3], io.Discard, io.Discard); err != nil {
 		t.Fatalf("newest run evicted: %v", err)
 	}
