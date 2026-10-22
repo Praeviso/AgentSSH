@@ -96,7 +96,7 @@ func TestReattachAfterRetentionIsRefused(t *testing.T) {
 	if !strings.Contains(err.Error(), "expired") {
 		t.Fatalf("refusal does not explain expiry: %v", err)
 	}
-	if _, statErr := os.Stat(filepath.Join(f.dir, "runs", result.RunID)); !os.IsNotExist(statErr) {
+	if _, statErr := os.Stat(filepath.Join(f.dir, "runs", f.client.State.DeviceID, result.RunID)); !os.IsNotExist(statErr) {
 		t.Fatalf("expired run still on disk: %v", statErr)
 	}
 }
@@ -128,7 +128,7 @@ func TestRunBeyondItsCapIsTruncatedAndFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	check("replay", replay)
-	if info, err := os.Stat(filepath.Join(f.dir, "runs", result.RunID, "frames")); err != nil || info.Size() > 32<<10 {
+	if info, err := os.Stat(filepath.Join(f.dir, "runs", f.client.State.DeviceID, result.RunID, "frames")); err != nil || info.Size() > 32<<10 {
 		t.Fatalf("spool size: %v %v", info, err)
 	}
 }
@@ -138,7 +138,7 @@ func TestRunLostToARestartIsReportedAsInterrupted(t *testing.T) {
 	// What a gateway that died mid-run leaves behind: a record without a
 	// finish time.
 	id := "rn_abcdefabcdefabcdefabcdefabcdefab"
-	dir := filepath.Join(f.dir, "runs", id)
+	dir := filepath.Join(f.dir, "runs", f.client.State.DeviceID, id)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -176,5 +176,40 @@ func TestExecGivesUpReattachingWithoutClaimingAnOutcome(t *testing.T) {
 	err := <-done
 	if err == nil || !strings.Contains(err.Error(), "may still be running") {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+// An enrolled device cannot fill the gateway's disk with runs: its finished
+// runs are kept within a quota, oldest evicted first.
+func TestDeviceRunsAreKeptWithinAQuota(t *testing.T) {
+	f, _ := execGateway(t)
+	f.server.RunMaxBytes = 64 << 10
+	f.server.RunQuotaBytes = 128 << 10
+	req := execReq("flood")
+	req.Stream = true
+	var ids []string
+	for range 4 {
+		result, err := f.client.Exec(context.Background(), req, io.Discard, io.Discard)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, result.RunID)
+	}
+	var total int64
+	runs, _ := filepath.Glob(filepath.Join(f.dir, "runs", f.client.State.DeviceID, "rn_*", "frames"))
+	for _, path := range runs {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		total += info.Size()
+	}
+	if total > f.server.RunQuotaBytes {
+		t.Fatalf("device keeps %d bytes of runs, quota %d", total, f.server.RunQuotaBytes)
+	}
+	_, err := f.client.Attach(context.Background(), ids[0], io.Discard, io.Discard)
+	runNotFound(t, err)
+	if _, err := f.client.Attach(context.Background(), ids[3], io.Discard, io.Discard); err != nil {
+		t.Fatalf("newest run evicted: %v", err)
 	}
 }

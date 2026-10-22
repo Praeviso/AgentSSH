@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -28,6 +29,10 @@ const (
 	DefaultRunRetention = 24 * time.Hour
 	// DefaultRunMaxBytes caps one run's spooled frames.
 	DefaultRunMaxBytes = 64 << 20
+	// DefaultRunQuotaBytes caps the finished runs one device keeps; the oldest
+	// are evicted first. With MaxConcurrentPerDevice runs in flight, a device
+	// occupies at most quota + concurrency × DefaultRunMaxBytes.
+	DefaultRunQuotaBytes = 512 << 20
 
 	// runReserveBytes is kept back per target so a response, stripped of its
 	// output, always fits after the cap is reached.
@@ -85,6 +90,19 @@ func newRunID() string {
 
 func (s *Server) runsDir() string { return filepath.Join(s.Dir, dirRuns) }
 
+// runDir keeps each device's runs apart, so quota and lookups only ever see
+// that device's runs.
+func (s *Server) runDir(deviceID, id string) string {
+	return filepath.Join(s.runsDir(), deviceID, id)
+}
+
+func (s *Server) runQuotaBytes() int64 {
+	if s.RunQuotaBytes > 0 {
+		return s.RunQuotaBytes
+	}
+	return DefaultRunQuotaBytes
+}
+
 func (s *Server) runRetention() time.Duration {
 	if s.RunRetention > 0 {
 		return s.RunRetention
@@ -102,7 +120,7 @@ func (s *Server) runMaxBytes() int64 {
 // startRun creates a run's spool and registers it; cancel stops its context.
 func (s *Server) startRun(deviceID string, targets int, cancel context.CancelFunc) (*run, error) {
 	id := newRunID()
-	dir := filepath.Join(s.runsDir(), id)
+	dir := s.runDir(deviceID, id)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
@@ -238,7 +256,7 @@ func (s *Server) lookupRun(deviceID, id string) (*run, error) {
 		}
 		return live, nil
 	}
-	dir := filepath.Join(s.runsDir(), id)
+	dir := s.runDir(deviceID, id)
 	data, err := os.ReadFile(filepath.Join(dir, fileRunMeta))
 	if err != nil {
 		return nil, errRunNotFound
@@ -264,6 +282,69 @@ func (s *Server) lookupRun(deviceID, id string) (*run, error) {
 	return &run{id: id, deviceID: deviceID, dir: dir, meta: meta, size: info.Size(), done: true}, nil
 }
 
+// storedRun is a run on disk that is not running in this process.
+type storedRun struct {
+	dir   string
+	meta  runMeta
+	bytes int64
+	// at orders eviction: when the run finished, or was created if a
+	// restart left it unfinished.
+	at time.Time
+}
+
+// storedRuns lists deviceID's runs on disk that are not live.
+func (s *Server) storedRuns(deviceID string) []storedRun {
+	base := filepath.Join(s.runsDir(), deviceID)
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		return nil
+	}
+	var out []storedRun
+	for _, entry := range entries {
+		id := entry.Name()
+		s.mu.Lock()
+		_, live := s.runs[id]
+		s.mu.Unlock()
+		if live || !remote.ValidRunID(id) {
+			continue
+		}
+		dir := filepath.Join(base, id)
+		data, err := os.ReadFile(filepath.Join(dir, fileRunMeta))
+		var meta runMeta
+		if err != nil || json.Unmarshal(data, &meta) != nil {
+			continue
+		}
+		run := storedRun{dir: dir, meta: meta, at: controlplane.ParseTime(meta.CreatedAt)}
+		if meta.FinishedAt != "" {
+			run.at = controlplane.ParseTime(meta.FinishedAt)
+		}
+		if info, err := os.Stat(filepath.Join(dir, fileRunFrames)); err == nil {
+			run.bytes = info.Size()
+		}
+		out = append(out, run)
+	}
+	return out
+}
+
+// makeRoom evicts deviceID's oldest stored runs until a new run's full spool
+// fits the device's quota.
+func (s *Server) makeRoom(deviceID string) {
+	runs := s.storedRuns(deviceID)
+	var total int64
+	for _, run := range runs {
+		total += run.bytes
+	}
+	sort.Slice(runs, func(i, j int) bool { return runs[i].at.Before(runs[j].at) })
+	for _, run := range runs {
+		if total+s.runMaxBytes() <= s.runQuotaBytes() {
+			return
+		}
+		if err := os.RemoveAll(run.dir); err == nil {
+			total -= run.bytes
+		}
+	}
+}
+
 // sweepRuns deletes expired runs, and runs a restart left unfinished once
 // they can no longer be running. It runs at most once a minute.
 func (s *Server) sweepRuns() {
@@ -275,28 +356,17 @@ func (s *Server) sweepRuns() {
 	}
 	s.nextSweep = now.Add(runSweepEvery)
 	s.mu.Unlock()
-	entries, err := os.ReadDir(s.runsDir())
+	devices, err := os.ReadDir(s.runsDir())
 	if err != nil {
 		return
 	}
-	for _, entry := range entries {
-		id := entry.Name()
-		s.mu.Lock()
-		_, live := s.runs[id]
-		s.mu.Unlock()
-		if live || !remote.ValidRunID(id) {
-			continue
-		}
-		dir := filepath.Join(s.runsDir(), id)
-		data, err := os.ReadFile(filepath.Join(dir, fileRunMeta))
-		var meta runMeta
-		if err != nil || json.Unmarshal(data, &meta) != nil {
-			continue
-		}
-		expired := meta.FinishedAt != "" && now.After(controlplane.ParseTime(meta.FinishedAt).Add(s.runRetention()))
-		abandoned := meta.FinishedAt == "" && now.After(controlplane.ParseTime(meta.CreatedAt).Add(s.runRetention()+s.execTimeout()))
-		if expired || abandoned {
-			_ = os.RemoveAll(dir)
+	for _, device := range devices {
+		for _, run := range s.storedRuns(device.Name()) {
+			expired := run.meta.FinishedAt != "" && now.After(run.at.Add(s.runRetention()))
+			abandoned := run.meta.FinishedAt == "" && now.After(run.at.Add(s.runRetention()+s.execTimeout()))
+			if expired || abandoned {
+				_ = os.RemoveAll(run.dir)
+			}
 		}
 	}
 }
@@ -353,6 +423,7 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request, device con
 		controlplane.WriteError(w, http.StatusBadRequest, remote.CodeBadRequest, "malformed attach request")
 		return
 	}
+	s.sweepRuns()
 	rn, err := s.lookupRun(device.ID, req.RunID)
 	if err != nil {
 		writeRunError(w, err, s.runRetention())

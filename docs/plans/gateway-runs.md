@@ -102,6 +102,16 @@ protocol refusals end it. On context cancellation it sends `/exec/cancel`
   retention, cap).
 - [x] Final validation.
 
+- [x] Security review follow-up (PR #26): retention alone left an enrolled
+  device free to fill the gateway's disk by running large-output commands back
+  to back (64 MiB each, kept 24 h), which would also break the audit and
+  database. Runs now live under `runs/<device-id>/<run-id>/`, and before each
+  new run the device's oldest stored runs are evicted until a full run fits
+  `--run-quota-bytes` (default 512 MiB); the sweep also runs on attach. Test:
+  four capped runs under a 128 KiB quota keep the device's spool within it,
+  the oldest run is `run_not_found` and the newest still replays; without the
+  eviction the same test keeps 195 KiB.
+
 ## Validation
 
 ```

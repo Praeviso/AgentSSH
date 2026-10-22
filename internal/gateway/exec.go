@@ -99,6 +99,7 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, device contr
 		return
 	}
 	s.sweepRuns()
+	s.makeRoom(device.ID)
 	// The run outlives this request: a dropped connection only detaches the
 	// device, and /exec/cancel or the timeout stops the command.
 	ctx, cancel := context.WithTimeout(context.Background(), s.execTimeout())

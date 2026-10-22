@@ -52,12 +52,14 @@ type Server struct {
 	Store *controlplane.Store
 	Keys  *controlplane.Keys
 	Now   func() time.Time
-	// ExecTimeout and MaxConcurrentPerDevice bound executions; RunRetention
-	// and RunMaxBytes bound their spooled output. Zero values use the defaults.
+	// ExecTimeout and MaxConcurrentPerDevice bound executions; RunRetention,
+	// RunMaxBytes and RunQuotaBytes (per device) bound their spooled output.
+	// Zero values use the defaults.
 	ExecTimeout            time.Duration
 	MaxConcurrentPerDevice int
 	RunRetention           time.Duration
 	RunMaxBytes            int64
+	RunQuotaBytes          int64
 
 	mu        sync.Mutex
 	running   map[string]int

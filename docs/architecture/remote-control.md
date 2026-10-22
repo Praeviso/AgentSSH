@@ -91,7 +91,7 @@ digest. Requests the CLI would reject as usage errors return 400 `usage`; a devi
 concurrency limit (`serve --max-concurrent`, default 4) gets 429 `busy`.
 
 Each `/exec` is a run with a gateway-minted ID (`rn_` + 32 hex). Its frames,
-`type:1 | length:4 big-endian | payload`, are spooled under `runs/<id>/`:
+`type:1 | length:4 big-endian | payload`, are spooled under `runs/<device-id>/<id>/`:
 stdout (1) and stderr (2) data frames of at most 64 KiB, sent only when the
 request asks to stream a single-host run; then one response frame (5) per
 target with its `run --json` object; then a result frame (3,
@@ -120,7 +120,10 @@ at most `serve --run-max-bytes` (default 64 MiB) of frames, holding back 16 KiB
 per target: output beyond it is dropped, responses that no longer fit lose
 their output (`output_truncated`), and the result says `truncated: true` with
 the exit code raised to at least 1, so a partial result never passes for a
-complete one. The request must arrive within the 60 s proof lifetime;
+complete one. A device keeps at most `serve --run-quota-bytes` (default
+512 MiB) of finished runs: before a new run starts, its oldest runs are evicted
+(and then answer `run_not_found`). With the concurrency limit, one device
+occupies at most quota + `--max-concurrent` × `--run-max-bytes` on disk. The request must arrive within the 60 s proof lifetime;
 ingresses must stream responses (the gateway sends `X-Accel-Buffering: no`).
 
 Every run is recorded in one hash chain per gateway, `audit.jsonl`, with
