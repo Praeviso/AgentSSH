@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/Praeviso/AgentSSH/internal/fileutil"
 )
 
 // A plan bundles the gray-zone commands of one multi-step task into a single
@@ -149,19 +151,13 @@ func (s PendingStore) CreatePlan(manifest PlanManifest) (PlanManifest, error) {
 	if err != nil {
 		return PlanManifest{}, fmt.Errorf("marshal plan manifest: %w", err)
 	}
-	file, err := os.OpenFile(planPath(s.PlansDir, manifest.ID), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	// Published whole, so `plan status` never reads a partial manifest.
+	err = fileutil.CreateFileExclusive(planPath(s.PlansDir, manifest.ID), append(data, '\n'), 0o600, ".publish-*.tmp")
 	if errors.Is(err, os.ErrExist) {
 		return PlanManifest{}, fmt.Errorf("plan id collision %s: %w", manifest.ID, err)
 	}
 	if err != nil {
 		return PlanManifest{}, fmt.Errorf("create plan manifest: %w", err)
-	}
-	if _, err := file.Write(append(data, '\n')); err != nil {
-		_ = file.Close()
-		return PlanManifest{}, fmt.Errorf("write plan manifest: %w", err)
-	}
-	if err := file.Close(); err != nil {
-		return PlanManifest{}, fmt.Errorf("close plan manifest: %w", err)
 	}
 	return manifest, nil
 }

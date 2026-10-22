@@ -103,3 +103,47 @@ func TestApplyDecisionAtomicClaimBeforeHostSideEffects(t *testing.T) {
 		t.Fatalf("status = %#v", status)
 	}
 }
+
+// `approval wait` polls Status while an operator's decision is written. It
+// must see the request as pending or resolved, never a corrupt resolution.
+func TestStatusNeverSeesAHalfWrittenResolution(t *testing.T) {
+	root := t.TempDir()
+	pending := PendingStore{PendingDir: filepath.Join(root, "pending"), ResponsesDir: filepath.Join(root, "responses")}
+	matcher, err := Generalize("ls /var", HostGrantSafePrefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 100 {
+		req, err := pending.Create(PendingRequest{ReqID: "r", SessionID: "s" + string(rune('a'+i%26)) + string(rune('a'+i/26)), Host: "web-1", Cmd: "ls /var", Candidate: matcher})
+		if err != nil {
+			t.Fatal(err)
+		}
+		stop := make(chan struct{})
+		var wg sync.WaitGroup
+		for range 4 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for {
+					if _, err := pending.Status(req.ID); err != nil {
+						t.Errorf("Status during Resolve: %v", err)
+						return
+					}
+					select {
+					case <-stop:
+						return
+					default:
+					}
+				}
+			}()
+		}
+		if _, err := pending.Resolve(req, VerdictDenied, ""); err != nil {
+			t.Fatal(err)
+		}
+		close(stop)
+		wg.Wait()
+		if t.Failed() {
+			return
+		}
+	}
+}
