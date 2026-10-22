@@ -264,6 +264,9 @@ func execute(ctx context.Context, env Env, req Request, obs Observer, p plan, si
 	}
 	record := stampRun(baseRecord(p.ReqID, p.SessionCtx, event, p.Target.Name, req.Command, decision, &result.ExitCode, outputHash, result.Duration.Milliseconds(), filtered), req)
 	record.RemoteSignID = result.RemoteSignID
+	if event == audit.EventFailed {
+		record.Error = interruption(ctx)
+	}
 	if _, err := env.Audit.Append(record); err != nil {
 		return executed{}, err
 	}
@@ -296,6 +299,19 @@ func execute(ctx context.Context, env Env, req Request, obs Observer, p plan, si
 	}, req)
 	obs.Finished(p.Target.Name, result, filtered, streamed)
 	return executed{Response: response, Result: result, StreamErr: streamErr}, nil
+}
+
+// interruption names why ctx ended while a command ran, so the audit shows a
+// cancelled or timed-out run rather than a bare transport failure.
+func interruption(ctx context.Context) string {
+	switch {
+	case ctx.Err() == nil:
+		return ""
+	case errors.Is(ctx.Err(), context.DeadlineExceeded):
+		return "timed out"
+	default:
+		return "cancelled"
+	}
 }
 
 func buildPlans(env Env, req Request) ([]plan, error) {

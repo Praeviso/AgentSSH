@@ -67,6 +67,9 @@ type Record struct {
 	// RemoteSignID is the control plane's signing-log id for a remotely signed
 	// login. Appended with omitempty so older records keep their canonical form.
 	RemoteSignID string `json:"remote_sign_id,omitempty"`
+	// DeviceID names the enrolled device a gateway ran the command for. Only a
+	// gateway's audit chain sets it; omitempty keeps older canonical forms.
+	DeviceID string `json:"device_id,omitempty"`
 }
 
 const ZeroHash = "0000000000000000000000000000000000000000000000000000000000000000"
@@ -402,6 +405,7 @@ type canonicalRecord struct {
 	StepID          string `json:"step_id,omitempty"`
 	ReviewSHA256    string `json:"review_sha256,omitempty"`
 	RemoteSignID    string `json:"remote_sign_id,omitempty"`
+	DeviceID        string `json:"device_id,omitempty"`
 }
 
 func canonicalJSON(record Record) ([]byte, error) {
@@ -434,5 +438,6 @@ func canonicalJSON(record Record) ([]byte, error) {
 		StepID:          record.StepID,
 		ReviewSHA256:    record.ReviewSHA256,
 		RemoteSignID:    record.RemoteSignID,
+		DeviceID:        record.DeviceID,
 	})
 }

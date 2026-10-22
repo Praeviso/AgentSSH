@@ -63,3 +63,20 @@ func TestGatewayDoesNotLinkManagedSigning(t *testing.T) {
 		t.Fatal("agentssh-gateway depends on internal/remoteserver")
 	}
 }
+
+func TestAuditVerifyOnFreshGateway(t *testing.T) {
+	old := gateway.ScryptWorkFactor
+	gateway.ScryptWorkFactor = 10
+	t.Cleanup(func() { gateway.ScryptWorkFactor = old })
+	dir := t.TempDir()
+	if err := gateway.Init(dir, "master"); err != nil {
+		t.Fatal(err)
+	}
+	cmd := newRootCommand()
+	var stdout bytes.Buffer
+	cmd.SetOut(&stdout)
+	cmd.SetArgs([]string{"--data", dir, "audit", "verify"})
+	if err := cmd.Execute(); err != nil || stdout.String() != "audit chain ok · records=0\n" {
+		t.Fatalf("audit verify: %q %v", stdout.String(), err)
+	}
+}

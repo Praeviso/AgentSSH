@@ -16,6 +16,10 @@ import (
 
 const maxRequestBytes = 64 << 10
 
+// streamingBodyTimeout bounds how long a streaming route may take to upload
+// its (larger) body.
+const streamingBodyTimeout = 5 * time.Minute
+
 // DeviceHandler serves a request whose device signature, standing and nonce
 // have been verified.
 type DeviceHandler func(w http.ResponseWriter, r *http.Request, device Device, body []byte)
@@ -28,6 +32,12 @@ type Route struct {
 	// before the refusal is sent. A non-nil error turns the refusal into a 500
 	// carrying the error's message.
 	Revoked func(deviceID string, body []byte, now time.Time) error
+	// MaxBody caps the request body; zero means 64 KiB.
+	MaxBody int64
+	// Streaming routes get streamingBodyTimeout to upload their body and then
+	// no read or write deadline, so a long-running response is not cut off by
+	// the server's per-request timeouts.
+	Streaming bool
 }
 
 // API is the HTTP surface every control plane shares: enrollment, signed
@@ -97,11 +107,15 @@ func DecodeBody(data []byte, value any) error {
 }
 
 func requestBytes(r *http.Request) ([]byte, error) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBytes+1))
+	return requestBytesLimit(r, maxRequestBytes)
+}
+
+func requestBytesLimit(r *http.Request, limit int64) ([]byte, error) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, limit+1))
 	if err != nil {
 		return nil, err
 	}
-	if len(body) > maxRequestBytes {
+	if int64(len(body)) > limit {
 		return nil, errors.New("request body too large")
 	}
 	return body, nil
@@ -145,8 +159,16 @@ func (a API) handleEnroll(w http.ResponseWriter, r *http.Request, base string) {
 }
 
 func (a API) device(base string, route Route) http.HandlerFunc {
+	limit := route.MaxBody
+	if limit <= 0 {
+		limit = maxRequestBytes
+	}
 	return func(w http.ResponseWriter, r *http.Request) {
-		body, err := requestBytes(r)
+		rc := http.NewResponseController(w)
+		if route.Streaming {
+			_ = rc.SetReadDeadline(time.Now().Add(streamingBodyTimeout))
+		}
+		body, err := requestBytesLimit(r, limit)
 		if err != nil {
 			WriteError(w, 400, remote.CodeBadRequest, "request body too large or unreadable")
 			return
@@ -193,6 +215,12 @@ func (a API) device(base string, route Route) http.HandlerFunc {
 		case err != nil:
 			WriteError(w, 500, remote.CodeInternal, "replay protection unavailable")
 			return
+		}
+		if route.Streaming {
+			// The body is consumed; keep the connection's background read free
+			// of a deadline so it does not cancel the request mid-stream.
+			_ = rc.SetReadDeadline(time.Time{})
+			_ = rc.SetWriteDeadline(time.Time{})
 		}
 		route.Handler(w, r, device, body)
 	}

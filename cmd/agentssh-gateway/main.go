@@ -1,14 +1,17 @@
 // Command agentssh-gateway is the AgentSSH gateway control plane: it enrolls
 // devices and holds their inventory, policy and SSH identities. Unlike
 // agentssh-server it never hands a device a signature or a configuration
-// bundle; devices forward commands and the gateway executes them.
+// bundle; devices forward commands and the gateway authorizes, executes and
+// audits them.
 package main
 
 import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
+	"github.com/Praeviso/AgentSSH/internal/audit"
 	"github.com/Praeviso/AgentSSH/internal/controlplane"
 	"github.com/Praeviso/AgentSSH/internal/controlplane/admin"
 	"github.com/Praeviso/AgentSSH/internal/gateway"
@@ -59,6 +62,7 @@ func newRootCommand() *cobra.Command {
 		program.DeviceCommand(dir),
 		program.IdentityCommand(dir),
 		program.ConfigCommand(dir),
+		newAuditCommand(dir),
 	)
 	return root
 }
@@ -66,6 +70,8 @@ func newRootCommand() *cobra.Command {
 func newServeCommand(dir func() (string, error)) *cobra.Command {
 	var listen string
 	var publicURL string
+	var execTimeout time.Duration
+	var maxConcurrent int
 	cmd := &cobra.Command{
 		Use:   "serve --public-url <https-base> [--listen 127.0.0.1:8080]",
 		Short: "Run the gateway API.",
@@ -91,7 +97,10 @@ func newServeCommand(dir func() (string, error)) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			handler, err := gateway.NewServer(store, keys).Handler(publicURL)
+			server := gateway.NewServer(d, store, keys)
+			server.ExecTimeout = execTimeout
+			server.MaxConcurrentPerDevice = maxConcurrent
+			handler, err := server.Handler(publicURL)
 			if err != nil {
 				return err
 			}
@@ -100,5 +109,35 @@ func newServeCommand(dir func() (string, error)) *cobra.Command {
 	}
 	cmd.Flags().StringVar(&listen, "listen", "127.0.0.1:8080", "private HTTP origin listen address behind the public HTTPS ingress")
 	cmd.Flags().StringVar(&publicURL, "public-url", "", "public HTTPS base (including path prefix)")
+	cmd.Flags().DurationVar(&execTimeout, "exec-timeout", gateway.DefaultExecTimeout, "longest a single execution may run")
+	cmd.Flags().IntVar(&maxConcurrent, "max-concurrent", gateway.DefaultMaxConcurrentPerDevice, "executions one device may run at once")
+	return cmd
+}
+
+func newAuditCommand(dir func() (string, error)) *cobra.Command {
+	cmd := &cobra.Command{Use: "audit", Short: "Inspect the gateway's audit chain."}
+	cmd.AddCommand(&cobra.Command{
+		Use:   "verify",
+		Short: "Recompute the audit hash chain.",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			d, err := dir()
+			if err != nil {
+				return err
+			}
+			if err := program.CheckDir(d); err != nil {
+				return err
+			}
+			result, err := audit.NewStore(filepath.Join(d, gateway.FileAudit)).Verify()
+			if err != nil {
+				return err
+			}
+			if !result.OK {
+				return fmt.Errorf("audit chain broken · seq=%d · reason=%s", result.BrokenSeq, result.Reason)
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "audit chain ok · records=%d\n", result.Count)
+			return nil
+		},
+	})
 	return cmd
 }
