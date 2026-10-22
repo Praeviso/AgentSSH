@@ -61,6 +61,29 @@ func TestHTTPSRequestCoverageAndClockBounds(t *testing.T) {
 	}
 }
 
+func TestHeaderVerificationBindsTheBodyDigest(t *testing.T) {
+	pub, key, _ := ed25519.GenerateKey(rand.Reader)
+	now := time.Unix(1700000000, 0)
+	body := []byte(`{"cmd":"uptime"}`)
+	target := "https://gw.example/agentssh/exec"
+	r := httptest.NewRequest("POST", target, strings.NewReader(string(body)))
+	if err := SignHTTPRequest(r, body, "dev_fixture", DeviceSignatureTag, key, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := VerifyHTTPRequestHeaders(r, target, "dev_fixture", DeviceSignatureTag, pub, now); err != nil {
+		t.Fatalf("authentic headers refused: %v", err)
+	}
+	if !ContentDigestMatches(r, body) || ContentDigestMatches(r, []byte(`{"cmd":"reboot"}`)) {
+		t.Fatal("digest check does not bind the body")
+	}
+	// Swapping the digest header for another body's breaks the signature.
+	other := r.Clone(r.Context())
+	other.Header.Set("Content-Digest", contentDigest([]byte(`{"cmd":"reboot"}`)))
+	if _, err := VerifyHTTPRequestHeaders(other, target, "dev_fixture", DeviceSignatureTag, pub, now); err == nil {
+		t.Fatal("rewritten Content-Digest accepted")
+	}
+}
+
 func TestHTTPSIndependentWebCryptoVectors(t *testing.T) {
 	raw, err := os.ReadFile("testdata/https.json")
 	if err != nil {

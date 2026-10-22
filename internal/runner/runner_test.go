@@ -394,6 +394,55 @@ func TestRunMapsRemoteAndTransportFailures(t *testing.T) {
 	}
 }
 
+// interruptedExecutor runs until its context ends, like a command cut off by
+// Ctrl-C, a dropped gateway request, or a timeout.
+type interruptedExecutor struct{}
+
+func (interruptedExecutor) Run(ctx context.Context, _ executor.Request) executor.Result {
+	<-ctx.Done()
+	return executor.Result{ExitCode: -1, Err: ctx.Err()}
+}
+
+func (interruptedExecutor) Close() error { return nil }
+
+func TestRunAuditsWhyAnInterruptedCommandFailed(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		ctx  func() (context.Context, context.CancelFunc)
+		want string
+	}{
+		{"cancelled", func() (context.Context, context.CancelFunc) {
+			ctx, cancel := context.WithCancel(context.Background())
+			time.AfterFunc(20*time.Millisecond, cancel)
+			return ctx, cancel
+		}, "cancelled"},
+		{"timed out", func() (context.Context, context.CancelFunc) {
+			return context.WithTimeout(context.Background(), 20*time.Millisecond)
+		}, "timed out"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t, allowUptime(), true, "web-1")
+			f.env.Executor = interruptedExecutor{}
+			ctx, cancel := tc.ctx()
+			defer cancel()
+			outcome, err := runner.Run(ctx, f.env, runner.Request{Target: hostTarget("web-1"), Command: "uptime", Session: "s_1"})
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if outcome.ExitCode != runner.ExitSSHError {
+				t.Fatalf("exit = %d, want 9", outcome.ExitCode)
+			}
+			records, err := audit.NewStore(filepath.Join(f.dir, "audit.jsonl")).ReadAll()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if last := records[len(records)-1]; last.Event != audit.EventFailed || last.Error != tc.want {
+				t.Fatalf("audit = %s %q, want failed %q", last.Event, last.Error, tc.want)
+			}
+		})
+	}
+}
+
 func TestRunReleasesOnceGrantAfterTransportFailure(t *testing.T) {
 	f := newFixture(t, policy.Config{}, true, "web-1")
 	grant(t, f, "s_1", "web-1", "systemctl restart nginx", approval.ScopeOnce)

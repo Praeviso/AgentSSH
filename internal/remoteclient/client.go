@@ -76,6 +76,9 @@ func invalidEnrollment(err error) error {
 type Client struct {
 	State State
 	http  *http.Client
+	// stream shares http's signing transport without a whole-request
+	// timeout, for executions that run as long as their command.
+	stream *http.Client
 }
 
 // NewClient loads the device key and uses ordinary HTTPS trust.
@@ -100,7 +103,10 @@ func NewClient(home string) (*Client, error) {
 	if !ok {
 		return nil, errors.New("HTTPS device key must be Ed25519")
 	}
-	return &Client{State: state, http: signedHTTPClient(key, state.DeviceID, remote.DeviceSignatureTag)}, nil
+	client := signedHTTPClient(key, state.DeviceID, remote.DeviceSignatureTag)
+	stream := *client
+	stream.Timeout = 0
+	return &Client{State: state, http: client, stream: &stream}, nil
 }
 
 // Status reports the device's standing; a revoked device gets an APIError.
@@ -122,6 +128,41 @@ func (c *Client) Sign(ctx context.Context, host string, data []byte) (remote.Sig
 	var out remote.SignResponse
 	err := c.call(ctx, http.MethodPost, remote.PathSign, remote.SignRequest{Host: host, Data: data}, &out)
 	return out, err
+}
+
+// Exec runs one command on a gateway, copying streamed output to stdout and
+// stderr. Cancelling ctx drops the request, which ends the remote command. An
+// ErrNoResult error means the connection ended before the outcome was known.
+func (c *Client) Exec(ctx context.Context, req remote.ExecRequest, stdout, stderr io.Writer) (remote.ExecResult, error) {
+	data, err := json.Marshal(req)
+	if err != nil {
+		return remote.ExecResult{}, err
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.State.ServerURL+remote.PathExec, bytes.NewReader(data))
+	if err != nil {
+		return remote.ExecResult{}, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	resp, err := c.stream.Do(httpReq)
+	if err != nil {
+		var apiErr *remote.APIError
+		if errors.As(err, &apiErr) {
+			return remote.ExecResult{}, apiErr
+		}
+		return remote.ExecResult{}, &UnreachableError{Err: err}
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode/100 != 2 {
+		data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		if err != nil {
+			return remote.ExecResult{}, &UnreachableError{Err: err}
+		}
+		return remote.ExecResult{}, statusError(resp.StatusCode, data)
+	}
+	if resp.Header.Get("Content-Type") != remote.ExecContentType {
+		return remote.ExecResult{}, fmt.Errorf("control plane answered /exec with %q, not an execution stream", resp.Header.Get("Content-Type"))
+	}
+	return remote.ReadExecStream(resp.Body, stdout, stderr)
 }
 
 func (c *Client) call(ctx context.Context, method string, path string, body any, out any) error {
@@ -163,18 +204,7 @@ func doJSON(ctx context.Context, client *http.Client, method string, endpoint st
 		return errors.New("control plane response is too large")
 	}
 	if resp.StatusCode/100 != 2 {
-		var apiErr remote.ErrorResponse
-		if json.Unmarshal(data, &apiErr) != nil || apiErr.Code == "" || apiErr.Error == "" {
-			// An ingress cannot report device standing when its backend is
-			// unavailable. Keep actual protocol refusals distinct from gateway
-			// failures so only the latter permit an unexpired cached bundle.
-			switch resp.StatusCode {
-			case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
-				return &UnreachableError{Err: fmt.Errorf("HTTPS ingress returned HTTP %d", resp.StatusCode)}
-			}
-			return &remote.APIError{Status: resp.StatusCode, Code: remote.CodeInternal, Message: fmt.Sprintf("HTTP %d", resp.StatusCode)}
-		}
-		return &remote.APIError{Status: resp.StatusCode, Code: apiErr.Code, Message: apiErr.Error}
+		return statusError(resp.StatusCode, data)
 	}
 	if out == nil {
 		return nil
@@ -183,6 +213,22 @@ func doJSON(ctx context.Context, client *http.Client, method string, endpoint st
 		return fmt.Errorf("decode control plane response: %w", err)
 	}
 	return nil
+}
+
+// statusError classifies a non-2xx response body.
+func statusError(status int, data []byte) error {
+	var apiErr remote.ErrorResponse
+	if json.Unmarshal(data, &apiErr) != nil || apiErr.Code == "" || apiErr.Error == "" {
+		// An ingress cannot report device standing when its backend is
+		// unavailable. Keep actual protocol refusals distinct from gateway
+		// failures so only the latter permit an unexpired cached bundle.
+		switch status {
+		case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+			return &UnreachableError{Err: fmt.Errorf("HTTPS ingress returned HTTP %d", status)}
+		}
+		return &remote.APIError{Status: status, Code: remote.CodeInternal, Message: fmt.Sprintf("HTTP %d", status)}
+	}
+	return &remote.APIError{Status: status, Code: apiErr.Code, Message: apiErr.Error}
 }
 
 // Leave removes the device credentials and cached bundle, returning home to

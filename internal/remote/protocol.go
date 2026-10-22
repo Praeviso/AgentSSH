@@ -41,6 +41,12 @@ const (
 	CodeIdentityDisabled = "identity_disabled"
 	CodeSignRejected     = "sign_rejected"
 	CodeInternal         = "internal"
+	// CodeUsage rejects an execution request the CLI would reject as a usage
+	// error (exit 2): no session, unknown host, invalid policy.
+	CodeUsage = "usage"
+	// CodeBusy means the device already has the maximum number of executions
+	// running.
+	CodeBusy = "busy"
 )
 
 // StatusResponse reports the calling device's standing and the control

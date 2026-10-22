@@ -1,16 +1,19 @@
 // Package gateway is the gateway-mode control plane. Devices enroll and
 // authenticate exactly as with a managed control plane, but inventory, policy,
-// identities and SSH stay here: there is no signing or bundle endpoint, so no
-// request path hands a device an identity signature or its policy.
+// identities and SSH stay here: devices send commands to /exec, and there is no
+// signing or bundle endpoint, so no request path hands a device an identity
+// signature or its policy.
 package gateway
 
 import (
 	"net/http"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/Praeviso/AgentSSH/internal/controlplane"
 	"github.com/Praeviso/AgentSSH/internal/remote"
+	"golang.org/x/crypto/ssh"
 )
 
 // FileDatabase is the gateway's database file. It differs from the managed
@@ -43,14 +46,26 @@ func OpenStore(path string) (*controlplane.Store, error) {
 
 // Server is the gateway HTTP API.
 type Server struct {
+	// Dir is the data directory: the audit chain, known_hosts, and per-device
+	// approval state live here.
+	Dir   string
 	Store *controlplane.Store
 	Keys  *controlplane.Keys
 	Now   func() time.Time
+	// ExecTimeout and MaxConcurrentPerDevice bound executions; zero values use
+	// the defaults.
+	ExecTimeout            time.Duration
+	MaxConcurrentPerDevice int
+
+	mu      sync.Mutex
+	running map[string]int
+	signers map[string]ssh.Signer
 }
 
-// NewServer wires a store and unlocked keys into an API server.
-func NewServer(store *controlplane.Store, keys *controlplane.Keys) *Server {
-	return &Server{Store: store, Keys: keys, Now: time.Now}
+// NewServer wires a data directory, its store and unlocked keys into an API
+// server.
+func NewServer(dir string, store *controlplane.Store, keys *controlplane.Keys) *Server {
+	return &Server{Dir: dir, Store: store, Keys: keys, Now: time.Now}
 }
 
 func (s *Server) now() time.Time {
@@ -60,8 +75,8 @@ func (s *Server) now() time.Time {
 	return time.Now()
 }
 
-// Handler serves enrollment and authenticated device requests under the public
-// HTTPS base, with the same trust requirements as the managed handler.
+// Handler serves enrollment, /status and /exec under the public HTTPS base,
+// with the same trust requirements as the managed handler.
 func (s *Server) Handler(publicURL string) (http.Handler, error) {
 	api := controlplane.API{
 		Mode:  remote.ModeGateway,
@@ -69,5 +84,5 @@ func (s *Server) Handler(publicURL string) (http.Handler, error) {
 		Keys:  func() *controlplane.Keys { return s.Keys },
 		Now:   s.now,
 	}
-	return api.Handler(publicURL)
+	return api.Handler(publicURL, s.execRoute())
 }

@@ -192,7 +192,8 @@ run web-1 -- sudo systemctl restart nginx
 ```
 
 - `event` ∈ `started | completed | failed | denied`。`deny` 记一条 `denied`(无 exit_code)。
-- `error` 是可选的人类可读异常说明,主要用于本地管理操作的失败记录;常规 `run` 记录为空。
+- `error` 是可选的人类可读异常说明,主要用于本地管理操作的失败记录;常规 `run` 记录为空。A `failed` run record whose command was interrupted carries `cancelled` (Ctrl-C, a dropped gateway request) or `timed out`.
+- `device_id` (gateway audit chain only, `omitempty`) names the enrolled device the gateway ran the command for; it is covered by the hash like every other field.
 - harness 的交互审批不由 AgentSSH 记录(在 harness 自己的日志里);AgentSSH 只记自己看到与执行的事实。
 - hash 链:`hash = SHA256(prev_hash || canonical_json(record_without_hash))`。第 0 条 `prev_hash` 全零。`agentssh audit verify` 从头重算,任一行被改/删/插都会断链。
 - 修复只允许 `agentssh audit repair --truncate-broken`:从第一条断链记录开始截断到文件末尾,并先写 `audit.log.bak`。不支持任意删除单条审计记录。

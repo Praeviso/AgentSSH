@@ -21,9 +21,18 @@ func init() {
 	gateway.ScryptWorkFactor = 10
 }
 
+type fixture struct {
+	base   string
+	dir    string
+	store  *controlplane.Store
+	keys   *controlplane.Keys
+	server *gateway.Server
+	client *remoteclient.Client
+}
+
 // enrolledGateway runs an in-process gateway behind a TLS ingress and enrolls
 // one device home against it with the real client.
-func enrolledGateway(t *testing.T) (*controlplane.Store, *remoteclient.Client) {
+func enrolledGateway(t *testing.T) *fixture {
 	t.Helper()
 	dir := t.TempDir()
 	if err := gateway.Init(dir, "master"); err != nil {
@@ -40,10 +49,15 @@ func enrolledGateway(t *testing.T) (*controlplane.Store, *remoteclient.Client) {
 	}
 	mux := http.NewServeMux()
 	ingress := httptest.NewUnstartedServer(mux)
+	// Like admin.Serve's per-request timeouts, scaled down: a streaming
+	// execution must outlive them.
+	ingress.Config.ReadTimeout = time.Second
+	ingress.Config.WriteTimeout = time.Second
 	ingress.StartTLS()
 	t.Cleanup(ingress.Close)
 	base := ingress.URL + "/agentssh"
-	handler, err := gateway.NewServer(store, keys).Handler(base)
+	server := gateway.NewServer(dir, store, keys)
+	handler, err := server.Handler(base)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,11 +86,12 @@ func enrolledGateway(t *testing.T) (*controlplane.Store, *remoteclient.Client) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return store, client
+	return &fixture{base: base, dir: dir, store: store, keys: keys, server: server, client: client}
 }
 
 func TestEnrolledDeviceIsRefusedAfterRevocation(t *testing.T) {
-	store, client := enrolledGateway(t)
+	f := enrolledGateway(t)
+	store, client := f.store, f.client
 	status, err := client.Status(context.Background())
 	if err != nil {
 		t.Fatalf("status: %v", err)
@@ -93,7 +108,7 @@ func TestEnrolledDeviceIsRefusedAfterRevocation(t *testing.T) {
 }
 
 func TestSigningAndBundleEndpointsDoNotExist(t *testing.T) {
-	_, client := enrolledGateway(t)
+	client := enrolledGateway(t).client
 	_, signErr := client.Sign(context.Background(), "web-1", []byte("userauth"))
 	_, bundleErr := client.FetchBundle(context.Background())
 	for name, err := range map[string]error{"sign": signErr, "bundle": bundleErr} {

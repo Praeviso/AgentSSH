@@ -305,6 +305,18 @@ func runSSHSession(ctx context.Context, session *ssh.Session, command string, cl
 	case err := <-done:
 		return err
 	case <-ctx.Done():
+		// OpenSSH (7.9+) delivers this to a non-pty command; closing the
+		// connection alone leaves such a command running on the host. Bound
+		// the send: a stalled transport must not block cancellation.
+		signaled := make(chan struct{})
+		go func() {
+			_ = session.Signal(ssh.SIGTERM)
+			close(signaled)
+		}()
+		select {
+		case <-signaled:
+		case <-time.After(time.Second):
+		}
 		if closeClient != nil {
 			closeClient()
 		} else {

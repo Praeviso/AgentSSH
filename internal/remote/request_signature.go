@@ -94,6 +94,23 @@ func RequestKeyID(req *http.Request) string {
 // URI. A terminating proxy must not derive that URI from untrusted forwarding
 // headers. Replay protection is a separate mandatory durable operation.
 func VerifyHTTPRequest(req *http.Request, body []byte, target, keyID, tag string, key ed25519.PublicKey, now time.Time) (RequestProof, error) {
+	if !ContentDigestMatches(req, body) {
+		return RequestProof{}, errors.New("invalid or expired request signature")
+	}
+	return VerifyHTTPRequestHeaders(req, target, keyID, tag, key, now)
+}
+
+// ContentDigestMatches reports whether body is what the single Content-Digest
+// header describes.
+func ContentDigestMatches(req *http.Request, body []byte) bool {
+	return len(req.Header.Values("Content-Digest")) == 1 && req.Header.Get("Content-Digest") == contentDigest(body)
+}
+
+// VerifyHTTPRequestHeaders authenticates the request before its body is read:
+// the signature covers the Content-Digest header, so a verifier can admit a
+// large body only from an authenticated sender and then must confirm it with
+// ContentDigestMatches before trusting any of it.
+func VerifyHTTPRequestHeaders(req *http.Request, target, keyID, tag string, key ed25519.PublicKey, now time.Time) (RequestProof, error) {
 	fail := errors.New("invalid or expired request signature")
 	if len(key) != ed25519.PublicKeySize {
 		return RequestProof{}, fail
@@ -114,7 +131,7 @@ func VerifyHTTPRequest(req *http.Request, body []byte, target, keyID, tag string
 		return RequestProof{}, fail
 	}
 	nonce, err := base64.RawURLEncoding.Strict().DecodeString(parts[3])
-	if err != nil || len(nonce) != 32 || req.Header.Get("Content-Digest") != contentDigest(body) {
+	if err != nil || len(nonce) != 32 {
 		return RequestProof{}, fail
 	}
 	rawSig := req.Header.Get("Signature")
@@ -122,7 +139,7 @@ func VerifyHTTPRequest(req *http.Request, body []byte, target, keyID, tag string
 		return RequestProof{}, fail
 	}
 	sig, err := base64.StdEncoding.Strict().DecodeString(strings.TrimSuffix(strings.TrimPrefix(rawSig, "agentssh=:"), ":"))
-	if err != nil || !ed25519.Verify(key, signatureBase(req.Method, target, contentDigest(body), strings.TrimPrefix(input, "agentssh=")), sig) {
+	if err != nil || !ed25519.Verify(key, signatureBase(req.Method, target, req.Header.Get("Content-Digest"), strings.TrimPrefix(input, "agentssh=")), sig) {
 		return RequestProof{}, fail
 	}
 	if now.Unix() >= expires || created > now.Add(RequestClockSkew).Unix() {

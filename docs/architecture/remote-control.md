@@ -70,12 +70,46 @@ the public age recipient. The public HTTPS ingress owns transport certificates.
 ### Gateway mode
 
 `agentssh-gateway` shares this enrollment, request-signature, revocation, identity
-and configuration machinery (`internal/controlplane`), but registers only
-`/enroll` and `/status` (mode `gateway`) from the table above: `/bundle` and
-`/sign` return 404, and the binary does not link `internal/remoteserver`. Its
-database is `gateway.db`, so a managed binary pointed at a gateway directory has no
-devices or identities to sign for. Remote execution and the client side follow in
-#15 and #17; the full design will live in `docs/architecture/gateway-mode.md`.
+and configuration machinery (`internal/controlplane`), but from the table above
+registers only `/enroll` and `/status` (mode `gateway`), plus its own `/exec`:
+`/bundle` and `/sign` return 404, and the binary does not link
+`internal/remoteserver`. Its database is `gateway.db`, so a managed binary pointed
+at a gateway directory has no devices or identities to sign for.
+
+`POST /exec` carries one signed JSON body: target, command (at most 128 KiB, the
+local argv limit), session and optional stdin (base64, at most 32 MiB); host,
+session and plan identifiers are at most 256 bytes and the session label 1 KiB,
+so no audit record nears the reader's 8 MiB line limit. The gateway runs it
+through the same pipeline as the CLI (`internal/runner`) against the device's
+pushed inventory and policy, connecting with its own identities in-process (no
+agent, local keys or ssh_config; no connection reuse; `known_hosts` in the data
+directory). Because its body is
+larger than other endpoints', the gateway verifies the signature over the
+request headers (which cover `Content-Digest`) before reading the body, refuses
+an oversized `Content-Length` with 413, and then checks the body against the
+digest. Requests the CLI would reject as usage errors return 400 `usage`; a device over its
+concurrency limit (`serve --max-concurrent`, default 4) gets 429 `busy`.
+
+The response is a stream of frames, `type:1 | length:4 big-endian | payload`:
+stdout (1) and stderr (2) data frames of at most 64 KiB, sent only when the
+request asks to stream a single-host run; then one response frame (5) per
+target with its `run --json` object; then a result frame (3, `{exit_code}`).
+An error frame (4, `ErrorResponse`) may replace everything after the data
+frames. Response, result and error frames are at most 16 MiB: the gateway caps
+each stream's output at 1 MiB unless the policy's `output.max_bytes` is lower
+(applied before auditing, so the audit hash covers what is returned), which
+keeps a response within one frame even when JSON escapes every byte. A stream
+that ends without its final frame means the outcome is unknown. There is no cancel frame: dropping the request cancels the
+run, and the gateway sends the remote command `SIGTERM` before closing the SSH
+connection; `serve --exec-timeout` (default 30m) does the same. The request
+must arrive within the 60 s proof lifetime; ingresses must stream responses
+(the gateway sends `X-Accel-Buffering: no`).
+
+Every run is recorded in one hash chain per gateway, `audit.jsonl`, with
+`device_id` on each record (`agentssh-gateway audit verify`). Pending approval
+requests live under `devices/<id>/approval/`; operator decisions, the client
+side and the full design follow in #17, #19, #20 and
+`docs/architecture/gateway-mode.md`.
 
 ## Enrollment
 
