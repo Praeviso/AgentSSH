@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,7 +23,10 @@ func init() {
 }
 
 type fixture struct {
-	base   string
+	base    string
+	ingress *httptest.Server
+	// down makes the ingress answer 503, like a gateway that is unreachable.
+	down   *atomic.Bool
 	dir    string
 	store  *controlplane.Store
 	keys   *controlplane.Keys
@@ -61,7 +65,14 @@ func enrolledGateway(t *testing.T) *fixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mux.Handle("/", handler)
+	down := new(atomic.Bool)
+	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if down.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		handler.ServeHTTP(w, r)
+	}))
 	original := http.DefaultTransport
 	transport := original.(*http.Transport).Clone()
 	pool := x509.NewCertPool()
@@ -70,23 +81,31 @@ func enrolledGateway(t *testing.T) *fixture {
 	http.DefaultTransport = transport
 	t.Cleanup(func() { http.DefaultTransport = original; transport.CloseIdleConnections() })
 
-	pub, err := controlplane.LoadBundlePublicKey(dir)
+	f := &fixture{base: base, ingress: ingress, down: down, dir: dir, store: store, keys: keys, server: server}
+	f.client = f.enroll(t, "agent-vm")
+	return f
+}
+
+// enroll enrolls another device home with the real client.
+func (f *fixture) enroll(t *testing.T, name string) *remoteclient.Client {
+	t.Helper()
+	pub, err := controlplane.LoadBundlePublicKey(f.dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	token, err := store.CreateEnrollToken("agent-vm", base, remote.PublicKeyFingerprint(pub), time.Minute, time.Now())
+	token, err := f.store.CreateEnrollToken(name, f.base, remote.PublicKeyFingerprint(pub), time.Minute, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
 	home := t.TempDir()
-	if _, err := remoteclient.Enroll(context.Background(), home, base, token.String(), time.Now()); err != nil {
+	if _, err := remoteclient.Enroll(context.Background(), home, f.base, token.String(), time.Now()); err != nil {
 		t.Fatalf("enroll: %v", err)
 	}
 	client, err := remoteclient.NewClient(home)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &fixture{base: base, dir: dir, store: store, keys: keys, server: server, client: client}
+	return client
 }
 
 func TestEnrolledDeviceIsRefusedAfterRevocation(t *testing.T) {

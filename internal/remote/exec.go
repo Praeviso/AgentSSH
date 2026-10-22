@@ -6,12 +6,20 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/Praeviso/AgentSSH/internal/runner"
 )
 
-// PathExec runs one command on a gateway (gateway mode only).
-const PathExec = "/exec"
+// Gateway execution endpoints (gateway mode only).
+const (
+	// PathExec starts a run and streams it.
+	PathExec = "/exec"
+	// PathExecAttach streams an existing run from a spool offset.
+	PathExecAttach = "/exec/attach"
+	// PathExecCancel stops a run. Dropping a connection does not.
+	PathExecCancel = "/exec/cancel"
+)
 
 // Execution request limits. Every field lands in the audit chain, whose reader
 // caps one record at 8 MiB; these keep a record far below that even when JSON
@@ -49,31 +57,83 @@ type ExecRequest struct {
 	Stream bool `json:"stream,omitempty"`
 }
 
-// ExecResult is the outcome of an execution: the merged exit code (the CLI
-// contract: 0, 1, 6, 7, 9) and one `run --json` object per target. On the
-// wire each response is its own frame, followed by a result frame with the
-// exit code, so a group's size never adds up into one frame.
+// ExecResult is the outcome of a run: the merged exit code (the CLI contract:
+// 0, 1, 6, 7, 9) and one `run --json` object per target. Truncated means the
+// run's spool cap dropped output, so the result is incomplete; the exit code is
+// then at least 1.
 type ExecResult struct {
+	RunID     string            `json:"run_id"`
 	ExitCode  int               `json:"exit_code"`
+	Truncated bool              `json:"truncated,omitempty"`
 	Responses []runner.Response `json:"responses"`
 }
 
-type execFinal struct {
-	ExitCode int `json:"exit_code"`
+// ExecFinal is the payload of a result frame.
+type ExecFinal struct {
+	ExitCode  int  `json:"exit_code"`
+	Truncated bool `json:"truncated,omitempty"`
+}
+
+// ExecRun is the payload of the run frame that starts every /exec and
+// /exec/attach response.
+type ExecRun struct {
+	RunID string `json:"run_id"`
+}
+
+// ExecAttachRequest resumes streaming a run. Offset is ExecStream.Offset: the
+// spool bytes of the frames already consumed.
+type ExecAttachRequest struct {
+	RunID  string `json:"run_id"`
+	Offset int64  `json:"offset"`
+}
+
+// ExecCancelRequest stops a run.
+type ExecCancelRequest struct {
+	RunID string `json:"run_id"`
+}
+
+// ExecCancelResponse reports whether the run was still running.
+type ExecCancelResponse struct {
+	RunID     string `json:"run_id"`
+	Cancelled bool   `json:"cancelled"`
+}
+
+// Run errors. A run that is unknown, belongs to another device, or has expired
+// is refused alike, so run IDs reveal nothing.
+const (
+	CodeRunNotFound    = "run_not_found"
+	CodeRunInterrupted = "run_interrupted"
+)
+
+// ValidRunID reports whether id has the gateway's run ID shape:
+// "rn_" and 32 lowercase hex characters.
+func ValidRunID(id string) bool {
+	hexPart, ok := strings.CutPrefix(id, "rn_")
+	if !ok || len(hexPart) != 32 {
+		return false
+	}
+	for _, c := range hexPart {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // ExecContentType labels an /exec response body made of frames.
 const ExecContentType = "application/vnd.agentssh.exec-frames"
 
-// Frame types. A stream holds any number of stdout/stderr frames, then one
-// response frame per target, then exactly one result frame. An error frame
-// may replace everything after the data frames.
+// Frame types. A run's spool holds any number of stdout/stderr frames, then
+// one response frame per target, then exactly one result frame; an error frame
+// may replace everything after the data frames. Each HTTP response carries a
+// run frame and then the spool from the requested offset.
 const (
 	FrameStdout   byte = 1
 	FrameStderr   byte = 2
 	FrameResult   byte = 3
 	FrameError    byte = 4
 	FrameResponse byte = 5
+	FrameRun      byte = 6
 )
 
 const (
@@ -81,16 +141,17 @@ const (
 	// MaxDataFrameBytes bounds one stdout/stderr frame; writers split larger
 	// chunks.
 	MaxDataFrameBytes = 64 << 10
-	// MaxMessageFrameBytes bounds a response, result or error frame.
+	// MaxMessageFrameBytes bounds a response, result, error or run frame.
 	MaxMessageFrameBytes = 16 << 20
 )
 
 var (
-	// ErrNoResult means the stream ended before its result frame: the outcome
-	// of the command is unknown.
+	// ErrNoResult means the stream ended or broke before its final frame: the
+	// outcome is not known yet, and the run can be reattached.
 	ErrNoResult = errors.New("execution stream ended before a result")
 	// ErrFrameTooLarge rejects a frame above its type's limit.
 	ErrFrameTooLarge = errors.New("execution frame too large")
+	errUnknownFrame  = errors.New("unknown execution frame type")
 )
 
 // WriteFrame writes one frame. Data payloads above MaxDataFrameBytes are split.
@@ -104,7 +165,7 @@ func WriteFrame(w io.Writer, kind byte, payload []byte) error {
 			}
 			payload = payload[limit:]
 		}
-	} else if kind != FrameResult && kind != FrameError && kind != FrameResponse {
+	} else if kind != FrameResult && kind != FrameError && kind != FrameResponse && kind != FrameRun {
 		return fmt.Errorf("unknown execution frame type %d", kind)
 	}
 	if len(payload) > limit {
@@ -139,12 +200,12 @@ func ReadFrame(r io.Reader) (byte, []byte, error) {
 		if size > MaxDataFrameBytes {
 			return 0, nil, ErrFrameTooLarge
 		}
-	case FrameResult, FrameError, FrameResponse:
+	case FrameResult, FrameError, FrameResponse, FrameRun:
 		if size > MaxMessageFrameBytes {
 			return 0, nil, ErrFrameTooLarge
 		}
 	default:
-		return 0, nil, fmt.Errorf("unknown execution frame type %d", kind)
+		return 0, nil, fmt.Errorf("%w %d", errUnknownFrame, kind)
 	}
 	// Grow with the bytes that actually arrive rather than trusting the
 	// declared size up front.
@@ -158,63 +219,46 @@ func ReadFrame(r io.Reader) (byte, []byte, error) {
 	return kind, payload, nil
 }
 
-// EncodeExecResult renders result as response frames and a result frame,
-// checking every size before the first frame is emitted, so an oversized
-// response never leaves a stream half written.
-func EncodeExecResult(result ExecResult) ([][]byte, error) {
-	payloads := make([][]byte, 0, len(result.Responses)+1)
-	for _, response := range result.Responses {
-		payload, err := json.Marshal(response)
-		if err != nil {
-			return nil, err
-		}
-		if len(payload) > MaxMessageFrameBytes {
-			return nil, ErrFrameTooLarge
-		}
-		payloads = append(payloads, payload)
-	}
-	final, err := json.Marshal(execFinal{ExitCode: result.ExitCode})
-	if err != nil {
-		return nil, err
-	}
-	return append(payloads, final), nil
+// FrameSize is the encoded size of a frame with payload bytes.
+func FrameSize(payload int) int64 {
+	return int64(frameHeaderBytes + payload)
 }
 
-// WriteExecResult writes EncodeExecResult's frames through write.
-func WriteExecResult(write func(kind byte, payload []byte) error, result ExecResult) error {
-	payloads, err := EncodeExecResult(result)
-	if err != nil {
-		return err
-	}
-	for i, payload := range payloads {
-		kind := FrameResponse
-		if i == len(payloads)-1 {
-			kind = FrameResult
-		}
-		if err := write(kind, payload); err != nil {
-			return err
-		}
-	}
-	return nil
+// ExecStream reads one run across reconnects. RunID is set by the first run
+// frame; Offset counts the spool bytes of complete frames consumed, so a
+// reattach from Offset delivers every remaining frame exactly once; responses
+// collected before a break are kept.
+type ExecStream struct {
+	RunID     string
+	Offset    int64
+	responses []runner.Response
 }
 
-// ReadExecStream copies data frames to stdout and stderr, collects response
-// frames, and returns at the result frame. An error frame is returned as an
-// *APIError. Data after a response, anything after the final frame, or a
-// stream without one, is an error.
-func ReadExecStream(r io.Reader, stdout, stderr io.Writer) (ExecResult, error) {
-	var result ExecResult
+// Read consumes one /exec or /exec/attach response body. It returns the
+// result at the result frame, an *APIError for an error frame, and an error
+// wrapping ErrNoResult when the body ends or breaks first; the stream can then
+// be reattached from Offset.
+func (s *ExecStream) Read(r io.Reader, stdout, stderr io.Writer) (ExecResult, error) {
+	kind, payload, err := ReadFrame(r)
+	if err != nil {
+		return ExecResult{}, broken(err)
+	}
+	var run ExecRun
+	if kind != FrameRun || json.Unmarshal(payload, &run) != nil || !ValidRunID(run.RunID) {
+		return ExecResult{}, errors.New("execution stream does not start with a run frame")
+	}
+	if s.RunID != "" && s.RunID != run.RunID {
+		return ExecResult{}, fmt.Errorf("reattached to run %s instead of %s", run.RunID, s.RunID)
+	}
+	s.RunID = run.RunID
 	for {
 		kind, payload, err := ReadFrame(r)
-		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-			return ExecResult{}, ErrNoResult
-		}
 		if err != nil {
-			return ExecResult{}, err
+			return ExecResult{}, broken(err)
 		}
 		switch kind {
 		case FrameStdout, FrameStderr:
-			if result.Responses != nil {
+			if s.responses != nil {
 				return ExecResult{}, errors.New("execution output after a response frame")
 			}
 			dst := stdout
@@ -229,11 +273,12 @@ func ReadExecStream(r io.Reader, stdout, stderr io.Writer) (ExecResult, error) {
 			if err := json.Unmarshal(payload, &response); err != nil {
 				return ExecResult{}, fmt.Errorf("malformed execution response: %w", err)
 			}
-			result.Responses = append(result.Responses, response)
+			s.responses = append(s.responses, response)
 		case FrameResult, FrameError:
 			if _, _, err := ReadFrame(r); !errors.Is(err, io.EOF) {
 				return ExecResult{}, errors.New("execution stream continues after its final frame")
 			}
+			s.Offset += FrameSize(len(payload))
 			if kind == FrameError {
 				var refusal ErrorResponse
 				if err := json.Unmarshal(payload, &refusal); err != nil || refusal.Code == "" {
@@ -241,12 +286,27 @@ func ReadExecStream(r io.Reader, stdout, stderr io.Writer) (ExecResult, error) {
 				}
 				return ExecResult{}, &APIError{Code: refusal.Code, Message: refusal.Error}
 			}
-			var final execFinal
+			var final ExecFinal
 			if err := json.Unmarshal(payload, &final); err != nil {
 				return ExecResult{}, fmt.Errorf("malformed execution result: %w", err)
 			}
-			result.ExitCode = final.ExitCode
-			return result, nil
+			return ExecResult{RunID: s.RunID, ExitCode: final.ExitCode, Truncated: final.Truncated, Responses: s.responses}, nil
+		default:
+			return ExecResult{}, errors.New("unexpected run frame inside an execution stream")
 		}
+		s.Offset += FrameSize(len(payload))
 	}
+}
+
+// broken classifies a read failure: a size or type violation is a protocol
+// error; anything else (end of body, connection reset) means the stream broke
+// and the outcome is not known yet.
+func broken(err error) error {
+	if errors.Is(err, ErrFrameTooLarge) || errors.Is(err, errUnknownFrame) {
+		return err
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return ErrNoResult
+	}
+	return fmt.Errorf("%w: %v", ErrNoResult, err)
 }

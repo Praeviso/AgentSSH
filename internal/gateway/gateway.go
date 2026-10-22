@@ -52,14 +52,18 @@ type Server struct {
 	Store *controlplane.Store
 	Keys  *controlplane.Keys
 	Now   func() time.Time
-	// ExecTimeout and MaxConcurrentPerDevice bound executions; zero values use
-	// the defaults.
+	// ExecTimeout and MaxConcurrentPerDevice bound executions; RunRetention
+	// and RunMaxBytes bound their spooled output. Zero values use the defaults.
 	ExecTimeout            time.Duration
 	MaxConcurrentPerDevice int
+	RunRetention           time.Duration
+	RunMaxBytes            int64
 
-	mu      sync.Mutex
-	running map[string]int
-	signers map[string]ssh.Signer
+	mu        sync.Mutex
+	running   map[string]int
+	signers   map[string]ssh.Signer
+	runs      map[string]*run
+	nextSweep time.Time
 }
 
 // NewServer wires a data directory, its store and unlocked keys into an API
@@ -75,8 +79,8 @@ func (s *Server) now() time.Time {
 	return time.Now()
 }
 
-// Handler serves enrollment, /status and /exec under the public HTTPS base,
-// with the same trust requirements as the managed handler.
+// Handler serves enrollment, /status and the /exec endpoints under the public
+// HTTPS base, with the same trust requirements as the managed handler.
 func (s *Server) Handler(publicURL string) (http.Handler, error) {
 	api := controlplane.API{
 		Mode:  remote.ModeGateway,
@@ -84,5 +88,5 @@ func (s *Server) Handler(publicURL string) (http.Handler, error) {
 		Keys:  func() *controlplane.Keys { return s.Keys },
 		Now:   s.now,
 	}
-	return api.Handler(publicURL, s.execRoute())
+	return api.Handler(publicURL, s.execRoutes()...)
 }
