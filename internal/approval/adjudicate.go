@@ -24,6 +24,9 @@ type ApplyOptions struct {
 	ExecutionID  string
 	StepID       string
 	SavePolicy   func(policy.Config) error
+	// DeviceID stamps the decision's audit record on a gateway, whose
+	// audit chain holds every device's records.
+	DeviceID string
 }
 
 type ApplyResult struct {
@@ -253,6 +256,7 @@ func appendApprovalAudit(opts ApplyOptions, req PendingRequest, verdict Verdict,
 		ExecutionID:     executionID,
 		StepID:          stepID,
 		ReviewSHA256:    reviewSHA256,
+		DeviceID:        opts.DeviceID,
 	}
 	if scope == ScopeTask {
 		if permission := TaskCandidate(req.Cmd, req.StdinSHA256); permission != nil {

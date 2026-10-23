@@ -12,6 +12,7 @@ import (
 
 	"github.com/Praeviso/AgentSSH/internal/approval"
 	"github.com/Praeviso/AgentSSH/internal/config"
+	"github.com/Praeviso/AgentSSH/internal/remote"
 	"github.com/spf13/cobra"
 )
 
@@ -129,7 +130,7 @@ func runAwaited(cmd *cobra.Command, host, command string, flags runFlags) error 
 			}
 		}
 		waitCtx, cancel := context.WithTimeout(ctx, timeout)
-		status, err := waitForRunApproval(waitCtx, approvalStore(cfg.Paths), ids, rows, command, stdin.sha256)
+		status, err := waitForRunApproval(waitCtx, cfg, ids, rows, command, stdin.sha256)
 		cancel()
 		if err != nil {
 			return err
@@ -163,8 +164,8 @@ func runAwaited(cmd *cobra.Command, host, command string, flags runFlags) error 
 
 // A resolution is written before its grant. Wait for usable authorization too,
 // avoiding the approved-not-yet-granted race and duplicate pending requests.
-func waitForRunApproval(ctx context.Context, store approval.PendingStore, ids []string, rows []runResponse, command, stdinHash string) (string, error) {
-	ticker := time.NewTicker(50 * time.Millisecond)
+func waitForRunApproval(ctx context.Context, cfg *config.Config, ids []string, rows []runResponse, command, stdinHash string) (string, error) {
+	ticker := time.NewTicker(pollInterval(cfg))
 	defer ticker.Stop()
 	for {
 		if ctx.Err() != nil {
@@ -172,7 +173,10 @@ func waitForRunApproval(ctx context.Context, store approval.PendingStore, ids []
 		}
 		allApproved := len(ids) > 0
 		for _, id := range ids {
-			status, err := store.Status(id)
+			status, _, err := approvalStatus(ctx, cfg, id)
+			if ctx.Err() != nil {
+				return "pending", nil
+			}
 			if err != nil {
 				return "", err
 			}
@@ -184,24 +188,23 @@ func waitForRunApproval(ctx context.Context, store approval.PendingStore, ids []
 			}
 		}
 		if allApproved {
-			cfg, err := config.Load()
-			if err != nil {
-				return "", classifyConfigError(err)
+			checks := make([]remote.AuthorizeCheck, 0, len(rows))
+			for _, row := range rows {
+				checks = append(checks, remote.AuthorizeCheck{Host: row.Host, Session: row.SessionID, Cmd: command, StdinSHA256: stdinHash})
 			}
-			runtime, err := approvalRuntime(cfg)
+			statuses, enabled, err := preflight(ctx, cfg, checks)
+			if ctx.Err() != nil {
+				return "pending", nil
+			}
 			if err != nil {
 				return "", err
 			}
 			ready := true
-			for _, row := range rows {
-				auth, err := approval.PreflightAuthorize(cfg.Policy, cfg.Inventory, approval.SessionStore{Dir: cfg.Paths.SessionsDir}, runtime, row.SessionID, row.Host, command, stdinHash)
-				if err != nil {
-					return "", err
-				}
-				if auth.Status == approval.AuthHardDeny || !runtime.Enabled && auth.Status == approval.AuthNeedsApproval {
+			for _, status := range statuses {
+				if status == approval.AuthHardDeny || !enabled && status == approval.AuthNeedsApproval {
 					return "policy_denied", nil
 				}
-				if auth.Status != approval.AuthAllow && auth.Status != approval.AuthAllowByGrant {
+				if status != approval.AuthAllow && status != approval.AuthAllowByGrant {
 					ready = false
 				}
 			}

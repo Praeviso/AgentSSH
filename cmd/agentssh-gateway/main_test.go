@@ -3,10 +3,13 @@ package main
 import (
 	"bytes"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 
+	"github.com/Praeviso/AgentSSH/internal/approval"
+	"github.com/Praeviso/AgentSSH/internal/audit"
 	"github.com/Praeviso/AgentSSH/internal/gateway"
 	"github.com/Praeviso/AgentSSH/internal/remote"
 )
@@ -78,5 +81,75 @@ func TestAuditVerifyOnFreshGateway(t *testing.T) {
 	cmd.SetArgs([]string{"--data", dir, "audit", "verify"})
 	if err := cmd.Execute(); err != nil || stdout.String() != "audit chain ok · records=0\n" {
 		t.Fatalf("audit verify: %q %v", stdout.String(), err)
+	}
+}
+
+func runGatewayCLI(t *testing.T, args ...string) (string, error) {
+	t.Helper()
+	cmd := newRootCommand()
+	var stdout bytes.Buffer
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&bytes.Buffer{})
+	cmd.SetArgs(args)
+	err := cmd.Execute()
+	return stdout.String(), err
+}
+
+// The gateway's operator reviews and decides devices' requests and plans from
+// the data directory; host scope is refused before anything is resolved.
+func TestApprovalAndPlanCommands(t *testing.T) {
+	old := gateway.ScryptWorkFactor
+	gateway.ScryptWorkFactor = 10
+	t.Cleanup(func() { gateway.ScryptWorkFactor = old })
+	dir := t.TempDir()
+	if err := gateway.Init(dir, "master"); err != nil {
+		t.Fatal(err)
+	}
+	base := filepath.Join(dir, "devices", "dev_test", "approval")
+	store := approval.PendingStore{PendingDir: filepath.Join(base, "pending"), ResponsesDir: filepath.Join(base, "responses"), PlansDir: filepath.Join(base, "plans")}
+	create := func(cmd, planID string) approval.PendingRequest {
+		t.Helper()
+		matcher, err := approval.Exact(cmd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req, err := store.Create(approval.PendingRequest{ReqID: "r1", SessionID: "s_test", Host: "web-1", Cmd: cmd, Candidate: matcher, PlanID: planID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return req
+	}
+	single := create("systemctl restart app", "")
+	planID, _ := approval.NewPlanID()
+	member := create("systemctl reload app", planID)
+	if _, err := store.CreatePlan(approval.PlanManifest{ID: planID, SessionID: "s_test", Host: "web-1", MemberIDs: []string{member.ID}}); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := runGatewayCLI(t, "--data", dir, "approval", "ls")
+	if err != nil || !strings.Contains(out, single.ID+" device=dev_test host=web-1") || !strings.Contains(out, "plan="+planID) {
+		t.Fatalf("approval ls: %v\n%s", err, out)
+	}
+	if _, err := runGatewayCLI(t, "--data", dir, "approval", "grant", single.ID); err == nil {
+		t.Fatal("grant without a scope")
+	}
+	if out, err := runGatewayCLI(t, "--data", dir, "approval", "grant", single.ID, "--once"); err != nil || !strings.Contains(out, "approved "+single.ID+" for dev_test scope=once") {
+		t.Fatalf("approval grant: %v %s", err, out)
+	}
+	if out, err := runGatewayCLI(t, "--data", dir, "approval", "show", single.ID); err != nil || !strings.Contains(out, `"status": "approved"`) || !strings.Contains(out, `"device_id": "dev_test"`) {
+		t.Fatalf("approval show: %v %s", err, out)
+	}
+	if out, err := runGatewayCLI(t, "--data", dir, "plan", "show", planID); err != nil || !strings.Contains(out, "plan "+planID+" · pending · device dev_test") || !strings.Contains(out, `"systemctl reload app"`) {
+		t.Fatalf("plan show: %v %s", err, out)
+	}
+	if out, err := runGatewayCLI(t, "--data", dir, "plan", "deny", planID); err != nil || !strings.Contains(out, "denied 1 command(s)") {
+		t.Fatalf("plan deny: %v %s", err, out)
+	}
+	if _, err := runGatewayCLI(t, "--data", dir, "approval", "deny", "ap_00000000000000000000000000"); err == nil {
+		t.Fatal("deny of an unknown request")
+	}
+	records, err := audit.NewStore(filepath.Join(dir, gateway.FileAudit)).ReadAll()
+	if err != nil || len(records) != 2 || records[0].DeviceID != "dev_test" || records[1].Event != audit.EventApprovalDenied {
+		t.Fatalf("audit = %+v, %v", records, err)
 	}
 }

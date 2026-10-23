@@ -16,19 +16,23 @@ import (
 	"github.com/Praeviso/AgentSSH/internal/config"
 	"github.com/Praeviso/AgentSSH/internal/fileutil"
 	"github.com/Praeviso/AgentSSH/internal/inventory"
+	"github.com/Praeviso/AgentSSH/internal/remote"
 	"github.com/Praeviso/AgentSSH/internal/session"
 	"github.com/spf13/cobra"
 )
 
 type planExecution struct {
-	Version           int                              `json:"version"`
-	ID                string                           `json:"execution_id"`
-	Host              string                           `json:"host"`
-	SessionID         string                           `json:"session_id"`
-	Label             string                           `json:"label,omitempty"`
-	Metadata          approval.PlanMetadata            `json:"metadata,omitempty"`
-	ReviewSHA256      string                           `json:"review_sha256,omitempty"`
-	ApprovalPlanID    string                           `json:"approval_plan_id,omitempty"`
+	Version        int                   `json:"version"`
+	ID             string                `json:"execution_id"`
+	Host           string                `json:"host"`
+	SessionID      string                `json:"session_id"`
+	Label          string                `json:"label,omitempty"`
+	Metadata       approval.PlanMetadata `json:"metadata,omitempty"`
+	ReviewSHA256   string                `json:"review_sha256,omitempty"`
+	ApprovalPlanID string                `json:"approval_plan_id,omitempty"`
+	// ApprovalOnGateway says the approval plan was submitted to a gateway
+	// rather than kept in this home's own approval store.
+	ApprovalOnGateway bool                             `json:"approval_on_gateway,omitempty"`
 	ApprovalRounds    []executionApprovalRound         `json:"approval_rounds,omitempty"`
 	Status            string                           `json:"status"`
 	NextAction        *executionNextAction             `json:"next_action,omitempty"`
@@ -72,9 +76,6 @@ func newPlanRunCommand() *cobra.Command {
 		cfg, err := config.Load()
 		if err != nil {
 			return classifyConfigError(err)
-		}
-		if err := refuseGatewayWait(cfg, wait); err != nil {
-			return err
 		}
 		inv := cfg.Inventory
 		if cfg.Gateway != nil {
@@ -164,9 +165,6 @@ func newPlanResumeCommand() *cobra.Command {
 		cfg, err := config.Load()
 		if err != nil {
 			return classifyConfigError(err)
-		}
-		if err := refuseGatewayWait(cfg, wait); err != nil {
-			return err
 		}
 		run := planExecution{ID: args[0]}
 		return executeSavedPlan(cmd, cfg, &run, executionRunOptions{wait: wait, jsonOutput: jsonOutput, events: events}, false)
@@ -441,8 +439,22 @@ func executeSavedPlan(cmd *cobra.Command, cfg *config.Config, run *planExecution
 		}
 		return nil
 	}
+	if run.ApprovalPlanID != "" && run.ApprovalOnGateway != (cfg.Gateway != nil) {
+		// The plan lives in an approval store this home no longer uses: a
+		// local plan on a device that now runs through a gateway, or a
+		// gateway's plan after the device left it. It authorizes nothing
+		// here, so the remaining steps are submitted again where they run.
+		appendApprovalRound(run, run.ApprovalPlanID, "superseded", "the approval plan is kept where this device no longer runs its commands; the remaining steps are submitted again", 0, 0, 0)
+		run.ApprovalPlanID, run.ApprovalOnGateway = "", false
+		if run.Status == "pending" || run.Status == "expired" {
+			run.Status = "ready"
+		}
+		if err := saveExecution(path, run); err != nil {
+			return err
+		}
+	}
 	if run.ApprovalPlanID != "" {
-		status, err := approvalStore(cfg.Paths).PlanStatus(run.ApprovalPlanID)
+		status, _, err := planStatus(cmd.Context(), cfg, run.ApprovalPlanID)
 		if err != nil {
 			return err
 		}
@@ -478,7 +490,7 @@ func executeSavedPlan(cmd *cobra.Command, cfg *config.Config, run *planExecution
 				return commandExitError{Code: exitApprovalRequired}
 			}
 		case "approved":
-			ready, err := executionAuthorizationReady(cfg, run, remaining)
+			ready, err := executionAuthorizationReady(cmd.Context(), cfg, run, remaining)
 			if err != nil {
 				return err
 			}
@@ -516,15 +528,14 @@ func executeSavedPlan(cmd *cobra.Command, cfg *config.Config, run *planExecution
 			}
 		}
 	}
-	// A gateway reauthorizes each step itself; the client keeps no approvals.
-	if cfg.Gateway == nil && (run.ApprovalPlanID == "" || run.Status == "expired") {
+	if run.ApprovalPlanID == "" || run.Status == "expired" {
 		runtime, err := approvalRuntime(cfg)
 		if err != nil {
 			return err
 		}
 		response, err := submitPlanInputs(cmd, cfg, runtime, run.Host, remaining, run.SessionID, run.Label, executionPlanReview(run))
 		if response.PlanID != "" {
-			run.ApprovalPlanID = response.PlanID
+			run.ApprovalPlanID, run.ApprovalOnGateway = response.PlanID, cfg.Gateway != nil
 			if response.ReviewSHA256 != "" {
 				run.ReviewSHA256 = response.ReviewSHA256
 			}
@@ -723,13 +734,16 @@ func executeSavedPlan(cmd *cobra.Command, cfg *config.Config, run *planExecution
 }
 
 func waitPlanReady(ctx context.Context, cfg *config.Config, run *planExecution, commands []planCommand) (string, error) {
-	ticker := time.NewTicker(50 * time.Millisecond)
+	ticker := time.NewTicker(pollInterval(cfg))
 	defer ticker.Stop()
 	for {
 		if ctx.Err() != nil {
 			return "pending", nil
 		}
-		status, err := approvalStore(cfg.Paths).PlanStatus(run.ApprovalPlanID)
+		status, _, err := planStatus(ctx, cfg, run.ApprovalPlanID)
+		if ctx.Err() != nil {
+			return "pending", nil
+		}
 		if err != nil {
 			return "", err
 		}
@@ -737,26 +751,15 @@ func waitPlanReady(ctx context.Context, cfg *config.Config, run *planExecution, 
 			return status.Status, nil
 		}
 		if status.Status == "approved" {
-			current, err := config.Load()
+			ready, err := executionAuthorizationReady(ctx, cfg, run, commands)
+			if exitCodeForError(err) == exitPolicyDenied {
+				return "denied", nil
+			}
+			if ctx.Err() != nil {
+				return "pending", nil
+			}
 			if err != nil {
 				return "", err
-			}
-			runtime, err := approvalRuntime(current)
-			if err != nil {
-				return "", err
-			}
-			ready := true
-			for _, command := range commands {
-				auth, err := approval.PreflightAuthorize(current.Policy, current.Inventory, approval.SessionStore{Dir: current.Paths.SessionsDir}, runtime, run.SessionID, run.Host, command.Cmd, command.stdin.sha256)
-				if err != nil {
-					return "", err
-				}
-				if auth.Status == approval.AuthHardDeny || !runtime.Enabled && auth.Status == approval.AuthNeedsApproval {
-					return "denied", nil
-				}
-				if auth.Status != approval.AuthAllow && auth.Status != approval.AuthAllowByGrant {
-					ready = false
-				}
 			}
 			if ready {
 				return "approved", nil
@@ -770,20 +773,22 @@ func waitPlanReady(ctx context.Context, cfg *config.Config, run *planExecution, 
 	}
 }
 
-func executionAuthorizationReady(cfg *config.Config, run *planExecution, commands []planCommand) (bool, error) {
-	runtime, err := approvalRuntime(cfg)
+// executionAuthorizationReady reports whether every remaining command is
+// authorized now; a command that can never be is a policy denial.
+func executionAuthorizationReady(ctx context.Context, cfg *config.Config, run *planExecution, commands []planCommand) (bool, error) {
+	checks := make([]remote.AuthorizeCheck, 0, len(commands))
+	for _, command := range commands {
+		checks = append(checks, remote.AuthorizeCheck{Host: run.Host, Session: run.SessionID, Cmd: command.Cmd, StdinSHA256: command.stdin.sha256})
+	}
+	statuses, enabled, err := preflight(ctx, cfg, checks)
 	if err != nil {
 		return false, err
 	}
-	for _, command := range commands {
-		auth, err := approval.PreflightAuthorize(cfg.Policy, cfg.Inventory, approval.SessionStore{Dir: cfg.Paths.SessionsDir}, runtime, run.SessionID, run.Host, command.Cmd, command.stdin.sha256)
-		if err != nil {
-			return false, err
-		}
-		if auth.Status == approval.AuthHardDeny || !runtime.Enabled && auth.Status == approval.AuthNeedsApproval {
+	for _, status := range statuses {
+		if status == approval.AuthHardDeny || !enabled && status == approval.AuthNeedsApproval {
 			return false, commandExitError{Code: exitPolicyDenied}
 		}
-		if auth.Status != approval.AuthAllow && auth.Status != approval.AuthAllowByGrant {
+		if status != approval.AuthAllow && status != approval.AuthAllowByGrant {
 			return false, nil
 		}
 	}
@@ -797,15 +802,6 @@ func hasVerificationFailure(steps []planExecutionStep) bool {
 		}
 	}
 	return false
-}
-
-// refuseGatewayWait refuses --wait-approval on a gateway device, whose
-// approvals are kept on the gateway.
-func refuseGatewayWait(cfg *config.Config, wait string) error {
-	if cfg.Gateway == nil || wait == "" {
-		return nil
-	}
-	return newUsageError("--wait-approval is not available in gateway mode yet: this device's approvals are kept on the gateway\n  wait for the operator's decision, then resume the execution")
 }
 
 func validateApprovalWait(value string) error {

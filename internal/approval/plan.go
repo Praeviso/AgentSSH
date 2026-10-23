@@ -113,6 +113,11 @@ func validPlanID(id string) bool {
 	return validPrefixedID(id, "pl_")
 }
 
+// ValidPlanID reports whether id has the shape of a plan ID.
+func ValidPlanID(id string) bool {
+	return validPlanID(id)
+}
+
 func (s PendingStore) CreatePlan(manifest PlanManifest) (PlanManifest, error) {
 	if s.PlansDir == "" {
 		return PlanManifest{}, ErrPlansDirUnset

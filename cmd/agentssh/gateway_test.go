@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Praeviso/AgentSSH/internal/approval"
 	"github.com/Praeviso/AgentSSH/internal/audit"
 	"github.com/Praeviso/AgentSSH/internal/config"
 	"github.com/Praeviso/AgentSSH/internal/controlplane"
@@ -211,6 +212,7 @@ func asGateway(outcome cliOutcome) cliOutcome {
 var mintedIDs = []*regexp.Regexp{
 	regexp.MustCompile(`("req_id": )"[0-9a-f]{6}"`),
 	regexp.MustCompile(`()\bap_[0-9a-f]+\b`),
+	regexp.MustCompile(`("ts": )"[^"]*"`),
 }
 
 func normalizeIDs(value string) string {
@@ -365,16 +367,6 @@ func TestGatewayModeRefusesLocalStateCommands(t *testing.T) {
 			t.Fatalf("%v: %+v", args, got)
 		}
 	}
-	for _, args := range [][]string{
-		{"approval", "wait", "ap_0"},
-		{"plan", "status", "pl_0"},
-		{"run", "web-1", "--wait-approval", "5s", "--", "uptime"},
-	} {
-		got := runIn(t, device.home, args...)
-		if got.code != exitUsage || !strings.Contains(got.err, "not available in gateway mode yet: this device's approvals are kept on the gateway") {
-			t.Fatalf("%v: %+v", args, got)
-		}
-	}
 	if got := runIn(t, device.home, "session", "new"); got.code != exitOK || !strings.HasPrefix(got.stdout, "s_") {
 		t.Fatalf("session new: %+v", got)
 	}
@@ -383,9 +375,11 @@ func TestGatewayModeRefusesLocalStateCommands(t *testing.T) {
 	}
 }
 
-// plan run executes each step through the gateway, which reauthorizes it, and
-// streams step output with the step's request ID like a local run.
-func TestGatewayPlanRunsEachStepThroughTheGateway(t *testing.T) {
+// plan run submits the plan to the gateway for one review; once the gateway's
+// operator approves it, resume sends each step as its own run, the gateway
+// reauthorizes it with the plan's grants and opens no new approval request,
+// and streamed step output names the step's request like a local run.
+func TestGatewayPlanIsApprovedOnceThenRunsStepByStep(t *testing.T) {
 	_, device := paritySetup(t)
 	device.exec.Store(&fakeExecutor{stdout: "step output\n"})
 	dir := t.TempDir()
@@ -394,60 +388,79 @@ func TestGatewayPlanRunsEachStepThroughTheGateway(t *testing.T) {
 		t.Fatal(err)
 	}
 	plan := filepath.Join(dir, "plan.yaml")
-	if err := os.WriteFile(plan, []byte("version: 1\ncommands:\n  - {id: check, cmd: uptime}\n  - {id: apply, cmd: echo apply, stdin_file: "+payload+"}\n  - {id: restart, cmd: systemctl restart app}\n"), 0o600); err != nil {
+	if err := os.WriteFile(plan, []byte("version: 1\ncommands:\n  - {id: check, cmd: uptime}\n  - {id: apply, cmd: install -m 0644 /dev/stdin /etc/app.conf, stdin_file: "+payload+"}\n  - {id: restart, cmd: systemctl restart app}\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	got := runIn(t, device.home, "plan", "run", "web-1", "--file", plan, "--events")
-	if got.code != exitApprovalRequired {
-		t.Fatalf("plan run: %+v", got)
+	got := runIn(t, device.home, "plan", "run", "web-1", "--file", plan, "--json")
+	var execution planExecution
+	if err := json.Unmarshal([]byte(got.stdout), &execution); err != nil || got.code != exitApprovalRequired {
+		t.Fatalf("plan run: %+v: %v", got, err)
 	}
-	var executionID string
+	if execution.Status != "pending" || execution.ApprovalPlanID == "" {
+		t.Fatalf("execution before approval: %+v", execution)
+	}
+	if steps := device.audit(t); len(steps) != 2 {
+		t.Fatalf("before approval the gateway holds %d records, want the two approval requests: %+v", len(steps), steps)
+	}
+	status := runIn(t, device.home, "plan", "status", execution.ApprovalPlanID, "--json")
+	if status.code != exitApprovalRequired || !strings.Contains(status.stdout, `"pending": 2`) {
+		t.Fatalf("plan status: %+v", status)
+	}
+
+	if _, _, err := gateway.DecidePlan(device.dir, device.store, execution.ApprovalPlanID, approval.VerdictApproved, approval.ScopeSession); err != nil {
+		t.Fatal(err)
+	}
+	if got := runIn(t, device.home, "plan", "wait", execution.ApprovalPlanID, "--timeout", "5s"); got.code != exitOK {
+		t.Fatalf("plan wait: %+v", got)
+	}
+	got = runIn(t, device.home, "plan", "resume", execution.ID, "--events")
+	if got.code != exitOK {
+		t.Fatalf("resume: %+v", got)
+	}
 	outputs := map[string]string{}
 	for _, line := range strings.Split(strings.TrimSpace(got.stdout), "\n") {
 		var event executionEvent
 		if err := json.Unmarshal([]byte(line), &event); err != nil {
 			t.Fatalf("event %q: %v", line, err)
 		}
-		executionID = event.ExecutionID
 		if event.Type == "step_output" {
 			if event.RequestID == "" {
 				t.Fatalf("streamed output without its request: %s", line)
 			}
 			outputs[event.StepID] = event.RequestID
 		}
-		if event.Type == "step_completed" && event.Status == "completed" && outputs[event.StepID] != event.RequestID {
+		if event.Type == "step_completed" && outputs[event.StepID] != event.RequestID {
 			t.Fatalf("step %s streamed as request %q but completed as %q", event.StepID, outputs[event.StepID], event.RequestID)
 		}
 	}
+	var resumed planExecution
+	if err := json.Unmarshal([]byte(runIn(t, device.home, "plan", "execution", execution.ID).stdout), &resumed); err != nil {
+		t.Fatal(err)
+	}
+	if resumed.Status != "completed" || resumed.ApprovalPlanID != execution.ApprovalPlanID || !resumed.ApprovalOnGateway {
+		t.Fatalf("the gateway's plan did not carry the execution: %+v", resumed)
+	}
+	for _, round := range resumed.ApprovalRounds {
+		if round.Status == "superseded" {
+			t.Fatalf("the gateway's own plan was superseded: %+v", resumed.ApprovalRounds)
+		}
+	}
+	events := map[audit.Event]int{}
 	steps := map[string]audit.Record{}
 	for _, record := range device.audit(t) {
-		if record.ExecutionID != executionID {
-			t.Fatalf("gateway audit record outside the execution: %+v", record)
+		events[record.Event]++
+		if record.Event == audit.EventCompleted {
+			steps[record.StepID] = record
 		}
-		steps[record.StepID] = record
+		if record.Event == audit.EventApprovalGranted && (record.DeviceID != device.deviceID || record.ApprovalChannel != approval.ChannelGateway || record.PlanID != execution.ApprovalPlanID) {
+			t.Fatalf("decision record: %+v", record)
+		}
 	}
-	if steps["check"].Event != audit.EventCompleted || steps["apply"].Event != audit.EventCompleted || steps["apply"].StdinBytes != int64(len("listen 80\n")) {
+	if events[audit.EventApprovalRequested] != 2 || events[audit.EventApprovalGranted] != 2 || events[audit.EventCompleted] != 3 {
+		t.Fatalf("gateway audit events = %v; the approved plan's steps must not ask again", events)
+	}
+	if steps["apply"].StdinBytes != int64(len("listen 80\n")) || steps["restart"].ExecutionID != execution.ID {
 		t.Fatalf("steps on the gateway: %+v", steps)
-	}
-	if steps["restart"].Event != audit.EventApprovalRequested {
-		t.Fatalf("the gray-zone step was not sent for approval: %+v", steps["restart"])
-	}
-
-	status := runIn(t, device.home, "plan", "execution", executionID)
-	var execution planExecution
-	if err := json.Unmarshal([]byte(status.stdout), &execution); err != nil {
-		t.Fatalf("execution: %v\n%s", err, status.stdout)
-	}
-	if execution.Status != "pending" || execution.Steps[2].Status != "not_started" || execution.NextAction == nil || !strings.Contains(strings.Join(execution.NextAction.Argv, " "), "plan resume "+executionID) {
-		t.Fatalf("execution after a pending step: %+v", execution)
-	}
-	// Resuming asks the gateway again; without a decision the step stays
-	// pending and the completed steps do not run again.
-	if got := runIn(t, device.home, "plan", "resume", executionID, "--json"); got.code != exitApprovalRequired {
-		t.Fatalf("resume: %+v", got)
-	}
-	if n := len(device.audit(t)); n != 6 {
-		t.Fatalf("gateway audit has %d records after resume, want 6 (two steps run once, two approval requests)", n)
 	}
 	if got := runIn(t, device.home, "plan", "run", "solo", "--file", plan); got.code != exitUsage || !strings.Contains(got.err, "plan run requires a single host") {
 		t.Fatalf("plan run on a group: %+v", got)
@@ -478,5 +491,188 @@ func TestRemoteEnrollChecksTheMode(t *testing.T) {
 	}
 	if got := runIn(t, home, "remote", "enroll", device.base, "--token", token, "--mode", "local"); got.code != exitUsage {
 		t.Fatalf("unknown mode: %+v", got)
+	}
+}
+
+// pendingID returns the approval ID a run --json printed.
+func pendingID(t *testing.T, outcome cliOutcome) string {
+	t.Helper()
+	var response runResponse
+	if err := json.Unmarshal([]byte(outcome.stdout), &response); err != nil || response.ApprovalID == "" {
+		t.Fatalf("no pending approval in %+v: %v", outcome, err)
+	}
+	return response.ApprovalID
+}
+
+// The approval workflow reads the same on a gateway device: a gray-zone run
+// exits 7, approval status and wait report the operator's decision as
+// locally, and the rerun of an approved command runs; a denied one exits 6.
+// Only the decision itself moves, to the gateway's operator.
+func TestGatewayApprovalWorkflowMatchesLocal(t *testing.T) {
+	local, device := paritySetup(t)
+	withOperatorAuth(t, local)
+	device.exec.Store(&fakeExecutor{stdout: "restarted\n"})
+	decide := map[string]func(id string, approve bool){
+		local: func(id string, approve bool) {
+			args := []string{"approval", "deny", id}
+			if approve {
+				args = []string{"approval", "grant", id, "--session"}
+			}
+			if got := runIn(t, local, args...); got.code != exitOK {
+				t.Fatalf("local decision: %+v", got)
+			}
+		},
+		device.home: func(id string, approve bool) {
+			verdict, scope := approval.VerdictDenied, approval.Scope("")
+			if approve {
+				verdict, scope = approval.VerdictApproved, approval.ScopeSession
+			}
+			if _, _, err := gateway.DecideApproval(device.dir, device.store, id, verdict, scope); err != nil {
+				t.Fatal(err)
+			}
+		},
+	}
+	var outcomes [2][]cliOutcome
+	for i, home := range []string{local, device.home} {
+		record := func(outcome cliOutcome) { outcomes[i] = append(outcomes[i], outcome) }
+		for _, approve := range []bool{true, false} {
+			command := []string{"run", "web-1", "--json", "--", "systemctl", "restart", "nginx"}
+			if !approve {
+				command = []string{"run", "web-1", "--json", "--", "systemctl", "stop", "nginx"}
+			}
+			first := runIn(t, home, command...)
+			record(first)
+			id := pendingID(t, first)
+			record(runIn(t, home, "approval", "status", id))
+			record(runIn(t, home, "approval", "wait", id, "--timeout", "0s"))
+			decide[home](id, approve)
+			record(runIn(t, home, "approval", "wait", id, "--timeout", "5s"))
+			record(runIn(t, home, "approval", "status", id))
+			if approve {
+				record(runIn(t, home, command...))
+			}
+		}
+		record(runIn(t, home, "approval", "status", "ap_00000000000000000000000000"))
+	}
+	for i := range outcomes[0] {
+		want, got := asGateway(outcomes[0][i]), outcomes[1][i]
+		if got.code != want.code || got.err != want.err || normalizeIDs(got.stdout) != normalizeIDs(want.stdout) || normalizeIDs(got.stderr) != normalizeIDs(want.stderr) {
+			t.Fatalf("step %d differs\nlocal:   %+v\ngateway: %+v", i, want, got)
+		}
+	}
+	// pending, approved after the wait, rerun, denied after the wait, unknown
+	want := map[int]int{0: exitApprovalRequired, 3: exitOK, 5: exitOK, 9: exitPolicyDenied, 11: exitUsage}
+	for i, code := range want {
+		if outcomes[1][i].code != code {
+			t.Fatalf("step %d exited %d, want %d: %+v", i, outcomes[1][i].code, code, outcomes[1][i])
+		}
+	}
+}
+
+// A session grant decided on the gateway covers reruns in that session only,
+// and an explicit deny the gateway's policy adds later still wins over it.
+func TestGatewaySessionGrantScopeAndDenyPrecedence(t *testing.T) {
+	_, device := paritySetup(t)
+	var calls int32
+	device.exec.Store(&fakeExecutor{calls: &calls})
+	command := []string{"run", "web-1", "--json", "--", "systemctl", "restart", "nginx"}
+	id := pendingID(t, runIn(t, device.home, command...))
+	if _, _, err := gateway.DecideApproval(device.dir, device.store, id, approval.VerdictApproved, approval.ScopeSession); err != nil {
+		t.Fatal(err)
+	}
+	if got := runIn(t, device.home, command...); got.code != exitOK {
+		t.Fatalf("rerun in the granted session: %+v", got)
+	}
+	if got := runIn(t, device.home, command...); got.code != exitOK {
+		t.Fatalf("second rerun in the granted session: %+v", got)
+	}
+	t.Setenv("AGENTSSH_SESSION", "s_other")
+	if got := runIn(t, device.home, command...); got.code != exitApprovalRequired {
+		t.Fatalf("another session reused the grant: %+v", got)
+	}
+	t.Setenv("AGENTSSH_SESSION", "s_test")
+	denying := strings.Replace(parityPolicy, "rules:\n", "rules:\n  - {name: no-restart, priority: 50, match: {cmd_regex: '^systemctl restart'}, action: deny}\n", 1)
+	if _, err := controlplane.PushConfig(device.store, device.deviceID, parityInventory, denying, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if got := runIn(t, device.home, command...); got.code != exitPolicyDenied {
+		t.Fatalf("the session grant overrode an explicit deny: %+v", got)
+	}
+	if atomic.LoadInt32(&calls) != 2 {
+		t.Fatalf("target ran %d commands, want the two granted reruns", calls)
+	}
+}
+
+// run --wait-approval waits for the gateway operator's decision and then runs
+// the unchanged request once.
+func TestGatewayRunWaitsForTheGatewaysDecision(t *testing.T) {
+	_, device := paritySetup(t)
+	var calls int32
+	device.exec.Store(&fakeExecutor{calls: &calls, stdout: "restarted\n"})
+	go func() {
+		for {
+			requests, err := gateway.ListApprovals(device.dir)
+			if err == nil && len(requests) == 1 {
+				_, _, _ = gateway.DecideApproval(device.dir, device.store, requests[0].ID, approval.VerdictApproved, approval.ScopeOnce)
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}()
+	got := runIn(t, device.home, "run", "web-1", "--wait-approval", "10s", "--json", "--", "systemctl", "restart", "nginx")
+	if got.code != exitOK || !strings.Contains(got.stdout, `"status": "completed"`) || !strings.Contains(got.stderr, "waiting for approval ap_") {
+		t.Fatalf("run --wait-approval: %+v", got)
+	}
+	if atomic.LoadInt32(&calls) != 1 {
+		t.Fatalf("target ran %d commands, want 1", calls)
+	}
+}
+
+// Without --timeout, waits use the wait_timeout of the device's policy on the
+// gateway, as a local wait uses the local policy's.
+func TestGatewayWaitsUseTheGatewayPolicysTimeout(t *testing.T) {
+	_, device := paritySetup(t)
+	short := strings.Replace(parityPolicy, "  enabled: true\n", "  enabled: true\n  wait_timeout: 300ms\n", 1)
+	if _, err := controlplane.PushConfig(device.store, device.deviceID, parityInventory, short, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	id := pendingID(t, runIn(t, device.home, "run", "web-1", "--json", "--", "systemctl", "restart", "nginx"))
+	start := time.Now()
+	if got := runIn(t, device.home, "approval", "wait", id); got.code != exitApprovalRequired || time.Since(start) > 5*time.Second {
+		t.Fatalf("approval wait: %+v after %s", got, time.Since(start))
+	}
+}
+
+// An execution saved before the device enrolled with a gateway may still wait
+// on a local approval plan. On a gateway device that plan authorizes nothing,
+// so resume sends the remaining steps to the gateway instead of waiting on it.
+func TestGatewayResumeIgnoresALocalApprovalPlan(t *testing.T) {
+	_, device := paritySetup(t)
+	device.exec.Store(&fakeExecutor{stdout: "up\n"})
+	cfg := &config.Config{Paths: config.NewPaths(device.home)}
+	const id = "px_0123456789abcdef01234567"
+	path, err := executionPath(cfg, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	run := planExecution{Version: 1, ID: id, Host: "web-1", SessionID: "s_test", Status: "pending", ApprovalPlanID: "pl_0123456789abcdef01234567",
+		Steps: []planExecutionStep{{ID: "check", Cmd: "uptime", Status: "not_started"}}}
+	if err := saveExecution(path, &run); err != nil {
+		t.Fatal(err)
+	}
+	got := runIn(t, device.home, "plan", "resume", id, "--json")
+	var resumed planExecution
+	if err := json.Unmarshal([]byte(got.stdout), &resumed); err != nil {
+		t.Fatalf("resume: %+v: %v", got, err)
+	}
+	if got.code != exitOK || resumed.Status != "completed" || resumed.ApprovalPlanID != "" || resumed.Steps[0].Status != "completed" {
+		t.Fatalf("resume: %+v\n%+v", got, resumed)
+	}
+	records := device.audit(t)
+	if len(records) != 2 || records[1].Event != audit.EventCompleted || records[1].ExecutionID != id {
+		t.Fatalf("gateway audit: %+v", records)
 	}
 }

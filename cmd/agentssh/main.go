@@ -2344,7 +2344,7 @@ func printHosts(cmd *cobra.Command, public inventory.PublicInventory, jsonOutput
 }
 
 func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flags runFlags) error {
-	if flags.waitApproval != "" && !gatewayHome() {
+	if flags.waitApproval != "" {
 		return runAwaited(cmd, targetName, remoteCommand, flags)
 	}
 	cfg, err := config.Load()
@@ -3686,10 +3686,7 @@ func runApprovalStatus(cmd *cobra.Command, id string) error {
 	if err != nil {
 		return classifyConfigError(err)
 	}
-	status, err := approvalStore(cfg.Paths).Status(id)
-	if errors.Is(err, approval.ErrPendingNotFound) || errors.Is(err, approval.ErrInvalidID) {
-		return newUsageError("%v", err)
-	}
+	status, _, err := approvalStatus(cmd.Context(), cfg, id)
 	if err != nil {
 		return err
 	}
@@ -3708,16 +3705,36 @@ func runApprovalWait(cmd *cobra.Command, id string, timeoutValue string) error {
 	if err != nil {
 		return newUsageError("%v", err)
 	}
-	timeout, err := resolveWaitTimeout(runtime.WaitTimeout, timeoutValue)
-	if err != nil {
-		return err
-	}
-	status, err := approvalStore(cfg.Paths).Wait(id, timeout)
-	if errors.Is(err, approval.ErrPendingNotFound) || errors.Is(err, approval.ErrInvalidID) {
-		return newUsageError("%v", err)
-	}
-	if err != nil {
-		return err
+	var status approval.StatusResult
+	if cfg.Gateway != nil {
+		first, defaultTimeout, err := approvalStatus(cmd.Context(), cfg, id)
+		if err != nil {
+			return err
+		}
+		timeout, err := resolveWaitTimeout(defaultTimeout, timeoutValue)
+		if err != nil {
+			return err
+		}
+		status, err = waitFor(cmd.Context(), timeout, first, func(s approval.StatusResult) bool { return s.Status == "approved" || s.Status == "denied" },
+			func(ctx context.Context) (approval.StatusResult, error) {
+				status, _, err := approvalStatus(ctx, cfg, id)
+				return status, err
+			})
+		if err != nil {
+			return err
+		}
+	} else {
+		timeout, err := resolveWaitTimeout(runtime.WaitTimeout, timeoutValue)
+		if err != nil {
+			return err
+		}
+		status, err = approvalStore(cfg.Paths).Wait(id, timeout)
+		if errors.Is(err, approval.ErrPendingNotFound) || errors.Is(err, approval.ErrInvalidID) {
+			return newUsageError("%v", err)
+		}
+		if err != nil {
+			return err
+		}
 	}
 	if err := writeJSON(cmd, status); err != nil {
 		return err

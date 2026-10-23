@@ -8,6 +8,7 @@ package gateway
 import (
 	"net/http"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 
@@ -101,5 +102,5 @@ func (s *Server) Handler(publicURL string) (http.Handler, error) {
 		Keys:  func() *controlplane.Keys { return s.Keys },
 		Now:   s.now,
 	}
-	return api.Handler(publicURL, append(s.execRoutes(), s.deviceRoutes()...)...)
+	return api.Handler(publicURL, slices.Concat(s.execRoutes(), s.deviceRoutes(), s.approvalRoutes())...)
 }

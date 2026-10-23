@@ -122,6 +122,16 @@ func (f *fixture) restart(t *testing.T) {
 // enroll enrolls another device home with the real client.
 func (f *fixture) enroll(t *testing.T, name string) *remoteclient.Client {
 	t.Helper()
+	client, err := remoteclient.NewClient(f.enrollHome(t, name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client
+}
+
+// enrollHome enrolls another device and returns its home.
+func (f *fixture) enrollHome(t *testing.T, name string) string {
+	t.Helper()
 	pub, err := controlplane.LoadBundlePublicKey(f.dir)
 	if err != nil {
 		t.Fatal(err)
@@ -134,11 +144,7 @@ func (f *fixture) enroll(t *testing.T, name string) *remoteclient.Client {
 	if _, err := remoteclient.Enroll(context.Background(), home, f.base, token.String(), remote.ModeGateway, time.Now()); err != nil {
 		t.Fatalf("enroll: %v", err)
 	}
-	client, err := remoteclient.NewClient(home)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return client
+	return home
 }
 
 func TestEnrolledDeviceIsRefusedAfterRevocation(t *testing.T) {

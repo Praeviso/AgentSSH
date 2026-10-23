@@ -178,6 +178,34 @@ func (c *Client) RequestStatus(ctx context.Context, reqID string) (runner.Respon
 	return out, err
 }
 
+// ApprovalStatus reads one of this device's approval requests on a gateway.
+func (c *Client) ApprovalStatus(ctx context.Context, id string) (remote.ApprovalStatusResponse, error) {
+	var out remote.ApprovalStatusResponse
+	err := c.call(ctx, http.MethodPost, remote.PathApprovalStatus, remote.ApprovalStatusRequest{ApprovalID: id}, &out)
+	return out, err
+}
+
+// PlanStatus reads one of this device's plans on a gateway.
+func (c *Client) PlanStatus(ctx context.Context, id string) (remote.PlanStatusResponse, error) {
+	var out remote.PlanStatusResponse
+	err := c.call(ctx, http.MethodPost, remote.PathPlanStatus, remote.PlanStatusRequest{PlanID: id}, &out)
+	return out, err
+}
+
+// SubmitPlan submits a plan for approval on a gateway without running it.
+func (c *Client) SubmitPlan(ctx context.Context, req remote.PlanSubmitRequest) (remote.PlanSubmitResult, error) {
+	var out remote.PlanSubmitResult
+	err := c.call(ctx, http.MethodPost, remote.PathPlanSubmit, req, &out)
+	return out, err
+}
+
+// Authorize asks a gateway how each check would be authorized now.
+func (c *Client) Authorize(ctx context.Context, checks []remote.AuthorizeCheck) (remote.AuthorizeResponse, error) {
+	var out remote.AuthorizeResponse
+	err := c.call(ctx, http.MethodPost, remote.PathAuthorize, remote.AuthorizeRequest{Checks: checks}, &out)
+	return out, err
+}
+
 // Sign asks the control plane to sign SSH userauth data for host.
 func (c *Client) Sign(ctx context.Context, host string, data []byte) (remote.SignResponse, error) {
 	var out remote.SignResponse

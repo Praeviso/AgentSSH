@@ -63,6 +63,8 @@ func newRootCommand() *cobra.Command {
 		program.IdentityCommand(dir),
 		program.ConfigCommand(dir),
 		newAuditCommand(dir),
+		newApprovalCommand(dir),
+		newPlanCommand(dir),
 	)
 	return root
 }
