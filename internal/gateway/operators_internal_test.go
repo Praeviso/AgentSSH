@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -111,5 +112,33 @@ func TestTOTPCodesAreAcceptedOnce(t *testing.T) {
 	}
 	if err := checkTOTP(store, keys, id, code, later); err == nil {
 		t.Fatal("a code was accepted twice")
+	}
+}
+
+// A host grant adds its rule to the policy it read; if another push lands
+// first, the grant fails instead of overwriting that push.
+func TestHostGrantNeverOverwritesANewerPush(t *testing.T) {
+	store, _, _ := operatorStore(t)
+	now := time.Now()
+	if _, err := store.DB().Exec(`INSERT INTO devices (id, name, public_key, status, created_at) VALUES ('dev_test', 'vm', 'k', 'active', ?)`, controlplane.FormatTime(now)); err != nil {
+		t.Fatal(err)
+	}
+	inv := "hosts:\n  web-1: {addr: 10.0.0.1, user: deploy, identity: web}\n"
+	if _, err := store.DB().Exec(`INSERT INTO identities (name, public_key, private_key, status, created_at) VALUES ('web', 'p', x'00', 'active', ?)`, controlplane.FormatTime(now)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controlplane.PushConfig(store, "dev_test", inv, "version: 1\n", now); err != nil {
+		t.Fatal(err)
+	}
+	opts := decisionOptions(t.TempDir(), store, "dev_test", "web:alice", now)
+	admin := "version: 1\nrules:\n  - {name: admin, match: {cmd_regex: '^uptime$'}, action: allow}\n"
+	if _, err := controlplane.PushConfig(store, "dev_test", inv, admin, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := opts.SavePolicy(opts.Bundle.Policy); !errors.Is(err, controlplane.ErrConfigChanged) {
+		t.Fatalf("save over a newer push: %v", err)
+	}
+	if cfg, _ := store.Config("dev_test"); cfg.Version != 2 || cfg.PolicyYAML != admin {
+		t.Fatalf("config after the refused save: v%d\n%s", cfg.Version, cfg.PolicyYAML)
 	}
 }

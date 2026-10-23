@@ -220,16 +220,17 @@ func (w *WebUI) login(rw http.ResponseWriter, r *http.Request) {
 	}
 	name, address := strings.TrimSpace(r.PostFormValue("name")), clientAddress(r)
 	now := w.now()
-	if !w.limiter.allowed(name, address, now) {
+	succeeded, ok := w.limiter.begin(name, address, now)
+	if !ok {
 		w.renderLogin(rw, http.StatusTooManyRequests, "Too many failed attempts; wait 15 minutes and try again.")
 		return
 	}
 	op, err := checkOperatorPassword(w.Store, name, r.PostFormValue("password"))
 	if err != nil {
-		w.limiter.fail(name, address, now)
 		w.renderLogin(rw, http.StatusUnauthorized, "Wrong name or password.")
 		return
 	}
+	succeeded(false)
 	token, err := newSession(w.Store, op.ID, StagePassword, now)
 	if err != nil {
 		http.Error(rw, "session storage unavailable", http.StatusInternalServerError)
@@ -268,7 +269,8 @@ func (w *WebUI) renderTOTP(rw http.ResponseWriter, status int, session WebSessio
 func (w *WebUI) totp(rw http.ResponseWriter, r *http.Request, session WebSession, token string) {
 	now := w.now()
 	address := clientAddress(r)
-	if !w.limiter.allowed(session.Operator.Name, address, now) {
+	succeeded, ok := w.limiter.begin(session.Operator.Name, address, now)
+	if !ok {
 		w.renderTOTP(rw, http.StatusTooManyRequests, session, token, "Too many failed attempts; wait 15 minutes and sign in again.")
 		return
 	}
@@ -283,10 +285,10 @@ func (w *WebUI) totp(rw http.ResponseWriter, r *http.Request, session WebSession
 		}
 	}
 	if err != nil {
-		w.limiter.fail(session.Operator.Name, address, now)
 		w.renderTOTP(rw, http.StatusUnauthorized, session, token, "That code did not match; enter the current one.")
 		return
 	}
+	succeeded(true)
 	// A new token for the signed-in session, so a password-stage token
 	// never becomes a full one.
 	_ = endSession(w.Store, token)
@@ -295,7 +297,6 @@ func (w *WebUI) totp(rw http.ResponseWriter, r *http.Request, session WebSession
 		http.Error(rw, "session storage unavailable", http.StatusInternalServerError)
 		return
 	}
-	w.limiter.reset(session.Operator.Name)
 	sweepSessions(w.Store, now)
 	setCookie(rw, sessionCookie, active, int(sessionTTL.Seconds()))
 	http.Redirect(rw, r, "/approvals", http.StatusSeeOther)
@@ -381,6 +382,8 @@ func decisionError(err error) string {
 		return "Already decided, perhaps by another operator."
 	case errors.Is(err, approval.ErrPendingNotFound), errors.Is(err, approval.ErrPlanNotFound):
 		return "No such request; it may have expired."
+	case errors.Is(err, controlplane.ErrConfigChanged):
+		return "The device's configuration changed while you decided, so no rule was added; the device's rerun will ask again."
 	case errors.Is(err, ErrAmbiguousID):
 		return "More than one device holds this ID; decide it with agentssh-gateway --device."
 	default:
@@ -542,22 +545,34 @@ func (l *loginLimiter) recent(key string, now time.Time) int {
 	return len(kept)
 }
 
-func (l *loginLimiter) allowed(account, address string, now time.Time) bool {
+// begin reserves an attempt for account and address, counted as a failure
+// until the caller reports success, and refuses once either is at its limit.
+// Checking and counting are one step, so concurrent attempts cannot pass the
+// limit together. succeeded(signedIn) takes the reservation back; signedIn
+// also clears the account's earlier failures.
+func (l *loginLimiter) begin(account, address string, now time.Time) (succeeded func(signedIn bool), ok bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.recent("account:"+account, now) < accountFailures && l.recent("address:"+address, now) < addressFailures
-}
-
-func (l *loginLimiter) fail(account, address string, now time.Time) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	for _, key := range []string{"account:" + account, "address:" + address} {
-		l.failures[key] = append(l.failures[key], now)
+	accountKey, addressKey := "account:"+account, "address:"+address
+	if l.recent(accountKey, now) >= accountFailures || l.recent(addressKey, now) >= addressFailures {
+		return nil, false
 	}
-}
-
-func (l *loginLimiter) reset(account string) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	delete(l.failures, "account:"+account)
+	l.failures[accountKey] = append(l.failures[accountKey], now)
+	l.failures[addressKey] = append(l.failures[addressKey], now)
+	return func(signedIn bool) {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		for _, key := range []string{accountKey, addressKey} {
+			if signedIn && key == accountKey {
+				delete(l.failures, key)
+				continue
+			}
+			for i, t := range l.failures[key] {
+				if t.Equal(now) {
+					l.failures[key] = append(l.failures[key][:i], l.failures[key][i+1:]...)
+					break
+				}
+			}
+		}
+	}, true
 }

@@ -391,3 +391,38 @@ func TestPlansAreDecidedAsAWholeAfterRowDenials(t *testing.T) {
 		t.Fatalf("plan status = %+v, %v", status.Status, err)
 	}
 }
+
+// Checking the limit and counting an attempt are one step: a burst of
+// concurrent wrong passwords gets at most the account's allowance checked.
+func TestConcurrentLoginsCannotPassTheLimit(t *testing.T) {
+	w := newWebFixture(t)
+	type attempt struct {
+		b    *browser
+		csrf string
+	}
+	var attempts []attempt
+	for i := 0; i < 30; i++ {
+		b := w.browser(t)
+		attempts = append(attempts, attempt{b, csrfOf(t, b.do(http.MethodGet, "/login", nil))})
+	}
+	statuses := make(chan int, len(attempts))
+	var wg sync.WaitGroup
+	for _, a := range attempts {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			statuses <- a.b.do(http.MethodPost, "/login", url.Values{"csrf": {a.csrf}, "name": {"alice"}, "password": {"wrong password!"}}).status
+		}()
+	}
+	wg.Wait()
+	close(statuses)
+	checked := 0
+	for status := range statuses {
+		if status == http.StatusUnauthorized {
+			checked++
+		}
+	}
+	if checked > 5 {
+		t.Fatalf("%d concurrent wrong passwords were checked; the limit is 5", checked)
+	}
+}

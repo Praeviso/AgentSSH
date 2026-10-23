@@ -287,6 +287,17 @@ func (s *Store) DisableIdentity(name string, now time.Time) error {
 
 // PutConfig replaces a device's configuration and bumps its version.
 func (s *Store) PutConfig(deviceID string, inventoryYAML string, policyYAML string, now time.Time) (int64, error) {
+	return s.putConfig(deviceID, -1, inventoryYAML, policyYAML, now)
+}
+
+// ErrConfigChanged refuses a configuration derived from a version that is no
+// longer current.
+var ErrConfigChanged = errors.New("the device's configuration changed meanwhile")
+
+// putConfig stores the next version; with from >= 0 only if the current
+// version is still from, so a change derived from it never overwrites a
+// newer push.
+func (s *Store) putConfig(deviceID string, from int64, inventoryYAML string, policyYAML string, now time.Time) (int64, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return 0, err
@@ -296,6 +307,9 @@ func (s *Store) PutConfig(deviceID string, inventoryYAML string, policyYAML stri
 	err = tx.QueryRow(`SELECT version FROM configs WHERE device_id = ?`, deviceID).Scan(&version)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return 0, err
+	}
+	if from >= 0 && version != from {
+		return 0, ErrConfigChanged
 	}
 	version++
 	_, err = tx.Exec(`INSERT INTO configs (device_id, version, inventory_yaml, policy_yaml, updated_at) VALUES (?, ?, ?, ?, ?)

@@ -235,7 +235,10 @@ deciding `operator` (`local:<user>` from the CLI, `web:<name>` from the Web UI).
 A host-scope grant appends an allow rule for the request's matcher to the
 device's policy and pushes it as a new configuration version; the policy YAML is
 re-rendered from its structure, so comments and formatting in the pushed file are
-not kept. A whole plan is approved once, for the session or for the task, never
+not kept. The new version is written only if the policy it was derived from is
+still current; if another push landed first the decision fails without a rule
+(the request stays approved without one, so the device's rerun asks again) and
+the other push is kept. A whole plan is approved once, for the session or for the task, never
 for the host. `plan show` lists the commands of the plan's requests, which are
 what a grant authorizes, before the steps as the device described them.
 
@@ -265,7 +268,8 @@ origin; pages send a CSP without inline script, `frame-ancestors 'none'`,
 `no-store` and `Referrer-Policy: same-origin`. Failed passwords and codes are
 limited per account (5 in 15 minutes) and per client address (20; behind a
 proxy that is the proxy's), after which sign-in is refused until the window
-passes. The Approvals page lists plans (approve the remaining steps as a whole
+passes. An attempt is counted when it starts and taken back if it succeeds, so
+concurrent attempts cannot pass the limit together. The Approvals page lists plans (approve the remaining steps as a whole
 after denying single ones) and single requests (once, session, task, host,
 deny), warning about commands that use shell syntax; the Audit page browses the
 chain by device, host and session, newest first, with its verification result.

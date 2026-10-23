@@ -501,7 +501,12 @@ func decisionOptions(dir string, store *controlplane.Store, deviceID, operator s
 		DeviceID:   deviceID,
 		Operator:   operator,
 	}
-	inv, pol, err := server.loadDeviceConfig(deviceID)
+	cfg, err := store.Config(deviceID)
+	var inv inventory.Inventory
+	var pol policy.Config
+	if err == nil {
+		inv, pol, err = remote.ParseManaged(cfg.InventoryYAML, cfg.PolicyYAML, nil)
+	}
 	if err != nil {
 		opts.SavePolicy = func(policy.Config) error {
 			return fmt.Errorf("host scope needs the device's configuration: %w", err)
@@ -509,6 +514,9 @@ func decisionOptions(dir string, store *controlplane.Store, deviceID, operator s
 		return opts
 	}
 	opts.Bundle = policy.Bundle{Policy: pol, Inventory: inv}
+	// The rule is added to the policy as read here; if another push lands
+	// first, the decision fails rather than overwrite it (the request stays
+	// approved without a rule, so the device's rerun asks again).
 	opts.SavePolicy = func(next policy.Config) error {
 		if next.Version == 0 {
 			next.Version = 1
@@ -517,11 +525,7 @@ func decisionOptions(dir string, store *controlplane.Store, deviceID, operator s
 		if err != nil {
 			return err
 		}
-		cfg, err := store.Config(deviceID)
-		if err != nil {
-			return err
-		}
-		_, err = controlplane.PushConfig(store, deviceID, cfg.InventoryYAML, string(data), now)
+		_, err = controlplane.ReplaceConfig(store, deviceID, cfg.Version, cfg.InventoryYAML, string(data), now)
 		return err
 	}
 	return opts

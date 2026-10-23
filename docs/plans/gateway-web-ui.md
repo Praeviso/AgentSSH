@@ -93,6 +93,19 @@ Web (`internal/gateway/web`):
   `same-origin`, and a test covers `Origin: null`); host and device names broke
   at their hyphens in the audit table; filter controls had uneven heights; the
   TOTP key wrapped inside a group; no favicon.
+- [x] Commit security review follow-up (bb3d186):
+  - The login limiter checked the limit and recorded a failure in separate
+    steps, so a burst of concurrent TOTP or password attempts all passed the
+    check. `loginLimiter.begin` now counts an attempt as a failure when it
+    starts, under the same lock as the check, and takes it back on success.
+    Test: `TestConcurrentLoginsCannotPassTheLimit` (30 concurrent wrong
+    passwords, at most 5 checked; a mutation reopening the gap fails it).
+  - A host grant re-read the configuration only for the inventory and pushed
+    the policy derived from what it read earlier, so an admin push in between
+    was overwritten. `controlplane.ReplaceConfig` writes only if the version
+    is still the one read (`ErrConfigChanged` otherwise; the decision fails
+    without a rule). Test: `TestHostGrantNeverOverwritesANewerPush`
+    (mutation-checked).
 - [x] Docs: `docs/architecture/remote-control.md`.
 - [x] Final validation.
 
