@@ -28,8 +28,8 @@ import (
 )
 
 // signedPost sends body to path signed with home's device key, as a modified
-// client could.
-func signedPost(t *testing.T, f *fixture, home, path string, body []byte) int {
+// client could: JSON unless contentType names another type.
+func signedPost(t *testing.T, f *fixture, home, path string, body []byte, contentType ...string) int {
 	t.Helper()
 	data, err := os.ReadFile(filepath.Join(managedmode.Dir(home), "device.key"))
 	if err != nil {
@@ -49,6 +49,9 @@ func signedPost(t *testing.T, f *fixture, home, path string, body []byte) int {
 		t.Fatal(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if len(contentType) > 0 {
+		req.Header.Set("Content-Type", contentType[0])
+	}
 	if err := remote.SignHTTPRequest(req, body, state.DeviceID, remote.DeviceSignatureTag, parsed.(ed25519.PrivateKey), time.Now()); err != nil {
 		t.Fatal(err)
 	}

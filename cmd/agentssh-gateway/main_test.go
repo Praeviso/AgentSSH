@@ -188,4 +188,10 @@ func TestOperatorCommands(t *testing.T) {
 	if _, err := runGatewayCLI(t, "--data", dir, "serve", "--public-url", "https://gw.example/a", "--listen", "127.0.0.1:1", "--web-listen", "127.0.0.1:1"); err == nil || !strings.Contains(err.Error(), "--web-listen must differ") {
 		t.Fatalf("shared listener: %v", err)
 	}
+	if _, err := runGatewayCLI(t, "--data", dir, "serve", "--public-url", "https://gw.example/a", "--listen", "127.0.0.1:1", "--web-listen", "127.0.0.1:2"); err == nil || !strings.Contains(err.Error(), "--web-origin is required") {
+		t.Fatalf("plain HTTP without an origin: %v", err)
+	}
+	if _, err := runGatewayCLI(t, "--data", dir, "serve", "--public-url", "https://gw.example/a", "--listen", "127.0.0.1:1", "--web-listen", "127.0.0.1:2", "--web-origin", "http://gw.example"); err == nil || !strings.Contains(err.Error(), "--web-origin") {
+		t.Fatalf("plain HTTP origin: %v", err)
+	}
 }

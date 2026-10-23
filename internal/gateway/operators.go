@@ -349,7 +349,8 @@ func lookupSession(store *controlplane.Store, token string, now time.Time) (WebS
 
 // pendingTOTP returns the sealed key a password-stage session is enrolling,
 // minting and keeping one on first use, so the code verified is for the
-// key the operator scanned.
+// key the operator scanned. Of concurrent first uses (two tabs) only one
+// key is kept, and every page shows that one.
 func pendingTOTP(store *controlplane.Store, keys *controlplane.Keys, token string) ([]byte, error) {
 	var sealed []byte
 	if err := store.DB().QueryRow(`SELECT pending_totp FROM web_sessions WHERE token_sha256 = ?`, tokenDigest(token)).Scan(&sealed); err != nil {
@@ -363,8 +364,13 @@ func pendingTOTP(store *controlplane.Store, keys *controlplane.Keys, token strin
 	if err != nil {
 		return nil, err
 	}
-	if _, err := store.DB().Exec(`UPDATE web_sessions SET pending_totp = ? WHERE token_sha256 = ?`, sealed, tokenDigest(token)); err != nil {
+	res, err := store.DB().Exec(`UPDATE web_sessions SET pending_totp = ? WHERE token_sha256 = ? AND pending_totp IS NULL`, sealed, tokenDigest(token))
+	if err != nil {
 		return nil, err
+	}
+	if n, err := res.RowsAffected(); err != nil || n == 0 {
+		// Another request kept its key first (or the session ended).
+		return pendingTOTP(store, keys, token)
 	}
 	return secret, nil
 }

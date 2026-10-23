@@ -246,13 +246,18 @@ what a grant authorizes, before the steps as the device described them.
 away from the gateway host, from assets embedded in the binary, on its own
 listener: never the device API's, so no device request reaches it and no
 operator request reaches the device API. It speaks TLS with
-`--web-cert/--web-key`, or plain HTTP behind a TLS-terminating proxy.
+`--web-cert/--web-key`, or plain HTTP behind a TLS-terminating proxy. A proxy
+may rewrite `Host` to its upstream address, so plain HTTP requires
+`--web-origin`, the HTTPS origin browsers use (`https://ops.example`); posts must
+come from it. With TLS and no `--web-origin`, a post's `Origin` must match its
+`Host`.
 
 ```sh
 agentssh-gateway operator add <name>     # password from the TTY, or AGENTSSH_GATEWAY_OPERATOR_PASSWORD
 agentssh-gateway operator ls
 agentssh-gateway operator revoke <name>  # ends their sessions at once
-agentssh-gateway serve --public-url https://gw.example/agentssh --web-listen 127.0.0.1:8443
+agentssh-gateway serve --public-url https://gw.example/agentssh \
+  --web-listen 127.0.0.1:8443 --web-origin https://ops.example
 ```
 
 Operators are accounts of their own (`operators` in `gateway.db`): argon2id
@@ -264,7 +269,8 @@ keyed by the SHA-256 of a random cookie token, 12 h, 30 min idle) and every
 request rechecks the operator, so revocation takes effect on the next request.
 Cookies are `HttpOnly; Secure; SameSite=Strict`; every POST needs the session's
 CSRF token (the login form a double-submit token) and must not come from another
-origin; pages send a CSP without inline script, `frame-ancestors 'none'`,
+origin; POST bodies are URL-encoded and at most 64 KiB, checked before any
+field is read; pages send a CSP without inline script, `frame-ancestors 'none'`,
 `no-store` and `Referrer-Policy: same-origin`. Failed passwords and codes are
 limited per account (5 in 15 minutes) and per client address (20; behind a
 proxy that is the proxy's), after which sign-in is refused until the window

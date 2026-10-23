@@ -54,7 +54,11 @@ Web (`internal/gateway/web`):
 - Cookies: session `HttpOnly; Secure; SameSite=Strict; Path=/`; the login form
   uses a double-submit token. Every POST after login needs the session's CSRF
   token. Headers: strict CSP (`default-src 'none'`, self scripts/styles),
-  `frame-ancestors 'none'`, `no-store`, `no-referrer`, `nosniff`.
+  `frame-ancestors 'none'`, `no-store`, `Referrer-Policy: same-origin`,
+  `nosniff`. POST bodies: URL-encoded only, at most 64 KiB, parsed before any
+  handler reads a field. Origin check: against `--web-origin` when given
+  (required for plain HTTP behind a proxy, which may rewrite `Host`), else
+  against the request's `Host`.
 - Rate limit: in memory, per account and per client address, 5 failures in 15
   minutes lock out for the rest of the window (password and TOTP failures).
 - Decisions go through `gateway.DecideApproval`/`DecidePlan` with the operator
@@ -106,6 +110,22 @@ Web (`internal/gateway/web`):
     is still the one read (`ErrConfigChanged` otherwise; the decision fails
     without a rule). Test: `TestHostGrantNeverOverwritesANewerPush`
     (mutation-checked).
+- [x] PR review follow-up (review of ecf9c78):
+  - `PostFormValue` parsed multipart bodies, streaming file parts to disk
+    without a total limit, before the limiter ran. `formPosts` now refuses
+    anything but URL-encoded bodies (415) and bounds them to 64 KiB (413)
+    before a handler runs. Test: `TestFormBodiesAreBounded`.
+  - Behind a proxy that rewrites `Host`, every post failed the origin check.
+    `serve --web-origin` names the origin browsers use (`gateway.WebOrigin`
+    normalizes it as browsers send it); plain HTTP requires it. Tests:
+    `TestConfiguredOriginBehindAProxy`, `TestWebOrigin`, `TestOperatorCommands`.
+  - Two enrollment pages opened at once each minted a key and the last write
+    won, so the other page's code never verified. The key is now kept only
+    while none is (`... AND pending_totp IS NULL`), and a losing request shows
+    the kept one. Test: `TestConcurrentEnrollmentPagesShowOneKey`.
+  - Each test fails under the mutation removing its fix (body parsing,
+    `MaxBytesReader`, content-type check, configured origin, the `IS NULL`
+    guard).
 - [x] Docs: `docs/architecture/remote-control.md`.
 - [x] Final validation.
 

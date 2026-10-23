@@ -10,6 +10,7 @@ import (
 	"html/template"
 	"io/fs"
 	"log"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -46,6 +47,8 @@ const (
 	addressFailures   = 20
 	webIssuer         = "AgentSSH gateway"
 	auditPageMaxLines = 200
+	// maxFormBytes bounds a POST body; the largest form is a plan decision.
+	maxFormBytes = 64 << 10
 )
 
 // WebUI serves the operator Web UI: login with password and TOTP, approval
@@ -56,6 +59,10 @@ type WebUI struct {
 	Store *controlplane.Store
 	Keys  *controlplane.Keys
 	Now   func() time.Time
+	// Origin is the origin browsers reach the Web UI at (see WebOrigin).
+	// Empty compares a request's Origin header with its Host, which holds
+	// when browsers connect directly or a proxy preserves Host.
+	Origin string
 
 	pages   map[string]*template.Template
 	limiter *loginLimiter
@@ -102,7 +109,49 @@ func (w *WebUI) Handler() http.Handler {
 	mux.HandleFunc("POST /approvals/{id}", w.withSession(StageActive, w.decideApproval))
 	mux.HandleFunc("POST /plans/{id}", w.withSession(StageActive, w.decidePlan))
 	mux.HandleFunc("GET /audit", w.withSession(StageActive, w.auditPage))
-	return securityHeaders(mux)
+	return securityHeaders(formPosts(mux))
+}
+
+// WebOrigin checks an HTTPS origin, such as https://gw.example, and returns it
+// as browsers send it in an Origin header.
+func WebOrigin(raw string) (string, error) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Path != "" && u.Path != "/" {
+		return "", fmt.Errorf("%q is not an HTTPS origin such as https://gw.example (no path)", raw)
+	}
+	host := strings.ToLower(u.Host)
+	if u.Port() == "443" {
+		host = strings.ToLower(u.Hostname())
+		if strings.Contains(host, ":") {
+			host = "[" + host + "]"
+		}
+	}
+	return "https://" + host, nil
+}
+
+// formPosts accepts only bounded URL-encoded POST bodies and parses them
+// before any handler reads a field, so no request streams a multipart body
+// to memory or disk.
+func formPosts(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			if mediaType, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type")); mediaType != "application/x-www-form-urlencoded" {
+				http.Error(rw, "forms are URL-encoded", http.StatusUnsupportedMediaType)
+				return
+			}
+			r.Body = http.MaxBytesReader(rw, r.Body, maxFormBytes)
+			if err := r.ParseForm(); err != nil {
+				var tooLarge *http.MaxBytesError
+				if errors.As(err, &tooLarge) {
+					http.Error(rw, "form too large", http.StatusRequestEntityTooLarge)
+				} else {
+					http.Error(rw, "malformed form", http.StatusBadRequest)
+				}
+				return
+			}
+		}
+		next.ServeHTTP(rw, r)
+	})
 }
 
 // securityHeaders forbids framing, inline script, cross-site referrers and
@@ -148,7 +197,7 @@ func (w *WebUI) withSession(stage string, next sessionHandler) http.HandlerFunc 
 			http.Redirect(rw, r, next, http.StatusSeeOther)
 			return
 		}
-		if r.Method == http.MethodPost && (!sameOrigin(r) || !validToken(r.PostFormValue("csrf"), session.CSRF)) {
+		if r.Method == http.MethodPost && (!w.sameOrigin(r) || !validToken(r.PostFormValue("csrf"), session.CSRF)) {
 			http.Error(rw, "the form expired or did not come from this page; reload and try again", http.StatusForbidden)
 			return
 		}
@@ -162,11 +211,14 @@ func validToken(got, want string) bool {
 
 // sameOrigin refuses a POST a browser marks as cross-site. Browsers that send
 // neither header still need the CSRF token.
-func sameOrigin(r *http.Request) bool {
+func (w *WebUI) sameOrigin(r *http.Request) bool {
 	if site := r.Header.Get("Sec-Fetch-Site"); site != "" && site != "same-origin" && site != "none" {
 		return false
 	}
 	if origin := r.Header.Get("Origin"); origin != "" {
+		if w.Origin != "" {
+			return origin == w.Origin
+		}
 		u, err := url.Parse(origin)
 		return err == nil && u.Host == r.Host
 	}
@@ -214,7 +266,7 @@ func clientAddress(r *http.Request) string {
 
 func (w *WebUI) login(rw http.ResponseWriter, r *http.Request) {
 	cookie, err := r.Cookie(loginCookie)
-	if err != nil || !sameOrigin(r) || !validToken(r.PostFormValue("csrf"), cookie.Value) {
+	if err != nil || !w.sameOrigin(r) || !validToken(r.PostFormValue("csrf"), cookie.Value) {
 		w.renderLogin(rw, http.StatusForbidden, "The sign-in form expired; try again.")
 		return
 	}

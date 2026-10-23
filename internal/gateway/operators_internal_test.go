@@ -1,8 +1,10 @@
 package gateway
 
 import (
+	"bytes"
 	"errors"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -140,5 +142,40 @@ func TestHostGrantNeverOverwritesANewerPush(t *testing.T) {
 	}
 	if cfg, _ := store.Config("dev_test"); cfg.Version != 2 || cfg.PolicyYAML != admin {
 		t.Fatalf("config after the refused save: v%d\n%s", cfg.Version, cfg.PolicyYAML)
+	}
+}
+
+// Concurrent enrollment pages (two tabs) all show the one key the session
+// keeps, so a code from any of them verifies.
+func TestConcurrentEnrollmentPagesShowOneKey(t *testing.T) {
+	store, keys, id := operatorStore(t)
+	for round := 0; round < 20; round++ {
+		token, err := newSession(store, id, StagePassword, time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		const pages = 8
+		secrets := make([][]byte, pages)
+		var start, done sync.WaitGroup
+		start.Add(1)
+		for i := range secrets {
+			done.Add(1)
+			go func() {
+				defer done.Done()
+				start.Wait()
+				secrets[i], _ = pendingTOTP(store, keys, token)
+			}()
+		}
+		start.Done()
+		done.Wait()
+		kept, err := pendingTOTP(store, keys, token)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i, secret := range secrets {
+			if !bytes.Equal(secret, kept) {
+				t.Fatalf("round %d: page %d shows a key the session did not keep", round, i)
+			}
+		}
 	}
 }

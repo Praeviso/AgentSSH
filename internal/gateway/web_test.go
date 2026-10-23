@@ -40,6 +40,7 @@ func (c *clock) Add(d time.Duration) {
 // webFixture is the Web UI over an exec gateway, behind TLS.
 type webFixture struct {
 	*fixture
+	web   *gateway.WebUI
 	site  *httptest.Server
 	clock *clock
 	// secrets are the operators' TOTP keys, as their authenticator holds them.
@@ -64,7 +65,7 @@ func newWebFixture(t *testing.T) *webFixture {
 			t.Fatal(err)
 		}
 	}
-	return &webFixture{fixture: f, site: site, clock: c, secrets: map[string][]byte{}}
+	return &webFixture{fixture: f, web: web, site: site, clock: c, secrets: map[string][]byte{}}
 }
 
 // browser is one operator's browser: a cookie jar that never follows
@@ -73,6 +74,8 @@ type browser struct {
 	t      *testing.T
 	w      *webFixture
 	client *http.Client
+	// origin, when set, is the Origin header of every POST.
+	origin string
 }
 
 func (w *webFixture) browser(t *testing.T) *browser {
@@ -99,6 +102,9 @@ func (b *browser) do(method, path string, form url.Values, header ...string) pag
 	}
 	if method == http.MethodPost {
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		if b.origin != "" {
+			req.Header.Set("Origin", b.origin)
+		}
 	}
 	for i := 0; i+1 < len(header); i += 2 {
 		req.Header.Set(header[i], header[i+1])
@@ -220,9 +226,9 @@ func TestDecisionsNeedAnOperatorSession(t *testing.T) {
 	if p := anonymous.do(http.MethodPost, "/approvals/"+id, url.Values{"decision": {"once"}}); p.status != http.StatusForbidden {
 		t.Fatalf("anonymous decision: %+v", p)
 	}
-	// A device's own signed request, aimed at the Web UI.
+	// A device's own signed request, aimed at the Web UI as a form.
 	home := w.enrollHome(t, "tampered")
-	if status := signedPost(t, &fixture{base: w.site.URL}, home, "/approvals/"+id, []byte("decision=once")); status != http.StatusForbidden {
+	if status := signedPost(t, &fixture{base: w.site.URL}, home, "/approvals/"+id, []byte("decision=once"), "application/x-www-form-urlencoded"); status != http.StatusForbidden {
 		t.Fatalf("device-signed decision answered %d", status)
 	}
 	if got := w.status(t, id); got != "pending" {
@@ -424,5 +430,77 @@ func TestConcurrentLoginsCannotPassTheLimit(t *testing.T) {
 	}
 	if checked > 5 {
 		t.Fatalf("%d concurrent wrong passwords were checked; the limit is 5", checked)
+	}
+}
+
+// POST bodies are URL-encoded and bounded before any field is read, so no
+// request, signed in or not, streams a large or multipart body.
+func TestFormBodiesAreBounded(t *testing.T) {
+	w := newWebFixture(t)
+	id := w.grayRun(t)
+	b := w.browser(t)
+	login := csrfOf(t, b.do(http.MethodGet, "/login", nil))
+	multipart := "multipart/form-data; boundary=x"
+	part := "--x\r\nContent-Disposition: form-data; name=\"f\"; filename=\"f\"\r\n\r\n" + strings.Repeat("a", 1<<10) + "\r\n--x--\r\n"
+	req, _ := http.NewRequest(http.MethodPost, w.site.URL+"/login?csrf="+login, strings.NewReader(part))
+	req.Header.Set("Content-Type", multipart)
+	resp, err := b.client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusUnsupportedMediaType {
+		t.Fatalf("multipart login: %d", resp.StatusCode)
+	}
+	big := url.Values{"csrf": {login}, "name": {"alice"}, "password": {strings.Repeat("a", 100<<10)}}
+	if p := b.do(http.MethodPost, "/login", big); p.status != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized login: %d", p.status)
+	}
+	csrf := b.signIn("alice")
+	if p := b.do(http.MethodPost, "/approvals/"+id, url.Values{"decision": {"once"}, "csrf": {csrf}}, "Content-Type", multipart); p.status != http.StatusUnsupportedMediaType {
+		t.Fatalf("multipart decision: %+v", p)
+	}
+	if got := w.status(t, id); got != "pending" {
+		t.Fatalf("status = %s", got)
+	}
+}
+
+// Behind a TLS proxy that rewrites Host, posts are checked against the
+// configured origin, not the Host the gateway sees.
+func TestConfiguredOriginBehindAProxy(t *testing.T) {
+	w := newWebFixture(t)
+	w.web.Origin = "https://gw.example"
+	id := w.grayRun(t)
+	b := w.browser(t)
+	b.origin = "https://gw.example"
+	csrf := b.signIn("alice")
+	// The Host the gateway sees is no longer an acceptable origin.
+	if p := b.do(http.MethodPost, "/approvals/"+id, url.Values{"decision": {"once"}, "csrf": {csrf}}, "Origin", w.site.URL); p.status != http.StatusForbidden {
+		t.Fatalf("decision from the upstream address: %+v", p)
+	}
+	if p := b.do(http.MethodPost, "/approvals/"+id, url.Values{"decision": {"once"}, "csrf": {csrf}}); p.status != http.StatusSeeOther {
+		t.Fatalf("decision from the configured origin: %+v", p)
+	}
+	if got := w.status(t, id); got != "approved" {
+		t.Fatalf("status = %s", got)
+	}
+}
+
+func TestWebOrigin(t *testing.T) {
+	for raw, want := range map[string]string{
+		"https://gw.example":      "https://gw.example",
+		"https://GW.example:443/": "https://gw.example",
+		"https://gw.example:8443": "https://gw.example:8443",
+		"https://[::1]:443":       "https://[::1]",
+		"http://gw.example":       "",
+		"https://gw.example/ops":  "",
+		"https://u@gw.example":    "",
+		"https://gw.example/?a=1": "",
+		"gw.example":              "",
+	} {
+		got, err := gateway.WebOrigin(raw)
+		if want == "" && err == nil || want != "" && (err != nil || got != want) {
+			t.Fatalf("WebOrigin(%q) = %q, %v; want %q", raw, got, err, want)
+		}
 	}
 }
