@@ -23,6 +23,20 @@ const (
 	ModeGateway = "gateway"
 )
 
+// HeaderMode carries the control plane's mode on every response, including
+// refusals of unauthenticated requests, so a client checks it before spending
+// an enrollment token and on every request after. A response without it comes
+// from a managed control plane that predates the header.
+const HeaderMode = "AgentSSH-Mode"
+
+// ResponseMode is the mode a response's HeaderMode value names.
+func ResponseMode(header string) string {
+	if header == "" {
+		return ModeManaged
+	}
+	return header
+}
+
 // Device status values.
 const (
 	DeviceActive  = "active"

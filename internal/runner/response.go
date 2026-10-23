@@ -6,6 +6,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/Praeviso/AgentSSH/internal/approval"
+	"github.com/Praeviso/AgentSSH/internal/audit"
 )
 
 // Response is one target's result, in the shape of `run --json`.
@@ -85,4 +86,41 @@ func Finalize(responses []Response, stdin Stdin) {
 			responses[i].CmdTruncated = true
 		}
 	}
+}
+
+// RequestStatus summarizes the latest of records for reqID, as
+// `agentssh status --json` prints it. It reports false when no record has
+// that request ID.
+func RequestStatus(records []audit.Record, reqID string) (Response, bool) {
+	var latest *audit.Record
+	for i := range records {
+		if records[i].ReqID == reqID {
+			latest = &records[i]
+		}
+	}
+	if latest == nil {
+		return Response{}, false
+	}
+	exitCode := 0
+	if latest.ExitCode != nil {
+		exitCode = *latest.ExitCode
+	} else if latest.Event == audit.EventDenied {
+		exitCode = ExitPolicyDenied
+	}
+	return Response{
+		ReqID:           latest.ReqID,
+		SessionID:       latest.SessionID,
+		Host:            latest.Host,
+		Cmd:             latest.Cmd,
+		Status:          string(latest.Event),
+		ExitCode:        exitCode,
+		DurationMS:      latest.DurationMS,
+		OutputTruncated: latest.OutputTruncated,
+		Redactions:      latest.Redactions,
+		PolicyAction:    latest.PolicyAction,
+		PolicyRule:      latest.PolicyRule,
+		ExecutionID:     latest.ExecutionID,
+		StepID:          latest.StepID,
+		ReviewSHA256:    latest.ReviewSHA256,
+	}, true
 }

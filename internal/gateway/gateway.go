@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/Praeviso/AgentSSH/internal/controlplane"
+	"github.com/Praeviso/AgentSSH/internal/executor"
+	"github.com/Praeviso/AgentSSH/internal/inventory"
 	"github.com/Praeviso/AgentSSH/internal/remote"
 	"golang.org/x/crypto/ssh"
 )
@@ -62,6 +64,9 @@ type Server struct {
 	RunQuotaBytes          int64
 	// RunRecords caps the run records one device keeps.
 	RunRecords int
+	// Executor, when set, replaces SSH with the gateway's identities for a
+	// device's inventory. Tests use it to drive a fake target.
+	Executor func(inventory.Inventory) executor.Executor
 
 	mu        sync.Mutex
 	running   map[string]int
@@ -87,7 +92,7 @@ func (s *Server) now() time.Time {
 	return time.Now()
 }
 
-// Handler serves enrollment, /status and the /exec endpoints under the public
+// Handler serves enrollment, /status, /hosts, /requests/status and the /exec endpoints under the public
 // HTTPS base, with the same trust requirements as the managed handler.
 func (s *Server) Handler(publicURL string) (http.Handler, error) {
 	api := controlplane.API{
@@ -96,5 +101,5 @@ func (s *Server) Handler(publicURL string) (http.Handler, error) {
 		Keys:  func() *controlplane.Keys { return s.Keys },
 		Now:   s.now,
 	}
-	return api.Handler(publicURL, s.execRoutes()...)
+	return api.Handler(publicURL, append(s.execRoutes(), s.deviceRoutes()...)...)
 }

@@ -10,6 +10,7 @@ import (
 	"github.com/Praeviso/AgentSSH/internal/inventory"
 	"github.com/Praeviso/AgentSSH/internal/managedmode"
 	"github.com/Praeviso/AgentSSH/internal/policy"
+	"github.com/Praeviso/AgentSSH/internal/remote"
 	"github.com/Praeviso/AgentSSH/internal/remoteclient"
 	"gopkg.in/yaml.v3"
 )
@@ -108,6 +109,10 @@ type Config struct {
 	// control; nil in local mode. In remote mode Inventory and Policy come from
 	// the signed bundle and the local policy.yaml is only a deny overlay.
 	Remote *remoteclient.Session
+	// Gateway is the control-plane client when the home is enrolled in
+	// gateway mode; nil otherwise. Inventory and Policy are then empty: the
+	// gateway resolves, authorizes and runs every command.
+	Gateway *remoteclient.Client
 }
 
 // RemoteError reports that remote-managed configuration is unavailable. It is
@@ -272,7 +277,31 @@ func LoadPaths() (*Config, error) {
 	if err := requireHome(home); err != nil {
 		return nil, err
 	}
-	return &Config{Paths: NewPaths(home)}, nil
+	cfg := &Config{Paths: NewPaths(home)}
+	if _, err := remoteclient.LoadMode(home); err != nil {
+		// An unreadable enrollment must not lock the operator out of the
+		// local audit and sessions; commands that need the control plane
+		// fail on it in Load.
+		return cfg, nil
+	}
+	return cfg, attachGateway(cfg)
+}
+
+// attachGateway sets cfg.Gateway when the home is enrolled in gateway mode.
+func attachGateway(cfg *Config) error {
+	mode, err := remoteclient.LoadMode(cfg.Paths.Home)
+	if err != nil {
+		return RemoteError{Err: err}
+	}
+	if mode != remote.ModeGateway {
+		return nil
+	}
+	client, err := remoteclient.NewClient(cfg.Paths.Home)
+	if err != nil {
+		return RemoteError{Err: err}
+	}
+	cfg.Gateway = client
+	return nil
 }
 
 // LoadHome is Load for an explicit configuration directory.
@@ -282,6 +311,12 @@ func LoadHome(home string) (*Config, error) {
 	}
 
 	cfg := &Config{Paths: NewPaths(home)}
+	if err := attachGateway(cfg); err != nil {
+		return nil, err
+	}
+	if cfg.Gateway != nil {
+		return cfg, nil
+	}
 	if managedmode.Enrolled(home) {
 		return loadRemote(cfg)
 	}

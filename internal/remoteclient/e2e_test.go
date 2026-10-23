@@ -102,7 +102,7 @@ func newControlPlane(t *testing.T) *controlPlane {
 	}
 
 	cp.home = t.TempDir()
-	state, err := remoteclient.Enroll(context.Background(), cp.home, cp.base, cp.token(t), now)
+	state, err := remoteclient.Enroll(context.Background(), cp.home, cp.base, cp.token(t), remote.ModeManaged, now)
 	if err != nil {
 		t.Fatalf("enroll: %v", err)
 	}
@@ -378,19 +378,19 @@ func rewriteServerURL(t *testing.T, home string, url string) {
 func TestEnrollmentTokenChecks(t *testing.T) {
 	cp := newControlPlane(t)
 	token := cp.token(t)
-	if _, err := remoteclient.Enroll(context.Background(), t.TempDir(), cp.base, token, time.Now()); err != nil {
+	if _, err := remoteclient.Enroll(context.Background(), t.TempDir(), cp.base, token, remote.ModeManaged, time.Now()); err != nil {
 		t.Fatalf("first enroll: %v", err)
 	}
-	if _, err := remoteclient.Enroll(context.Background(), t.TempDir(), cp.base, token, time.Now()); err == nil {
+	if _, err := remoteclient.Enroll(context.Background(), t.TempDir(), cp.base, token, remote.ModeManaged, time.Now()); err == nil {
 		t.Fatal("enrollment token was accepted twice")
 	}
-	if _, err := remoteclient.Enroll(context.Background(), cp.home, cp.base, cp.token(t), time.Now()); err == nil {
+	if _, err := remoteclient.Enroll(context.Background(), cp.home, cp.base, cp.token(t), remote.ModeManaged, time.Now()); err == nil {
 		t.Fatal("an already enrolled home enrolled again")
 	}
 	parsed, _ := remote.ParseEnrollToken(cp.token(t))
 	parsed.BundleFingerprint = strings.Repeat("00", 32)
 	home := t.TempDir()
-	if _, err := remoteclient.Enroll(context.Background(), home, cp.base, parsed.String(), time.Now()); err == nil {
+	if _, err := remoteclient.Enroll(context.Background(), home, cp.base, parsed.String(), remote.ModeManaged, time.Now()); err == nil {
 		t.Fatal("enrollment trusted a server whose bundle key does not match the token")
 	}
 	if managedmode.Enrolled(home) {
@@ -596,5 +596,55 @@ func (s *sshServer) session(channel ssh.Channel, requests <-chan *ssh.Request, c
 		}
 		_, _ = channel.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{0}))
 		return
+	}
+}
+
+// Enrolling for the wrong mode is refused before the token is spent, so the
+// same token then enrolls in the right mode.
+func TestEnrollmentRefusesAControlPlaneOfAnotherMode(t *testing.T) {
+	cp := newControlPlane(t)
+	token := cp.token(t)
+	home := t.TempDir()
+	_, err := remoteclient.Enroll(context.Background(), home, cp.base, token, remote.ModeGateway, time.Now())
+	var mismatch *remoteclient.ModeMismatchError
+	if !errors.As(err, &mismatch) || mismatch.Got != remote.ModeManaged || mismatch.Want != remote.ModeGateway {
+		t.Fatalf("enroll for gateway against a managed control plane: %v", err)
+	}
+	if managedmode.Enrolled(home) {
+		t.Fatal("a refused enrollment left the home enrolled")
+	}
+	state, err := remoteclient.Enroll(context.Background(), home, cp.base, token, remote.ModeManaged, time.Now())
+	if err != nil || state.Mode != remote.ModeManaged {
+		t.Fatalf("the token was spent by the refused enrollment: %+v, %v", state, err)
+	}
+}
+
+// A control plane that answers in another mode after enrollment fails every
+// request closed: it is not mistaken for an unreachable one, so no cached
+// configuration is used in its place.
+func TestControlPlaneOfAnotherModeFailsClosed(t *testing.T) {
+	cp := newControlPlane(t)
+	cp.open(t)
+	impostor := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(remote.HeaderMode, remote.ModeGateway)
+		http.NotFound(w, r)
+	}))
+	impostor.TLS = &tls.Config{Certificates: cp.http.TLS.Certificates, MinVersion: tls.VersionTLS13}
+	impostor.StartTLS()
+	t.Cleanup(impostor.Close)
+	rewriteServerURL(t, cp.home, impostor.URL+"/plugins/agentssh")
+
+	later := time.Now().Add(2 * time.Minute)
+	_, err := remoteclient.Open(context.Background(), cp.home, remoteclient.OpenOptions{Now: func() time.Time { return later }})
+	var mismatch *remoteclient.ModeMismatchError
+	if !errors.As(err, &mismatch) || mismatch.Got != remote.ModeGateway {
+		t.Fatalf("open against a gateway: %v; want a mode mismatch, not the cached bundle", err)
+	}
+	client, err := remoteclient.NewClient(cp.home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Status(context.Background()); !errors.As(err, &mismatch) {
+		t.Fatalf("status against a gateway: %v", err)
 	}
 }

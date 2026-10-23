@@ -10,6 +10,9 @@ import (
 )
 
 type DiagnosticReport struct {
+	// Mode is local, managed or gateway; callers that know the enrollment
+	// set it.
+	Mode     string           `json:"mode,omitempty"`
 	Home     string           `json:"home"`
 	StateDir string           `json:"state_dir"`
 	Paths    []DiagnosticPath `json:"paths"`

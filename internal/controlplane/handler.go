@@ -70,6 +70,7 @@ func (a API) Handler(publicURL string, routes ...Route) (http.Handler, error) {
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set(remote.HeaderMode, a.Mode)
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		// Refuse alternate path spellings and redirects before routing; signatures
 		// authenticate the externally configured URI's exact path bytes.

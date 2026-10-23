@@ -61,7 +61,7 @@ func TestSignedGETDoesNotReplayAfterLostResponse(t *testing.T) {
 	}))
 	defer server.Close()
 	endpoint = server.URL + remote.PathBundle
-	client := signedHTTPClient(key, "dev_fixture", remote.DeviceSignatureTag)
+	client := signedHTTPClient(key, "dev_fixture", remote.DeviceSignatureTag, remote.ModeManaged)
 	transport := client.Transport.(*proofTransport).base.(*http.Transport)
 	transport.TLSClientConfig.RootCAs = server.Client().Transport.(*http.Transport).TLSClientConfig.RootCAs
 	defer transport.CloseIdleConnections()

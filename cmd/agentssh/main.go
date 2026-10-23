@@ -32,6 +32,7 @@ import (
 	"github.com/Praeviso/AgentSSH/internal/inventory"
 	"github.com/Praeviso/AgentSSH/internal/output"
 	"github.com/Praeviso/AgentSSH/internal/policy"
+	"github.com/Praeviso/AgentSSH/internal/remoteclient"
 	"github.com/Praeviso/AgentSSH/internal/runner"
 	agentruntime "github.com/Praeviso/AgentSSH/internal/runtime"
 	"github.com/Praeviso/AgentSSH/internal/secrets"
@@ -170,6 +171,7 @@ func newRootCommand() *cobra.Command {
 		newDiagnosticsCommand(),
 		newRemoteCommand(),
 	)
+	guardGatewayMode(cmd)
 
 	return cmd
 }
@@ -199,7 +201,13 @@ func newHostsCommand() *cobra.Command {
 			if err != nil {
 				return classifyConfigError(err)
 			}
-			return printHosts(cmd, inventory.NewResolver(cfg.Inventory).Public(), jsonOutput)
+			public := inventory.NewResolver(cfg.Inventory).Public()
+			if cfg.Gateway != nil {
+				if public, err = gatewayHosts(cmd, cfg); err != nil {
+					return err
+				}
+			}
+			return printHosts(cmd, public, jsonOutput)
 		},
 	}
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "emit machine-readable JSON")
@@ -2160,10 +2168,17 @@ func runDiagnostics(cmd *cobra.Command, jsonOutput bool) error {
 		return err
 	}
 	report := agentruntime.DiagnosePaths(config.NewPaths(home))
+	report.Mode = "local"
+	if mode, err := remoteclient.LoadMode(home); err != nil {
+		report.Mode = "unknown"
+	} else if mode != "" {
+		report.Mode = mode
+	}
 	if jsonOutput {
 		return writeJSON(cmd, report)
 	}
 	out := cmd.OutOrStdout()
+	_, _ = fmt.Fprintf(out, "mode=%s\n", report.Mode)
 	_, _ = fmt.Fprintf(out, "home=%s\n", report.Home)
 	_, _ = fmt.Fprintf(out, "state_dir=%s\n", report.StateDir)
 	for _, path := range report.Paths {
@@ -2329,22 +2344,21 @@ func printHosts(cmd *cobra.Command, public inventory.PublicInventory, jsonOutput
 }
 
 func runDirect(cmd *cobra.Command, targetName string, remoteCommand string, flags runFlags) error {
-	if flags.waitApproval != "" {
+	if flags.waitApproval != "" && !gatewayHome() {
 		return runAwaited(cmd, targetName, remoteCommand, flags)
 	}
 	cfg, err := config.Load()
 	if err != nil {
 		return classifyConfigError(err)
 	}
+	if cfg.Gateway != nil {
+		return runGateway(cmd, cfg, targetName, remoteCommand, flags)
+	}
 	runtime := approvalRuntimeWithWarning(cmd, cfg)
 
 	resolved, err := inventory.NewResolver(cfg.Inventory).Resolve(targetName)
 	if err != nil {
-		if inventory.IsUnknown(err) {
-			return newUsageError("%v\n  list all hosts: agentssh hosts", err)
-		}
-		// e.g. a group whose tags match no hosts.
-		return newUsageError("%v\n  list hosts and tags with: agentssh hosts", err)
+		return runner.ResolveUsage(err)
 	}
 
 	outputFilter, err := output.NewFilter(cfg.Policy.Output)
@@ -2615,6 +2629,9 @@ func printSSHErrorHint(cmd *cobra.Command, result executor.Result) {
 	// which is operator-facing and prints it in full.
 	_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "ssh connection failed (exit 9)")
 	hint := executor.ConnectHint(result.Err)
+	if errors.Is(result.Err, errGatewaySSH) {
+		hint = "hint: the gateway could not connect to this host; its administrator can find the cause in the gateway's log."
+	}
 	if hint == "" {
 		hint = "hint: SSH connection failed; check addr, port, network, host key trust, and available SSH keys."
 	}
@@ -3526,46 +3543,26 @@ func runStatus(cmd *cobra.Command, reqID string, jsonOutput bool) error {
 	if err != nil {
 		return classifyConfigError(err)
 	}
-	records, err := audit.NewStore(cfg.Paths.AuditFile).ReadAll()
-	if err != nil {
-		return err
-	}
-	var latest *audit.Record
-	for i := range records {
-		if records[i].ReqID == reqID {
-			latest = &records[i]
+	var response runResponse
+	if cfg.Gateway != nil {
+		response, err = gatewayRequestStatus(cmd, cfg, reqID)
+		if err != nil {
+			return err
 		}
-	}
-	if latest == nil {
-		return newUsageError("audit request %q not found", reqID)
-	}
-	status := string(latest.Event)
-	exitCode := 0
-	if latest.ExitCode != nil {
-		exitCode = *latest.ExitCode
-	} else if latest.Event == audit.EventDenied {
-		exitCode = exitPolicyDenied
-	}
-	response := runResponse{
-		ReqID:           latest.ReqID,
-		SessionID:       latest.SessionID,
-		Host:            latest.Host,
-		Cmd:             latest.Cmd,
-		Status:          status,
-		ExitCode:        exitCode,
-		DurationMS:      latest.DurationMS,
-		OutputTruncated: latest.OutputTruncated,
-		Redactions:      latest.Redactions,
-		PolicyAction:    latest.PolicyAction,
-		PolicyRule:      latest.PolicyRule,
-		ExecutionID:     latest.ExecutionID,
-		StepID:          latest.StepID,
-		ReviewSHA256:    latest.ReviewSHA256,
+	} else {
+		records, err := audit.NewStore(cfg.Paths.AuditFile).ReadAll()
+		if err != nil {
+			return err
+		}
+		var ok bool
+		if response, ok = runner.RequestStatus(records, reqID); !ok {
+			return newUsageError("audit request %q not found", reqID)
+		}
 	}
 	if jsonOutput {
 		return writeJSON(cmd, response)
 	}
-	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s · host=%s · status=%s · exit=%d · policy=%s/%s\n", latest.ReqID, latest.Host, status, exitCode, latest.PolicyAction, latest.PolicyRule)
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s · host=%s · status=%s · exit=%d · policy=%s/%s\n", response.ReqID, response.Host, response.Status, response.ExitCode, response.PolicyAction, response.PolicyRule)
 	return nil
 }
 

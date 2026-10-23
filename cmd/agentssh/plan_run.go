@@ -73,7 +73,19 @@ func newPlanRunCommand() *cobra.Command {
 		if err != nil {
 			return classifyConfigError(err)
 		}
-		resolved, err := inventory.NewResolver(cfg.Inventory).Resolve(args[0])
+		if err := refuseGatewayWait(cfg, wait); err != nil {
+			return err
+		}
+		inv := cfg.Inventory
+		if cfg.Gateway != nil {
+			// The gateway's names and tags resolve exactly like its inventory.
+			public, err := gatewayHosts(cmd, cfg)
+			if err != nil {
+				return err
+			}
+			inv = inventory.FromPublic(public)
+		}
+		resolved, err := inventory.NewResolver(inv).Resolve(args[0])
 		if err != nil {
 			return newUsageError("%v", err)
 		}
@@ -152,6 +164,9 @@ func newPlanResumeCommand() *cobra.Command {
 		cfg, err := config.Load()
 		if err != nil {
 			return classifyConfigError(err)
+		}
+		if err := refuseGatewayWait(cfg, wait); err != nil {
+			return err
 		}
 		run := planExecution{ID: args[0]}
 		return executeSavedPlan(cmd, cfg, &run, executionRunOptions{wait: wait, jsonOutput: jsonOutput, events: events}, false)
@@ -501,11 +516,12 @@ func executeSavedPlan(cmd *cobra.Command, cfg *config.Config, run *planExecution
 			}
 		}
 	}
-	runtime, err := approvalRuntime(cfg)
-	if err != nil {
-		return err
-	}
-	if run.ApprovalPlanID == "" || run.Status == "expired" {
+	// A gateway reauthorizes each step itself; the client keeps no approvals.
+	if cfg.Gateway == nil && (run.ApprovalPlanID == "" || run.Status == "expired") {
+		runtime, err := approvalRuntime(cfg)
+		if err != nil {
+			return err
+		}
 		response, err := submitPlanInputs(cmd, cfg, runtime, run.Host, remaining, run.SessionID, run.Label, executionPlanReview(run))
 		if response.PlanID != "" {
 			run.ApprovalPlanID = response.PlanID
@@ -781,6 +797,15 @@ func hasVerificationFailure(steps []planExecutionStep) bool {
 		}
 	}
 	return false
+}
+
+// refuseGatewayWait refuses --wait-approval on a gateway device, whose
+// approvals are kept on the gateway.
+func refuseGatewayWait(cfg *config.Config, wait string) error {
+	if cfg.Gateway == nil || wait == "" {
+		return nil
+	}
+	return newUsageError("--wait-approval is not available in gateway mode yet: this device's approvals are kept on the gateway\n  wait for the operator's decision, then resume the execution")
 }
 
 func validateApprovalWait(value string) error {

@@ -29,10 +29,10 @@ func TestEnrollmentStateIsMinimal(t *testing.T) {
 	if err := yaml.Unmarshal(data, &state); err != nil {
 		t.Fatal(err)
 	}
-	if len(state) != 4 {
+	if len(state) != 5 || state["mode"] != remote.ModeManaged {
 		t.Fatalf("enrollment fields: %+v", state)
 	}
-	for _, field := range []string{"server_url", "device_id", "bundle_public_key", "enrolled_at"} {
+	for _, field := range []string{"server_url", "device_id", "bundle_public_key", "enrolled_at", "mode"} {
 		if _, ok := state[field]; !ok {
 			t.Fatalf("missing %s", field)
 		}
@@ -61,19 +61,19 @@ func TestHTTPSEnrollmentPinsAndRedirects(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := remoteclient.Enroll(context.Background(), t.TempDir(), cp.http.URL, token.String(), time.Now()); err == nil {
+	if _, err := remoteclient.Enroll(context.Background(), t.TempDir(), cp.http.URL, token.String(), remote.ModeManaged, time.Now()); err == nil {
 		t.Fatal("wrong URL accepted")
 	}
 	wrongPin := token
 	wrongPin.BundleFingerprint = strings.Repeat("0", 64)
 	home := t.TempDir()
-	if _, err := remoteclient.Enroll(context.Background(), home, base, wrongPin.String(), time.Now()); err == nil || !strings.Contains(err.Error(), "bundle public key") {
+	if _, err := remoteclient.Enroll(context.Background(), home, base, wrongPin.String(), remote.ModeManaged, time.Now()); err == nil || !strings.Contains(err.Error(), "bundle public key") {
 		t.Fatalf("wrong pin: %v", err)
 	}
 	if managedmode.Enrolled(home) {
 		t.Fatal("pin failure activated remote mode")
 	}
-	if _, err := remoteclient.Enroll(context.Background(), t.TempDir(), base, token.String(), time.Now()); err == nil {
+	if _, err := remoteclient.Enroll(context.Background(), t.TempDir(), base, token.String(), remote.ModeManaged, time.Now()); err == nil {
 		t.Fatal("used token accepted")
 	}
 
@@ -87,7 +87,7 @@ func TestHTTPSEnrollmentPinsAndRedirects(t *testing.T) {
 	ingress.StartTLS()
 	t.Cleanup(ingress.Close)
 	token.ServerURL = ingress.URL
-	_, err = remoteclient.Enroll(context.Background(), t.TempDir(), ingress.URL, token.String(), time.Now())
+	_, err = remoteclient.Enroll(context.Background(), t.TempDir(), ingress.URL, token.String(), remote.ModeManaged, time.Now())
 	var apiErr *remote.APIError
 	if !errors.As(err, &apiErr) || requests != 0 {
 		t.Fatalf("redirect: %v; forwarded requests=%d", err, requests)

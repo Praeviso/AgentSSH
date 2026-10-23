@@ -117,6 +117,8 @@ type runRecord struct {
 	// RequestSHA256 identifies the request that started the run, so a
 	// repeated request can join it and a different one is refused.
 	RequestSHA256 string `json:"request_sha256,omitempty"`
+	// ReqID is a single-host run's request ID, sent in its run frame.
+	ReqID string `json:"req_id,omitempty"`
 	// Frames is the spool's file name while the output is kept.
 	Frames string `json:"frames,omitempty"`
 	// Broken means a spool write failed, so the spool lacks its result.
@@ -137,6 +139,7 @@ type run struct {
 	recordPath    string
 	framesPath    string
 	requestSHA256 string
+	reqID         string
 	limit         int64
 
 	mu        sync.Mutex
@@ -230,7 +233,7 @@ func randomSuffix() string {
 // startRun claims id for deviceID and opens its spool; cancel stops the
 // run's context. errRunExists means the ID is already claimed: by a repeat
 // of this request, a different request, or a cancel that overtook it.
-func (s *Server) startRun(deviceID, id, requestSHA256 string, targets int, cancel context.CancelFunc) (*run, error) {
+func (s *Server) startRun(deviceID, id, requestSHA256, reqID string, targets int, cancel context.CancelFunc) (*run, error) {
 	if int64(targets) > s.maxRunTargets() {
 		return nil, errRunTooLarge
 	}
@@ -256,7 +259,7 @@ func (s *Server) startRun(deviceID, id, requestSHA256 string, targets int, cance
 	}
 	rec := runRecord{
 		RunID: id, DeviceID: deviceID, State: stateRunning,
-		CreatedAt: controlplane.FormatTime(s.now()), RequestSHA256: requestSHA256, Frames: frames,
+		CreatedAt: controlplane.FormatTime(s.now()), RequestSHA256: requestSHA256, ReqID: reqID, Frames: frames,
 	}
 	data, err := json.Marshal(rec)
 	if err == nil {
@@ -272,7 +275,7 @@ func (s *Server) startRun(deviceID, id, requestSHA256 string, targets int, cance
 	}
 	rn := &run{
 		id: id, deviceID: deviceID, recordPath: s.recordPath(deviceID, id), framesPath: framesPath,
-		requestSHA256: requestSHA256, limit: s.runMaxBytes(),
+		requestSHA256: requestSHA256, reqID: reqID, limit: s.runMaxBytes(),
 		record: rec, file: file, pending: targets, wake: make(chan struct{}), cancel: cancel,
 	}
 	if s.runs == nil {
@@ -335,7 +338,7 @@ func (s *Server) lookupRun(deviceID, id string) (*run, error) {
 		return nil, errRunBroken
 	}
 	return &run{id: id, deviceID: deviceID, recordPath: path, framesPath: framesPath,
-		requestSHA256: rec.RequestSHA256, record: rec, size: info.Size(), done: true}, nil
+		requestSHA256: rec.RequestSHA256, reqID: rec.ReqID, record: rec, size: info.Size(), done: true}, nil
 }
 
 // cancelRun stops deviceID's live run id. When the ID was never claimed, it

@@ -29,7 +29,7 @@ func (s *Server) streamRun(w http.ResponseWriter, ctx context.Context, rn *run, 
 		return
 	}
 	defer func() { _ = file.Close() }()
-	runFrame, _ := json.Marshal(remote.ExecRun{RunID: rn.id})
+	runFrame, _ := json.Marshal(remote.ExecRun{RunID: rn.id, ReqID: rn.reqID})
 	w.Header().Set("Content-Type", remote.ExecContentType)
 	// Ask buffering reverse proxies to pass frames through as they arrive.
 	w.Header().Set("X-Accel-Buffering", "no")

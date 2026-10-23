@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -20,9 +21,14 @@ import (
 )
 
 // Enroll proves ownership of a fresh device key and commits local state last.
-func Enroll(ctx context.Context, home, serverURL, rawToken string, now time.Time) (State, error) {
+// mode is the control-plane mode the device expects; a control plane of
+// another mode is refused before the token is spent.
+func Enroll(ctx context.Context, home, serverURL, rawToken, mode string, now time.Time) (State, error) {
 	if managedmode.Enrolled(home) {
 		return State{}, errors.New("this AgentSSH home is already enrolled; run agentssh remote leave first")
+	}
+	if mode != remote.ModeManaged && mode != remote.ModeGateway {
+		return State{}, fmt.Errorf("unknown control-plane mode %q; use managed or gateway", mode)
 	}
 	token, err := remote.ParseEnrollToken(rawToken)
 	if err != nil {
@@ -32,11 +38,14 @@ func Enroll(ctx context.Context, home, serverURL, rawToken string, now time.Time
 	if err != nil || base != token.ServerURL {
 		return State{}, errors.New("control plane URL does not match the HTTPS enrollment token")
 	}
+	if err := probeMode(ctx, base, mode); err != nil {
+		return State{}, err
+	}
 	pub, key, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		return State{}, err
 	}
-	client := signedHTTPClient(key, token.ID, remote.EnrollSignatureTag)
+	client := signedHTTPClient(key, token.ID, remote.EnrollSignatureTag, mode)
 	var response remote.EnrollResponse
 	if err := doJSON(ctx, client, http.MethodPost, base+remote.PathEnroll, remote.EnrollRequest{
 		TokenID: token.ID, TokenSecret: token.Secret, PublicKey: base64.StdEncoding.EncodeToString(pub)}, &response); err != nil {
@@ -53,7 +62,7 @@ func Enroll(ctx context.Context, home, serverURL, rawToken string, now time.Time
 	if err != nil {
 		return State{}, err
 	}
-	state := State{ServerURL: base, DeviceID: response.DeviceID, BundlePublicKey: response.BundlePublicKey, EnrolledAt: now.UTC()}
+	state := State{ServerURL: base, DeviceID: response.DeviceID, BundlePublicKey: response.BundlePublicKey, EnrolledAt: now.UTC(), Mode: mode}
 	encoded, err := yaml.Marshal(state)
 	if err != nil {
 		return State{}, err
@@ -70,6 +79,23 @@ func Enroll(ctx context.Context, home, serverURL, rawToken string, now time.Time
 		return State{}, err
 	}
 	return state, nil
+}
+
+// probeMode reads the control plane's mode from an unsigned /status: its
+// refusal still names the mode, and asking costs no token.
+func probeMode(ctx context.Context, base, mode string) error {
+	ctx, cancel := context.WithTimeout(ctx, RequestTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+remote.PathStatus, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := controlPlaneClient(baseTransport()).Do(req)
+	if err != nil {
+		return transportError(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	return checkMode(resp, mode)
 }
 
 func validDeviceID(id string) bool {

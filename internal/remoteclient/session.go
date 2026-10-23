@@ -69,6 +69,9 @@ func Open(ctx context.Context, home string, opts OpenOptions) (*Session, error) 
 	if err != nil {
 		return nil, err
 	}
+	if client.State.Gateway() {
+		return nil, errors.New("this device is enrolled with a gateway, which keeps its configuration")
+	}
 	pub, err := base64.StdEncoding.DecodeString(client.State.BundlePublicKey)
 	if err != nil || len(pub) != ed25519.PublicKeySize {
 		return nil, errors.New("pinned bundle public key is invalid; run agentssh remote leave and enroll again")
