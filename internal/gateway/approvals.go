@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 	"unicode"
 
 	"github.com/Praeviso/AgentSSH/internal/approval"
@@ -19,6 +20,7 @@ import (
 	"github.com/Praeviso/AgentSSH/internal/remote"
 	"github.com/Praeviso/AgentSSH/internal/runner"
 	"github.com/Praeviso/AgentSSH/internal/session"
+	"gopkg.in/yaml.v3"
 )
 
 // maxPlanSubmitBody fits MaxPlanCommands commands at the command size limit
@@ -472,17 +474,24 @@ func planIDTaken(dir, deviceID, planID string) (bool, error) {
 	return false, nil
 }
 
-// ErrHostScope refuses host-scope grants, which would rewrite a device's
-// pushed policy.
-var ErrHostScope = errors.New("host scope is unavailable on a gateway: it would change the device's policy; edit the policy and push it with agentssh-gateway config push, or approve once, for the session or for the task")
+// Decider is who decides and, when an ID is ambiguous, the device it belongs
+// to.
+type Decider struct {
+	// Operator is recorded in the decision's audit record.
+	Operator string
+	// DeviceID, when set, limits the lookup to that device.
+	DeviceID string
+}
 
 // decisionOptions applies decisions for deviceID with its policy's grant
-// lifetimes, recording them in the gateway's audit chain.
-func decisionOptions(dir string, store *controlplane.Store, deviceID string) approval.ApplyOptions {
+// lifetimes, recording them in the gateway's audit chain. A host-scope grant
+// appends its rule to the device's policy and pushes it as a new
+// configuration version.
+func decisionOptions(dir string, store *controlplane.Store, deviceID, operator string, now time.Time) approval.ApplyOptions {
 	server := &Server{Dir: dir, Store: store}
 	runtime := server.deviceRuntime(deviceID)
 	stores := deviceApprovals(dir, deviceID)
-	return approval.ApplyOptions{
+	opts := approval.ApplyOptions{
 		Pending:    stores.Pending,
 		Sessions:   stores.Sessions,
 		Audit:      audit.NewStore(filepath.Join(dir, FileAudit)),
@@ -490,30 +499,55 @@ func decisionOptions(dir string, store *controlplane.Store, deviceID string) app
 		TaskTTL:    runtime.TaskTTL,
 		Channel:    approval.ChannelGateway,
 		DeviceID:   deviceID,
+		Operator:   operator,
 	}
+	cfg, err := store.Config(deviceID)
+	var inv inventory.Inventory
+	var pol policy.Config
+	if err == nil {
+		inv, pol, err = remote.ParseManaged(cfg.InventoryYAML, cfg.PolicyYAML, nil)
+	}
+	if err != nil {
+		opts.SavePolicy = func(policy.Config) error {
+			return fmt.Errorf("host scope needs the device's configuration: %w", err)
+		}
+		return opts
+	}
+	opts.Bundle = policy.Bundle{Policy: pol, Inventory: inv}
+	// The rule is added to the policy as read here; if another push lands
+	// first, the decision fails rather than overwrite it (the request stays
+	// approved without a rule, so the device's rerun asks again).
+	opts.SavePolicy = func(next policy.Config) error {
+		if next.Version == 0 {
+			next.Version = 1
+		}
+		data, err := yaml.Marshal(&next)
+		if err != nil {
+			return err
+		}
+		_, err = controlplane.ReplaceConfig(store, deviceID, cfg.Version, cfg.InventoryYAML, string(data), now)
+		return err
+	}
+	return opts
 }
 
-// DecideApproval resolves one approval request of the device that made it;
-// deviceID, when set, names that device.
-func DecideApproval(dir string, store *controlplane.Store, deviceID, id string, verdict approval.Verdict, scope approval.Scope) (string, approval.ApplyResult, error) {
-	if verdict == approval.VerdictApproved && scope == approval.ScopeHost {
-		return "", approval.ApplyResult{}, ErrHostScope
-	}
-	deviceID, _, err := ApprovalStatus(dir, deviceID, id)
+// DecideApproval resolves one approval request of the device that made it.
+func DecideApproval(dir string, store *controlplane.Store, by Decider, id string, verdict approval.Verdict, scope approval.Scope) (string, approval.ApplyResult, error) {
+	deviceID, _, err := ApprovalStatus(dir, by.DeviceID, id)
 	if err != nil {
 		return "", approval.ApplyResult{}, err
 	}
-	result, err := approval.ApplyDecision(decisionOptions(dir, store, deviceID), id, verdict, scope)
+	result, err := approval.ApplyDecision(decisionOptions(dir, store, deviceID, by.Operator, time.Now()), id, verdict, scope)
 	return deviceID, result, err
 }
 
-// DecidePlan resolves every pending member of a plan with one verdict;
-// deviceID, when set, names the plan's device.
-func DecidePlan(dir string, store *controlplane.Store, deviceID, id string, verdict approval.Verdict, scope approval.Scope) (string, []approval.ApplyResult, error) {
-	deviceID, _, err := PlanStatus(dir, deviceID, id)
+// DecidePlan resolves every pending member of a plan with one verdict; host
+// scope is not offered for a whole plan.
+func DecidePlan(dir string, store *controlplane.Store, by Decider, id string, verdict approval.Verdict, scope approval.Scope) (string, []approval.ApplyResult, error) {
+	deviceID, _, err := PlanStatus(dir, by.DeviceID, id)
 	if err != nil {
 		return "", nil, err
 	}
-	results, err := approval.ApplyPlanDecision(decisionOptions(dir, store, deviceID), id, verdict, scope)
+	results, err := approval.ApplyPlanDecision(decisionOptions(dir, store, deviceID, by.Operator, time.Now()), id, verdict, scope)
 	return deviceID, results, err
 }

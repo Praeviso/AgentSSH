@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"os/user"
 	"strconv"
 
 	"github.com/Praeviso/AgentSSH/internal/approval"
@@ -12,6 +14,15 @@ import (
 	"github.com/Praeviso/AgentSSH/internal/gateway"
 	"github.com/spf13/cobra"
 )
+
+// localOperator names a decision made on the gateway host in the audit.
+func localOperator() string {
+	name := os.Getenv("USER")
+	if u, err := user.Current(); err == nil {
+		name = u.Username
+	}
+	return "local:" + name
+}
 
 // withStore checks the data directory and opens its store for run.
 func withStore(dir func() (string, error), run func(d string, store *controlplane.Store) error) error {
@@ -36,9 +47,12 @@ func writeJSON(out io.Writer, value any) error {
 	return err
 }
 
-// grantScope reads exactly one of the scope flags a gateway can grant.
-func grantScope(once, session, task bool) (approval.Scope, error) {
+// grantScope reads exactly one of the scope flags.
+func grantScope(once, session, task bool, host ...bool) (approval.Scope, error) {
 	var scopes []approval.Scope
+	if len(host) > 0 && host[0] {
+		scopes = append(scopes, approval.ScopeHost)
+	}
 	if once {
 		scopes = append(scopes, approval.ScopeOnce)
 	}
@@ -49,7 +63,7 @@ func grantScope(once, session, task bool) (approval.Scope, error) {
 		scopes = append(scopes, approval.ScopeTask)
 	}
 	if len(scopes) != 1 {
-		return "", errors.New("grant requires exactly one of --once, --session or --task")
+		return "", errors.New("grant requires exactly one scope flag")
 	}
 	return scopes[0], nil
 }
@@ -125,18 +139,19 @@ func newApprovalCommand(dir func() (string, error)) *cobra.Command {
 		},
 	}
 
-	var once, session, task bool
+	var once, session, task, host bool
 	grantCmd := &cobra.Command{
-		Use:   "grant <approval-id> --once|--session|--task",
+		Use:   "grant <approval-id> --once|--session|--task|--host",
 		Short: "Approve a request; the device's rerun then runs.",
+		Long:  "Approve a request. --host adds an allow rule for the command's matcher to the device's policy and pushes it as a new configuration version; the policy is re-rendered, so comments and formatting in it are not kept.",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			scope, err := grantScope(once, session, task)
+			scope, err := grantScope(once, session, task, host)
 			if err != nil {
 				return err
 			}
 			return withStore(dir, func(d string, store *controlplane.Store) error {
-				decided, _, err := gateway.DecideApproval(d, store, deviceID, args[0], approval.VerdictApproved, scope)
+				decided, _, err := gateway.DecideApproval(d, store, gateway.Decider{Operator: localOperator(), DeviceID: deviceID}, args[0], approval.VerdictApproved, scope)
 				if err != nil {
 					return err
 				}
@@ -146,6 +161,7 @@ func newApprovalCommand(dir func() (string, error)) *cobra.Command {
 		},
 	}
 	addScopeFlags(grantCmd, &once, &session, &task, "the command")
+	grantCmd.Flags().BoolVar(&host, "host", false, "approve the command's matcher on this host permanently, as a rule in the device's policy")
 
 	denyCmd := &cobra.Command{
 		Use:   "deny <approval-id>",
@@ -153,7 +169,7 @@ func newApprovalCommand(dir func() (string, error)) *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withStore(dir, func(d string, store *controlplane.Store) error {
-				decided, _, err := gateway.DecideApproval(d, store, deviceID, args[0], approval.VerdictDenied, "")
+				decided, _, err := gateway.DecideApproval(d, store, gateway.Decider{Operator: localOperator(), DeviceID: deviceID}, args[0], approval.VerdictDenied, "")
 				if err != nil {
 					return err
 				}
@@ -208,7 +224,7 @@ func newPlanCommand(dir func() (string, error)) *cobra.Command {
 				return err
 			}
 			return withStore(dir, func(d string, store *controlplane.Store) error {
-				decided, results, err := gateway.DecidePlan(d, store, deviceID, args[0], approval.VerdictApproved, scope)
+				decided, results, err := gateway.DecidePlan(d, store, gateway.Decider{Operator: localOperator(), DeviceID: deviceID}, args[0], approval.VerdictApproved, scope)
 				if err != nil {
 					return err
 				}
@@ -225,7 +241,7 @@ func newPlanCommand(dir func() (string, error)) *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withStore(dir, func(d string, store *controlplane.Store) error {
-				decided, results, err := gateway.DecidePlan(d, store, deviceID, args[0], approval.VerdictDenied, "")
+				decided, results, err := gateway.DecidePlan(d, store, gateway.Decider{Operator: localOperator(), DeviceID: deviceID}, args[0], approval.VerdictDenied, "")
 				if err != nil {
 					return err
 				}

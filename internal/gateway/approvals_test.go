@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -27,8 +28,8 @@ import (
 )
 
 // signedPost sends body to path signed with home's device key, as a modified
-// client could.
-func signedPost(t *testing.T, f *fixture, home, path string, body []byte) int {
+// client could: JSON unless contentType names another type.
+func signedPost(t *testing.T, f *fixture, home, path string, body []byte, contentType ...string) int {
 	t.Helper()
 	data, err := os.ReadFile(filepath.Join(managedmode.Dir(home), "device.key"))
 	if err != nil {
@@ -48,6 +49,9 @@ func signedPost(t *testing.T, f *fixture, home, path string, body []byte) int {
 		t.Fatal(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if len(contentType) > 0 {
+		req.Header.Set("Content-Type", contentType[0])
+	}
 	if err := remote.SignHTTPRequest(req, body, state.DeviceID, remote.DeviceSignatureTag, parsed.(ed25519.PrivateKey), time.Now()); err != nil {
 		t.Fatal(err)
 	}
@@ -107,14 +111,11 @@ func TestOperatorDecisionsAreAuditedPerDevice(t *testing.T) {
 	if err != nil || len(requests) != 1 || requests[0].ID != id || requests[0].DeviceID != f.client.State.DeviceID {
 		t.Fatalf("pending = %+v, %v", requests, err)
 	}
-	if _, _, err := gateway.DecideApproval(f.dir, f.store, "", id, approval.VerdictApproved, approval.ScopeHost); !errors.Is(err, gateway.ErrHostScope) {
-		t.Fatalf("host scope: %v", err)
-	}
-	deviceID, _, err := gateway.DecideApproval(f.dir, f.store, "", id, approval.VerdictApproved, approval.ScopeOnce)
+	deviceID, _, err := gateway.DecideApproval(f.dir, f.store, gateway.Decider{Operator: "web:alice"}, id, approval.VerdictApproved, approval.ScopeOnce)
 	if err != nil || deviceID != f.client.State.DeviceID {
 		t.Fatalf("decide = %s, %v", deviceID, err)
 	}
-	if _, _, err := gateway.DecideApproval(f.dir, f.store, "", id, approval.VerdictDenied, ""); !errors.Is(err, approval.ErrAlreadyResolved) {
+	if _, _, err := gateway.DecideApproval(f.dir, f.store, gateway.Decider{Operator: "test"}, id, approval.VerdictDenied, ""); !errors.Is(err, approval.ErrAlreadyResolved) {
 		t.Fatalf("second decision: %v", err)
 	}
 	records, err := audit.NewStore(filepath.Join(f.dir, gateway.FileAudit)).ReadAll()
@@ -122,7 +123,7 @@ func TestOperatorDecisionsAreAuditedPerDevice(t *testing.T) {
 		t.Fatal(err)
 	}
 	last := records[len(records)-1]
-	if last.Event != audit.EventApprovalGranted || last.ApprovalID != id || last.DeviceID != deviceID || last.ApprovalChannel != approval.ChannelGateway || last.ApprovalScope != string(approval.ScopeOnce) {
+	if last.Event != audit.EventApprovalGranted || last.ApprovalID != id || last.DeviceID != deviceID || last.ApprovalChannel != approval.ChannelGateway || last.ApprovalScope != string(approval.ScopeOnce) || last.Operator != "web:alice" {
 		t.Fatalf("decision record = %+v", last)
 	}
 	other := f.enroll(t, "other-vm")
@@ -183,7 +184,7 @@ func TestAPlanIDBelongsToOneDevice(t *testing.T) {
 	if _, err := thief.SubmitPlan(context.Background(), plan); !errors.As(err, &apiErr) || apiErr.Status != http.StatusConflict {
 		t.Fatalf("another device reused the plan ID: %v", err)
 	}
-	deviceID, results, err := gateway.DecidePlan(f.dir, f.store, "", planID, approval.VerdictApproved, approval.ScopeOnce)
+	deviceID, results, err := gateway.DecidePlan(f.dir, f.store, gateway.Decider{Operator: "test"}, planID, approval.VerdictApproved, approval.ScopeOnce)
 	if err != nil || deviceID != f.client.State.DeviceID || len(results) != 1 || results[0].Request.Cmd != "systemctl restart app" {
 		t.Fatalf("decision = %s %+v, %v", deviceID, results, err)
 	}
@@ -206,10 +207,10 @@ func TestAnAmbiguousIDNeedsTheDevice(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if _, _, err := gateway.DecidePlan(f.dir, f.store, "", planID, approval.VerdictApproved, approval.ScopeOnce); !errors.Is(err, gateway.ErrAmbiguousID) {
+	if _, _, err := gateway.DecidePlan(f.dir, f.store, gateway.Decider{Operator: "test"}, planID, approval.VerdictApproved, approval.ScopeOnce); !errors.Is(err, gateway.ErrAmbiguousID) {
 		t.Fatalf("ambiguous decision: %v", err)
 	}
-	deviceID, results, err := gateway.DecidePlan(f.dir, f.store, "dev_b", planID, approval.VerdictApproved, approval.ScopeOnce)
+	deviceID, results, err := gateway.DecidePlan(f.dir, f.store, gateway.Decider{Operator: "test", DeviceID: "dev_b"}, planID, approval.VerdictApproved, approval.ScopeOnce)
 	if err != nil || deviceID != "dev_b" || len(results) != 1 || results[0].Request.Cmd != "systemctl restart dev_b" {
 		t.Fatalf("decision for dev_b = %s %+v, %v", deviceID, results, err)
 	}
@@ -293,7 +294,7 @@ func TestGrantsAreBoundToTheStatedStdinSize(t *testing.T) {
 			Commands: []remote.PlanSubmitCommand{{ID: "load", Cmd: "cat -", StdinSHA256: stdinSHA, StdinBytes: stated}}}); err != nil {
 			t.Fatal(err)
 		}
-		if _, _, err := gateway.DecidePlan(f.dir, f.store, "", planID, approval.VerdictApproved, approval.ScopeOnce); err != nil {
+		if _, _, err := gateway.DecidePlan(f.dir, f.store, gateway.Decider{Operator: "test"}, planID, approval.VerdictApproved, approval.ScopeOnce); err != nil {
 			t.Fatal(err)
 		}
 		req := remote.ExecRequest{Host: "web-1", Cmd: "cat -", Session: session, Stdin: payload}
@@ -311,5 +312,33 @@ func TestGrantsAreBoundToTheStatedStdinSize(t *testing.T) {
 	}
 	if runs := host.runs("cat -"); runs != 1 {
 		t.Fatalf("target ran cat %d times, want only the honestly stated payload", runs)
+	}
+}
+
+// A host-scope grant becomes a rule in the device's policy, pushed as a new
+// configuration version, so any session's rerun runs without a grant.
+func TestHostScopeAddsARuleToTheDevicesPolicy(t *testing.T) {
+	f, _ := execGateway(t)
+	result, err := f.client.Exec(context.Background(), execReq("uname"), io.Discard, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := f.store.Config(f.client.State.DeviceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := gateway.DecideApproval(f.dir, f.store, gateway.Decider{Operator: "web:alice"}, result.Responses[0].ApprovalID, approval.VerdictApproved, approval.ScopeHost); err != nil {
+		t.Fatal(err)
+	}
+	after, err := f.store.Config(f.client.State.DeviceID)
+	if err != nil || after.Version != before.Version+1 || !strings.Contains(after.PolicyYAML, "host:web-1:") || !strings.Contains(after.PolicyYAML, `cmd_regex: \Auname`) || after.InventoryYAML != before.InventoryYAML {
+		t.Fatalf("pushed config v%d: %v\n%s", after.Version, err, after.PolicyYAML)
+	}
+	req := execReq("uname")
+	req.Session = "s_other"
+	rerun, err := f.client.Exec(context.Background(), req, io.Discard, io.Discard)
+	// The target does not know the command; what matters is that it ran.
+	if err != nil || rerun.Responses[0].PolicyAction != "allow" || rerun.Responses[0].GrantScope != string(approval.ScopeHost) || rerun.Responses[0].ExecutionState != "finished" {
+		t.Fatalf("rerun in another session: %+v, %v", rerun, err)
 	}
 }

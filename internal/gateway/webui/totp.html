@@ -1,0 +1,18 @@
+{{define "content"}}
+{{if .Enroll}}
+<h1>Set up two-factor sign-in</h1>
+<p class="lead">Scan the code with an authenticator app, then enter the 6-digit code it shows. You need it at every sign-in.</p>
+<figure class="qr"><img src="{{.QR}}" alt="QR code for the authenticator app" width="220" height="220"></figure>
+<p class="hint">Can't scan? Enter this key: <code class="secret">{{.Secret}}</code></p>
+{{else}}
+<h1>Verify it's you</h1>
+<p class="lead">Enter the 6-digit code from your authenticator app for <strong>{{.Operator}}</strong>.</p>
+{{end}}
+{{if .Error}}<p class="banner bad" role="alert">{{.Error}}</p>{{end}}
+<form method="post" action="/login/totp" class="stack">
+  <input type="hidden" name="csrf" value="{{.CSRF}}">
+  <label>Code<input name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9 ]{6,7}" maxlength="7" required autofocus></label>
+  <button class="primary">Verify</button>
+</form>
+<form method="post" action="/logout"><input type="hidden" name="csrf" value="{{.CSRF}}"><button class="link">Cancel</button></form>
+{{end}}

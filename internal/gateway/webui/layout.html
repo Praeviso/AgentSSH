@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{.Title}} · AgentSSH gateway</title>
+<link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/app.css">
+<script src="/static/app.js" defer></script>
+</head>
+<body>
+{{if .Nav}}
+<header class="bar">
+  <span class="brand">AgentSSH gateway</span>
+  <nav>
+    <a href="/approvals"{{if eq .Nav "approvals"}} aria-current="page"{{end}}>Approvals</a>
+    <a href="/audit"{{if eq .Nav "audit"}} aria-current="page"{{end}}>Audit</a>
+  </nav>
+  <form method="post" action="/logout" class="who">
+    <span>{{.Operator}}</span>
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <button class="link">Sign out</button>
+  </form>
+</header>
+{{end}}
+<main{{if not .Nav}} class="narrow"{{end}}>
+{{template "content" .}}
+</main>
+</body>
+</html>

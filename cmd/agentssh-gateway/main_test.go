@@ -155,3 +155,43 @@ func TestApprovalAndPlanCommands(t *testing.T) {
 		t.Fatalf("audit = %+v, %v", records, err)
 	}
 }
+
+func TestOperatorCommands(t *testing.T) {
+	old := gateway.ScryptWorkFactor
+	gateway.ScryptWorkFactor = 10
+	t.Cleanup(func() { gateway.ScryptWorkFactor = old })
+	gateway.PasswordParams.Time, gateway.PasswordParams.MemoryKiB = 1, 64
+	dir := t.TempDir()
+	if err := gateway.Init(dir, "master"); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(envOperatorPassword, "short")
+	if _, err := runGatewayCLI(t, "--data", dir, "operator", "add", "alice"); err == nil {
+		t.Fatal("a short password was accepted")
+	}
+	t.Setenv(envOperatorPassword, "correct horse battery")
+	if out, err := runGatewayCLI(t, "--data", dir, "operator", "add", "alice"); err != nil || !strings.Contains(out, "Added operator alice") {
+		t.Fatalf("add: %v %s", err, out)
+	}
+	if _, err := runGatewayCLI(t, "--data", dir, "operator", "add", "alice"); err == nil {
+		t.Fatal("a duplicate operator was added")
+	}
+	if out, err := runGatewayCLI(t, "--data", dir, "operator", "ls"); err != nil || !strings.Contains(out, "alice") || !strings.Contains(out, "not set up") {
+		t.Fatalf("ls: %v %s", err, out)
+	}
+	if out, err := runGatewayCLI(t, "--data", dir, "operator", "revoke", "alice"); err != nil || !strings.Contains(out, "Revoked operator alice") {
+		t.Fatalf("revoke: %v %s", err, out)
+	}
+	if out, _ := runGatewayCLI(t, "--data", dir, "operator", "ls"); !strings.Contains(out, "revoked") {
+		t.Fatalf("ls after revoke: %s", out)
+	}
+	if _, err := runGatewayCLI(t, "--data", dir, "serve", "--public-url", "https://gw.example/a", "--listen", "127.0.0.1:1", "--web-listen", "127.0.0.1:1"); err == nil || !strings.Contains(err.Error(), "--web-listen must differ") {
+		t.Fatalf("shared listener: %v", err)
+	}
+	if _, err := runGatewayCLI(t, "--data", dir, "serve", "--public-url", "https://gw.example/a", "--listen", "127.0.0.1:1", "--web-listen", "127.0.0.1:2"); err == nil || !strings.Contains(err.Error(), "--web-origin is required") {
+		t.Fatalf("plain HTTP without an origin: %v", err)
+	}
+	if _, err := runGatewayCLI(t, "--data", dir, "serve", "--public-url", "https://gw.example/a", "--listen", "127.0.0.1:1", "--web-listen", "127.0.0.1:2", "--web-origin", "http://gw.example"); err == nil || !strings.Contains(err.Error(), "--web-origin") {
+		t.Fatalf("plain HTTP origin: %v", err)
+	}
+}

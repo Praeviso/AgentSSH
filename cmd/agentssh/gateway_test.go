@@ -4,10 +4,14 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base32"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -63,6 +67,7 @@ type gatewayDevice struct {
 	dir      string
 	deviceID string
 	store    *controlplane.Store
+	keys     *controlplane.Keys
 	// exec is what the target does, for the gateway and local runs alike.
 	exec *atomic.Pointer[fakeExecutor]
 }
@@ -82,7 +87,7 @@ func newGatewayDevice(t *testing.T) *gatewayDevice {
 	if err != nil {
 		t.Fatal(err)
 	}
-	d := &gatewayDevice{dir: dir, store: store, exec: new(atomic.Pointer[fakeExecutor])}
+	d := &gatewayDevice{dir: dir, store: store, keys: keys, exec: new(atomic.Pointer[fakeExecutor])}
 	d.exec.Store(&fakeExecutor{})
 	server := gateway.NewServer(dir, store, keys)
 	server.Executor = func(inventory.Inventory) executor.Executor { return *d.exec.Load() }
@@ -213,6 +218,8 @@ var mintedIDs = []*regexp.Regexp{
 	regexp.MustCompile(`("req_id": )"[0-9a-f]{6}"`),
 	regexp.MustCompile(`()\bap_[0-9a-f]+\b`),
 	regexp.MustCompile(`("ts": )"[^"]*"`),
+	// Each mode grants at its own second.
+	regexp.MustCompile(`("grant_expires_ts": )"[^"]*"`),
 }
 
 func normalizeIDs(value string) string {
@@ -407,7 +414,7 @@ func TestGatewayPlanIsApprovedOnceThenRunsStepByStep(t *testing.T) {
 		t.Fatalf("plan status: %+v", status)
 	}
 
-	if _, _, err := gateway.DecidePlan(device.dir, device.store, "", execution.ApprovalPlanID, approval.VerdictApproved, approval.ScopeSession); err != nil {
+	if _, _, err := gateway.DecidePlan(device.dir, device.store, gateway.Decider{Operator: "test"}, execution.ApprovalPlanID, approval.VerdictApproved, approval.ScopeSession); err != nil {
 		t.Fatal(err)
 	}
 	if got := runIn(t, device.home, "plan", "wait", execution.ApprovalPlanID, "--timeout", "5s"); got.code != exitOK {
@@ -527,7 +534,7 @@ func TestGatewayApprovalWorkflowMatchesLocal(t *testing.T) {
 			if approve {
 				verdict, scope = approval.VerdictApproved, approval.ScopeSession
 			}
-			if _, _, err := gateway.DecideApproval(device.dir, device.store, "", id, verdict, scope); err != nil {
+			if _, _, err := gateway.DecideApproval(device.dir, device.store, gateway.Decider{Operator: "test"}, id, verdict, scope); err != nil {
 				t.Fatal(err)
 			}
 		},
@@ -577,7 +584,7 @@ func TestGatewaySessionGrantScopeAndDenyPrecedence(t *testing.T) {
 	device.exec.Store(&fakeExecutor{calls: &calls})
 	command := []string{"run", "web-1", "--json", "--", "systemctl", "restart", "nginx"}
 	id := pendingID(t, runIn(t, device.home, command...))
-	if _, _, err := gateway.DecideApproval(device.dir, device.store, "", id, approval.VerdictApproved, approval.ScopeSession); err != nil {
+	if _, _, err := gateway.DecideApproval(device.dir, device.store, gateway.Decider{Operator: "test"}, id, approval.VerdictApproved, approval.ScopeSession); err != nil {
 		t.Fatal(err)
 	}
 	if got := runIn(t, device.home, command...); got.code != exitOK {
@@ -613,7 +620,7 @@ func TestGatewayRunWaitsForTheGatewaysDecision(t *testing.T) {
 		for {
 			requests, err := gateway.ListApprovals(device.dir)
 			if err == nil && len(requests) == 1 {
-				_, _, _ = gateway.DecideApproval(device.dir, device.store, "", requests[0].ID, approval.VerdictApproved, approval.ScopeOnce)
+				_, _, _ = gateway.DecideApproval(device.dir, device.store, gateway.Decider{Operator: "test"}, requests[0].ID, approval.VerdictApproved, approval.ScopeOnce)
 				return
 			}
 			time.Sleep(20 * time.Millisecond)
@@ -696,5 +703,80 @@ func TestGatewayApprovalsIgnoreLocalApprovalSettings(t *testing.T) {
 	}
 	if got := runIn(t, device.home, "plan", "run", "web-1", "--file", plan, "--json"); got.code != exitApprovalRequired {
 		t.Fatalf("plan run: %+v", got)
+	}
+}
+
+// The issue's end to end: a gray-zone run exits 7, an operator approves it in
+// the Web UI, approval wait on the device returns 0, and the rerun runs.
+func TestOperatorApprovesInTheWebUIEndToEnd(t *testing.T) {
+	_, device := paritySetup(t)
+	device.exec.Store(&fakeExecutor{stdout: "restarted\n"})
+	gateway.PasswordParams.Time, gateway.PasswordParams.MemoryKiB = 1, 64
+	if err := gateway.AddOperator(device.store, "alice", "correct horse battery", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	web, err := gateway.NewWebUI(device.dir, device.store, device.keys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	site := httptest.NewTLSServer(web.Handler())
+	t.Cleanup(site.Close)
+	browser := *site.Client()
+	browser.Jar, _ = cookiejar.New(nil)
+	browser.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	csrf := regexp.MustCompile(`name="csrf" value="([0-9a-f]+)"`)
+	fetch := func(method, path string, form url.Values) string {
+		t.Helper()
+		req, _ := http.NewRequest(method, site.URL+path, strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		resp, err := browser.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		body, _ := io.ReadAll(resp.Body)
+		return string(body)
+	}
+	token := func(body string) string {
+		t.Helper()
+		m := csrf.FindStringSubmatch(body)
+		if m == nil {
+			t.Fatalf("no CSRF token in:\n%.300s", body)
+		}
+		return m[1]
+	}
+
+	run := runIn(t, device.home, "run", "web-1", "--json", "--", "systemctl", "restart", "nginx")
+	id := pendingID(t, run)
+	if run.code != exitApprovalRequired {
+		t.Fatalf("run: %+v", run)
+	}
+	fetch("POST", "/login", url.Values{"csrf": {token(fetch("GET", "/login", nil))}, "name": {"alice"}, "password": {"correct horse battery"}})
+	enroll := fetch("GET", "/login/totp", nil)
+	encoded := regexp.MustCompile(`class="secret">([A-Z2-7 ]+)<`).FindStringSubmatch(enroll)
+	if encoded == nil {
+		t.Fatalf("enrollment page:\n%.400s", enroll)
+	}
+	secret, err := base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(strings.ReplaceAll(encoded[1], " ", ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fetch("POST", "/login/totp", url.Values{"csrf": {token(enroll)}, "code": {gateway.TOTPCode(secret, time.Now())}})
+	approvals := fetch("GET", "/approvals", nil)
+	if !strings.Contains(approvals, id) {
+		t.Fatalf("approvals page lacks %s:\n%.400s", id, approvals)
+	}
+	fetch("POST", "/approvals/"+id, url.Values{"csrf": {token(approvals)}, "decision": {"once"}})
+
+	if got := runIn(t, device.home, "approval", "wait", id, "--timeout", "5s"); got.code != exitOK || !strings.Contains(got.stdout, `"status": "approved"`) {
+		t.Fatalf("approval wait: %+v", got)
+	}
+	if got := runIn(t, device.home, "run", "web-1", "--", "systemctl", "restart", "nginx"); got.code != exitOK || !strings.Contains(got.stdout, "restarted") {
+		t.Fatalf("rerun: %+v", got)
+	}
+	for _, record := range device.audit(t) {
+		if record.Event == audit.EventApprovalGranted && record.Operator != "web:alice" {
+			t.Fatalf("decision record without the operator: %+v", record)
+		}
 	}
 }

@@ -6,9 +6,12 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"github.com/Praeviso/AgentSSH/internal/audit"
@@ -65,6 +68,7 @@ func newRootCommand() *cobra.Command {
 		newAuditCommand(dir),
 		newApprovalCommand(dir),
 		newPlanCommand(dir),
+		newOperatorCommand(dir),
 	)
 	return root
 }
@@ -79,6 +83,7 @@ func newServeCommand(dir func() (string, error)) *cobra.Command {
 	var runQuotaBytes int64
 	var runRecords int
 	var maxPendingApprovals int
+	var webListen, webCert, webKey, webOrigin string
 	cmd := &cobra.Command{
 		Use:   "serve --public-url <https-base> [--listen 127.0.0.1:8080]",
 		Short: "Run the gateway API.",
@@ -86,6 +91,27 @@ func newServeCommand(dir func() (string, error)) *cobra.Command {
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if _, err := remote.HTTPSBaseURL(publicURL); err != nil {
 				return fmt.Errorf("--public-url: %w", err)
+			}
+			if (webCert == "") != (webKey == "") || webCert != "" && webListen == "" {
+				return errors.New("--web-cert and --web-key go together, with --web-listen")
+			}
+			if webListen != "" && webListen == listen {
+				return errors.New("--web-listen must differ from --listen: the Web UI never shares the device API's listener")
+			}
+			if webOrigin != "" && webListen == "" {
+				return errors.New("--web-origin goes with --web-listen")
+			}
+			// Behind a proxy the request's Host may be the proxy's upstream
+			// address, so the origin browsers use must be given.
+			if webListen != "" && webCert == "" && webOrigin == "" {
+				return errors.New("--web-origin is required without --web-cert: name the HTTPS origin browsers reach the Web UI at through the proxy, such as https://gw.example")
+			}
+			if webOrigin != "" {
+				origin, err := gateway.WebOrigin(webOrigin)
+				if err != nil {
+					return fmt.Errorf("--web-origin: %w", err)
+				}
+				webOrigin = origin
 			}
 			d, err := dir()
 			if err != nil {
@@ -116,7 +142,19 @@ func newServeCommand(dir func() (string, error)) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return program.Serve(cmd.Context(), cmd.OutOrStdout(), listen, publicURL, handler)
+			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
+			defer stop()
+			if webListen != "" {
+				web, err := gateway.NewWebUI(d, store, keys)
+				if err != nil {
+					return err
+				}
+				web.Origin = webOrigin
+				if err := serveWeb(ctx, cmd.OutOrStdout(), webListen, webCert, webKey, web.Handler()); err != nil {
+					return err
+				}
+			}
+			return program.Serve(ctx, cmd.OutOrStdout(), listen, publicURL, handler)
 		},
 	}
 	cmd.Flags().StringVar(&listen, "listen", "127.0.0.1:8080", "private HTTP origin listen address behind the public HTTPS ingress")
@@ -127,6 +165,10 @@ func newServeCommand(dir func() (string, error)) *cobra.Command {
 	cmd.Flags().Int64Var(&runMaxBytes, "run-max-bytes", gateway.DefaultRunMaxBytes, "spooled output kept per run; beyond it the result is marked truncated")
 	cmd.Flags().Int64Var(&runQuotaBytes, "run-quota-bytes", gateway.DefaultRunQuotaBytes, "finished-run output kept per device; the oldest runs are evicted first")
 	cmd.Flags().IntVar(&runRecords, "run-records", gateway.DefaultRunRecords, "run records (any state) kept per device; beyond it new runs and cancels are refused")
+	cmd.Flags().StringVar(&webListen, "web-listen", "", "serve the operator Web UI on this address (its own listener; off when empty)")
+	cmd.Flags().StringVar(&webCert, "web-cert", "", "TLS certificate for the Web UI; without it the Web UI speaks plain HTTP for a TLS-terminating proxy")
+	cmd.Flags().StringVar(&webKey, "web-key", "", "TLS private key for --web-cert")
+	cmd.Flags().StringVar(&webOrigin, "web-origin", "", "HTTPS origin browsers reach the Web UI at, such as https://gw.example; required without --web-cert, otherwise the request's Host")
 	cmd.Flags().IntVar(&maxPendingApprovals, "max-pending-approvals", gateway.DefaultMaxPendingApprovals, "approval requests, and separately plans, one device may have awaiting a decision; beyond it new ones are refused")
 	return cmd
 }

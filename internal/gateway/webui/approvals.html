@@ -1,0 +1,69 @@
+{{define "content"}}
+<h1>{{if .Total}}{{.Total}} waiting for a decision{{else}}Nothing waiting for a decision{{end}}</h1>
+{{if .Notice}}<p class="banner ok" role="status">{{.Notice}}</p>{{end}}
+{{if .Error}}<p class="banner bad" role="alert">{{.Error}}</p>{{end}}
+{{$csrf := .CSRF}}
+{{range .Plans}}
+<section class="card">
+  <header class="card-head">
+    <h2>Plan{{with .Status.Metadata.Title}} · {{.}}{{end}}</h2>
+    <p class="meta">{{.Status.Host}} · {{if .DeviceName}}{{.DeviceName}}{{else}}{{.DeviceID}}{{end}} · session {{.Status.SessionID}} · {{.Status.ID}}</p>
+  </header>
+  {{with .Status.Metadata}}{{if or .Description .Impact .Recovery}}
+  <dl class="facts">
+    {{with .Description}}<dt>Description</dt><dd>{{.}}</dd>{{end}}
+    {{with .Impact}}<dt>Impact</dt><dd>{{.}}</dd>{{end}}
+    {{with .Recovery}}<dt>Recovery</dt><dd>{{.}}</dd>{{end}}
+  </dl>
+  {{end}}{{end}}
+  <ol class="members">
+    {{$plan := .}}
+    {{range .Pending}}
+    <li>
+      <pre class="cmd">{{.Request.Cmd}}</pre>
+      {{if shell .Request.Cmd}}<p class="warn">Uses shell syntax: check what it expands to.</p>{{end}}
+      {{if .Request.StdinSHA256}}<p class="meta">stdin <code>{{.Request.StdinSHA256}}</code> · {{.Request.StdinBytes}} bytes</p>{{end}}
+      <form method="post" action="/approvals/{{.ApprovalID}}" class="row-action">
+        <input type="hidden" name="csrf" value="{{$csrf}}">
+        <input type="hidden" name="device" value="{{$plan.DeviceID}}">
+        <button name="decision" value="deny" class="danger small">Deny this step</button>
+      </form>
+    </li>
+    {{end}}
+  </ol>
+  <form method="post" action="/plans/{{.Status.ID}}" class="actions">
+    <input type="hidden" name="csrf" value="{{$csrf}}">
+    <input type="hidden" name="device" value="{{.DeviceID}}">
+    <span class="label">Approve the {{len .Pending}} remaining</span>
+    <button name="decision" value="once" class="primary">Once</button>
+    <button name="decision" value="session">For the session</button>
+    <button name="decision" value="task">For the task</button>
+    <button name="decision" value="deny" class="danger" data-confirm="Deny every remaining step of this plan?">Deny all</button>
+  </form>
+</section>
+{{end}}
+{{range .Requests}}
+<section class="card">
+  <header class="card-head">
+    <h2>{{.Host}}</h2>
+    <p class="meta">{{if .DeviceName}}{{.DeviceName}}{{else}}{{.DeviceID}}{{end}} · session {{.SessionID}} · {{when .TS}} · {{.ID}}</p>
+  </header>
+  <pre class="cmd">{{.Cmd}}</pre>
+  {{if shell .Cmd}}<p class="warn">Uses shell syntax: check what it expands to.</p>{{end}}
+  <dl class="facts">
+    <dt>Matcher</dt><dd><code>{{.Candidate.Regex}}</code></dd>
+    {{if .StdinSHA256}}<dt>Stdin</dt><dd><code>{{.StdinSHA256}}</code> · {{.StdinBytes}} bytes</dd>{{end}}
+  </dl>
+  <form method="post" action="/approvals/{{.ID}}" class="actions">
+    <input type="hidden" name="csrf" value="{{$csrf}}">
+    <input type="hidden" name="device" value="{{.DeviceID}}">
+    <span class="label">Approve</span>
+    <button name="decision" value="once" class="primary">Once</button>
+    <button name="decision" value="session">For the session</button>
+    {{if offers .ProposedScopes "task"}}<button name="decision" value="task">For the task</button>{{end}}
+    {{if offers .ProposedScopes "host"}}<button name="decision" value="host" data-confirm="Allow this matcher on {{.Host}} permanently? It becomes a rule in the device's policy, pushed as a new configuration version; the policy is rewritten, so its comments and formatting are lost.">On this host</button>{{end}}
+    <button name="decision" value="deny" class="danger">Deny</button>
+  </form>
+</section>
+{{end}}
+{{end}}
