@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha1"
@@ -72,6 +73,7 @@ var (
 	ErrOperatorExists   = errors.New("an operator with this name already exists")
 	ErrOperatorNotFound = errors.New("no such operator")
 	ErrBadCredentials   = errors.New("wrong name, password or code")
+	ErrPasswordsBusy    = errors.New("too many sign-ins at once")
 )
 
 // PasswordParams are the argon2id costs of new operator passwords. Tests
@@ -174,9 +176,22 @@ func RevokeOperator(store *controlplane.Store, name string, now time.Time) error
 	return tx.Commit()
 }
 
+// passwordChecks bounds the argon2id checks running at once. Each holds
+// PasswordParams.MemoryKiB, so sign-ins from any number of clients stay
+// within a fixed memory budget; the failure limits alone bound only how many
+// attempts fail, not how many run together.
+var passwordChecks = make(chan struct{}, 2)
+
 // checkOperatorPassword returns the active operator name and password
-// identify, or ErrBadCredentials.
-func checkOperatorPassword(store *controlplane.Store, name, password string) (Operator, error) {
+// identify, or ErrBadCredentials. It waits for a free password check until
+// ctx ends (ErrPasswordsBusy).
+func checkOperatorPassword(ctx context.Context, store *controlplane.Store, name, password string) (Operator, error) {
+	select {
+	case passwordChecks <- struct{}{}:
+		defer func() { <-passwordChecks }()
+	case <-ctx.Done():
+		return Operator{}, ErrPasswordsBusy
+	}
 	var op Operator
 	var hash string
 	err := store.DB().QueryRow(`SELECT id, name, status, password_hash, totp_secret IS NOT NULL FROM operators WHERE name = ?`, name).

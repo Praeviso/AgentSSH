@@ -275,7 +275,10 @@ field is read; pages send a CSP without inline script, `frame-ancestors 'none'`,
 limited per account (5 in 15 minutes) and per client address (20; behind a
 proxy that is the proxy's), after which sign-in is refused until the window
 passes. An attempt is counted when it starts and taken back if it succeeds, so
-concurrent attempts cannot pass the limit together. The Approvals page lists plans (approve the remaining steps as a whole
+concurrent attempts cannot pass the limit together. At most two password
+checks (argon2id, 64 MiB each) run at once across all clients; a sign-in waits
+up to five seconds for one, then is refused as busy without counting as a
+failure. The Approvals page lists plans (approve the remaining steps as a whole
 after denying single ones) and single requests (once, session, task, host,
 deny), warning about commands that use shell syntax; the Audit page browses the
 chain by device, host and session, newest first, with its verification result.

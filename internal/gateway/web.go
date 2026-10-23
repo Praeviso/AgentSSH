@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"crypto/subtle"
 	"embed"
 	"encoding/base32"
@@ -50,6 +51,10 @@ const (
 	// maxFormBytes bounds a POST body; the largest form is a plan decision.
 	maxFormBytes = 64 << 10
 )
+
+// passwordWait is how long a sign-in waits for a free password check
+// before it is refused as busy.
+var passwordWait = 5 * time.Second
 
 // WebUI serves the operator Web UI: login with password and TOTP, approval
 // decisions, and the audit chain. It runs on its own listener, never on the
@@ -277,7 +282,15 @@ func (w *WebUI) login(rw http.ResponseWriter, r *http.Request) {
 		w.renderLogin(rw, http.StatusTooManyRequests, "Too many failed attempts; wait 15 minutes and try again.")
 		return
 	}
-	op, err := checkOperatorPassword(w.Store, name, r.PostFormValue("password"))
+	ctx, cancel := context.WithTimeout(r.Context(), passwordWait)
+	op, err := checkOperatorPassword(ctx, w.Store, name, r.PostFormValue("password"))
+	cancel()
+	if errors.Is(err, ErrPasswordsBusy) {
+		// The password was never checked, so the attempt is not a failure.
+		succeeded(false)
+		w.renderLogin(rw, http.StatusServiceUnavailable, "The gateway is busy signing others in; try again in a moment.")
+		return
+	}
 	if err != nil {
 		w.renderLogin(rw, http.StatusUnauthorized, "Wrong name or password.")
 		return

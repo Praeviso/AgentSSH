@@ -2,8 +2,15 @@ package gateway
 
 import (
 	"bytes"
+	"context"
 	"errors"
+	"io"
+	"net/http"
+	"net/http/cookiejar"
+	"net/http/httptest"
+	"net/url"
 	"path/filepath"
+	"regexp"
 	"sync"
 	"testing"
 	"time"
@@ -63,7 +70,7 @@ func operatorStore(t *testing.T) (*controlplane.Store, *controlplane.Keys, int64
 	if err := AddOperator(store, "alice", "correct horse battery", time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	op, err := checkOperatorPassword(store, "alice", "correct horse battery")
+	op, err := checkOperatorPassword(context.Background(), store, "alice", "correct horse battery")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,5 +184,94 @@ func TestConcurrentEnrollmentPagesShowOneKey(t *testing.T) {
 				t.Fatalf("round %d: page %d shows a key the session did not keep", round, i)
 			}
 		}
+	}
+}
+
+// takePasswordChecks occupies every password check, as concurrent sign-ins
+// would, and returns a function that frees one; the test's end frees the
+// rest.
+func takePasswordChecks(t *testing.T) (free func()) {
+	t.Helper()
+	held := cap(passwordChecks)
+	for range held {
+		passwordChecks <- struct{}{}
+	}
+	free = func() {
+		if held > 0 {
+			held--
+			<-passwordChecks
+		}
+	}
+	t.Cleanup(func() {
+		for held > 0 {
+			free()
+		}
+	})
+	return free
+}
+
+// At most cap(passwordChecks) argon2id checks run at once; a check waits for
+// a free one only until its context ends.
+func TestPasswordChecksAreBoundedAtOnce(t *testing.T) {
+	store, _, _ := operatorStore(t)
+	free := takePasswordChecks(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := checkOperatorPassword(ctx, store, "alice", "correct horse battery"); !errors.Is(err, ErrPasswordsBusy) {
+		t.Fatalf("check with every slot taken: %v", err)
+	}
+	free()
+	if _, err := checkOperatorPassword(context.Background(), store, "alice", "correct horse battery"); err != nil {
+		t.Fatalf("check with a free slot: %v", err)
+	}
+}
+
+// A sign-in refused as busy never had its password checked, so it does not
+// count against the account: more busy refusals than the failure limit
+// still leave the operator able to sign in.
+func TestBusySignInsAreNotFailures(t *testing.T) {
+	store, keys, _ := operatorStore(t)
+	web, err := NewWebUI(t.TempDir(), store, keys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	site := httptest.NewTLSServer(web.Handler())
+	t.Cleanup(site.Close)
+	client := *site.Client()
+	client.Jar, _ = cookiejar.New(nil)
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	csrf := regexp.MustCompile(`name="csrf" value="([0-9a-f]+)"`)
+	login := func() int {
+		t.Helper()
+		resp, err := client.Get(site.URL + "/login")
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		m := csrf.FindSubmatch(body)
+		if m == nil {
+			t.Fatalf("no CSRF token:\n%.300s", body)
+		}
+		resp, err = client.PostForm(site.URL+"/login", url.Values{"csrf": {string(m[1])}, "name": {"alice"}, "password": {"correct horse battery"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		return resp.StatusCode
+	}
+	defer func(wait time.Duration) { passwordWait = wait }(passwordWait)
+	passwordWait = 20 * time.Millisecond
+	free := takePasswordChecks(t)
+	for i := 0; i <= accountFailures; i++ {
+		if status := login(); status != http.StatusServiceUnavailable {
+			t.Fatalf("busy sign-in %d answered %d", i, status)
+		}
+	}
+	for range cap(passwordChecks) {
+		free()
+	}
+	if status := login(); status != http.StatusSeeOther {
+		t.Fatalf("sign-in once checks were free answered %d", status)
 	}
 }

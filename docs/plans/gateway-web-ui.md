@@ -126,6 +126,14 @@ Web (`internal/gateway/web`):
   - Each test fails under the mutation removing its fix (body parsing,
     `MaxBytesReader`, content-type check, configured origin, the `IS NULL`
     guard).
+- [x] PR review follow-up (review of 41f3788): the failure limits bound how
+  many sign-ins fail, not how many argon2id checks (64 MiB each) run at once,
+  so 20 concurrent logins from one address, or any number from many, could
+  exhaust memory. `passwordChecks` admits two checks at a time across all
+  clients; a sign-in waits up to 5 s, then gets 503 and the attempt is taken
+  back, since its password was never checked. Tests:
+  `TestPasswordChecksAreBoundedAtOnce`, `TestBusySignInsAreNotFailures`; each
+  fails without its guard.
 - [x] Docs: `docs/architecture/remote-control.md`.
 - [x] Final validation.
 
