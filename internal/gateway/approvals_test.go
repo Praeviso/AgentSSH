@@ -105,14 +105,14 @@ func TestOperatorDecisionsAreAuditedPerDevice(t *testing.T) {
 	if err != nil || len(requests) != 1 || requests[0].ID != id || requests[0].DeviceID != f.client.State.DeviceID {
 		t.Fatalf("pending = %+v, %v", requests, err)
 	}
-	if _, _, err := gateway.DecideApproval(f.dir, f.store, id, approval.VerdictApproved, approval.ScopeHost); !errors.Is(err, gateway.ErrHostScope) {
+	if _, _, err := gateway.DecideApproval(f.dir, f.store, "", id, approval.VerdictApproved, approval.ScopeHost); !errors.Is(err, gateway.ErrHostScope) {
 		t.Fatalf("host scope: %v", err)
 	}
-	deviceID, _, err := gateway.DecideApproval(f.dir, f.store, id, approval.VerdictApproved, approval.ScopeOnce)
+	deviceID, _, err := gateway.DecideApproval(f.dir, f.store, "", id, approval.VerdictApproved, approval.ScopeOnce)
 	if err != nil || deviceID != f.client.State.DeviceID {
 		t.Fatalf("decide = %s, %v", deviceID, err)
 	}
-	if _, _, err := gateway.DecideApproval(f.dir, f.store, id, approval.VerdictDenied, ""); !errors.Is(err, approval.ErrAlreadyResolved) {
+	if _, _, err := gateway.DecideApproval(f.dir, f.store, "", id, approval.VerdictDenied, ""); !errors.Is(err, approval.ErrAlreadyResolved) {
 		t.Fatalf("second decision: %v", err)
 	}
 	records, err := audit.NewStore(filepath.Join(f.dir, gateway.FileAudit)).ReadAll()
@@ -158,5 +158,60 @@ func TestPlanReviewTextCannotCarryControlCharacters(t *testing.T) {
 	}
 	if err := submit(approval.PlanReview{Metadata: approval.PlanMetadata{Title: "deploy", Description: "first line\n\tsecond line"}}); err != nil {
 		t.Fatalf("multi-line description: %v", err)
+	}
+}
+
+// Devices mint plan IDs, so a device must not be able to claim another
+// device's: a decision by that ID would then land on its own plan.
+func TestAPlanIDBelongsToOneDevice(t *testing.T) {
+	f, host := execGateway(t)
+	planID, _ := approval.NewPlanID()
+	plan := remote.PlanSubmitRequest{PlanID: planID, Host: "web-1", Session: "s_test",
+		Commands: []remote.PlanSubmitCommand{{ID: "restart", Cmd: "systemctl restart app"}}}
+	if result, err := f.client.SubmitPlan(context.Background(), plan); err != nil || result.Response.PlanID != planID {
+		t.Fatalf("submit = %+v, %v", result, err)
+	}
+	thief := f.enroll(t, "thief")
+	inv := fmt.Sprintf("host_key_policy: accept-new\nhosts:\n  web-1: {addr: 127.0.0.1, port: %d, user: deploy, identity: web}\n", host.port())
+	if _, err := controlplane.PushConfig(f.store, thief.State.DeviceID, inv, testPolicy, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	plan.Commands[0].Cmd = "systemctl stop app"
+	var apiErr *remote.APIError
+	if _, err := thief.SubmitPlan(context.Background(), plan); !errors.As(err, &apiErr) || apiErr.Status != http.StatusConflict {
+		t.Fatalf("another device reused the plan ID: %v", err)
+	}
+	deviceID, results, err := gateway.DecidePlan(f.dir, f.store, "", planID, approval.VerdictApproved, approval.ScopeOnce)
+	if err != nil || deviceID != f.client.State.DeviceID || len(results) != 1 || results[0].Request.Cmd != "systemctl restart app" {
+		t.Fatalf("decision = %s %+v, %v", deviceID, results, err)
+	}
+}
+
+// An ID more than one device holds (for example plans written before IDs were
+// checked) is decided only when the operator names the device.
+func TestAnAmbiguousIDNeedsTheDevice(t *testing.T) {
+	f, _ := execGateway(t)
+	planID, _ := approval.NewPlanID()
+	for _, device := range []string{"dev_a", "dev_b"} {
+		base := filepath.Join(f.dir, "devices", device, "approval")
+		store := approval.PendingStore{PendingDir: filepath.Join(base, "pending"), ResponsesDir: filepath.Join(base, "responses"), PlansDir: filepath.Join(base, "plans")}
+		matcher, _ := approval.Exact("systemctl restart " + device)
+		req, err := store.Create(approval.PendingRequest{ReqID: "r1", SessionID: "s_test", Host: "web-1", Cmd: "systemctl restart " + device, Candidate: matcher, PlanID: planID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.CreatePlan(approval.PlanManifest{ID: planID, SessionID: "s_test", Host: "web-1", MemberIDs: []string{req.ID}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, err := gateway.DecidePlan(f.dir, f.store, "", planID, approval.VerdictApproved, approval.ScopeOnce); !errors.Is(err, gateway.ErrAmbiguousID) {
+		t.Fatalf("ambiguous decision: %v", err)
+	}
+	deviceID, results, err := gateway.DecidePlan(f.dir, f.store, "dev_b", planID, approval.VerdictApproved, approval.ScopeOnce)
+	if err != nil || deviceID != "dev_b" || len(results) != 1 || results[0].Request.Cmd != "systemctl restart dev_b" {
+		t.Fatalf("decision for dev_b = %s %+v, %v", deviceID, results, err)
+	}
+	if _, status, err := gateway.PlanStatus(f.dir, "dev_a", planID); err != nil || status.Status != "pending" {
+		t.Fatalf("dev_a's plan = %+v, %v", status, err)
 	}
 }

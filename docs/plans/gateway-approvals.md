@@ -81,6 +81,14 @@ status, plan submit, preflight — used by the existing commands and wait loops.
   stay allowed in description, impact and recovery, at most 16 KiB each), so a
   device cannot write terminal escapes to the operator's screen.
   Test: `TestPlanReviewTextCannotCarryControlCharacters` (mutation-checked).
+- [x] Commit security review follow-up: devices mint plan IDs, so a device
+  could submit another device's plan ID first and have the operator's
+  decision by ID land on its own plan (the lookup took the first device).
+  `/plans/submit` now refuses a plan ID another device holds (409), and a
+  lookup that more than one device answers is refused (`ErrAmbiguousID`) until
+  `--device` names the device; that covers two submissions racing past the
+  check. Tests: `TestAPlanIDBelongsToOneDevice`,
+  `TestAnAmbiguousIDNeedsTheDevice` (both mutation-checked).
 - [x] Tests: see Validation.
 - [x] Docs: `docs/architecture/remote-control.md` (approvals table, admin
   commands, superseded plans).

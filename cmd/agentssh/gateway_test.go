@@ -407,7 +407,7 @@ func TestGatewayPlanIsApprovedOnceThenRunsStepByStep(t *testing.T) {
 		t.Fatalf("plan status: %+v", status)
 	}
 
-	if _, _, err := gateway.DecidePlan(device.dir, device.store, execution.ApprovalPlanID, approval.VerdictApproved, approval.ScopeSession); err != nil {
+	if _, _, err := gateway.DecidePlan(device.dir, device.store, "", execution.ApprovalPlanID, approval.VerdictApproved, approval.ScopeSession); err != nil {
 		t.Fatal(err)
 	}
 	if got := runIn(t, device.home, "plan", "wait", execution.ApprovalPlanID, "--timeout", "5s"); got.code != exitOK {
@@ -527,7 +527,7 @@ func TestGatewayApprovalWorkflowMatchesLocal(t *testing.T) {
 			if approve {
 				verdict, scope = approval.VerdictApproved, approval.ScopeSession
 			}
-			if _, _, err := gateway.DecideApproval(device.dir, device.store, id, verdict, scope); err != nil {
+			if _, _, err := gateway.DecideApproval(device.dir, device.store, "", id, verdict, scope); err != nil {
 				t.Fatal(err)
 			}
 		},
@@ -577,7 +577,7 @@ func TestGatewaySessionGrantScopeAndDenyPrecedence(t *testing.T) {
 	device.exec.Store(&fakeExecutor{calls: &calls})
 	command := []string{"run", "web-1", "--json", "--", "systemctl", "restart", "nginx"}
 	id := pendingID(t, runIn(t, device.home, command...))
-	if _, _, err := gateway.DecideApproval(device.dir, device.store, id, approval.VerdictApproved, approval.ScopeSession); err != nil {
+	if _, _, err := gateway.DecideApproval(device.dir, device.store, "", id, approval.VerdictApproved, approval.ScopeSession); err != nil {
 		t.Fatal(err)
 	}
 	if got := runIn(t, device.home, command...); got.code != exitOK {
@@ -613,7 +613,7 @@ func TestGatewayRunWaitsForTheGatewaysDecision(t *testing.T) {
 		for {
 			requests, err := gateway.ListApprovals(device.dir)
 			if err == nil && len(requests) == 1 {
-				_, _, _ = gateway.DecideApproval(device.dir, device.store, requests[0].ID, approval.VerdictApproved, approval.ScopeOnce)
+				_, _, _ = gateway.DecideApproval(device.dir, device.store, "", requests[0].ID, approval.VerdictApproved, approval.ScopeOnce)
 				return
 			}
 			time.Sleep(20 * time.Millisecond)

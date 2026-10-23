@@ -138,6 +138,16 @@ func (s *Server) handlePlanSubmit(w http.ResponseWriter, _ *http.Request, device
 		controlplane.WriteError(w, http.StatusBadRequest, remote.CodeUsage, "plan submit targets a single host; submit one plan per host")
 		return
 	}
+	// Plan IDs are the device's; one another device holds is refused, so an
+	// operator's decision by ID cannot be steered onto this device's plan.
+	if taken, err := planIDTaken(s.Dir, device.ID, req.PlanID); err != nil || taken {
+		if err != nil {
+			controlplane.WriteError(w, http.StatusInternalServerError, remote.CodeInternal, "approval store unavailable")
+		} else {
+			controlplane.WriteError(w, http.StatusConflict, remote.CodeUsage, "plan id is already in use; submit again")
+		}
+		return
+	}
 	runtime := approvalRuntime(device.ID, pol.Approval)
 	if !runtime.Enabled {
 		controlplane.WriteError(w, http.StatusBadRequest, remote.CodeUsage, "plan submit requires the async approval channel\n  approvals are disabled in this device's policy on the gateway; ask the gateway's administrator")
@@ -305,46 +315,62 @@ func ListApprovals(dir string) ([]DeviceApproval, error) {
 	return out, nil
 }
 
-// findDevice returns the device whose store holds id, as found reports it.
-func findDevice(dir string, found func(approvalStores) error) (string, error) {
+// ErrAmbiguousID refuses a lookup by an ID that more than one device holds.
+// Devices mint plan IDs, so a device could reuse another's to have a decision
+// meant for that plan land on its own.
+var ErrAmbiguousID = errors.New("more than one device holds this ID; name the device with --device")
+
+// findDevice returns the one device whose store holds an ID, as found reports
+// it; deviceID, when set, limits the search to that device.
+func findDevice(dir, deviceID string, found func(approvalStores) error) (string, error) {
 	ids, err := deviceIDs(dir)
 	if err != nil {
 		return "", err
 	}
-	var last error
+	var match string
+	notFound := approval.ErrPendingNotFound
 	for _, id := range ids {
-		err := found(deviceApprovals(dir, id))
-		if err == nil {
-			return id, nil
+		if deviceID != "" && id != deviceID {
+			continue
 		}
-		last = err
-		if !errors.Is(err, approval.ErrPendingNotFound) && !errors.Is(err, approval.ErrPlanNotFound) {
+		err := found(deviceApprovals(dir, id))
+		switch {
+		case err == nil && match != "":
+			return "", ErrAmbiguousID
+		case err == nil:
+			match = id
+		case errors.Is(err, approval.ErrPendingNotFound), errors.Is(err, approval.ErrPlanNotFound):
+			notFound = err
+		default:
 			return "", err
 		}
 	}
-	if last == nil {
-		return "", approval.ErrPendingNotFound
+	if match == "" {
+		return "", notFound
 	}
-	return "", last
+	// Reread the match: the scan may have overwritten what found recorded.
+	return match, found(deviceApprovals(dir, match))
 }
 
-// ApprovalStatus finds an approval request and reports its device and status.
-func ApprovalStatus(dir, id string) (string, approval.StatusResult, error) {
+// ApprovalStatus finds an approval request, on deviceID when set, and reports
+// its device and status.
+func ApprovalStatus(dir, deviceID, id string) (string, approval.StatusResult, error) {
 	var status approval.StatusResult
-	deviceID, err := findDevice(dir, func(stores approvalStores) (err error) {
+	deviceID, err := findDevice(dir, deviceID, func(stores approvalStores) (err error) {
 		status, err = stores.Pending.Status(id)
 		return err
 	})
 	return deviceID, status, err
 }
 
-// PlanStatus finds a plan and reports its device and status.
-func PlanStatus(dir, id string) (string, approval.PlanStatus, error) {
+// PlanStatus finds a plan, on deviceID when set, and reports its device and
+// status.
+func PlanStatus(dir, deviceID, id string) (string, approval.PlanStatus, error) {
 	if !approval.ValidPlanID(id) {
 		return "", approval.PlanStatus{}, approval.ErrInvalidPlanID
 	}
 	var status approval.PlanStatus
-	deviceID, err := findDevice(dir, func(stores approvalStores) (err error) {
+	deviceID, err := findDevice(dir, deviceID, func(stores approvalStores) (err error) {
 		status, err = stores.Pending.PlanStatus(id)
 		return err
 	})
@@ -352,6 +378,27 @@ func PlanStatus(dir, id string) (string, approval.PlanStatus, error) {
 		err = approval.ErrPlanNotFound
 	}
 	return deviceID, status, err
+}
+
+// planIDTaken reports whether a device other than deviceID holds planID.
+func planIDTaken(dir, deviceID, planID string) (bool, error) {
+	ids, err := deviceIDs(dir)
+	if err != nil {
+		return false, err
+	}
+	for _, id := range ids {
+		if id == deviceID {
+			continue
+		}
+		_, err := deviceApprovals(dir, id).Pending.GetPlan(planID)
+		if err == nil {
+			return true, nil
+		}
+		if !errors.Is(err, approval.ErrPlanNotFound) {
+			return false, err
+		}
+	}
+	return false, nil
 }
 
 // ErrHostScope refuses host-scope grants, which would rewrite a device's
@@ -375,12 +422,13 @@ func decisionOptions(dir string, store *controlplane.Store, deviceID string) app
 	}
 }
 
-// DecideApproval resolves one approval request of whichever device made it.
-func DecideApproval(dir string, store *controlplane.Store, id string, verdict approval.Verdict, scope approval.Scope) (string, approval.ApplyResult, error) {
+// DecideApproval resolves one approval request of the device that made it;
+// deviceID, when set, names that device.
+func DecideApproval(dir string, store *controlplane.Store, deviceID, id string, verdict approval.Verdict, scope approval.Scope) (string, approval.ApplyResult, error) {
 	if verdict == approval.VerdictApproved && scope == approval.ScopeHost {
 		return "", approval.ApplyResult{}, ErrHostScope
 	}
-	deviceID, _, err := ApprovalStatus(dir, id)
+	deviceID, _, err := ApprovalStatus(dir, deviceID, id)
 	if err != nil {
 		return "", approval.ApplyResult{}, err
 	}
@@ -388,9 +436,10 @@ func DecideApproval(dir string, store *controlplane.Store, id string, verdict ap
 	return deviceID, result, err
 }
 
-// DecidePlan resolves every pending member of a plan with one verdict.
-func DecidePlan(dir string, store *controlplane.Store, id string, verdict approval.Verdict, scope approval.Scope) (string, []approval.ApplyResult, error) {
-	deviceID, _, err := PlanStatus(dir, id)
+// DecidePlan resolves every pending member of a plan with one verdict;
+// deviceID, when set, names the plan's device.
+func DecidePlan(dir string, store *controlplane.Store, deviceID, id string, verdict approval.Verdict, scope approval.Scope) (string, []approval.ApplyResult, error) {
+	deviceID, _, err := PlanStatus(dir, deviceID, id)
 	if err != nil {
 		return "", nil, err
 	}

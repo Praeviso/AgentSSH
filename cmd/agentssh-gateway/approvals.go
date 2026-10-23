@@ -60,8 +60,15 @@ func addScopeFlags(cmd *cobra.Command, once, session, task *bool, what string) {
 	cmd.Flags().BoolVar(task, "task", false, "approve "+what+"'s bounded task profile for the session")
 }
 
+// addDeviceFlag lets the operator name the device an ID belongs to; a lookup
+// that more than one device answers is refused without it.
+func addDeviceFlag(cmd *cobra.Command, deviceID *string) {
+	cmd.Flags().StringVar(deviceID, "device", "", "the device the ID belongs to (agentssh-gateway device ls)")
+}
+
 func newApprovalCommand(dir func() (string, error)) *cobra.Command {
 	cmd := &cobra.Command{Use: "approval", Short: "Review and decide devices' approval requests."}
+	var deviceID string
 
 	var jsonOutput bool
 	lsCmd := &cobra.Command{
@@ -106,14 +113,14 @@ func newApprovalCommand(dir func() (string, error)) *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withStore(dir, func(d string, _ *controlplane.Store) error {
-				deviceID, status, err := gateway.ApprovalStatus(d, args[0])
+				owner, status, err := gateway.ApprovalStatus(d, deviceID, args[0])
 				if err != nil {
 					return err
 				}
 				return writeJSON(cmd.OutOrStdout(), struct {
 					DeviceID string `json:"device_id"`
 					approval.StatusResult
-				}{deviceID, status})
+				}{owner, status})
 			})
 		},
 	}
@@ -129,11 +136,11 @@ func newApprovalCommand(dir func() (string, error)) *cobra.Command {
 				return err
 			}
 			return withStore(dir, func(d string, store *controlplane.Store) error {
-				deviceID, _, err := gateway.DecideApproval(d, store, args[0], approval.VerdictApproved, scope)
+				decided, _, err := gateway.DecideApproval(d, store, deviceID, args[0], approval.VerdictApproved, scope)
 				if err != nil {
 					return err
 				}
-				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "approved %s for %s scope=%s\n", args[0], deviceID, scope)
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "approved %s for %s scope=%s\n", args[0], decided, scope)
 				return nil
 			})
 		},
@@ -146,14 +153,17 @@ func newApprovalCommand(dir func() (string, error)) *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withStore(dir, func(d string, store *controlplane.Store) error {
-				deviceID, _, err := gateway.DecideApproval(d, store, args[0], approval.VerdictDenied, "")
+				decided, _, err := gateway.DecideApproval(d, store, deviceID, args[0], approval.VerdictDenied, "")
 				if err != nil {
 					return err
 				}
-				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "denied %s for %s\n", args[0], deviceID)
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "denied %s for %s\n", args[0], decided)
 				return nil
 			})
 		},
+	}
+	for _, sub := range []*cobra.Command{showCmd, grantCmd, denyCmd} {
+		addDeviceFlag(sub, &deviceID)
 	}
 	cmd.AddCommand(lsCmd, showCmd, grantCmd, denyCmd)
 	return cmd
@@ -161,6 +171,7 @@ func newApprovalCommand(dir func() (string, error)) *cobra.Command {
 
 func newPlanCommand(dir func() (string, error)) *cobra.Command {
 	cmd := &cobra.Command{Use: "plan", Short: "Review and decide devices' submitted plans."}
+	var deviceID string
 
 	var jsonOutput bool
 	showCmd := &cobra.Command{
@@ -169,7 +180,7 @@ func newPlanCommand(dir func() (string, error)) *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withStore(dir, func(d string, _ *controlplane.Store) error {
-				deviceID, status, err := gateway.PlanStatus(d, args[0])
+				owner, status, err := gateway.PlanStatus(d, deviceID, args[0])
 				if err != nil {
 					return err
 				}
@@ -177,9 +188,9 @@ func newPlanCommand(dir func() (string, error)) *cobra.Command {
 					return writeJSON(cmd.OutOrStdout(), struct {
 						DeviceID string `json:"device_id"`
 						approval.PlanStatus
-					}{deviceID, status})
+					}{owner, status})
 				}
-				printPlan(cmd.OutOrStdout(), deviceID, status)
+				printPlan(cmd.OutOrStdout(), owner, status)
 				return nil
 			})
 		},
@@ -197,11 +208,11 @@ func newPlanCommand(dir func() (string, error)) *cobra.Command {
 				return err
 			}
 			return withStore(dir, func(d string, store *controlplane.Store) error {
-				deviceID, results, err := gateway.DecidePlan(d, store, args[0], approval.VerdictApproved, scope)
+				decided, results, err := gateway.DecidePlan(d, store, deviceID, args[0], approval.VerdictApproved, scope)
 				if err != nil {
 					return err
 				}
-				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "plan %s for %s: approved scope=%s %d command(s)\n", args[0], deviceID, scope, len(results))
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "plan %s for %s: approved scope=%s %d command(s)\n", args[0], decided, scope, len(results))
 				return nil
 			})
 		},
@@ -214,14 +225,17 @@ func newPlanCommand(dir func() (string, error)) *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withStore(dir, func(d string, store *controlplane.Store) error {
-				deviceID, results, err := gateway.DecidePlan(d, store, args[0], approval.VerdictDenied, "")
+				decided, results, err := gateway.DecidePlan(d, store, deviceID, args[0], approval.VerdictDenied, "")
 				if err != nil {
 					return err
 				}
-				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "plan %s for %s: denied %d command(s)\n", args[0], deviceID, len(results))
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "plan %s for %s: denied %d command(s)\n", args[0], decided, len(results))
 				return nil
 			})
 		},
+	}
+	for _, sub := range []*cobra.Command{showCmd, grantCmd, denyCmd} {
+		addDeviceFlag(sub, &deviceID)
 	}
 	cmd.AddCommand(showCmd, grantCmd, denyCmd)
 	return cmd

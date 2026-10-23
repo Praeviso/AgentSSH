@@ -195,13 +195,19 @@ The gateway's operator decides on the gateway host, from the data directory:
 
 ```sh
 agentssh-gateway approval ls [--json]
-agentssh-gateway approval show <approval-id>
-agentssh-gateway approval grant <approval-id> --once|--session|--task
-agentssh-gateway approval deny <approval-id>
-agentssh-gateway plan show <plan-id> [--json]
-agentssh-gateway plan grant <plan-id> --once|--session|--task
-agentssh-gateway plan deny <plan-id>
+agentssh-gateway approval show <approval-id> [--device <id>]
+agentssh-gateway approval grant <approval-id> --once|--session|--task [--device <id>]
+agentssh-gateway approval deny <approval-id> [--device <id>]
+agentssh-gateway plan show <plan-id> [--json] [--device <id>]
+agentssh-gateway plan grant <plan-id> --once|--session|--task [--device <id>]
+agentssh-gateway plan deny <plan-id> [--device <id>]
 ```
+
+Plan IDs are minted by devices, so the gateway refuses a submitted plan ID that
+another device already holds (`409`), and a decision by an ID that more than
+one device holds (two submissions racing past that check) is refused until
+`--device` names the device. A decision by ID therefore never lands on another
+device's plan.
 
 Grant lifetimes come from the device's policy; each decision is appended to the
 gateway's audit chain with the device's `device_id` and channel `gateway`. Host
