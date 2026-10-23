@@ -199,7 +199,8 @@ run, so output and exit codes match local mode; only remediation hints name the
 gateway's administrator instead of the local files. `plan run` keeps its saved
 execution on the device and sends each step as its own `/exec`, so the gateway
 reauthorizes every step, and a step's stdin file is read only when that step is
-sent. Commands that read or change state the device no longer keeps
+sent. An execution saved before the device enrolled drops any local approval
+plan it waited on, since that plan authorizes nothing on the gateway. Commands that read or change state the device no longer keeps
 (inventory, policy, secret, approval decisions, audit, sessions, TUI) are
 refused with exit 2; `approval status|wait`, `plan submit|status|wait` and
 `--wait-approval` are refused until approvals move to the gateway (#19).

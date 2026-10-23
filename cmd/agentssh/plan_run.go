@@ -441,6 +441,19 @@ func executeSavedPlan(cmd *cobra.Command, cfg *config.Config, run *planExecution
 		}
 		return nil
 	}
+	if cfg.Gateway != nil && run.ApprovalPlanID != "" {
+		// A plan approved or pending on this machine was decided against the
+		// local policy; on a gateway device it authorizes nothing, and the
+		// gateway reauthorizes each remaining step when it is sent.
+		appendApprovalRound(run, run.ApprovalPlanID, "superseded", "this device now runs through a gateway, which reauthorizes each remaining step", 0, 0, 0)
+		run.ApprovalPlanID = ""
+		if run.Status == "pending" || run.Status == "expired" {
+			run.Status = "ready"
+		}
+		if err := saveExecution(path, run); err != nil {
+			return err
+		}
+	}
 	if run.ApprovalPlanID != "" {
 		status, err := approvalStore(cfg.Paths).PlanStatus(run.ApprovalPlanID)
 		if err != nil {

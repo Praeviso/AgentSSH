@@ -480,3 +480,37 @@ func TestRemoteEnrollChecksTheMode(t *testing.T) {
 		t.Fatalf("unknown mode: %+v", got)
 	}
 }
+
+// An execution saved before the device enrolled with a gateway may still wait
+// on a local approval plan. On a gateway device that plan authorizes nothing,
+// so resume sends the remaining steps to the gateway instead of waiting on it.
+func TestGatewayResumeIgnoresALocalApprovalPlan(t *testing.T) {
+	_, device := paritySetup(t)
+	device.exec.Store(&fakeExecutor{stdout: "up\n"})
+	cfg := &config.Config{Paths: config.NewPaths(device.home)}
+	const id = "px_0123456789abcdef01234567"
+	path, err := executionPath(cfg, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	run := planExecution{Version: 1, ID: id, Host: "web-1", SessionID: "s_test", Status: "pending", ApprovalPlanID: "pl_0123456789abcdef01234567",
+		Steps: []planExecutionStep{{ID: "check", Cmd: "uptime", Status: "not_started"}}}
+	if err := saveExecution(path, &run); err != nil {
+		t.Fatal(err)
+	}
+	got := runIn(t, device.home, "plan", "resume", id, "--json")
+	var resumed planExecution
+	if err := json.Unmarshal([]byte(got.stdout), &resumed); err != nil {
+		t.Fatalf("resume: %+v: %v", got, err)
+	}
+	if got.code != exitOK || resumed.Status != "completed" || resumed.ApprovalPlanID != "" || resumed.Steps[0].Status != "completed" {
+		t.Fatalf("resume: %+v\n%+v", got, resumed)
+	}
+	records := device.audit(t)
+	if len(records) != 2 || records[1].Event != audit.EventCompleted || records[1].ExecutionID != id {
+		t.Fatalf("gateway audit: %+v", records)
+	}
+}
