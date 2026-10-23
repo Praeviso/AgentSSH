@@ -747,6 +747,7 @@ func TestOperatorGateIgnoresEnvMasterPassword(t *testing.T) {
 }
 
 func TestOperatorGateCommandWiring(t *testing.T) {
+	t.Setenv("AGENTSSH_HOME", t.TempDir())
 	root := newRootCommand()
 	gated := []string{
 		"inventory add",
@@ -2265,10 +2266,17 @@ func findCommandForTest(t *testing.T, root *cobra.Command, path string) *cobra.C
 	return cmd
 }
 
+// hasOperatorGate reports whether cmd's persistent hook demands an operator.
+// Every command has a hook (the gateway-mode guard), so the gate is told
+// apart by refusing to run without a TTY.
 func hasOperatorGate(cmd *cobra.Command) bool {
+	restore := stdinIsTerminal
+	stdinIsTerminal = func() bool { return false }
+	defer func() { stdinIsTerminal = restore }()
 	for current := cmd; current != nil; current = current.Parent() {
 		if current.PersistentPreRunE != nil {
-			return true
+			err := current.PersistentPreRunE(cmd, nil)
+			return err != nil && strings.Contains(err.Error(), "operator commands require an interactive TTY")
 		}
 	}
 	return false

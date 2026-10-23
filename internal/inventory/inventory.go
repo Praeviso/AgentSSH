@@ -254,3 +254,17 @@ func sortedStrings(values []string) []string {
 	sort.Strings(result)
 	return result
 }
+
+// FromPublic rebuilds an inventory of names and tags only. It resolves
+// targets exactly like the inventory it was published from, without any
+// address or credential.
+func FromPublic(public PublicInventory) Inventory {
+	inv := Inventory{Hosts: map[string]Host{}, Groups: map[string]Group{}}
+	for _, host := range public.Hosts {
+		inv.Hosts[host.Name] = Host{Tags: host.Tags}
+	}
+	for _, group := range public.Groups {
+		inv.Groups[group.Name] = Group{Tags: group.Tags}
+	}
+	return inv
+}

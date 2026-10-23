@@ -41,6 +41,21 @@ func (e UsageError) Error() string {
 	return string(e)
 }
 
+// ErrNoSession refuses a run that declares no session.
+const ErrNoSession = UsageError("a session must be declared for run\n" +
+	"  mint one id per task: agentssh session new\n" +
+	"  then pass --session <id> on every run in the task (or export AGENTSSH_SESSION in a persistent shell)\n" +
+	"  do not mint a new id per command — one session per task keeps the audit trail grouped by task")
+
+// ResolveUsage explains a target that does not resolve.
+func ResolveUsage(err error) UsageError {
+	if inventory.IsUnknown(err) {
+		return usageErrorf("%v\n  list all hosts: agentssh hosts", err)
+	}
+	// e.g. a group whose tags match no hosts.
+	return usageErrorf("%v\n  list hosts and tags with: agentssh hosts", err)
+}
+
 func usageErrorf(format string, args ...any) UsageError {
 	return UsageError(fmt.Sprintf(format, args...))
 }
@@ -325,10 +340,7 @@ func buildPlans(env Env, req Request) ([]plan, error) {
 		sessionCtx, err := resolver.Resolve(target.Name, req.Session, req.SessionLabel)
 		if err != nil {
 			if errors.Is(err, session.ErrNoSession) {
-				return nil, UsageError("a session must be declared for run\n" +
-					"  mint one id per task: agentssh session new\n" +
-					"  then pass --session <id> on every run in the task (or export AGENTSSH_SESSION in a persistent shell)\n" +
-					"  do not mint a new id per command — one session per task keeps the audit trail grouped by task")
+				return nil, ErrNoSession
 			}
 			return nil, fmt.Errorf("resolve session: %w", err)
 		}

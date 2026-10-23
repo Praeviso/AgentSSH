@@ -87,7 +87,13 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, device contr
 	}
 	resolved, err := inventory.NewResolver(inv).Resolve(req.Host)
 	if err != nil {
-		controlplane.WriteError(w, http.StatusBadRequest, remote.CodeUsage, fmt.Sprintf("%v\n  list all hosts: agentssh hosts", err))
+		controlplane.WriteError(w, http.StatusBadRequest, remote.CodeUsage, runner.ResolveUsage(err).Error())
+		return
+	}
+	// Checked after the target, in the CLI's order. The runner would fall
+	// back to the gateway's own AGENTSSH_SESSION, which is never the device's.
+	if req.Session == "" {
+		controlplane.WriteError(w, http.StatusBadRequest, remote.CodeUsage, runner.ErrNoSession.Error())
 		return
 	}
 	// Cap output so each target's response fits one frame; the cap applies in
@@ -121,7 +127,18 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, device contr
 	if id == "" {
 		id = remote.NewRunID()
 	}
-	rn, err := s.startRun(device.ID, id, requestSHA256, len(resolved.Targets), cancel)
+	// A single-host run's request ID is minted now, so the run frame can name
+	// it before any output streams.
+	reqID := ""
+	if resolved.Kind == inventory.TargetKindHost {
+		if reqID, err = audit.NewReqID(); err != nil {
+			cancel()
+			s.release(device.ID)
+			controlplane.WriteError(w, http.StatusInternalServerError, remote.CodeInternal, "request id unavailable")
+			return
+		}
+	}
+	rn, err := s.startRun(device.ID, id, requestSHA256, reqID, len(resolved.Targets), cancel)
 	if err != nil {
 		cancel()
 		s.release(device.ID)
@@ -155,6 +172,9 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, device contr
 		Audit:    deviceAudit{log: audit.NewStore(filepath.Join(s.Dir, FileAudit)), deviceID: device.ID},
 		Executor: exec,
 		Output:   filter,
+	}
+	if reqID != "" {
+		env.NewReqID = func() (string, error) { return reqID, nil }
 	}
 	request := runner.Request{
 		Target:       resolved,
@@ -205,7 +225,7 @@ func (s *Server) execute(ctx context.Context, rn *run, env runner.Env, request r
 	for _, response := range outcome.Responses {
 		rn.response(response)
 	}
-	final := remote.ExecFinal{ExitCode: outcome.ExitCode, Truncated: rn.isTruncated()}
+	final := remote.ExecFinal{ExitCode: outcome.ExitCode, Truncated: rn.isTruncated(), TargetKind: string(request.Target.Kind)}
 	if final.Truncated {
 		// A partial result must never pass for a complete one.
 		final.ExitCode = runner.MergeExitCode(final.ExitCode, runner.ExitRemoteFailed)
@@ -244,8 +264,6 @@ func validateExec(req remote.ExecRequest) error {
 		return errors.New("a target host or group is required")
 	case strings.TrimSpace(req.Cmd) == "":
 		return errors.New("a command is required")
-	case req.Session == "":
-		return errors.New("a session must be declared for run\n  mint one id per task: agentssh session new, then pass --session <id> on every run in the task")
 	case len(req.Session) > remote.MaxExecFieldBytes || strings.IndexFunc(req.Session, unicode.IsControl) >= 0:
 		return fmt.Errorf("session id must be at most %d bytes without control characters", remote.MaxExecFieldBytes)
 	case len(req.Stdin) > remote.MaxExecStdinBytes:
@@ -291,6 +309,9 @@ func approvalRuntime(deviceID string, cfg policy.Approval) approval.RuntimeConfi
 // passwords or ssh_config, and no connection reuse, so disabling an identity
 // takes effect on the next connection.
 func (s *Server) executor(inv inventory.Inventory) executor.Executor {
+	if s.Executor != nil {
+		return s.Executor(inv)
+	}
 	return executor.NewNativeExecutor(executor.NativeOptions{
 		ConfigPath:             filepath.Join(s.Dir, "ssh_config"),
 		KnownHostsPath:         filepath.Join(s.Dir, FileKnownHosts),
@@ -399,7 +420,13 @@ type logObserver struct {
 func (logObserver) Denied(string, string, policy.Decision)          {}
 func (logObserver) ApprovalPending(string, approval.PendingRequest) {}
 func (logObserver) NotRun(string)                                   {}
-func (logObserver) Finished(string, executor.Result, output.FilterResult, bool) {
+
+// Finished logs SSH failures: the device only learns that the connection
+// failed, and the cause stays with the gateway's administrator.
+func (o logObserver) Finished(host string, result executor.Result, _ output.FilterResult, _ bool) {
+	if runner.IsSSHErrorResult(result) {
+		log.Printf("agentssh-gateway: device %s: host %s: ssh: %v", o.deviceID, host, result.Err)
+	}
 }
 func (o logObserver) Warning(message string) {
 	log.Printf("agentssh-gateway: device %s: %s", o.deviceID, message)

@@ -16,8 +16,10 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/Praeviso/AgentSSH/internal/inventory"
 	"github.com/Praeviso/AgentSSH/internal/managedmode"
 	"github.com/Praeviso/AgentSSH/internal/remote"
+	"github.com/Praeviso/AgentSSH/internal/runner"
 	"gopkg.in/yaml.v3"
 )
 
@@ -35,6 +37,36 @@ type State struct {
 	DeviceID        string    `yaml:"device_id"`
 	BundlePublicKey string    `yaml:"bundle_public_key"`
 	EnrolledAt      time.Time `yaml:"enrolled_at"`
+	// Mode is the control plane's mode, checked on every response. Records
+	// written before modes existed have none and are managed.
+	Mode string `yaml:"mode,omitempty"`
+}
+
+// Gateway reports whether the device forwards commands to a gateway rather
+// than running them itself under a managed configuration.
+func (s State) Gateway() bool { return s.Mode == remote.ModeGateway }
+
+// LoadMode returns the mode home is enrolled in, or "" when it is not
+// enrolled.
+func LoadMode(home string) (string, error) {
+	if !managedmode.Enrolled(home) {
+		return "", nil
+	}
+	state, err := LoadState(home)
+	if err != nil {
+		return "", err
+	}
+	return state.Mode, nil
+}
+
+// ModeMismatchError reports a control plane whose mode is not the one the
+// device enrolled for (or asked to enroll for).
+type ModeMismatchError struct {
+	Want, Got string
+}
+
+func (e *ModeMismatchError) Error() string {
+	return fmt.Sprintf("the control plane runs in %s mode, not %s mode", e.Got, e.Want)
 }
 
 // UnreachableError distinguishes transport failures from protocol refusals.
@@ -64,6 +96,13 @@ func LoadState(home string) (State, error) {
 	}
 	if _, err := remote.DecodePublicKey(state.BundlePublicKey); err != nil {
 		return State{}, invalidEnrollment(err)
+	}
+	switch state.Mode {
+	case "":
+		state.Mode = remote.ModeManaged
+	case remote.ModeManaged, remote.ModeGateway:
+	default:
+		return State{}, invalidEnrollment(fmt.Errorf("unknown mode %q", state.Mode))
 	}
 	return state, nil
 }
@@ -103,7 +142,7 @@ func NewClient(home string) (*Client, error) {
 	if !ok {
 		return nil, errors.New("HTTPS device key must be Ed25519")
 	}
-	client := signedHTTPClient(key, state.DeviceID, remote.DeviceSignatureTag)
+	client := signedHTTPClient(key, state.DeviceID, remote.DeviceSignatureTag, state.Mode)
 	stream := *client
 	stream.Timeout = 0
 	return &Client{State: state, http: client, stream: &stream}, nil
@@ -120,6 +159,22 @@ func (c *Client) Status(ctx context.Context) (remote.StatusResponse, error) {
 func (c *Client) FetchBundle(ctx context.Context) (remote.BundleResponse, error) {
 	var out remote.BundleResponse
 	err := c.call(ctx, http.MethodGet, remote.PathBundle, nil, &out)
+	return out, err
+}
+
+// Hosts lists the hosts and groups a gateway runs commands on for this
+// device.
+func (c *Client) Hosts(ctx context.Context) (inventory.PublicInventory, error) {
+	var out inventory.PublicInventory
+	err := c.call(ctx, http.MethodGet, remote.PathHosts, nil, &out)
+	return out, err
+}
+
+// RequestStatus reads a gateway's audit status of one of this device's
+// requests.
+func (c *Client) RequestStatus(ctx context.Context, reqID string) (runner.Response, error) {
+	var out runner.Response
+	err := c.call(ctx, http.MethodPost, remote.PathRequestStatus, remote.RequestStatusRequest{ReqID: reqID}, &out)
 	return out, err
 }
 
@@ -144,10 +199,17 @@ const cancelTimeout = 5 * time.Second
 // than starting it twice. Cancelling ctx sends an explicit cancel, which ends
 // the remote command, and returns the context's error.
 func (c *Client) Exec(ctx context.Context, req remote.ExecRequest, stdout, stderr io.Writer) (remote.ExecResult, error) {
+	return c.ExecNotify(ctx, req, nil, stdout, stderr)
+}
+
+// ExecNotify is Exec that also calls onRun with each run frame, before the
+// output that follows it, so a caller can attribute streamed output to the
+// run's request ID.
+func (c *Client) ExecNotify(ctx context.Context, req remote.ExecRequest, onRun func(remote.ExecRun), stdout, stderr io.Writer) (remote.ExecResult, error) {
 	if req.RunID == "" {
 		req.RunID = remote.NewRunID()
 	}
-	stream := remote.ExecStream{RunID: req.RunID}
+	stream := remote.ExecStream{RunID: req.RunID, OnRun: onRun}
 	start := func() (remote.ExecResult, error) {
 		return c.openStream(ctx, remote.PathExec, req, &stream, stdout, stderr)
 	}
@@ -234,11 +296,7 @@ func (c *Client) openStream(ctx context.Context, path string, body any, stream *
 	httpReq.Header.Set("Content-Type", "application/json")
 	resp, err := c.stream.Do(httpReq)
 	if err != nil {
-		var apiErr *remote.APIError
-		if errors.As(err, &apiErr) {
-			return remote.ExecResult{}, apiErr
-		}
-		return remote.ExecResult{}, &UnreachableError{Err: err}
+		return remote.ExecResult{}, transportError(err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode/100 != 2 {
@@ -278,11 +336,7 @@ func doJSON(ctx context.Context, client *http.Client, method string, endpoint st
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		var apiErr *remote.APIError
-		if errors.As(err, &apiErr) {
-			return apiErr
-		}
-		return &UnreachableError{Err: err}
+		return transportError(err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	data, err := io.ReadAll(io.LimitReader(resp.Body, (16<<20)+1))
@@ -304,6 +358,21 @@ func doJSON(ctx context.Context, client *http.Client, method string, endpoint st
 	return nil
 }
 
+// transportError classifies a failed round trip. Refusals the transport
+// raises itself (a redirect, a control plane of another mode) are not network
+// failures, so they never permit falling back to cached state.
+func transportError(err error) error {
+	var apiErr *remote.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr
+	}
+	var mismatch *ModeMismatchError
+	if errors.As(err, &mismatch) {
+		return mismatch
+	}
+	return &UnreachableError{Err: err}
+}
+
 // statusError classifies a non-2xx response body.
 func statusError(status int, data []byte) error {
 	var apiErr remote.ErrorResponse
@@ -311,8 +380,7 @@ func statusError(status int, data []byte) error {
 		// An ingress cannot report device standing when its backend is
 		// unavailable. Keep actual protocol refusals distinct from gateway
 		// failures so only the latter permit an unexpired cached bundle.
-		switch status {
-		case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		if ingressFailure(status) {
 			return &UnreachableError{Err: fmt.Errorf("HTTPS ingress returned HTTP %d", status)}
 		}
 		return &remote.APIError{Status: status, Code: remote.CodeInternal, Message: fmt.Sprintf("HTTP %d", status)}

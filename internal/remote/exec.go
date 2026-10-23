@@ -21,7 +21,21 @@ const (
 	PathExecAttach = "/exec/attach"
 	// PathExecCancel stops a run. Dropping a connection does not.
 	PathExecCancel = "/exec/cancel"
+	// PathHosts lists the device's hosts and groups, as `agentssh hosts`
+	// prints them (inventory.PublicInventory).
+	PathHosts = "/hosts"
+	// PathRequestStatus reports the device's latest audit record for one
+	// request, as `agentssh status --json` prints it (runner.Response).
+	PathRequestStatus = "/requests/status"
 )
+
+// RequestStatusRequest names one request of the calling device.
+type RequestStatusRequest struct {
+	ReqID string `json:"req_id"`
+}
+
+// CodeRequestNotFound refuses a request ID the device's audit does not hold.
+const CodeRequestNotFound = "request_not_found"
 
 // Execution request limits. Every field lands in the audit chain, whose reader
 // caps one record at 8 MiB; these keep a record far below that even when JSON
@@ -69,22 +83,28 @@ type ExecRequest struct {
 // run's spool cap dropped output, so the result is incomplete; the exit code is
 // then at least 1.
 type ExecResult struct {
-	RunID     string            `json:"run_id"`
-	ExitCode  int               `json:"exit_code"`
-	Truncated bool              `json:"truncated,omitempty"`
-	Responses []runner.Response `json:"responses"`
+	RunID     string `json:"run_id"`
+	ExitCode  int    `json:"exit_code"`
+	Truncated bool   `json:"truncated,omitempty"`
+	// TargetKind is "host" or "group": `run --json` prints one object for a
+	// host and an array for a group.
+	TargetKind string            `json:"target_kind,omitempty"`
+	Responses  []runner.Response `json:"responses"`
 }
 
 // ExecFinal is the payload of a result frame.
 type ExecFinal struct {
-	ExitCode  int  `json:"exit_code"`
-	Truncated bool `json:"truncated,omitempty"`
+	ExitCode   int    `json:"exit_code"`
+	Truncated  bool   `json:"truncated,omitempty"`
+	TargetKind string `json:"target_kind,omitempty"`
 }
 
 // ExecRun is the payload of the run frame that starts every /exec and
-// /exec/attach response.
+// /exec/attach response. ReqID is the request ID of a single-host run, known
+// before its output so streamed output can be attributed to it.
 type ExecRun struct {
 	RunID string `json:"run_id"`
+	ReqID string `json:"req_id,omitempty"`
 }
 
 // ExecAttachRequest resumes streaming a run. Offset is ExecStream.Offset: the
@@ -250,10 +270,15 @@ func FrameSize(payload int) int64 {
 // collected before a break are kept.
 type ExecStream struct {
 	RunID string
+	// ReqID is the run frame's request ID of a single-host run.
+	ReqID string
 	// Started is set once a run frame arrived: the gateway has the run, so
 	// the stream is resumed with /exec/attach rather than a repeated /exec.
-	Started   bool
-	Offset    int64
+	Started bool
+	Offset  int64
+	// OnRun, when set, is called with each run frame before the output that
+	// follows it.
+	OnRun     func(ExecRun)
 	responses []runner.Response
 }
 
@@ -273,7 +298,10 @@ func (s *ExecStream) Read(r io.Reader, stdout, stderr io.Writer) (ExecResult, er
 	if s.RunID != "" && s.RunID != run.RunID {
 		return ExecResult{}, fmt.Errorf("reattached to run %s instead of %s", run.RunID, s.RunID)
 	}
-	s.RunID, s.Started = run.RunID, true
+	s.RunID, s.ReqID, s.Started = run.RunID, run.ReqID, true
+	if s.OnRun != nil {
+		s.OnRun(run)
+	}
 	for {
 		kind, payload, err := ReadFrame(r)
 		if err != nil {
@@ -316,7 +344,7 @@ func (s *ExecStream) Read(r io.Reader, stdout, stderr io.Writer) (ExecResult, er
 			if err := json.Unmarshal(payload, &final); err != nil {
 				return ExecResult{}, fmt.Errorf("malformed execution result: %w", err)
 			}
-			return ExecResult{RunID: s.RunID, ExitCode: final.ExitCode, Truncated: final.Truncated, Responses: s.responses}, nil
+			return ExecResult{RunID: s.RunID, ExitCode: final.ExitCode, Truncated: final.Truncated, TargetKind: final.TargetKind, Responses: s.responses}, nil
 		default:
 			return ExecResult{}, errors.New("unexpected run frame inside an execution stream")
 		}

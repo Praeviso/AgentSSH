@@ -39,6 +39,15 @@ Append these literal endpoint paths:
 | GET | `/bundle` | Device proof; signed configuration bundle |
 | POST | `/sign` | Device proof; SSH authentication signature and signing-log ID |
 
+Every response, including a refusal of an unauthenticated request, carries
+`AgentSSH-Mode: managed` or `AgentSSH-Mode: gateway`; a response without it is
+from a managed control plane that predates the header (or, for 502/503/504, an
+ingress whose backend is down). A device is enrolled for one mode, stored as
+`mode` in `remote.yaml` (a record without it is managed), and its client checks
+the header on every response: a control plane of another mode fails the request
+closed and is never mistaken for an unreachable one, so no cached configuration
+is used in its place.
+
 Queries and redirects are refused. A terminating deployment configures the
 verifier with its external HTTPS base; never derive the signature target from
 client-supplied forwarding headers. The reference server mounts the full prefix,
@@ -71,7 +80,8 @@ the public age recipient. The public HTTPS ingress owns transport certificates.
 
 `agentssh-gateway` shares this enrollment, request-signature, revocation, identity
 and configuration machinery (`internal/controlplane`), but from the table above
-registers only `/enroll` and `/status` (mode `gateway`), plus its own `/exec`:
+registers only `/enroll` and `/status` (mode `gateway`), plus its own device
+endpoints, `/exec` and those below:
 `/bundle` and `/sign` return 404, and the binary does not link
 `internal/remoteserver`. Its database is `gateway.db`, so a managed binary pointed
 at a gateway directory has no devices or identities to sign for.
@@ -165,9 +175,34 @@ ingresses must stream responses (the gateway sends `X-Accel-Buffering: no`).
 
 Every run is recorded in one hash chain per gateway, `audit.jsonl`, with
 `device_id` on each record (`agentssh-gateway audit verify`). Pending approval
-requests live under `devices/<id>/approval/`; operator decisions, the client
-side and the full design follow in #17, #19, #20 and
-`docs/architecture/gateway-mode.md`.
+requests live under `devices/<id>/approval/`; operator decisions and the full
+design follow in #19, #20 and `docs/architecture/gateway-mode.md`.
+
+The other device endpoints answer what a local CLI reads from its own files:
+`GET /hosts` returns the device's hosts and groups as `agentssh hosts --json`
+prints them, and `POST /requests/status {req_id}` the device's latest audit
+record for that request as `agentssh status --json` prints it (another
+device's request is `404 request_not_found`). A single-host run's request ID
+is minted before it starts and sent in its run frame (`{run_id, req_id}`), so
+output streamed into plan events carries it; the result frame's `target_kind`
+(`host` or `group`) decides whether `run --json` prints an object or an array.
+Transport failures reach the device only as `ssh_error`; their cause is in the
+gateway's log.
+
+**Gateway devices.** `agentssh remote enroll <url> --token <t> --mode gateway`
+(the default is `managed`) enrolls a device for a gateway. In gateway mode
+`hosts`, `run`, `status` and `plan run|resume` go through these endpoints: the
+gateway resolves, authorizes, runs and audits every command, and the device's
+local `inventory.yaml`, `policy.yaml`, approvals and audit are ignored. The CLI
+renders the gateway's per-target responses with the same printers as a local
+run, so output and exit codes match local mode; only remediation hints name the
+gateway's administrator instead of the local files. `plan run` keeps its saved
+execution on the device and sends each step as its own `/exec`, so the gateway
+reauthorizes every step, and a step's stdin file is read only when that step is
+sent. Commands that read or change state the device no longer keeps
+(inventory, policy, secret, approval decisions, audit, sessions, TUI) are
+refused with exit 2; `approval status|wait`, `plan submit|status|wait` and
+`--wait-approval` are refused until approvals move to the gateway (#19).
 
 ## Enrollment
 
@@ -183,7 +218,9 @@ agentssh-enroll.<id>.<secret>.<bundle_fingerprint>.<encoded_base>
 - `encoded_base`: unpadded base64url of the UTF-8 canonical public HTTPS base.
 
 The supplied enrollment URL must match the token before sending anything. The
-client generates an Ed25519 key and sends JSON:
+client first sends an unsigned `GET /status`: its 401 still names the control
+plane's mode, so enrolling for the wrong mode is refused before the token is
+spent. It then generates an Ed25519 key and sends JSON:
 
 ```json
 {"token_id":"et_...","token_secret":"...","public_key":"<standard padded base64 raw Ed25519 public key>"}
@@ -200,7 +237,7 @@ key. Tokens are single-use and expire after 10 minutes by default. Return:
 
 The client checks the returned bundle-key fingerprint, then writes `device.key`
 (PKCS#8 PEM, 0600) and `remote.yaml` (0600). The enrollment marker commits last and
-has exactly `server_url`, `device_id`, `bundle_public_key`, `enrolled_at`. Failed
+has exactly `server_url`, `device_id`, `bundle_public_key`, `enrolled_at`, `mode`. Failed
 pin validation never activates remote mode. If a response or local write is lost,
 issue a fresh token instead of automatically reusing a consumed one.
 

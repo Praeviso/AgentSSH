@@ -131,7 +131,7 @@ func (f *fixture) enroll(t *testing.T, name string) *remoteclient.Client {
 		t.Fatal(err)
 	}
 	home := t.TempDir()
-	if _, err := remoteclient.Enroll(context.Background(), home, f.base, token.String(), time.Now()); err != nil {
+	if _, err := remoteclient.Enroll(context.Background(), home, f.base, token.String(), remote.ModeGateway, time.Now()); err != nil {
 		t.Fatalf("enroll: %v", err)
 	}
 	client, err := remoteclient.NewClient(home)
@@ -168,5 +168,76 @@ func TestSigningAndBundleEndpointsDoNotExist(t *testing.T) {
 		if !errors.As(err, &apiErr) || apiErr.Status != http.StatusNotFound {
 			t.Errorf("%s: %v, want HTTP 404", name, err)
 		}
+	}
+}
+
+// A device that expects a managed control plane is refused before /enroll,
+// so its token still enrolls the device in gateway mode.
+func TestManagedEnrollmentIsRefusedBeforeSpendingTheToken(t *testing.T) {
+	f := enrolledGateway(t)
+	pub, err := controlplane.LoadBundlePublicKey(f.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := f.store.CreateEnrollToken("laptop", f.base, remote.PublicKeyFingerprint(pub), time.Minute, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	_, err = remoteclient.Enroll(context.Background(), home, f.base, token.String(), remote.ModeManaged, time.Now())
+	var mismatch *remoteclient.ModeMismatchError
+	if !errors.As(err, &mismatch) || mismatch.Got != remote.ModeGateway {
+		t.Fatalf("managed enrollment against a gateway: %v", err)
+	}
+	if _, err := remoteclient.Enroll(context.Background(), home, f.base, token.String(), remote.ModeGateway, time.Now()); err != nil {
+		t.Fatalf("the refused enrollment spent the token: %v", err)
+	}
+}
+
+// A gateway answers the device's hosts from its pushed inventory, and request
+// status only from that device's own audit.
+func TestHostsAndRequestStatusAreTheDevicesOwn(t *testing.T) {
+	f, _ := execGateway(t)
+	hosts, err := f.client.Hosts(context.Background())
+	if err != nil || len(hosts.Hosts) != 1 || hosts.Hosts[0].Name != "web-1" {
+		t.Fatalf("hosts = %+v, %v", hosts, err)
+	}
+	result, err := f.client.Exec(context.Background(), execReq("uptime"), io.Discard, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reqID := result.Responses[0].ReqID
+	status, err := f.client.RequestStatus(context.Background(), reqID)
+	if err != nil || status.ReqID != reqID || status.Status != "completed" || status.Host != "web-1" {
+		t.Fatalf("status = %+v, %v", status, err)
+	}
+	other := f.enroll(t, "other-vm")
+	_, err = other.RequestStatus(context.Background(), reqID)
+	var apiErr *remote.APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != remote.CodeRequestNotFound {
+		t.Fatalf("another device read the request: %v", err)
+	}
+	if _, err := other.Hosts(context.Background()); !errors.As(err, &apiErr) || apiErr.Code != remote.CodeNoConfig {
+		t.Fatalf("hosts without a configuration: %v", err)
+	}
+}
+
+// A single-host run names its request before its output, on /exec and on
+// every reattach, and says it ran on a host.
+func TestRunFrameNamesTheRequestBeforeOutput(t *testing.T) {
+	f, _ := execGateway(t)
+	var seen []string
+	req := execReq("uptime")
+	req.Stream = true
+	result, err := f.client.ExecNotify(context.Background(), req, func(run remote.ExecRun) { seen = append(seen, run.ReqID) }, io.Discard, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(seen) != 1 || seen[0] == "" || seen[0] != result.Responses[0].ReqID || result.TargetKind != "host" {
+		t.Fatalf("run frames named %v; result %+v", seen, result)
+	}
+	replayed, err := f.client.Attach(context.Background(), result.RunID, io.Discard, io.Discard)
+	if err != nil || replayed.TargetKind != "host" || replayed.Responses[0].ReqID != seen[0] {
+		t.Fatalf("replay = %+v, %v", replayed, err)
 	}
 }

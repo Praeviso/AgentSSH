@@ -573,7 +573,9 @@ func refreshExecutionDerivedStatus(cfg *config.Config, run *planExecution, live 
 	switch run.Status {
 	case "pending":
 		run.NextAction = &executionNextAction{Argv: []string{"agentssh", "plan", "execution", run.ID, "--follow", "--timeout", "30s"}, Reason: "approval is still pending; follow observes without executing"}
-		if run.ApprovalPlanID != "" {
+		if cfg.Gateway != nil {
+			run.NextAction = &executionNextAction{Argv: []string{"agentssh", "plan", "resume", run.ID, "--json"}, Reason: "a step is waiting for approval on the gateway; resume after the operator decides"}
+		} else if run.ApprovalPlanID != "" {
 			run.NextAction = &executionNextAction{Argv: []string{"agentssh", "plan", "wait", run.ApprovalPlanID, "--timeout", "30s", "--json"}, Reason: "approval is still pending; wait for the existing plan decision"}
 			if status, err := approvalStore(cfg.Paths).PlanStatus(run.ApprovalPlanID); err == nil {
 				switch status.Status {
