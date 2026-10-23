@@ -7,7 +7,7 @@ Two principals, one binary:
 - **You (the operator)** drive everything from one full-screen console — `agentssh tui` — to onboard hosts, register credentials, test connectivity, tune policy, and review the audit trail.
 - **The agent** uses `agentssh hosts`, `run`, `plan run/resume`, and read-only status commands. It never sees addresses, keys, or passwords — those stay in your ssh-agent, `~/.ssh/`, and an encrypted local store.
 
-AgentSSH uses standard SSH from the local machine (its built-in Go SSH client by default) and needs no agent or daemon on remote hosts.
+AgentSSH uses standard SSH from the local machine (its built-in Go SSH client by default) and needs no agent or daemon on remote hosts. Two optional control planes move credentials, and in gateway mode all enforcement, off the agent's machine; see [Choose a mode](#choose-a-mode).
 
 ## Quick Start
 
@@ -45,6 +45,53 @@ agentssh tui            # Hosts tab for inventory · Policy tab for global/group
 ```
 
 That is the whole loop: you own hosts, policy, and the audit trail through `agentssh tui`; the agent only ever calls `agentssh`.
+
+## Choose a mode
+
+The Quick Start is **local** mode. Two control planes, each its own binary,
+take over parts of it. A control plane runs in one mode only, and a device
+enrolls for that mode.
+
+| | Local | Managed | Gateway |
+| --- | --- | --- | --- |
+| Control plane | none | `agentssh-server` | `agentssh-gateway` |
+| Inventory and policy | files on the device | signed bundle from the control plane; local deny rules still apply | on the gateway only; local files are ignored |
+| SSH private keys | your ssh-agent, `~/.ssh`, `secrets.enc` | control plane, which signs each login | gateway, never sent anywhere |
+| Connects to target hosts | the device | the device, with a login signature from the control plane | the gateway |
+| Enforces policy, approvals and output filtering | the CLI on the device | the CLI on the device | the gateway |
+| Approvals are decided | operator TUI or CLI on the device | operator TUI or CLI on the device | `agentssh-gateway` CLI or its Web UI |
+| Audit | hash chain on the device | the device's chain, plus the control plane's signing log | the gateway's chain, covering every run and decision |
+
+**What each mode protects against, and what it does not:**
+
+- **Local.** The agent goes through the CLI: deny rules hold even with no one
+  watching, credentials never appear in what the agent reads, and every
+  request is audited. The CLI is the boundary only for an agent that uses it.
+  A process running as the same OS user can read your keys, run `ssh`
+  directly, and edit policy, approvals and the audit files.
+- **Managed.** SSH private keys stay on the control plane, configuration is
+  central, and revoking a device stops its next login. Policy, approvals and
+  audit are still enforced by the client. A same-user process can read
+  `device.key`, request login signatures directly, and run any command the
+  identity's login user can, on any host it is assigned. Use it for machines
+  you trust that run agents you supervise.
+- **Gateway.** The device holds no SSH keys and no policy. It can only ask the
+  gateway to run commands, and the gateway authorizes, runs and audits each
+  one. A same-user process with the device key, or a modified client, can
+  still run what that device's gateway policy allows, until the device is
+  revoked. It cannot get login signatures, reach target hosts with the
+  gateway's identities, decide its own approvals, or alter the audit. The
+  gateway must be able to reach every target host, and it is the single point
+  of execution: if it is down, no commands run, and if it is compromised, every
+  target host trusting its identities is exposed. Choose it for cloud-hosted
+  or unattended agents, and for any agent machine you do not trust.
+
+The agent's commands (`hosts`, `run`, `status`, `plan`, `approval wait`) and
+their exit codes (0, 6 denied, 7 approval required, 9 SSH error) are the same
+in every mode. Set up [managed](#managed-mode-agentssh-server) or
+[gateway](#gateway-mode-agentssh-gateway) mode below; `agentssh remote enroll
+--mode` must name the control plane's mode, and a mismatch is refused before
+the token is spent.
 
 ## Task approvals and executable plans
 
@@ -200,7 +247,7 @@ curl -fsSL https://github.com/Praeviso/AgentSSH/releases/download/v0.14.0/agents
 
 Verify: `agentssh --version`. (Bump `v0.14.0` for a different release; checksums are in `SHA256SUMS.txt` on the Releases page.)
 
-Each archive also contains `agentssh-server`, the optional control plane (see [Remote control](#remote-control-optional)). To install it, replace the trailing `/agentssh` in the command with `/agentssh-server`.
+Each archive also contains the optional control planes, `agentssh-server` (managed mode) and `agentssh-gateway` (gateway mode, in releases after v0.14.0); see [Choose a mode](#choose-a-mode). To install one, replace the trailing `/agentssh` in the command with `/agentssh-server` or `/agentssh-gateway`.
 
 ### From source (needs Go matching the go.mod directive)
 
@@ -290,7 +337,7 @@ agentssh secret rm web-1
 
 > Security note: with `AGENTSSH_MASTER_PASSWORD` in an unattended agent's environment, that process can decrypt every stored password. Prefer key auth for agent-driven hosts; reserve passwords for hosts that truly need them.
 
-### Remote control (optional)
+## Managed mode (`agentssh-server`)
 
 A hosted control plane can manage AgentSSH devices, hold SSH identities and sign
 each login on demand. Clients authenticate over HTTPS using Ed25519 device request
@@ -312,7 +359,7 @@ agentssh-server serve --public-url https://cp.example/agentssh
 # Per device
 agentssh-server device token create --name alice-laptop \
   --public-url https://cp.example/agentssh
-agentssh remote enroll https://cp.example/agentssh --token '<token>'
+agentssh remote enroll https://cp.example/agentssh --token '<token>'   # --mode managed is the default
 agentssh-server config push --device <dev_id> --inventory inventory.yaml --policy policy.yaml
 
 # Day to day
@@ -326,7 +373,7 @@ The device private key remains local; target SSH private keys remain in the cont
 plane. Request signatures cover the method, URL and body, with a short validity
 window and durable replay protection.
 
-In remote mode:
+In managed mode:
 
 - **Inventory** comes only from the bundle. Each host needs `addr`, `user` and
   `identity`; local SSH aliases, identity files and password authentication are
@@ -343,6 +390,78 @@ See the [remote-control contract](docs/architecture/remote-control.md) for the
 wire protocol, trust boundaries, key storage and configuration-version semantics.
 Previously enrolled devices require a fresh enrollment, and the reference server
 requires a fresh data directory; old state is not automatically migrated.
+
+## Gateway mode (`agentssh-gateway`)
+
+`agentssh-gateway` keeps each device's inventory, policy, approvals, SSH
+identities and audit, and runs every command itself. The device only forwards:
+`agentssh run` sends the command to the gateway and prints what comes back.
+Like `agentssh-server`, it serves a private HTTP origin behind an HTTPS ingress
+that preserves the path and streams responses. The gateway must reach every
+target host on SSH.
+
+```bash
+# On the gateway host. The master password comes from
+# AGENTSSH_GATEWAY_MASTER_PASSWORD or a prompt.
+agentssh-gateway init
+agentssh-gateway identity create web          # public key for target authorized_keys
+agentssh-gateway serve --public-url https://gw.example/agentssh
+# Default origin: 127.0.0.1:8080, reachable only by the trusted HTTPS ingress.
+
+# Per device
+agentssh-gateway device token create --name ci-runner \
+  --public-url https://gw.example/agentssh
+agentssh remote enroll https://gw.example/agentssh --token '<token>' --mode gateway
+agentssh-gateway config push --device <dev_id> --inventory inventory.yaml --policy policy.yaml
+```
+
+Hosts in the pushed inventory need `addr`, `user` and `identity`, as in managed
+mode; the gateway keeps host keys in its own `known_hosts`, following the
+inventory's `host_key_policy`. On the device, `hosts`, `run`, `status`, `plan`
+and `approval status|wait` work as in local mode, with the same output and exit
+codes, and the local `inventory.yaml` and `policy.yaml` are ignored. Commands
+for state the device no longer keeps (inventory, policy, secrets, approval
+decisions, audit, the TUI) exit 2 and name the gateway.
+
+A dropped connection does not stop a command: it keeps running on the gateway,
+and the device reattaches and receives the rest of its output. Only Ctrl-C (an
+explicit cancel) or the gateway's `--exec-timeout` (30 minutes by default)
+stops it.
+
+Approvals are decided on the gateway, never on the device:
+
+```bash
+agentssh-gateway approval ls
+agentssh-gateway approval grant <approval-id> --once|--session|--task|--host
+agentssh-gateway approval deny <approval-id>
+agentssh-gateway plan show <plan-id>
+agentssh-gateway plan grant <plan-id> --once|--session|--task
+```
+
+A host grant adds an allow rule to that device's policy and pushes it as a new
+configuration version. Operators away from the gateway host can use its Web UI,
+on a listener of its own, with a password and mandatory TOTP:
+
+```bash
+agentssh-gateway operator add alice    # password from the TTY, or AGENTSSH_GATEWAY_OPERATOR_PASSWORD
+agentssh-gateway serve --public-url https://gw.example/agentssh \
+  --web-listen 127.0.0.1:8443 --web-origin https://ops.example
+# Without --web-cert/--web-key it speaks plain HTTP for a TLS-terminating proxy
+# that browsers reach at --web-origin.
+```
+
+Every run and every decision is recorded in the gateway's audit chain, with
+the device and the deciding operator:
+
+```bash
+agentssh-gateway audit verify
+agentssh-gateway device ls
+agentssh-gateway device revoke <dev_id>    # the device's next request is refused
+```
+
+See [gateway mode](docs/architecture/gateway-mode.md) for the design and its
+trade-offs, and the [remote-control contract](docs/architecture/remote-control.md#gateway-mode)
+for the gateway's endpoints.
 
 ## What the agent calls
 

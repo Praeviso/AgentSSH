@@ -276,6 +276,9 @@ agentssh/
 
 ## 11. 威胁 → 缓解 映射
 
+> This table covers local mode. For all three modes (local, managed, gateway) see the
+> threat model in [remote-control.md](remote-control.md#threat-model).
+
 | 威胁 | 组件 | 缓解 |
 |---|---|---|
 | 注入诱导破坏性命令 | Policy(deny) | 危险模式 `deny` 硬拦截,谁都不能临场覆盖;headless 亦生效 |

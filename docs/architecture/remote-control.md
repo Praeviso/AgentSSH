@@ -24,6 +24,25 @@ to the service; identities should be scoped to the hosts that share trust in the
 Command-level policy and in-flight cancellation are enforced by the client and
 cannot constrain a modified client binary.
 
+## Threat model
+
+What each mode does against each threat. "Same-user process" means code
+running as the agent's OS user outside the CLI, such as a compromised tool or a
+modified `agentssh`.
+
+| Threat | Local | Managed (`agentssh-server`) | Gateway (`agentssh-gateway`) |
+| --- | --- | --- | --- |
+| An injected agent asks the CLI for a destructive command | Deny rules on the device refuse it (exit 6) | Deny rules from the bundle and local deny rules refuse it | The gateway's policy for the device refuses it |
+| The agent reads credentials | Never in its output, but keys and `secrets.enc` are on the device | SSH keys are not on the device; `device.key` is | Neither SSH keys nor policy are on the device; `device.key` is |
+| A same-user process bypasses the CLI | Uses the keys and `ssh` directly; nothing constrains it | Requests login signatures with `device.key` and runs anything as the identity's user on its assigned hosts; only the signing log records the logins | Can only call the gateway, which runs what the device's policy and grants authorize and audits it |
+| The agent approves its own request | Decisions need operator authentication; a same-user process can edit the approval files | As local | No device endpoint decides; operators decide on the gateway host or in its Web UI |
+| Audit records are altered | The hash chain shows edits, but a same-user process can rewrite the whole file | As local for commands; the control plane's signing log is out of reach | The chain is on the gateway, out of the device's reach |
+| A device key is stolen | No device key | Logins to assigned hosts until the device is revoked | Commands the device's policy allows, until it is revoked |
+| A device is revoked | No device | Its next login is refused; running commands check standing every 30 s and are cancelled | Its next request is refused; a run already started continues until it finishes or `--exec-timeout` |
+| The control plane is down | Not involved | Cached bundle until expiry, but no new logins: commands fail closed | Nothing runs: the gateway is the single point of execution |
+| The control plane is compromised | Not involved | Every host trusting its identities | Every host trusting its identities, and every device's policy and audit |
+| Target hosts must trust | Your keys | The control plane's identities | The gateway's identities, and the gateway must reach them |
+
 ## Endpoint base and deployment
 
 An administrator chooses a canonical HTTPS base, for example
@@ -282,7 +301,7 @@ failure. The Approvals page lists plans (approve the remaining steps as a whole
 after denying single ones) and single requests (once, session, task, host,
 deny), warning about commands that use shell syntax; the Audit page browses the
 chain by device, host and session, newest first, with its verification result.
-The full design is in `docs/architecture/gateway-mode.md` (#21).
+The design and its trade-offs are in [gateway-mode.md](gateway-mode.md).
 
 The other device endpoints answer what a local CLI reads from its own files:
 `GET /hosts` returns the device's hosts and groups as `agentssh hosts --json`
