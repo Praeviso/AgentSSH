@@ -1,0 +1,30 @@
+{{define "content"}}
+<h1>Audit</h1>
+{{if .VerifyErr}}<p class="banner bad" role="alert">The audit chain could not be checked: {{.VerifyErr}}</p>
+{{else if .Verify.OK}}<p class="banner ok" role="status">Hash chain intact · {{.Verify.Count}} records</p>
+{{else}}<p class="banner bad" role="alert">Hash chain broken at record {{.Verify.BrokenSeq}} ({{.Verify.Reason}}): records from there on may have been changed.</p>{{end}}
+<form method="get" action="/audit" class="filters">
+  <label>Device<select name="device"><option value="">All</option>{{range .Devices}}<option value="{{.ID}}"{{if eq .ID $.Device}} selected{{end}}>{{.Name}}</option>{{end}}</select></label>
+  <label>Host<input name="host" value="{{.Host}}"></label>
+  <label>Session<input name="session" value="{{.Session}}"></label>
+  <button>Filter</button>
+</form>
+<p class="meta">{{if gt .Matched (len .Records)}}Latest {{len .Records}} of {{.Matched}} matching records{{else}}{{.Matched}} matching records{{end}}</p>
+<table class="audit">
+  <thead><tr><th>Time</th><th>Event</th><th>Device</th><th>Host</th><th>Session</th><th>Command</th><th>Exit</th><th>Decision</th></tr></thead>
+  <tbody>
+  {{range .Records}}
+  <tr class="ev-{{.Event}}">
+    <td data-label="Time">{{when .TS}}</td>
+    <td data-label="Event">{{.Event}}</td>
+    <td data-label="Device">{{with index $.Names .DeviceID}}{{.}}{{else}}{{.DeviceID}}{{end}}</td>
+    <td data-label="Host">{{.Host}}</td>
+    <td data-label="Session">{{.SessionID}}</td>
+    <td data-label="Command" class="cmdcell" title="{{.Cmd}}"><code>{{short .Cmd 120}}</code></td>
+    <td data-label="Exit">{{with .ExitCode}}{{.}}{{end}}</td>
+    <td data-label="Decision">{{with .ApprovalScope}}{{.}}{{end}}{{with .Operator}} · {{.}}{{end}}</td>
+  </tr>
+  {{end}}
+  </tbody>
+</table>
+{{end}}

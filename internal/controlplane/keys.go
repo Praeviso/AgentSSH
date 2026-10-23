@@ -193,6 +193,17 @@ func (k *Keys) DecryptIdentity(blob []byte) (ssh.Signer, error) {
 
 // LoadRecipient reads the public age recipient. Creating identities needs only
 // this, so it works without the master password.
+// Seal encrypts a secret the control plane keeps (such as an operator's TOTP
+// key) to its own recipient; only an unlocked control plane can Open it.
+func (k *Keys) Seal(plain []byte) ([]byte, error) {
+	return encryptTo(k.identity.Recipient(), plain)
+}
+
+// Open decrypts what Seal encrypted.
+func (k *Keys) Open(blob []byte) ([]byte, error) {
+	return decryptWith(k.identity, blob)
+}
+
 func LoadRecipient(dir string) (age.Recipient, error) {
 	data, err := os.ReadFile(filepath.Join(dir, fileRecipient))
 	if err != nil {

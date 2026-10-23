@@ -70,6 +70,9 @@ type Record struct {
 	// DeviceID names the enrolled device a gateway ran the command for. Only a
 	// gateway's audit chain sets it; omitempty keeps older canonical forms.
 	DeviceID string `json:"device_id,omitempty"`
+	// Operator names who decided an approval on a gateway ("web:<name>" or
+	// "local:<user>"); omitempty keeps older canonical forms.
+	Operator string `json:"operator,omitempty"`
 }
 
 const ZeroHash = "0000000000000000000000000000000000000000000000000000000000000000"
@@ -406,6 +409,7 @@ type canonicalRecord struct {
 	ReviewSHA256    string `json:"review_sha256,omitempty"`
 	RemoteSignID    string `json:"remote_sign_id,omitempty"`
 	DeviceID        string `json:"device_id,omitempty"`
+	Operator        string `json:"operator,omitempty"`
 }
 
 func canonicalJSON(record Record) ([]byte, error) {
@@ -439,5 +443,6 @@ func canonicalJSON(record Record) ([]byte, error) {
 		ReviewSHA256:    record.ReviewSHA256,
 		RemoteSignID:    record.RemoteSignID,
 		DeviceID:        record.DeviceID,
+		Operator:        record.Operator,
 	})
 }

@@ -196,7 +196,7 @@ The gateway's operator decides on the gateway host, from the data directory:
 ```sh
 agentssh-gateway approval ls [--json]
 agentssh-gateway approval show <approval-id> [--device <id>]
-agentssh-gateway approval grant <approval-id> --once|--session|--task [--device <id>]
+agentssh-gateway approval grant <approval-id> --once|--session|--task|--host [--device <id>]
 agentssh-gateway approval deny <approval-id> [--device <id>]
 agentssh-gateway plan show <plan-id> [--json] [--device <id>]
 agentssh-gateway plan grant <plan-id> --once|--session|--task [--device <id>]
@@ -230,12 +230,46 @@ one device holds (two submissions racing past that check) is refused until
 device's plan.
 
 Grant lifetimes come from the device's policy; each decision is appended to the
-gateway's audit chain with the device's `device_id` and channel `gateway`. Host
-scope is not offered: it would rewrite the device's pushed policy, which the
-operator edits and pushes with `config push` instead. `plan show` lists the
-commands of the plan's requests, which are what a grant authorizes, before the
-steps as the device described them. A Web UI for operators off the gateway host
-is #20; the full design is in `docs/architecture/gateway-mode.md`.
+gateway's audit chain with the device's `device_id`, channel `gateway` and the
+deciding `operator` (`local:<user>` from the CLI, `web:<name>` from the Web UI).
+A host-scope grant appends an allow rule for the request's matcher to the
+device's policy and pushes it as a new configuration version; the policy YAML is
+re-rendered from its structure, so comments and formatting in the pushed file are
+not kept. A whole plan is approved once, for the session or for the task, never
+for the host. `plan show` lists the commands of the plan's requests, which are
+what a grant authorizes, before the steps as the device described them.
+
+**Operator Web UI.** `serve --web-listen <addr>` serves a Web UI for operators
+away from the gateway host, from assets embedded in the binary, on its own
+listener: never the device API's, so no device request reaches it and no
+operator request reaches the device API. It speaks TLS with
+`--web-cert/--web-key`, or plain HTTP behind a TLS-terminating proxy.
+
+```sh
+agentssh-gateway operator add <name>     # password from the TTY, or AGENTSSH_GATEWAY_OPERATOR_PASSWORD
+agentssh-gateway operator ls
+agentssh-gateway operator revoke <name>  # ends their sessions at once
+agentssh-gateway serve --public-url https://gw.example/agentssh --web-listen 127.0.0.1:8443
+```
+
+Operators are accounts of their own (`operators` in `gateway.db`): argon2id
+password hashes, and TOTP that is mandatory and enrolled at the first sign-in
+from a QR code (RFC 6238, SHA-1, six digits, 30 s; the key sealed to the
+gateway's age recipient; each code accepted once). A password alone opens only a
+ten-minute session for the TOTP step. Sessions are server side (`web_sessions`,
+keyed by the SHA-256 of a random cookie token, 12 h, 30 min idle) and every
+request rechecks the operator, so revocation takes effect on the next request.
+Cookies are `HttpOnly; Secure; SameSite=Strict`; every POST needs the session's
+CSRF token (the login form a double-submit token) and must not come from another
+origin; pages send a CSP without inline script, `frame-ancestors 'none'`,
+`no-store` and `Referrer-Policy: same-origin`. Failed passwords and codes are
+limited per account (5 in 15 minutes) and per client address (20; behind a
+proxy that is the proxy's), after which sign-in is refused until the window
+passes. The Approvals page lists plans (approve the remaining steps as a whole
+after denying single ones) and single requests (once, session, task, host,
+deny), warning about commands that use shell syntax; the Audit page browses the
+chain by device, host and session, newest first, with its verification result.
+The full design is in `docs/architecture/gateway-mode.md` (#21).
 
 The other device endpoints answer what a local CLI reads from its own files:
 `GET /hosts` returns the device's hosts and groups as `agentssh hosts --json`

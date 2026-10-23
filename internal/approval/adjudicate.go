@@ -27,6 +27,8 @@ type ApplyOptions struct {
 	// DeviceID stamps the decision's audit record on a gateway, whose
 	// audit chain holds every device's records.
 	DeviceID string
+	// Operator names who decided, for the audit record.
+	Operator string
 }
 
 type ApplyResult struct {
@@ -257,6 +259,7 @@ func appendApprovalAudit(opts ApplyOptions, req PendingRequest, verdict Verdict,
 		StepID:          stepID,
 		ReviewSHA256:    reviewSHA256,
 		DeviceID:        opts.DeviceID,
+		Operator:        opts.Operator,
 	}
 	if scope == ScopeTask {
 		if permission := TaskCandidate(req.Cmd, req.StdinSHA256); permission != nil {
