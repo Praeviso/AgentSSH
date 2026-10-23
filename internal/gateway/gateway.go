@@ -81,6 +81,9 @@ type Server struct {
 	// last sweep; deviceSweeps says when that device is next aged out.
 	deviceRecords map[string]int
 	deviceSweeps  map[string]time.Time
+	// submits serializes each device's plan submissions, so a plan's
+	// precheck against the approval cap holds while it is submitted.
+	submits sync.Map // device ID → *sync.Mutex
 }
 
 // NewServer wires a data directory, its store and unlocked keys into an API

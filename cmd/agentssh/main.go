@@ -3702,10 +3702,6 @@ func runApprovalWait(cmd *cobra.Command, id string, timeoutValue string) error {
 	if err != nil {
 		return classifyConfigError(err)
 	}
-	runtime, err := approvalRuntime(cfg)
-	if err != nil {
-		return newUsageError("%v", err)
-	}
 	var status approval.StatusResult
 	if cfg.Gateway != nil {
 		first, defaultTimeout, err := approvalStatus(cmd.Context(), cfg, id)
@@ -3725,6 +3721,12 @@ func runApprovalWait(cmd *cobra.Command, id string, timeoutValue string) error {
 			return err
 		}
 	} else {
+		// Only a local wait reads local approval settings; a gateway's own
+		// policy sets its default.
+		runtime, err := approvalRuntime(cfg)
+		if err != nil {
+			return newUsageError("%v", err)
+		}
 		timeout, err := resolveWaitTimeout(runtime.WaitTimeout, timeoutValue)
 		if err != nil {
 			return err

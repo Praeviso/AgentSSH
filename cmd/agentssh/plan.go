@@ -348,8 +348,12 @@ func runPlanSubmit(cmd *cobra.Command, targetName string, commands []string, ses
 	if err != nil {
 		return classifyConfigError(err)
 	}
-	runtime := approvalRuntimeWithWarning(cmd, cfg)
-	// A gateway checks its own policy for the device.
+	// A gateway checks its own policy for the device; local approval
+	// settings apply only to a local plan.
+	var runtime approval.RuntimeConfig
+	if cfg.Gateway == nil {
+		runtime = approvalRuntimeWithWarning(cmd, cfg)
+	}
 	if !runtime.Enabled && cfg.Gateway == nil {
 		return newUsageError("plan submit requires the async approval channel\n" +
 			"  enable it in ~/.agentssh/policy.yaml (approval.enabled: true) or via AGENTSSH_APPROVAL\n" +

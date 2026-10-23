@@ -136,6 +136,12 @@ func (s PendingStore) CreatePlan(manifest PlanManifest) (PlanManifest, error) {
 	if err := os.MkdirAll(s.PlansDir, 0o700); err != nil {
 		return PlanManifest{}, fmt.Errorf("create plan directory: %w", err)
 	}
+	// Counting and publishing form one step, as in Create.
+	lock, err := lockSessionPath(s.PlansDir)
+	if err != nil {
+		return PlanManifest{}, err
+	}
+	defer unlockAndClose(lock)
 	if s.MaxPending > 0 {
 		waiting, err := s.pendingPlans()
 		if err != nil {

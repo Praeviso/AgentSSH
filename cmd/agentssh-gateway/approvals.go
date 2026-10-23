@@ -246,8 +246,14 @@ func newPlanCommand(dir func() (string, error)) *cobra.Command {
 // Device-supplied text is quoted, so it cannot write to the terminal.
 func printPlan(out io.Writer, deviceID string, status approval.PlanStatus) {
 	_, _ = fmt.Fprintf(out, "plan %s · %s · device %s · host %s · session %s\n", status.ID, status.Status, deviceID, status.Host, status.SessionID)
-	if title := status.Metadata.Title; title != "" {
-		_, _ = fmt.Fprintf(out, "title    %s\n", strconv.Quote(title))
+	meta := status.Metadata
+	for _, field := range []struct{ name, value string }{
+		{"title", meta.Title}, {"version", meta.Version}, {"revision", meta.Revision},
+		{"description", meta.Description}, {"impact", meta.Impact}, {"recovery", meta.Recovery},
+	} {
+		if field.value != "" {
+			_, _ = fmt.Fprintf(out, "%-12s %s\n", field.name, strconv.Quote(field.value))
+		}
 	}
 	_, _ = fmt.Fprintf(out, "approved %d · denied %d · pending %d\n", status.Approved, status.Denied, status.Pending)
 	for _, member := range status.Members {

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"unicode"
 
 	"github.com/Praeviso/AgentSSH/internal/approval"
@@ -180,8 +181,13 @@ func (s *Server) handlePlanSubmit(w http.ResponseWriter, _ *http.Request, device
 		})
 	}
 	stores := s.approvals(device.ID)
+	lock, _ := s.submits.LoadOrStore(device.ID, new(sync.Mutex))
+	lock.(*sync.Mutex).Lock()
+	defer lock.(*sync.Mutex).Unlock()
 	// Refuse a plan that cannot fit before it creates any request, so a
-	// refusal leaves nothing half submitted.
+	// refusal leaves nothing half submitted. A gray-zone run creating a
+	// request meanwhile can still make a plan stop part way; the cap holds
+	// either way, since every request is counted as it is created.
 	waiting, err := stores.Pending.Unresolved()
 	if err != nil {
 		controlplane.WriteError(w, http.StatusInternalServerError, remote.CodeInternal, "approval store unavailable")

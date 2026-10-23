@@ -529,9 +529,12 @@ func executeSavedPlan(cmd *cobra.Command, cfg *config.Config, run *planExecution
 		}
 	}
 	if run.ApprovalPlanID == "" || run.Status == "expired" {
-		runtime, err := approvalRuntime(cfg)
-		if err != nil {
-			return err
+		// A gateway applies its own approval settings to the submission.
+		var runtime approval.RuntimeConfig
+		if cfg.Gateway == nil {
+			if runtime, err = approvalRuntime(cfg); err != nil {
+				return err
+			}
 		}
 		response, err := submitPlanInputs(cmd, cfg, runtime, run.Host, remaining, run.SessionID, run.Label, executionPlanReview(run))
 		if response.PlanID != "" {

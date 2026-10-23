@@ -676,3 +676,25 @@ func TestGatewayResumeIgnoresALocalApprovalPlan(t *testing.T) {
 		t.Fatalf("gateway audit: %+v", records)
 	}
 }
+
+// A gateway device's approvals follow the gateway's policy, so a malformed
+// local AGENTSSH_APPROVAL does not stop it from waiting on or submitting
+// approvals.
+func TestGatewayApprovalsIgnoreLocalApprovalSettings(t *testing.T) {
+	_, device := paritySetup(t)
+	t.Setenv(config.EnvApproval, "not-a-bool")
+	id := pendingID(t, runIn(t, device.home, "run", "web-1", "--json", "--", "systemctl", "restart", "nginx"))
+	if got := runIn(t, device.home, "approval", "wait", id, "--timeout", "0s"); got.code != exitApprovalRequired {
+		t.Fatalf("approval wait: %+v", got)
+	}
+	plan := filepath.Join(t.TempDir(), "plan.yaml")
+	if err := os.WriteFile(plan, []byte("version: 1\ncommands:\n  - {id: restart, cmd: systemctl restart app}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := runIn(t, device.home, "plan", "submit", "web-1", "--file", plan, "--json"); got.code != exitApprovalRequired || strings.Contains(got.stderr, "WARNING") {
+		t.Fatalf("plan submit: %+v", got)
+	}
+	if got := runIn(t, device.home, "plan", "run", "web-1", "--file", plan, "--json"); got.code != exitApprovalRequired {
+		t.Fatalf("plan run: %+v", got)
+	}
+}

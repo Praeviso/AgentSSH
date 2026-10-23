@@ -117,6 +117,23 @@ status, plan submit, preflight — used by the existing commands and wait loops.
     closed). Tests: `TestCheckGrantedStdinComparesSizesStrictly`, the
     stated-size cases of `TestGrantsAreBoundToTheStatedStdinSize`
     (both mutation-checked).
+- [x] Second review round (Codex, 4f7dc59):
+  - P1: the cap's count and the create were separate steps, so concurrent
+    requests could all pass it. `Create` now deduplicates, counts and
+    publishes under one flock on the pending directory, and `CreatePlan`
+    counts and publishes under one on the plans directory (this also stops
+    the same request being created twice at once); the gateway serializes a
+    device's plan submissions so a plan's precheck holds against other
+    submissions. Test: `TestPendingCapHoldsUnderConcurrency` (40 concurrent
+    requesters, 20 concurrent plans; removing either lock fails it).
+  - P2: `agentssh-gateway plan show` printed only the title; it now shows all
+    of the plan's metadata, quoted.
+  - P2: a gateway device's `approval wait`, `plan submit` and `plan
+    run|resume` parsed the local `AGENTSSH_APPROVAL` first, so a malformed
+    value blocked them although the gateway's policy decides. Local approval
+    settings are now read only on the local path. Test:
+    `TestGatewayApprovalsIgnoreLocalApprovalSettings`.
+  - All three mutation-checked.
 - [x] Tests: see Validation.
 - [x] Docs: `docs/architecture/remote-control.md` (approvals table, admin
   commands, superseded plans).

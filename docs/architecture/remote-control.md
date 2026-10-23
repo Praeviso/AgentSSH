@@ -208,7 +208,10 @@ operator acts, so it is capped per device (`serve --max-pending-approvals`,
 default 1000): unresolved requests, and separately plans that still have one
 (plans with none left are reaped after a day, like resolved requests). A plan
 that does not fit is refused before it creates anything, and a request beyond
-the cap is `429 busy`, on `/exec` and `/plans/submit` alike.
+the cap is `429 busy`, on `/exec` and `/plans/submit` alike. Counting and
+creating are one step under a lock beside the device's approval directory, so
+concurrent requests cannot pass the cap together, and a device's plan
+submissions are serialized.
 
 A grant records the stdin size its request stated, and a run whose stdin
 differs in size is refused (`approval/stdin-size-mismatch`, exit 6); zero is a

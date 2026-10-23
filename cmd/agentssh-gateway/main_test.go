@@ -122,7 +122,8 @@ func TestApprovalAndPlanCommands(t *testing.T) {
 	single := create("systemctl restart app", "")
 	planID, _ := approval.NewPlanID()
 	member := create("systemctl reload app", planID)
-	if _, err := store.CreatePlan(approval.PlanManifest{ID: planID, SessionID: "s_test", Host: "web-1", MemberIDs: []string{member.ID}}); err != nil {
+	metadata := approval.PlanMetadata{Title: "deploy app", Description: "reload the app\nwith the new config", Impact: "brief reload", Recovery: "reload again"}
+	if _, err := store.CreatePlan(approval.PlanManifest{ID: planID, SessionID: "s_test", Host: "web-1", Metadata: metadata, MemberIDs: []string{member.ID}}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -139,7 +140,8 @@ func TestApprovalAndPlanCommands(t *testing.T) {
 	if out, err := runGatewayCLI(t, "--data", dir, "approval", "show", single.ID); err != nil || !strings.Contains(out, `"status": "approved"`) || !strings.Contains(out, `"device_id": "dev_test"`) {
 		t.Fatalf("approval show: %v %s", err, out)
 	}
-	if out, err := runGatewayCLI(t, "--data", dir, "plan", "show", planID); err != nil || !strings.Contains(out, "plan "+planID+" · pending · device dev_test") || !strings.Contains(out, `"systemctl reload app"`) {
+	if out, err := runGatewayCLI(t, "--data", dir, "plan", "show", planID); err != nil || !strings.Contains(out, "plan "+planID+" · pending · device dev_test") || !strings.Contains(out, `"systemctl reload app"`) ||
+		!strings.Contains(out, `description  "reload the app\nwith the new config"`) || !strings.Contains(out, `impact       "brief reload"`) || !strings.Contains(out, `recovery     "reload again"`) {
 		t.Fatalf("plan show: %v %s", err, out)
 	}
 	if out, err := runGatewayCLI(t, "--data", dir, "plan", "deny", planID); err != nil || !strings.Contains(out, "denied 1 command(s)") {

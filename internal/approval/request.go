@@ -100,6 +100,14 @@ func newPrefixedID(prefix string) (string, error) {
 
 func (s PendingStore) Create(req PendingRequest) (PendingRequest, error) {
 	_ = s.reapResolved(resolvedReapTTL)
+	// Deduplicating, counting and publishing form one step, under a lock
+	// beside the directory (<dir>.lock): concurrent requesters could
+	// otherwise all pass the cap, or both create the same request.
+	lock, err := lockSessionPath(s.PendingDir)
+	if err != nil {
+		return PendingRequest{}, err
+	}
+	defer unlockAndClose(lock)
 	if existing, ok, err := s.findUnresolved(req.SessionID, req.Host, shaHex(req.Cmd), req.StdinSHA256, req.StdinBytes); err != nil {
 		return PendingRequest{}, err
 	} else if ok {
