@@ -205,7 +205,7 @@ func TestAuthorizeGrantForPlusCommandFromProductionIncident(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Exact: %v", err)
 			}
-			if _, err := store.Grant("s_71d8e139", "greencloud-sg-1212", ScopeSession, matcher, "", "ap_0123456789abcdef01234567", "r1", time.Hour, ChannelCLI); err != nil {
+			if _, err := store.Grant("s_71d8e139", "greencloud-sg-1212", ScopeSession, matcher, "", 0, "ap_0123456789abcdef01234567", "r1", time.Hour, ChannelCLI); err != nil {
 				t.Fatal(err)
 			}
 

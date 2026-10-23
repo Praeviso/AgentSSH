@@ -158,7 +158,7 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, device contr
 		return
 	}
 	exec := s.executor(inv)
-	stores := deviceApprovals(s.Dir, device.ID)
+	stores := s.approvals(device.ID)
 	env := runner.Env{
 		Policy:    pol,
 		Inventory: inv,
@@ -211,6 +211,8 @@ func (s *Server) execute(ctx context.Context, rn *run, env runner.Env, request r
 		var usage runner.UsageError
 		if errors.As(err, &usage) {
 			code, message = remote.CodeUsage, usage.Error()
+		} else if errors.Is(err, approval.ErrTooManyPending) {
+			code, message = remote.CodeBusy, approval.ErrTooManyPending.Error()
 		} else {
 			log.Printf("agentssh-gateway: run %s: execution failed: %v", rn.id, err)
 		}

@@ -80,6 +80,7 @@ func SubmitPlan(env Env, req PlanSubmitRequest) (PlanSubmitResponse, int, error)
 			Task:        approval.TaskCandidate(command.Cmd, command.Stdin.SHA256),
 		}
 		auth, err := approval.PreflightAuthorize(env.Policy, env.Inventory, env.Sessions, env.Approval, sessionCtx.ID, req.Host, command.Cmd, command.Stdin.SHA256)
+		auth, _ = approval.CheckGrantedStdin(auth, command.Stdin.Bytes)
 		if err != nil {
 			return response, exitCode, usageErrorf("policy.yaml is invalid: %v\n  fix the rule in ~/.agentssh/policy.yaml (check: agentssh policy show)", err)
 		}

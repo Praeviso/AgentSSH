@@ -130,7 +130,7 @@ func runAwaited(cmd *cobra.Command, host, command string, flags runFlags) error 
 			}
 		}
 		waitCtx, cancel := context.WithTimeout(ctx, timeout)
-		status, err := waitForRunApproval(waitCtx, cfg, ids, rows, command, stdin.sha256)
+		status, err := waitForRunApproval(waitCtx, cfg, ids, rows, command, stdin)
 		cancel()
 		if err != nil {
 			return err
@@ -164,7 +164,7 @@ func runAwaited(cmd *cobra.Command, host, command string, flags runFlags) error 
 
 // A resolution is written before its grant. Wait for usable authorization too,
 // avoiding the approved-not-yet-granted race and duplicate pending requests.
-func waitForRunApproval(ctx context.Context, cfg *config.Config, ids []string, rows []runResponse, command, stdinHash string) (string, error) {
+func waitForRunApproval(ctx context.Context, cfg *config.Config, ids []string, rows []runResponse, command string, stdin stdinSpec) (string, error) {
 	ticker := time.NewTicker(pollInterval(cfg))
 	defer ticker.Stop()
 	for {
@@ -190,7 +190,7 @@ func waitForRunApproval(ctx context.Context, cfg *config.Config, ids []string, r
 		if allApproved {
 			checks := make([]remote.AuthorizeCheck, 0, len(rows))
 			for _, row := range rows {
-				checks = append(checks, remote.AuthorizeCheck{Host: row.Host, Session: row.SessionID, Cmd: command, StdinSHA256: stdinHash})
+				checks = append(checks, remote.AuthorizeCheck{Host: row.Host, Session: row.SessionID, Cmd: command, StdinSHA256: stdin.sha256, StdinBytes: stdin.bytes})
 			}
 			statuses, enabled, err := preflight(ctx, cfg, checks)
 			if ctx.Err() != nil {

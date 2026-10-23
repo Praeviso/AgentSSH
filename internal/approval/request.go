@@ -21,6 +21,11 @@ type PendingStore struct {
 	ResponsesDir string
 	PlansDir     string
 	Now          func() time.Time
+	// MaxPending, when positive, caps the requests awaiting a decision and,
+	// separately, the plans that still have one: what a requester can keep
+	// on disk without an operator. Beyond it Create and CreatePlan fail with
+	// ErrTooManyPending.
+	MaxPending int
 }
 
 const resolvedReapTTL = 24 * time.Hour
@@ -75,6 +80,8 @@ var (
 	ErrPendingNotFound   = errors.New("approval request not found")
 	ErrAlreadyResolved   = errors.New("approval request already resolved")
 	ErrCorruptResolution = errors.New("corrupt approval resolution")
+	// ErrTooManyPending refuses a request or plan beyond MaxPending.
+	ErrTooManyPending = errors.New("too many approval requests are waiting for an operator's decision; wait for decisions on the existing ones")
 )
 
 func NewID() (string, error) {
@@ -93,10 +100,19 @@ func newPrefixedID(prefix string) (string, error) {
 
 func (s PendingStore) Create(req PendingRequest) (PendingRequest, error) {
 	_ = s.reapResolved(resolvedReapTTL)
-	if existing, ok, err := s.findUnresolved(req.SessionID, req.Host, shaHex(req.Cmd), req.StdinSHA256); err != nil {
+	if existing, ok, err := s.findUnresolved(req.SessionID, req.Host, shaHex(req.Cmd), req.StdinSHA256, req.StdinBytes); err != nil {
 		return PendingRequest{}, err
 	} else if ok {
 		return existing, nil
+	}
+	if s.MaxPending > 0 {
+		waiting, err := s.Unresolved()
+		if err != nil {
+			return PendingRequest{}, err
+		}
+		if waiting >= s.MaxPending {
+			return PendingRequest{}, ErrTooManyPending
+		}
 	}
 	if req.ID == "" {
 		id, err := NewID()
@@ -140,6 +156,27 @@ func (s PendingStore) Create(req PendingRequest) (PendingRequest, error) {
 		return PendingRequest{}, fmt.Errorf("create pending approval: %w", err)
 	}
 	return req, nil
+}
+
+// Unresolved counts the requests awaiting a decision.
+func (s PendingStore) Unresolved() (int, error) {
+	entries, err := os.ReadDir(s.PendingDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("list pending approvals: %w", err)
+	}
+	count := 0
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		if _, err := os.Stat(responsePath(s.ResponsesDir, strings.TrimSuffix(entry.Name(), ".json"))); errors.Is(err, os.ErrNotExist) {
+			count++
+		}
+	}
+	return count, nil
 }
 
 func (s PendingStore) Get(id string) (PendingRequest, error) {
@@ -289,7 +326,7 @@ func (s PendingStore) readResolution(id string) (Resolution, bool, error) {
 	return resolution, true, nil
 }
 
-func (s PendingStore) findUnresolved(sessionID string, host string, cmdSHA256 string, stdinSHA256 string) (PendingRequest, bool, error) {
+func (s PendingStore) findUnresolved(sessionID string, host string, cmdSHA256 string, stdinSHA256 string, stdinBytes int64) (PendingRequest, bool, error) {
 	entries, err := os.ReadDir(s.PendingDir)
 	if errors.Is(err, os.ErrNotExist) {
 		return PendingRequest{}, false, nil
@@ -306,7 +343,7 @@ func (s PendingStore) findUnresolved(sessionID string, host string, cmdSHA256 st
 		if err != nil {
 			continue
 		}
-		if req.SessionID != sessionID || req.Host != host || req.CmdSHA256 != cmdSHA256 || req.StdinSHA256 != stdinSHA256 {
+		if req.SessionID != sessionID || req.Host != host || req.CmdSHA256 != cmdSHA256 || req.StdinSHA256 != stdinSHA256 || req.StdinBytes != stdinBytes {
 			continue
 		}
 		if _, ok, err := s.readResolution(id); err != nil {

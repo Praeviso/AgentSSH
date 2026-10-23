@@ -144,7 +144,7 @@ func applySessionGrant(opts ApplyOptions, req PendingRequest, scope Scope) (Gran
 	if ttl <= 0 {
 		ttl = DefaultSessionTTL
 	}
-	return opts.Sessions.Grant(req.SessionID, req.Host, scope, matcher, req.StdinSHA256, req.ID, req.ReqID, ttl, opts.Channel)
+	return opts.Sessions.Grant(req.SessionID, req.Host, scope, matcher, req.StdinSHA256, req.StdinBytes, req.ID, req.ReqID, ttl, opts.Channel)
 }
 
 func applyHostGrant(opts ApplyOptions, req PendingRequest) (string, error) {

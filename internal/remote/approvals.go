@@ -90,6 +90,7 @@ type AuthorizeCheck struct {
 	Session     string `json:"session"`
 	Cmd         string `json:"cmd"`
 	StdinSHA256 string `json:"stdin_sha256,omitempty"`
+	StdinBytes  int64  `json:"stdin_bytes,omitempty"`
 }
 
 // AuthorizeResponse holds one approval.AuthorizationStatus per check, and

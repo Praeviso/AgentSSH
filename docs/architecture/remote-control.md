@@ -203,6 +203,19 @@ agentssh-gateway plan grant <plan-id> --once|--session|--task [--device <id>]
 agentssh-gateway plan deny <plan-id> [--device <id>]
 ```
 
+What a device leaves awaiting a decision stays on the gateway's disk until an
+operator acts, so it is capped per device (`serve --max-pending-approvals`,
+default 1000): unresolved requests, and separately plans that still have one
+(plans with none left are reaped after a day, like resolved requests). A plan
+that does not fit is refused before it creates anything, and a request beyond
+the cap is `429 busy`, on `/exec` and `/plans/submit` alike.
+
+A grant records the stdin size its request stated, and a run whose stdin
+differs in size is refused (`approval/stdin-size-mismatch`, exit 6). The hash
+already pins the content; the size a device states when submitting a plan is
+what the operator reads, so a misstated one can never authorize the real
+payload.
+
 Plan IDs are minted by devices, so the gateway refuses a submitted plan ID that
 another device already holds (`409`), and a decision by an ID that more than
 one device holds (two submissions racing past that check) is refused until

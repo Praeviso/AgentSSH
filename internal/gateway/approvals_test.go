@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -213,5 +215,92 @@ func TestAnAmbiguousIDNeedsTheDevice(t *testing.T) {
 	}
 	if _, status, err := gateway.PlanStatus(f.dir, "dev_a", planID); err != nil || status.Status != "pending" {
 		t.Fatalf("dev_a's plan = %+v, %v", status, err)
+	}
+}
+
+// What a device leaves awaiting a decision stays on the gateway's disk, so it
+// is capped per device: a plan that does not fit is refused before it creates
+// anything, a gray-zone run beyond the cap is busy, plans built again and
+// again from the same request count too, and other devices are unaffected.
+func TestPendingApprovalsAreCappedPerDevice(t *testing.T) {
+	f, host := execGateway(t)
+	f.server.MaxPendingApprovals = 2
+	submit := func(client *remoteclient.Client, cmds ...string) error {
+		planID, _ := approval.NewPlanID()
+		req := remote.PlanSubmitRequest{PlanID: planID, Host: "web-1", Session: "s_test"}
+		for i, cmd := range cmds {
+			req.Commands = append(req.Commands, remote.PlanSubmitCommand{ID: fmt.Sprintf("s%d", i), Cmd: cmd})
+		}
+		_, err := client.SubmitPlan(context.Background(), req)
+		return err
+	}
+	busy := func(err error) bool {
+		var apiErr *remote.APIError
+		return errors.As(err, &apiErr) && apiErr.Code == remote.CodeBusy
+	}
+	if err := submit(f.client, "systemctl restart a", "systemctl restart b", "systemctl restart c"); !busy(err) {
+		t.Fatalf("oversized plan: %v", err)
+	}
+	if requests, _ := gateway.ListApprovals(f.dir); len(requests) != 0 {
+		t.Fatalf("a refused plan left %d requests", len(requests))
+	}
+	if err := submit(f.client, "systemctl restart a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := submit(f.client, "systemctl restart a"); err != nil {
+		t.Fatalf("a second plan of the same request: %v", err)
+	}
+	if err := submit(f.client, "systemctl restart a"); !busy(err) {
+		t.Fatalf("a third plan beyond the cap: %v", err)
+	}
+	if _, err := f.client.Exec(context.Background(), execReq("uname"), io.Discard, io.Discard); err != nil {
+		t.Fatalf("second request within the cap: %v", err)
+	}
+	if _, err := f.client.Exec(context.Background(), execReq("hostname"), io.Discard, io.Discard); !busy(err) {
+		t.Fatalf("a gray-zone run beyond the cap: %v", err)
+	}
+	other := f.enroll(t, "other-vm")
+	inv := fmt.Sprintf("host_key_policy: accept-new\nhosts:\n  web-1: {addr: 127.0.0.1, port: %d, user: deploy, identity: web}\n", host.port())
+	if _, err := controlplane.PushConfig(f.store, other.State.DeviceID, inv, testPolicy, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := submit(other, "systemctl restart a"); err != nil {
+		t.Fatalf("another device was capped too: %v", err)
+	}
+}
+
+// A grant covers the stdin size its request stated. The hash pins the
+// content, so a plan that misstates the size to the operator gets a grant
+// its real payload cannot use.
+func TestGrantsAreBoundToTheStatedStdinSize(t *testing.T) {
+	f, host := execGateway(t)
+	payload := []byte("0123456789")
+	sum := sha256.Sum256(payload)
+	stdinSHA := hex.EncodeToString(sum[:])
+	for _, stated := range []int64{1, int64(len(payload))} {
+		planID, _ := approval.NewPlanID()
+		session := fmt.Sprintf("s_%d", stated)
+		if _, err := f.client.SubmitPlan(context.Background(), remote.PlanSubmitRequest{PlanID: planID, Host: "web-1", Session: session,
+			Commands: []remote.PlanSubmitCommand{{ID: "load", Cmd: "cat -", StdinSHA256: stdinSHA, StdinBytes: stated}}}); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := gateway.DecidePlan(f.dir, f.store, "", planID, approval.VerdictApproved, approval.ScopeOnce); err != nil {
+			t.Fatal(err)
+		}
+		req := remote.ExecRequest{Host: "web-1", Cmd: "cat -", Session: session, Stdin: payload}
+		result, err := f.client.Exec(context.Background(), req, io.Discard, io.Discard)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response := result.Responses[0]
+		if stated == 1 && (result.ExitCode != 6 || response.PolicyRule != approval.RuleStdinSizeMismatch) {
+			t.Fatalf("a payload larger than approved: %+v", response)
+		}
+		if stated != 1 && response.GrantScope != string(approval.ScopeOnce) {
+			t.Fatalf("the payload the operator approved: %+v", response)
+		}
+	}
+	if runs := host.runs("cat -"); runs != 1 {
+		t.Fatalf("target ran cat %d times, want only the honestly stated payload", runs)
 	}
 }

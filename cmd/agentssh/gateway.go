@@ -325,6 +325,7 @@ func preflight(ctx context.Context, cfg *config.Config, checks []remote.Authoriz
 		if err != nil {
 			return nil, false, err
 		}
+		auth, _ = approval.CheckGrantedStdin(auth, check.StdinBytes)
 		statuses = append(statuses, auth.Status)
 	}
 	return statuses, runtime.Enabled, nil

@@ -65,6 +65,9 @@ type Server struct {
 	RunQuotaBytes          int64
 	// RunRecords caps the run records one device keeps.
 	RunRecords int
+	// MaxPendingApprovals caps one device's requests awaiting a decision, and
+	// separately its plans awaiting one.
+	MaxPendingApprovals int
 	// Executor, when set, replaces SSH with the gateway's identities for a
 	// device's inventory. Tests use it to drive a fake target.
 	Executor func(inventory.Inventory) executor.Executor

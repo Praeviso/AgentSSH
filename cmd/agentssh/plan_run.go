@@ -778,7 +778,7 @@ func waitPlanReady(ctx context.Context, cfg *config.Config, run *planExecution, 
 func executionAuthorizationReady(ctx context.Context, cfg *config.Config, run *planExecution, commands []planCommand) (bool, error) {
 	checks := make([]remote.AuthorizeCheck, 0, len(commands))
 	for _, command := range commands {
-		checks = append(checks, remote.AuthorizeCheck{Host: run.Host, Session: run.SessionID, Cmd: command.Cmd, StdinSHA256: command.stdin.sha256})
+		checks = append(checks, remote.AuthorizeCheck{Host: run.Host, Session: run.SessionID, Cmd: command.Cmd, StdinSHA256: command.stdin.sha256, StdinBytes: command.stdin.bytes})
 	}
 	statuses, enabled, err := preflight(ctx, cfg, checks)
 	if err != nil {

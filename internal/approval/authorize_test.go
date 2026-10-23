@@ -38,7 +38,7 @@ func TestAuthorizeSessionAndHostGrantOnlyAfterDefaultDeny(t *testing.T) {
 	inv := inventory.Inventory{Hosts: map[string]inventory.Host{"web-1": {}}}
 	store := SessionStore{Dir: t.TempDir()}
 	matcher, _ := Exact("systemctl restart nginx")
-	if _, err := store.Grant("s", "web-1", ScopeSession, matcher, "", "ap_0123456789abcdef01234567", "r1", time.Hour, ChannelCLI); err != nil {
+	if _, err := store.Grant("s", "web-1", ScopeSession, matcher, "", 0, "ap_0123456789abcdef01234567", "r1", time.Hour, ChannelCLI); err != nil {
 		t.Fatal(err)
 	}
 	auth, err := Authorize(policy.Config{}, inv, store, RuntimeConfig{Enabled: true, HostGrantMode: HostGrantSafePrefix}, "s", "web-1", "systemctl restart nginx", "", "req-test")
@@ -70,7 +70,7 @@ func TestAuthorizeNewDenyInvalidatesExistingGrant(t *testing.T) {
 	inv := inventory.Inventory{Hosts: map[string]inventory.Host{"web-1": {}}}
 	store := SessionStore{Dir: t.TempDir()}
 	matcher, _ := Exact("id")
-	if _, err := store.Grant("s", "web-1", ScopeSession, matcher, "", "ap_0123456789abcdef01234567", "r1", time.Hour, ChannelCLI); err != nil {
+	if _, err := store.Grant("s", "web-1", ScopeSession, matcher, "", 0, "ap_0123456789abcdef01234567", "r1", time.Hour, ChannelCLI); err != nil {
 		t.Fatal(err)
 	}
 	cfg := policy.Config{Rules: []policy.Rule{{

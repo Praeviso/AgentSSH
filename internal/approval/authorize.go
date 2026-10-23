@@ -27,7 +27,24 @@ type Authorization struct {
 	ApprovalMatcher Matcher
 	GrantExpiresTS  string
 	Task            *TaskPermission
+	// GrantStdinBytes is the stdin size the matched grant was approved for;
+	// see CheckGrantedStdin.
+	GrantStdinBytes int64
 }
+
+// CheckGrantedStdin refuses a grant approved for a stdin of another size than
+// the run's. The grant's hash pins the content, so the sizes differ only when
+// the request misstated its size to the operator, as a modified client
+// submitting a plan to a gateway could; such a run is not trusted.
+func CheckGrantedStdin(auth Authorization, stdinBytes int64) (Authorization, bool) {
+	if auth.Status != AuthAllowByGrant || auth.GrantStdinBytes == 0 || auth.GrantStdinBytes == stdinBytes {
+		return auth, true
+	}
+	return Authorization{Status: AuthHardDeny, Decision: policy.Decision{Action: policy.ActionDeny, Rule: RuleStdinSizeMismatch}}, false
+}
+
+// RuleStdinSizeMismatch names the refusal of CheckGrantedStdin.
+const RuleStdinSizeMismatch = "approval/stdin-size-mismatch"
 
 // Authorize decides one run request. A matching once grant is claimed under
 // reqID (two-phase consumption): the caller must settle the claim with
@@ -139,12 +156,13 @@ func authorize(cfg policy.Config, inv inventory.Inventory, sessionStore SessionS
 			}
 		}
 		return Authorization{
-			Status:         AuthAllowByGrant,
-			Decision:       policy.Decision{Action: policy.ActionAllow, Rule: "approval/session/" + grant.ApprovalID},
-			GrantScope:     grant.Scope,
-			GrantMatcher:   grant.Regex,
-			GrantExpiresTS: grant.ExpiresTS,
-			Task:           grant.Task,
+			Status:          AuthAllowByGrant,
+			Decision:        policy.Decision{Action: policy.ActionAllow, Rule: "approval/session/" + grant.ApprovalID},
+			GrantScope:      grant.Scope,
+			GrantMatcher:    grant.Regex,
+			GrantExpiresTS:  grant.ExpiresTS,
+			Task:            grant.Task,
+			GrantStdinBytes: grant.StdinBytes,
 		}, nil
 	}
 	// Persistent host approval rules match the command text only; they cannot

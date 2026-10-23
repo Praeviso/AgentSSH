@@ -3351,6 +3351,7 @@ func runPolicyTest(cmd *cobra.Command, host string, commands []string, file stri
 		if err != nil {
 			return newUsageError("cannot evaluate authorization: %v", err)
 		}
+		auth, _ = approval.CheckGrantedStdin(auth, input.stdin.bytes)
 		verdict := "deny"
 		switch auth.Status {
 		case approval.AuthAllow, approval.AuthAllowByGrant:

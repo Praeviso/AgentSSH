@@ -27,6 +27,25 @@ const maxPlanSubmitBody = 8 << 20
 // maxReviewTextBytes bounds a plan review's free-text fields.
 const maxReviewTextBytes = 16 << 10
 
+// DefaultMaxPendingApprovals is Server.MaxPendingApprovals's default.
+const DefaultMaxPendingApprovals = 1000
+
+func (s *Server) maxPendingApprovals() int {
+	if s.MaxPendingApprovals > 0 {
+		return s.MaxPendingApprovals
+	}
+	return DefaultMaxPendingApprovals
+}
+
+// approvals are deviceID's approval stores for its own requests: what the
+// device creates is capped, since it stays on the gateway's disk until an
+// operator decides.
+func (s *Server) approvals(deviceID string) approvalStores {
+	stores := deviceApprovals(s.Dir, deviceID)
+	stores.Pending.MaxPending = s.maxPendingApprovals()
+	return stores
+}
+
 // approvalStores are one device's approval state on the gateway.
 type approvalStores struct {
 	Pending  approval.PendingStore
@@ -93,7 +112,7 @@ func (s *Server) handleApprovalStatus(w http.ResponseWriter, _ *http.Request, de
 		controlplane.WriteError(w, http.StatusBadRequest, remote.CodeBadRequest, "malformed approval status query")
 		return
 	}
-	status, err := deviceApprovals(s.Dir, device.ID).Pending.Status(req.ApprovalID)
+	status, err := s.approvals(device.ID).Pending.Status(req.ApprovalID)
 	if err != nil {
 		writeApprovalError(w, err)
 		return
@@ -107,7 +126,7 @@ func (s *Server) handlePlanStatus(w http.ResponseWriter, _ *http.Request, device
 		controlplane.WriteError(w, http.StatusBadRequest, remote.CodeBadRequest, "malformed plan status query")
 		return
 	}
-	status, err := deviceApprovals(s.Dir, device.ID).Pending.PlanStatus(req.PlanID)
+	status, err := s.approvals(device.ID).Pending.PlanStatus(req.PlanID)
 	if err != nil {
 		writeApprovalError(w, err)
 		return
@@ -160,7 +179,18 @@ func (s *Server) handlePlanSubmit(w http.ResponseWriter, _ *http.Request, device
 			Stdin: runner.Stdin{SHA256: command.StdinSHA256, Bytes: command.StdinBytes}, PayloadRef: command.PayloadRef,
 		})
 	}
-	stores := deviceApprovals(s.Dir, device.ID)
+	stores := s.approvals(device.ID)
+	// Refuse a plan that cannot fit before it creates any request, so a
+	// refusal leaves nothing half submitted.
+	waiting, err := stores.Pending.Unresolved()
+	if err != nil {
+		controlplane.WriteError(w, http.StatusInternalServerError, remote.CodeInternal, "approval store unavailable")
+		return
+	}
+	if waiting+len(commands) > stores.Pending.MaxPending {
+		writeTooManyPending(w)
+		return
+	}
 	env := runner.Env{
 		Policy:    pol,
 		Inventory: inv,
@@ -178,15 +208,22 @@ func (s *Server) handlePlanSubmit(w http.ResponseWriter, _ *http.Request, device
 		Review:   req.Review,
 	})
 	var usage runner.UsageError
-	if errors.As(err, &usage) {
+	switch {
+	case errors.As(err, &usage):
 		controlplane.WriteError(w, http.StatusBadRequest, remote.CodeUsage, usage.Error())
 		return
-	}
-	if err != nil {
+	case errors.Is(err, approval.ErrTooManyPending):
+		writeTooManyPending(w)
+		return
+	case err != nil:
 		controlplane.WriteError(w, http.StatusInternalServerError, remote.CodeInternal, "plan submission failed")
 		return
 	}
 	controlplane.WriteJSON(w, http.StatusOK, remote.PlanSubmitResult{Response: response, ExitCode: exitCode})
+}
+
+func writeTooManyPending(w http.ResponseWriter) {
+	controlplane.WriteError(w, http.StatusTooManyRequests, remote.CodeBusy, approval.ErrTooManyPending.Error())
 }
 
 func validatePlanSubmit(req remote.PlanSubmitRequest) error {
@@ -257,7 +294,7 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, _ *http.Request, device 
 		return
 	}
 	runtime := approvalRuntime(device.ID, pol.Approval)
-	sessions := deviceApprovals(s.Dir, device.ID).Sessions
+	sessions := s.approvals(device.ID).Sessions
 	out := remote.AuthorizeResponse{ApprovalEnabled: runtime.Enabled, Results: make([]approval.AuthorizationStatus, 0, len(req.Checks))}
 	for _, check := range req.Checks {
 		auth, err := approval.PreflightAuthorize(pol, inv, sessions, runtime, check.Session, check.Host, check.Cmd, check.StdinSHA256)
@@ -265,6 +302,7 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, _ *http.Request, device 
 			controlplane.WriteError(w, http.StatusBadRequest, remote.CodeUsage, fmt.Sprintf("policy is invalid: %v", err))
 			return
 		}
+		auth, _ = approval.CheckGrantedStdin(auth, check.StdinBytes)
 		out.Results = append(out.Results, auth.Status)
 	}
 	controlplane.WriteJSON(w, http.StatusOK, out)

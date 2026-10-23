@@ -152,14 +152,14 @@ func TestTaskGrantLifecycleAndExactCompatibility(t *testing.T) {
 	if _, ok, err := store.Peek("s", "web-1", command, ""); err != nil || ok {
 		t.Fatal("grant survived expiry", err)
 	}
-	if _, err := store.Grant("exact", "web-1", ScopeSession, matcher, "", "old", "r", time.Hour, ChannelCLI); err != nil {
+	if _, err := store.Grant("exact", "web-1", ScopeSession, matcher, "", 0, "old", "r", time.Hour, ChannelCLI); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok, _ := store.Peek("exact", "web-1", "systemctl reload nginx", ""); ok {
 		t.Fatal("old exact scope widened")
 	}
 	task, _ := taskMatcher(command)
-	if _, err := store.Grant("s", "web-1", ScopeTask, task, "", "new", "r2", time.Hour, ChannelCLI); err != nil {
+	if _, err := store.Grant("s", "web-1", ScopeTask, task, "", 0, "new", "r2", time.Hour, ChannelCLI); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.End("s"); err != nil {
@@ -260,7 +260,7 @@ func TestPreflightDoesNotCreateLocksOrRewriteExpiredGrants(t *testing.T) {
 		t.Fatal("preflight created a store", err)
 	}
 	m, _ := Exact("id")
-	if _, err := store.Grant("s", "web", ScopeOnce, m, "", "ap", "req", time.Second, ChannelCLI); err != nil {
+	if _, err := store.Grant("s", "web", ScopeOnce, m, "", 0, "ap", "req", time.Second, ChannelCLI); err != nil {
 		t.Fatal(err)
 	}
 	file := sessionPath(store.Dir, "s")

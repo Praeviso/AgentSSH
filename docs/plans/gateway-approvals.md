@@ -89,6 +89,25 @@ status, plan submit, preflight — used by the existing commands and wait loops.
   `--device` names the device; that covers two submissions racing past the
   check. Tests: `TestAPlanIDBelongsToOneDevice`,
   `TestAnAmbiguousIDNeedsTheDevice` (both mutation-checked).
+- [x] PR #30 review (Codex), same root as #26's run records: state a device
+  creates and only an operator removes is a resource, and the device's
+  statements about it are claims.
+  - P1: pending requests and plan manifests were unbounded (many plans of up
+    to 1000 gray commands; also gray-zone `/exec` runs, and new manifests
+    built again and again over the same request). `PendingStore.MaxPending`
+    caps unresolved requests in `Create` and plans that still have one in
+    `CreatePlan` (decided plans reaped after a day); the gateway sets it per
+    device (`serve --max-pending-approvals`, default 1000), prechecks a plan's
+    size so a refusal creates nothing, and answers `429 busy`. Test:
+    `TestPendingApprovalsAreCappedPerDevice`.
+  - P2: the stdin size of a submitted plan was the device's claim, shown to
+    the operator but never checked. Grants record the stated size
+    (`Grant.StdinBytes`), `approval.CheckGrantedStdin` refuses a run (and
+    every preflight) whose size differs, releasing a claimed once grant, and
+    requests are deduplicated on size too. Test:
+    `TestGrantsAreBoundToTheStatedStdinSize`.
+  - Mutation checks: removing the request cap, the plan cap, the plan
+    precheck, the size check, or recording the size each fails its test.
 - [x] Tests: see Validation.
 - [x] Docs: `docs/architecture/remote-control.md` (approvals table, admin
   commands, superseded plans).
