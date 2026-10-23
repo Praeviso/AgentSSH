@@ -39,7 +39,7 @@ type Grant struct {
 	StdinSHA256 string `json:"stdin_sha256,omitempty"`
 	// StdinBytes is the stdin size the approved request stated. The hash pins
 	// the content, so a run whose size differs comes from a request that
-	// misstated it; callers refuse such a run (zero: not recorded).
+	// misstated it; callers refuse such a run (see CheckGrantedStdin).
 	StdinBytes int64 `json:"stdin_bytes,omitempty"`
 	// ClaimReqID/ClaimTS implement two-phase once-grant consumption: Claim marks
 	// the grant as reserved by one run request; Commit deletes it once the command

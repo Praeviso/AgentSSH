@@ -35,9 +35,11 @@ type Authorization struct {
 // CheckGrantedStdin refuses a grant approved for a stdin of another size than
 // the run's. The grant's hash pins the content, so the sizes differ only when
 // the request misstated its size to the operator, as a modified client
-// submitting a plan to a gateway could; such a run is not trusted.
+// submitting a plan to a gateway could; such a run is not trusted. A grant
+// recorded before sizes were bound has none and is refused for any non-empty
+// stdin, so its command needs approving again.
 func CheckGrantedStdin(auth Authorization, stdinBytes int64) (Authorization, bool) {
-	if auth.Status != AuthAllowByGrant || auth.GrantStdinBytes == 0 || auth.GrantStdinBytes == stdinBytes {
+	if auth.Status != AuthAllowByGrant || auth.GrantStdinBytes == stdinBytes {
 		return auth, true
 	}
 	return Authorization{Status: AuthHardDeny, Decision: policy.Decision{Action: policy.ActionDeny, Rule: RuleStdinSizeMismatch}}, false

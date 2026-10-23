@@ -108,6 +108,15 @@ status, plan submit, preflight — used by the existing commands and wait loops.
     `TestGrantsAreBoundToTheStatedStdinSize`.
   - Mutation checks: removing the request cap, the plan cap, the plan
     precheck, the size check, or recording the size each fails its test.
+  - Security review follow-up (8e85127): the size check treated a granted size
+    of 0 as "not recorded", so a plan stating 0 bytes beside a real hash got a
+    grant the check skipped. The comparison is now strict, and
+    `/plans/submit` refuses a hash and size that cannot describe one payload
+    (zero bytes only with the empty payload's hash). Grants recorded before
+    sizes were bound need approving again for a non-empty stdin (fails
+    closed). Tests: `TestCheckGrantedStdinComparesSizesStrictly`, the
+    stated-size cases of `TestGrantsAreBoundToTheStatedStdinSize`
+    (both mutation-checked).
 - [x] Tests: see Validation.
 - [x] Docs: `docs/architecture/remote-control.md` (approvals table, admin
   commands, superseded plans).

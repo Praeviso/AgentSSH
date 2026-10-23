@@ -277,6 +277,15 @@ func TestGrantsAreBoundToTheStatedStdinSize(t *testing.T) {
 	payload := []byte("0123456789")
 	sum := sha256.Sum256(payload)
 	stdinSHA := hex.EncodeToString(sum[:])
+	for _, stated := range []int64{0, -1, remote.MaxExecStdinBytes + 1} {
+		planID, _ := approval.NewPlanID()
+		_, err := f.client.SubmitPlan(context.Background(), remote.PlanSubmitRequest{PlanID: planID, Host: "web-1", Session: "s_bad",
+			Commands: []remote.PlanSubmitCommand{{ID: "load", Cmd: "cat -", StdinSHA256: stdinSHA, StdinBytes: stated}}})
+		var apiErr *remote.APIError
+		if !errors.As(err, &apiErr) || apiErr.Code != remote.CodeUsage {
+			t.Fatalf("stated size %d for a non-empty payload's hash: %v", stated, err)
+		}
+	}
 	for _, stated := range []int64{1, int64(len(payload))} {
 		planID, _ := approval.NewPlanID()
 		session := fmt.Sprintf("s_%d", stated)

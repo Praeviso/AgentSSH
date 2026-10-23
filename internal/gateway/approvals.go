@@ -274,11 +274,38 @@ func validatePlanSubmit(req remote.PlanSubmitRequest) error {
 		if len(command.Cmd) > remote.MaxExecCommandBytes {
 			return fmt.Errorf("command is %d bytes; the limit is %d bytes (128 KiB)", len(command.Cmd), remote.MaxExecCommandBytes)
 		}
-		for _, value := range []string{command.ID, command.Name, command.Phase, command.OnFailure, command.StdinSHA256, command.PayloadRef} {
+		if err := validStdinIdentity(command.StdinSHA256, command.StdinBytes); err != nil {
+			return err
+		}
+		for _, value := range []string{command.ID, command.Name, command.Phase, command.OnFailure, command.PayloadRef} {
 			if len(value) > remote.MaxExecLabelBytes || strings.IndexFunc(value, unicode.IsControl) >= 0 {
 				return fmt.Errorf("plan step fields must be at most %d bytes without control characters", remote.MaxExecLabelBytes)
 			}
 		}
+	}
+	return nil
+}
+
+// emptySHA256 is the hash of an empty stdin.
+const emptySHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+// validStdinIdentity checks that a stated stdin hash and size can describe
+// one payload: a well-formed hash, a size within the stdin limit, no size
+// without a hash, and size zero only for the empty payload's hash. The
+// gateway cannot check the size against content it never receives at
+// submit; grants bind it and execution compares it (CheckGrantedStdin).
+func validStdinIdentity(sha string, bytes int64) error {
+	switch {
+	case sha == "" && bytes == 0:
+		return nil
+	case sha == "":
+		return errors.New("a stdin size needs its sha256")
+	case len(sha) != 64 || strings.Trim(sha, "0123456789abcdef") != "":
+		return errors.New("stdin sha256 must be 64 lowercase hex characters")
+	case bytes < 0 || bytes > remote.MaxExecStdinBytes:
+		return fmt.Errorf("stdin is %d bytes; the limit is %d bytes (32 MiB)", bytes, remote.MaxExecStdinBytes)
+	case bytes == 0 && sha != emptySHA256:
+		return errors.New("a stdin of zero bytes has the empty payload's sha256")
 	}
 	return nil
 }

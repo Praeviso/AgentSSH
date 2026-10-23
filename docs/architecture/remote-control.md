@@ -211,10 +211,14 @@ that does not fit is refused before it creates anything, and a request beyond
 the cap is `429 busy`, on `/exec` and `/plans/submit` alike.
 
 A grant records the stdin size its request stated, and a run whose stdin
-differs in size is refused (`approval/stdin-size-mismatch`, exit 6). The hash
-already pins the content; the size a device states when submitting a plan is
-what the operator reads, so a misstated one can never authorize the real
-payload.
+differs in size is refused (`approval/stdin-size-mismatch`, exit 6); zero is a
+size like any other, not "unchecked", so a grant recorded before sizes were
+bound needs approving again for a non-empty stdin. The hash already pins the
+content; the size a device states when submitting a plan is what the operator
+reads, so a misstated one can never authorize the real payload. `/plans/submit`
+also refuses a hash and size that cannot describe one payload (a malformed
+hash, a size without a hash, a size beyond the stdin limit, or zero bytes with
+any hash but the empty payload's).
 
 Plan IDs are minted by devices, so the gateway refuses a submitted plan ID that
 another device already holds (`409`), and a decision by an ID that more than

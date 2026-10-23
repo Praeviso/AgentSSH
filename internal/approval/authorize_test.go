@@ -113,3 +113,23 @@ func TestAuthorizeDisabledApprovalUsesPersistedHostRules(t *testing.T) {
 		t.Fatalf("gray auth = %#v, want default-deny needs approval sentinel", auth)
 	}
 }
+
+// A grant's stdin size must equal the run's: no size counts as "unchecked",
+// so a grant without one (recorded before sizes were bound) does not cover a
+// non-empty stdin.
+func TestCheckGrantedStdinComparesSizesStrictly(t *testing.T) {
+	grant := Authorization{Status: AuthAllowByGrant}
+	for _, tc := range []struct {
+		granted, run int64
+		ok           bool
+	}{{0, 0, true}, {10, 10, true}, {1, 10, false}, {0, 10, false}, {10, 0, false}} {
+		grant.GrantStdinBytes = tc.granted
+		got, ok := CheckGrantedStdin(grant, tc.run)
+		if ok != tc.ok || !ok && (got.Status != AuthHardDeny || got.Decision.Rule != RuleStdinSizeMismatch) {
+			t.Fatalf("granted %d, run %d: %+v %v", tc.granted, tc.run, got, ok)
+		}
+	}
+	if _, ok := CheckGrantedStdin(Authorization{Status: AuthAllow}, 10); !ok {
+		t.Fatal("a policy allow was checked against a grant size")
+	}
+}
