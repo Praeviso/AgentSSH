@@ -61,7 +61,7 @@ pending IDs go to stderr. A wait timeout remains pending, not approved.
 | Failed execution or command | Inspect effects and outputs before retrying. |
 | Unknown execution | Never replay automatically; inspect the remote state and audit trail. |
 | Completed execution | Verify the business/application checks requested by the user. |
-| Hint names the control plane (revoked, unreachable, refused to sign) or "remote configuration unavailable" | Stop and tell the user; only the control plane's administrator can fix it. Do not retry or work around it. |
+| `run`, `plan` or `status` fails with a hint naming the control plane (revoked, unreachable, refused to sign) or "remote configuration unavailable" | Stop and tell the user; only the control plane's administrator can fix it. Do not retry or work around it. |
 
 ## Read only the detail needed
 
@@ -81,3 +81,8 @@ Use bounded remote output, such as `journalctl -n 100 --no-pager` or Compose
 use audit commands when execution evidence is missing or an audit is requested.
 If a documented command is unavailable, inspect that installed subcommand's
 `--help` and use the compatible path described in the references.
+
+On a device whose control plane keeps policy, grants and audit, `policy test`,
+`session grants` and `audit` exit 2 and name the control plane. They are
+optional: continue with `run`, `plan` and `status <req_id>`, and do not treat
+that refusal as a blocker.
