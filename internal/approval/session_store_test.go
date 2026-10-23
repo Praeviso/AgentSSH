@@ -15,7 +15,7 @@ func TestSessionStoreGrantMatchTTLHostAndEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Grant("s_test", "web-1", ScopeSession, matcher, "", "ap_0123456789abcdef01234567", "r1", time.Hour, ChannelCLI); err != nil {
+	if _, err := store.Grant("s_test", "web-1", ScopeSession, matcher, "", 0, "ap_0123456789abcdef01234567", "r1", time.Hour, ChannelCLI); err != nil {
 		t.Fatalf("Grant: %v", err)
 	}
 	if _, ok, err := store.Peek("s_test", "web-2", "systemctl restart nginx", ""); err != nil || ok {
@@ -30,7 +30,7 @@ func TestSessionStoreGrantMatchTTLHostAndEnd(t *testing.T) {
 	}
 
 	now = time.Date(2026, 6, 30, 1, 0, 0, 0, time.UTC)
-	if _, err := store.Grant("s_test", "web-1", ScopeSession, matcher, "", "ap_0123456789abcdef01234568", "r2", time.Hour, ChannelCLI); err != nil {
+	if _, err := store.Grant("s_test", "web-1", ScopeSession, matcher, "", 0, "ap_0123456789abcdef01234568", "r2", time.Hour, ChannelCLI); err != nil {
 		t.Fatalf("Grant again: %v", err)
 	}
 	if err := store.End("s_test"); err != nil {
@@ -47,7 +47,7 @@ func TestSessionStoreOnceConcurrentClaimsOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Grant("s_once", "web-1", ScopeOnce, matcher, "", "ap_0123456789abcdef01234567", "r1", time.Hour, ChannelCLI); err != nil {
+	if _, err := store.Grant("s_once", "web-1", ScopeOnce, matcher, "", 0, "ap_0123456789abcdef01234567", "r1", time.Hour, ChannelCLI); err != nil {
 		t.Fatalf("Grant: %v", err)
 	}
 	var matched int32
@@ -75,7 +75,7 @@ func TestSessionStoreOnceTwoPhaseClaimCommitRelease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Grant("s_2p", "web-1", ScopeOnce, matcher, "", "ap_0123456789abcdef01234567", "r1", time.Hour, ChannelCLI); err != nil {
+	if _, err := store.Grant("s_2p", "web-1", ScopeOnce, matcher, "", 0, "ap_0123456789abcdef01234567", "r1", time.Hour, ChannelCLI); err != nil {
 		t.Fatalf("Grant: %v", err)
 	}
 
@@ -117,7 +117,7 @@ func TestSessionStoreCommitReleaseIgnoreOtherClaims(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Grant("s_iso", "web-1", ScopeOnce, matcher, "", "ap_0123456789abcdef01234567", "r1", time.Hour, ChannelCLI); err != nil {
+	if _, err := store.Grant("s_iso", "web-1", ScopeOnce, matcher, "", 0, "ap_0123456789abcdef01234567", "r1", time.Hour, ChannelCLI); err != nil {
 		t.Fatalf("Grant: %v", err)
 	}
 	if _, ok, err := store.Claim("s_iso", "web-1", "id", "", "req-a"); err != nil || !ok {
@@ -145,10 +145,10 @@ func TestSessionStoreAllowsSameSessionAcrossHosts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Grant("s_shared", "web-1", ScopeSession, webMatcher, "", "ap_0123456789abcdef01234567", "r1", time.Hour, ChannelCLI); err != nil {
+	if _, err := store.Grant("s_shared", "web-1", ScopeSession, webMatcher, "", 0, "ap_0123456789abcdef01234567", "r1", time.Hour, ChannelCLI); err != nil {
 		t.Fatalf("Grant web: %v", err)
 	}
-	if _, err := store.Grant("s_shared", "db-1", ScopeSession, dbMatcher, "", "ap_0123456789abcdef01234568", "r2", time.Hour, ChannelCLI); err != nil {
+	if _, err := store.Grant("s_shared", "db-1", ScopeSession, dbMatcher, "", 0, "ap_0123456789abcdef01234568", "r2", time.Hour, ChannelCLI); err != nil {
 		t.Fatalf("Grant db: %v", err)
 	}
 	if grant, ok, err := store.Peek("s_shared", "web-1", "systemctl restart web", ""); err != nil || !ok || grant.Host != "web-1" {
@@ -169,7 +169,7 @@ func TestSessionStoreEndRemovesDerivedSessions(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, sessionID := range []string{"s_batch", "s_batch@web-1", "s_batch@web-2", "s_batch_other@web-3"} {
-		if _, err := store.Grant(sessionID, "web-1", ScopeSession, matcher, "", "ap_0123456789abcdef01234567", "r1", time.Hour, ChannelCLI); err != nil {
+		if _, err := store.Grant(sessionID, "web-1", ScopeSession, matcher, "", 0, "ap_0123456789abcdef01234567", "r1", time.Hour, ChannelCLI); err != nil {
 			t.Fatalf("Grant %s: %v", sessionID, err)
 		}
 	}

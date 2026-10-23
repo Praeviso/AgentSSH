@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/Praeviso/AgentSSH/internal/fileutil"
@@ -113,6 +114,11 @@ func validPlanID(id string) bool {
 	return validPrefixedID(id, "pl_")
 }
 
+// ValidPlanID reports whether id has the shape of a plan ID.
+func ValidPlanID(id string) bool {
+	return validPlanID(id)
+}
+
 func (s PendingStore) CreatePlan(manifest PlanManifest) (PlanManifest, error) {
 	if s.PlansDir == "" {
 		return PlanManifest{}, ErrPlansDirUnset
@@ -129,6 +135,21 @@ func (s PendingStore) CreatePlan(manifest PlanManifest) (PlanManifest, error) {
 	}
 	if err := os.MkdirAll(s.PlansDir, 0o700); err != nil {
 		return PlanManifest{}, fmt.Errorf("create plan directory: %w", err)
+	}
+	// Counting and publishing form one step, as in Create.
+	lock, err := lockSessionPath(s.PlansDir)
+	if err != nil {
+		return PlanManifest{}, err
+	}
+	defer unlockAndClose(lock)
+	if s.MaxPending > 0 {
+		waiting, err := s.pendingPlans()
+		if err != nil {
+			return PlanManifest{}, err
+		}
+		if waiting >= s.MaxPending {
+			return PlanManifest{}, ErrTooManyPending
+		}
 	}
 	manifest.Version = 1
 	if manifest.TS == "" {
@@ -160,6 +181,33 @@ func (s PendingStore) CreatePlan(manifest PlanManifest) (PlanManifest, error) {
 		return PlanManifest{}, fmt.Errorf("create plan manifest: %w", err)
 	}
 	return manifest, nil
+}
+
+// pendingPlans counts the plans that still have a request awaiting a
+// decision. Plans with none left are reaped once resolvedReapTTL old, like
+// resolved requests: a plan is cheap to create from requests that already
+// exist, so they must not pile up either.
+func (s PendingStore) pendingPlans() (int, error) {
+	entries, err := os.ReadDir(s.PlansDir)
+	if err != nil {
+		return 0, fmt.Errorf("list plans: %w", err)
+	}
+	cutoff := s.now().Add(-resolvedReapTTL)
+	count := 0
+	for _, entry := range entries {
+		id, ok := strings.CutSuffix(entry.Name(), ".json")
+		if entry.IsDir() || !ok || !validPlanID(id) {
+			continue
+		}
+		if status, err := s.PlanStatus(id); err == nil && status.Pending > 0 {
+			count++
+			continue
+		}
+		if info, err := entry.Info(); err == nil && info.ModTime().Before(cutoff) {
+			_ = os.Remove(planPath(s.PlansDir, id))
+		}
+	}
+	return count, nil
 }
 
 func (s PendingStore) GetPlan(id string) (PlanManifest, error) {

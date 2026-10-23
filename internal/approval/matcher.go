@@ -39,6 +39,8 @@ const (
 	ChannelTUI  = "tui"
 	ChannelExit = "exit"
 	ChannelPlan = "plan"
+	// ChannelGateway marks decisions an operator made on a gateway.
+	ChannelGateway = "gateway"
 )
 
 // Matcher is the reusable command matcher that can be stored in session grants

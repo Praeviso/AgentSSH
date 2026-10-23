@@ -8,6 +8,7 @@ package gateway
 import (
 	"net/http"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 
@@ -64,6 +65,9 @@ type Server struct {
 	RunQuotaBytes          int64
 	// RunRecords caps the run records one device keeps.
 	RunRecords int
+	// MaxPendingApprovals caps one device's requests awaiting a decision, and
+	// separately its plans awaiting one.
+	MaxPendingApprovals int
 	// Executor, when set, replaces SSH with the gateway's identities for a
 	// device's inventory. Tests use it to drive a fake target.
 	Executor func(inventory.Inventory) executor.Executor
@@ -77,6 +81,9 @@ type Server struct {
 	// last sweep; deviceSweeps says when that device is next aged out.
 	deviceRecords map[string]int
 	deviceSweeps  map[string]time.Time
+	// submits serializes each device's plan submissions, so a plan's
+	// precheck against the approval cap holds while it is submitted.
+	submits sync.Map // device ID → *sync.Mutex
 }
 
 // NewServer wires a data directory, its store and unlocked keys into an API
@@ -101,5 +108,5 @@ func (s *Server) Handler(publicURL string) (http.Handler, error) {
 		Keys:  func() *controlplane.Keys { return s.Keys },
 		Now:   s.now,
 	}
-	return api.Handler(publicURL, append(s.execRoutes(), s.deviceRoutes()...)...)
+	return api.Handler(publicURL, slices.Concat(s.execRoutes(), s.deviceRoutes(), s.approvalRoutes())...)
 }

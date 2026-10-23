@@ -167,6 +167,14 @@ func Run(ctx context.Context, env Env, req Request) (Outcome, error) {
 		if err != nil {
 			return Outcome{}, invalidPolicyError(err)
 		}
+		if checked, ok := approval.CheckGrantedStdin(auth, req.Stdin.Bytes); !ok {
+			// The refused once grant stays for a run with the stdin it was
+			// approved for.
+			if auth.GrantScope == approval.ScopeOnce {
+				_ = env.Sessions.Release(p.SessionCtx.ID, p.ReqID)
+			}
+			auth = checked
+		}
 		p.Auth = auth
 		switch auth.Status {
 		case approval.AuthHardDeny:
@@ -353,6 +361,12 @@ func buildPlans(env Env, req Request) ([]plan, error) {
 		}
 		if err != nil {
 			return nil, invalidPolicyError(err)
+		}
+		if checked, ok := approval.CheckGrantedStdin(auth, req.Stdin.Bytes); !ok {
+			if !env.Approval.Enabled && auth.GrantScope == approval.ScopeOnce {
+				_ = env.Sessions.Release(sessionCtx.ID, reqID)
+			}
+			auth = checked
 		}
 		plans = append(plans, plan{Target: target, ReqID: reqID, SessionCtx: sessionCtx, Auth: auth})
 	}

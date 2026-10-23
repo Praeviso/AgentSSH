@@ -19,6 +19,7 @@ import (
 	"github.com/Praeviso/AgentSSH/internal/policy"
 	"github.com/Praeviso/AgentSSH/internal/remote"
 	"github.com/Praeviso/AgentSSH/internal/remoteclient"
+	"github.com/Praeviso/AgentSSH/internal/runner"
 	"github.com/Praeviso/AgentSSH/internal/session"
 	"github.com/spf13/cobra"
 )
@@ -26,8 +27,8 @@ import (
 // gatewayCommands are what a gateway device runs: the agent's commands, which
 // the gateway answers, and the commands that touch only this machine's own
 // state (plan snapshots, stdin payloads, enrollment). Every other command
-// reads or changes inventory, policy, approvals or audit, which for a gateway
-// device live on the gateway.
+// reads or changes inventory, policy, audit or approval decisions, which for
+// a gateway device live on the gateway.
 var gatewayCommands = []string{
 	"agentssh hosts",
 	"agentssh run",
@@ -38,18 +39,13 @@ var gatewayCommands = []string{
 	"agentssh plan payload",
 	"agentssh plan template",
 	"agentssh session new",
-	"agentssh diagnostics",
-	"agentssh remote",
-}
-
-// gatewayApprovalCommands wait on or report approvals, which gateway devices
-// cannot do yet: their approvals are kept on the gateway.
-var gatewayApprovalCommands = []string{
 	"agentssh approval status",
 	"agentssh approval wait",
 	"agentssh plan submit",
 	"agentssh plan status",
 	"agentssh plan wait",
+	"agentssh diagnostics",
+	"agentssh remote",
 }
 
 func commandIn(path string, commands []string) bool {
@@ -77,9 +73,6 @@ func refuseInGateway(cmd *cobra.Command) error {
 	path := cmd.CommandPath()
 	if commandIn(path, gatewayCommands) || !gatewayHome() {
 		return nil
-	}
-	if commandIn(path, gatewayApprovalCommands) {
-		return newUsageError("%s is not available in gateway mode yet: this device's approvals are kept on the gateway\n  wait for the operator's decision, then re-run the original command", path)
 	}
 	return newUsageError("%s is not available in gateway mode: this device's inventory, policy, approvals and audit live on the gateway\n  ask the gateway's administrator; agentssh remote status shows which gateway", path)
 }
@@ -121,9 +114,6 @@ var errGatewaySSH = errors.New("the gateway could not reach the host over SSH")
 // runGateway sends one run to the gateway, which resolves, authorizes, runs
 // and audits it, and presents the outcome exactly as runDirect does.
 func runGateway(cmd *cobra.Command, cfg *config.Config, targetName, remoteCommand string, flags runFlags) error {
-	if flags.waitApproval != "" {
-		return newUsageError("--wait-approval is not available in gateway mode yet: this device's approvals are kept on the gateway\n  wait for the operator's decision, then re-run the original command")
-	}
 	var stdin stdinSpec
 	var err error
 	if flags.stdinSnapshot != nil {
@@ -270,4 +260,119 @@ func gatewayError(err error) error {
 		return fmt.Errorf("gateway: %w\n  the control plane's mode changed since this device enrolled; tell its administrator", err)
 	}
 	return fmt.Errorf("gateway: %w\n  check the control plane with: agentssh remote status", err)
+}
+
+// Approvals live where the home keeps them: in its own state directory, or
+// for a gateway device on the gateway. These read them from either.
+
+// approvalStatus reads one approval request, and the default wait for it.
+func approvalStatus(ctx context.Context, cfg *config.Config, id string) (approval.StatusResult, time.Duration, error) {
+	if cfg.Gateway != nil {
+		resp, err := cfg.Gateway.ApprovalStatus(ctx, id)
+		if err != nil {
+			return approval.StatusResult{}, 0, gatewayError(err)
+		}
+		return resp.Status, time.Duration(resp.WaitTimeoutMS) * time.Millisecond, nil
+	}
+	status, err := approvalStore(cfg.Paths).Status(id)
+	if errors.Is(err, approval.ErrPendingNotFound) || errors.Is(err, approval.ErrInvalidID) {
+		return approval.StatusResult{}, 0, newUsageError("%v", err)
+	}
+	return status, approval.DefaultWaitTimeout, err
+}
+
+// planStatus reads one plan, and the default wait for it.
+func planStatus(ctx context.Context, cfg *config.Config, id string) (approval.PlanStatus, time.Duration, error) {
+	if cfg.Gateway != nil {
+		resp, err := cfg.Gateway.PlanStatus(ctx, id)
+		if err != nil {
+			return approval.PlanStatus{}, 0, gatewayError(err)
+		}
+		return resp.Status, time.Duration(resp.WaitTimeoutMS) * time.Millisecond, nil
+	}
+	status, err := approvalStore(cfg.Paths).PlanStatus(id)
+	if err != nil {
+		return approval.PlanStatus{}, 0, mapPlanError(err)
+	}
+	return status, approval.DefaultWaitTimeout, nil
+}
+
+// preflight reports how each check would be authorized now, without side
+// effects, and whether approvals are enabled at all. A local home rereads its
+// configuration, so a policy edited meanwhile takes effect.
+func preflight(ctx context.Context, cfg *config.Config, checks []remote.AuthorizeCheck) ([]approval.AuthorizationStatus, bool, error) {
+	if cfg.Gateway != nil {
+		resp, err := cfg.Gateway.Authorize(ctx, checks)
+		if err != nil {
+			return nil, false, gatewayError(err)
+		}
+		if len(resp.Results) != len(checks) {
+			return nil, false, fmt.Errorf("gateway answered %d of %d authorization checks", len(resp.Results), len(checks))
+		}
+		return resp.Results, resp.ApprovalEnabled, nil
+	}
+	current, err := config.Load()
+	if err != nil {
+		return nil, false, classifyConfigError(err)
+	}
+	runtime, err := approvalRuntime(current)
+	if err != nil {
+		return nil, false, err
+	}
+	statuses := make([]approval.AuthorizationStatus, 0, len(checks))
+	for _, check := range checks {
+		auth, err := approval.PreflightAuthorize(current.Policy, current.Inventory, approval.SessionStore{Dir: current.Paths.SessionsDir}, runtime, check.Session, check.Host, check.Cmd, check.StdinSHA256)
+		if err != nil {
+			return nil, false, err
+		}
+		auth, _ = approval.CheckGrantedStdin(auth, check.StdinBytes)
+		statuses = append(statuses, auth.Status)
+	}
+	return statuses, runtime.Enabled, nil
+}
+
+// pollInterval is how often a wait asks again: often for local files, at
+// most every second for a gateway, where each question is a signed request.
+func pollInterval(cfg *config.Config) time.Duration {
+	if cfg.Gateway != nil {
+		return time.Second
+	}
+	return 50 * time.Millisecond
+}
+
+// waitFor asks fetch again until done or timeout and returns the last
+// answer. A gateway's answers back off from 200ms to 2s.
+func waitFor[T any](ctx context.Context, timeout time.Duration, first T, done func(T) bool, fetch func(context.Context) (T, error)) (T, error) {
+	deadline := time.Now().Add(timeout)
+	current, sleep := first, 200*time.Millisecond
+	for !done(current) && time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return current, ctx.Err()
+		case <-time.After(min(sleep, time.Until(deadline))):
+		}
+		next, err := fetch(ctx)
+		if err != nil {
+			return current, err
+		}
+		current, sleep = next, min(2*sleep, 2*time.Second)
+	}
+	return current, nil
+}
+
+// gatewaySubmitPlan submits a plan to the gateway with each command's stdin
+// identity; the content stays here until its step runs.
+func gatewaySubmitPlan(cmd *cobra.Command, cfg *config.Config, planID, host string, sessionCtx session.Context, commands []runner.PlanCommand, review approval.PlanReview) (planSubmitResponse, int, error) {
+	req := remote.PlanSubmitRequest{PlanID: planID, Host: host, Session: sessionCtx.ID, SessionLabel: sessionCtx.Label, Review: review}
+	for _, command := range commands {
+		req.Commands = append(req.Commands, remote.PlanSubmitCommand{
+			ID: command.ID, Name: command.Name, Phase: command.Phase, OnFailure: command.OnFailure, Cmd: command.Cmd,
+			StdinSHA256: command.Stdin.SHA256, StdinBytes: command.Stdin.Bytes, PayloadRef: command.PayloadRef,
+		})
+	}
+	result, err := cfg.Gateway.SubmitPlan(cmd.Context(), req)
+	if err != nil {
+		return planSubmitResponse{}, exitOK, gatewayError(err)
+	}
+	return result.Response, result.ExitCode, nil
 }

@@ -3,9 +3,11 @@ package approval
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -220,5 +222,62 @@ func TestPendingStoreReapsOldResolvedFiles(t *testing.T) {
 		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("%s still exists after reap: %v", path, err)
 		}
+	}
+}
+
+// The cap on requests and on plans awaiting a decision holds under
+// concurrent requesters, and the same request asked at once is created once.
+func TestPendingCapHoldsUnderConcurrency(t *testing.T) {
+	dir := t.TempDir()
+	store := PendingStore{PendingDir: filepath.Join(dir, "pending"), ResponsesDir: filepath.Join(dir, "responses"), PlansDir: filepath.Join(dir, "plans"), MaxPending: 5}
+	create := func(cmd string) (PendingRequest, error) {
+		matcher, err := Exact(cmd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return store.Create(PendingRequest{ReqID: "r", SessionID: "s", Host: "web-1", Cmd: cmd, Candidate: matcher})
+	}
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	ids := map[string]bool{}
+	for i := range 40 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Twenty distinct commands, each asked twice at once.
+			req, err := create(fmt.Sprintf("systemctl restart app-%d", i%20))
+			if err != nil && !errors.Is(err, ErrTooManyPending) {
+				t.Error(err)
+				return
+			}
+			if err == nil {
+				mu.Lock()
+				ids[req.ID] = true
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	if n, err := store.Unresolved(); err != nil || n != 5 || len(ids) != 5 {
+		t.Fatalf("unresolved %d (%v), distinct requests returned %d; want exactly the cap of 5", n, err, len(ids))
+	}
+
+	member := ""
+	for id := range ids {
+		member = id
+	}
+	var plans sync.WaitGroup
+	for range 20 {
+		plans.Add(1)
+		go func() {
+			defer plans.Done()
+			if _, err := store.CreatePlan(PlanManifest{SessionID: "s", Host: "web-1", MemberIDs: []string{member}}); err != nil && !errors.Is(err, ErrTooManyPending) {
+				t.Error(err)
+			}
+		}()
+	}
+	plans.Wait()
+	if n, err := store.pendingPlans(); err != nil || n != 5 {
+		t.Fatalf("pending plans %d (%v), want exactly the cap of 5", n, err)
 	}
 }

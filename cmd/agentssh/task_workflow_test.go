@@ -166,7 +166,7 @@ func TestRunWaitDoesNotReplayPartiallyExecutedGroup(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, host := range []string{"web-1", "web-2"} {
-		if _, err := store.Grant("s_test@"+host, host, approval.ScopeSession, matcher, "", "initial-"+host, "r", time.Hour, approval.ChannelCLI); err != nil {
+		if _, err := store.Grant("s_test@"+host, host, approval.ScopeSession, matcher, "", 0, "initial-"+host, "r", time.Hour, approval.ChannelCLI); err != nil {
 			t.Fatal(err)
 		}
 	}

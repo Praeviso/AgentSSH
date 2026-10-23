@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -347,8 +348,13 @@ func runPlanSubmit(cmd *cobra.Command, targetName string, commands []string, ses
 	if err != nil {
 		return classifyConfigError(err)
 	}
-	runtime := approvalRuntimeWithWarning(cmd, cfg)
-	if !runtime.Enabled {
+	// A gateway checks its own policy for the device; local approval
+	// settings apply only to a local plan.
+	var runtime approval.RuntimeConfig
+	if cfg.Gateway == nil {
+		runtime = approvalRuntimeWithWarning(cmd, cfg)
+	}
+	if !runtime.Enabled && cfg.Gateway == nil {
 		return newUsageError("plan submit requires the async approval channel\n" +
 			"  enable it in ~/.agentssh/policy.yaml (approval.enabled: true) or via AGENTSSH_APPROVAL\n" +
 			"  without approval, pre-check commands with: agentssh policy test --host <host> -- '<cmd>' '<cmd>'...")
@@ -416,7 +422,15 @@ func submitPlanInputs(cmd *cobra.Command, cfg *config.Config, runtime approval.R
 func submitPlanInputsWithOptions(cmd *cobra.Command, cfg *config.Config, runtime approval.RuntimeConfig, targetName string, planCommands []planCommand, sessionFlag, sessionLabel string, opts planSubmitOptions) (response planSubmitResponse, resultErr error) {
 	reviewTemplate := opts.Review
 
-	resolved, err := inventory.NewResolver(cfg.Inventory).Resolve(targetName)
+	inv := cfg.Inventory
+	if cfg.Gateway != nil {
+		public, err := gatewayHosts(cmd, cfg)
+		if err != nil {
+			return response, err
+		}
+		inv = inventory.FromPublic(public)
+	}
+	resolved, err := inventory.NewResolver(inv).Resolve(targetName)
 	if err != nil {
 		return response, newUsageError("%v\n  list all hosts: agentssh hosts", err)
 	}
@@ -470,21 +484,26 @@ func submitPlanInputsWithOptions(cmd *cobra.Command, cfg *config.Config, runtime
 			PayloadRef: command.PayloadRef,
 		})
 	}
-	env := runner.Env{
-		Policy:    cfg.Policy,
-		Inventory: cfg.Inventory,
-		Approval:  runtime,
-		Sessions:  approval.SessionStore{Dir: cfg.Paths.SessionsDir},
-		Pending:   approvalStore(cfg.Paths),
-		Audit:     audit.NewStore(cfg.Paths.AuditFile),
+	var exitCode int
+	if cfg.Gateway != nil {
+		response, exitCode, err = gatewaySubmitPlan(cmd, cfg, planID, target.Name, sessionCtx, commands, reviewTemplate)
+	} else {
+		env := runner.Env{
+			Policy:    cfg.Policy,
+			Inventory: cfg.Inventory,
+			Approval:  runtime,
+			Sessions:  approval.SessionStore{Dir: cfg.Paths.SessionsDir},
+			Pending:   approvalStore(cfg.Paths),
+			Audit:     audit.NewStore(cfg.Paths.AuditFile),
+		}
+		response, exitCode, err = runner.SubmitPlan(env, runner.PlanSubmitRequest{
+			PlanID:   planID,
+			Host:     target.Name,
+			Session:  sessionCtx,
+			Commands: commands,
+			Review:   reviewTemplate,
+		})
 	}
-	response, exitCode, err := runner.SubmitPlan(env, runner.PlanSubmitRequest{
-		PlanID:   planID,
-		Host:     target.Name,
-		Session:  sessionCtx,
-		Commands: commands,
-		Review:   reviewTemplate,
-	})
 	if err != nil {
 		return response, err
 	}
@@ -525,9 +544,9 @@ func runPlanStatus(cmd *cobra.Command, id string, jsonOutput bool) error {
 	if err != nil {
 		return classifyConfigError(err)
 	}
-	status, err := approvalStore(cfg.Paths).PlanStatus(id)
+	status, _, err := planStatus(cmd.Context(), cfg, id)
 	if err != nil {
-		return mapPlanError(err)
+		return err
 	}
 	if status.Status != "pending" {
 		releasePlanStatusPayloadPins(cfg.Paths, status)
@@ -540,14 +559,34 @@ func runPlanWait(cmd *cobra.Command, id string, timeoutValue string, jsonOutput 
 	if err != nil {
 		return classifyConfigError(err)
 	}
-	runtime := approvalRuntimeWithWarning(cmd, cfg)
-	timeout, err := resolveWaitTimeout(runtime.WaitTimeout, timeoutValue)
-	if err != nil {
-		return err
-	}
-	status, err := approvalStore(cfg.Paths).WaitPlan(id, timeout)
-	if err != nil {
-		return mapPlanError(err)
+	var status approval.PlanStatus
+	if cfg.Gateway != nil {
+		first, defaultTimeout, err := planStatus(cmd.Context(), cfg, id)
+		if err != nil {
+			return err
+		}
+		timeout, err := resolveWaitTimeout(defaultTimeout, timeoutValue)
+		if err != nil {
+			return err
+		}
+		status, err = waitFor(cmd.Context(), timeout, first, func(s approval.PlanStatus) bool { return s.Pending == 0 },
+			func(ctx context.Context) (approval.PlanStatus, error) {
+				status, _, err := planStatus(ctx, cfg, id)
+				return status, err
+			})
+		if err != nil {
+			return err
+		}
+	} else {
+		runtime := approvalRuntimeWithWarning(cmd, cfg)
+		timeout, err := resolveWaitTimeout(runtime.WaitTimeout, timeoutValue)
+		if err != nil {
+			return err
+		}
+		status, err = approvalStore(cfg.Paths).WaitPlan(id, timeout)
+		if err != nil {
+			return mapPlanError(err)
+		}
 	}
 	if status.Status != "pending" {
 		releasePlanStatusPayloadPins(cfg.Paths, status)

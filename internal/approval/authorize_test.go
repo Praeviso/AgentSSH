@@ -38,7 +38,7 @@ func TestAuthorizeSessionAndHostGrantOnlyAfterDefaultDeny(t *testing.T) {
 	inv := inventory.Inventory{Hosts: map[string]inventory.Host{"web-1": {}}}
 	store := SessionStore{Dir: t.TempDir()}
 	matcher, _ := Exact("systemctl restart nginx")
-	if _, err := store.Grant("s", "web-1", ScopeSession, matcher, "", "ap_0123456789abcdef01234567", "r1", time.Hour, ChannelCLI); err != nil {
+	if _, err := store.Grant("s", "web-1", ScopeSession, matcher, "", 0, "ap_0123456789abcdef01234567", "r1", time.Hour, ChannelCLI); err != nil {
 		t.Fatal(err)
 	}
 	auth, err := Authorize(policy.Config{}, inv, store, RuntimeConfig{Enabled: true, HostGrantMode: HostGrantSafePrefix}, "s", "web-1", "systemctl restart nginx", "", "req-test")
@@ -70,7 +70,7 @@ func TestAuthorizeNewDenyInvalidatesExistingGrant(t *testing.T) {
 	inv := inventory.Inventory{Hosts: map[string]inventory.Host{"web-1": {}}}
 	store := SessionStore{Dir: t.TempDir()}
 	matcher, _ := Exact("id")
-	if _, err := store.Grant("s", "web-1", ScopeSession, matcher, "", "ap_0123456789abcdef01234567", "r1", time.Hour, ChannelCLI); err != nil {
+	if _, err := store.Grant("s", "web-1", ScopeSession, matcher, "", 0, "ap_0123456789abcdef01234567", "r1", time.Hour, ChannelCLI); err != nil {
 		t.Fatal(err)
 	}
 	cfg := policy.Config{Rules: []policy.Rule{{
@@ -111,5 +111,25 @@ func TestAuthorizeDisabledApprovalUsesPersistedHostRules(t *testing.T) {
 	}
 	if auth.Status != AuthNeedsApproval || auth.Decision.Rule != policy.RuleDefaultDeny {
 		t.Fatalf("gray auth = %#v, want default-deny needs approval sentinel", auth)
+	}
+}
+
+// A grant's stdin size must equal the run's: no size counts as "unchecked",
+// so a grant without one (recorded before sizes were bound) does not cover a
+// non-empty stdin.
+func TestCheckGrantedStdinComparesSizesStrictly(t *testing.T) {
+	grant := Authorization{Status: AuthAllowByGrant}
+	for _, tc := range []struct {
+		granted, run int64
+		ok           bool
+	}{{0, 0, true}, {10, 10, true}, {1, 10, false}, {0, 10, false}, {10, 0, false}} {
+		grant.GrantStdinBytes = tc.granted
+		got, ok := CheckGrantedStdin(grant, tc.run)
+		if ok != tc.ok || !ok && (got.Status != AuthHardDeny || got.Decision.Rule != RuleStdinSizeMismatch) {
+			t.Fatalf("granted %d, run %d: %+v %v", tc.granted, tc.run, got, ok)
+		}
+	}
+	if _, ok := CheckGrantedStdin(Authorization{Status: AuthAllow}, 10); !ok {
+		t.Fatal("a policy allow was checked against a grant size")
 	}
 }

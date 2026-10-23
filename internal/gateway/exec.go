@@ -158,20 +158,16 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, device contr
 		return
 	}
 	exec := s.executor(inv)
-	approvalDir := filepath.Join(s.Dir, "devices", device.ID, "approval")
+	stores := s.approvals(device.ID)
 	env := runner.Env{
 		Policy:    pol,
 		Inventory: inv,
 		Approval:  approvalRuntime(device.ID, pol.Approval),
-		Sessions:  approval.SessionStore{Dir: filepath.Join(approvalDir, "sessions")},
-		Pending: approval.PendingStore{
-			PendingDir:   filepath.Join(approvalDir, "pending"),
-			ResponsesDir: filepath.Join(approvalDir, "responses"),
-			PlansDir:     filepath.Join(approvalDir, "plans"),
-		},
-		Audit:    deviceAudit{log: audit.NewStore(filepath.Join(s.Dir, FileAudit)), deviceID: device.ID},
-		Executor: exec,
-		Output:   filter,
+		Sessions:  stores.Sessions,
+		Pending:   stores.Pending,
+		Audit:     s.deviceAudit(device.ID),
+		Executor:  exec,
+		Output:    filter,
 	}
 	if reqID != "" {
 		env.NewReqID = func() (string, error) { return reqID, nil }
@@ -215,6 +211,8 @@ func (s *Server) execute(ctx context.Context, rn *run, env runner.Env, request r
 		var usage runner.UsageError
 		if errors.As(err, &usage) {
 			code, message = remote.CodeUsage, usage.Error()
+		} else if errors.Is(err, approval.ErrTooManyPending) {
+			code, message = remote.CodeBusy, approval.ErrTooManyPending.Error()
 		} else {
 			log.Printf("agentssh-gateway: run %s: execution failed: %v", rn.id, err)
 		}
@@ -387,6 +385,10 @@ func (s *Server) release(deviceID string) {
 	if s.running[deviceID]--; s.running[deviceID] <= 0 {
 		delete(s.running, deviceID)
 	}
+}
+
+func (s *Server) deviceAudit(deviceID string) deviceAudit {
+	return deviceAudit{log: audit.NewStore(filepath.Join(s.Dir, FileAudit)), deviceID: deviceID}
 }
 
 // deviceAudit stamps every record with the device it ran for.

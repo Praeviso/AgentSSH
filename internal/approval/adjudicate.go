@@ -24,6 +24,9 @@ type ApplyOptions struct {
 	ExecutionID  string
 	StepID       string
 	SavePolicy   func(policy.Config) error
+	// DeviceID stamps the decision's audit record on a gateway, whose
+	// audit chain holds every device's records.
+	DeviceID string
 }
 
 type ApplyResult struct {
@@ -141,7 +144,7 @@ func applySessionGrant(opts ApplyOptions, req PendingRequest, scope Scope) (Gran
 	if ttl <= 0 {
 		ttl = DefaultSessionTTL
 	}
-	return opts.Sessions.Grant(req.SessionID, req.Host, scope, matcher, req.StdinSHA256, req.ID, req.ReqID, ttl, opts.Channel)
+	return opts.Sessions.Grant(req.SessionID, req.Host, scope, matcher, req.StdinSHA256, req.StdinBytes, req.ID, req.ReqID, ttl, opts.Channel)
 }
 
 func applyHostGrant(opts ApplyOptions, req PendingRequest) (string, error) {
@@ -253,6 +256,7 @@ func appendApprovalAudit(opts ApplyOptions, req PendingRequest, verdict Verdict,
 		ExecutionID:     executionID,
 		StepID:          stepID,
 		ReviewSHA256:    reviewSHA256,
+		DeviceID:        opts.DeviceID,
 	}
 	if scope == ScopeTask {
 		if permission := TaskCandidate(req.Cmd, req.StdinSHA256); permission != nil {

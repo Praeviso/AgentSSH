@@ -9,6 +9,7 @@ import (
 	"github.com/Praeviso/AgentSSH/internal/audit"
 	"github.com/Praeviso/AgentSSH/internal/controlplane"
 	"github.com/Praeviso/AgentSSH/internal/inventory"
+	"github.com/Praeviso/AgentSSH/internal/policy"
 	"github.com/Praeviso/AgentSSH/internal/remote"
 	"github.com/Praeviso/AgentSSH/internal/runner"
 )
@@ -23,31 +24,26 @@ func (s *Server) deviceRoutes() []controlplane.Route {
 }
 
 func (s *Server) handleHosts(w http.ResponseWriter, _ *http.Request, device controlplane.Device, _ []byte) {
-	inv, ok := s.deviceInventory(w, device.ID)
+	inv, _, ok := s.deviceConfig(w, device.ID)
 	if !ok {
 		return
 	}
 	controlplane.WriteJSON(w, http.StatusOK, inventory.NewResolver(inv).Public())
 }
 
-// deviceInventory loads the inventory pushed for deviceID, answering the
-// request itself when there is none.
-func (s *Server) deviceInventory(w http.ResponseWriter, deviceID string) (inventory.Inventory, bool) {
-	cfg, err := s.Store.Config(deviceID)
-	if errors.Is(err, controlplane.ErrNotFound) {
+// deviceConfig loads the inventory and policy pushed for deviceID, answering
+// the request itself when there are none.
+func (s *Server) deviceConfig(w http.ResponseWriter, deviceID string) (inventory.Inventory, policy.Config, bool) {
+	inv, pol, err := s.loadDeviceConfig(deviceID)
+	switch {
+	case errors.Is(err, controlplane.ErrNotFound):
 		controlplane.WriteError(w, http.StatusNotFound, remote.CodeNoConfig, "no configuration has been pushed for this device")
-		return inventory.Inventory{}, false
+	case err != nil:
+		controlplane.WriteError(w, http.StatusInternalServerError, remote.CodeInternal, "this device's configuration is unavailable")
+	default:
+		return inv, pol, true
 	}
-	if err != nil {
-		controlplane.WriteError(w, http.StatusInternalServerError, remote.CodeInternal, "configuration lookup failed")
-		return inventory.Inventory{}, false
-	}
-	inv, _, err := remote.ParseManaged(cfg.InventoryYAML, cfg.PolicyYAML, nil)
-	if err != nil {
-		controlplane.WriteError(w, http.StatusInternalServerError, remote.CodeInternal, "stored configuration is unreadable")
-		return inventory.Inventory{}, false
-	}
-	return inv, true
+	return inventory.Inventory{}, policy.Config{}, false
 }
 
 func (s *Server) handleRequestStatus(w http.ResponseWriter, _ *http.Request, device controlplane.Device, body []byte) {

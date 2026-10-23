@@ -174,9 +174,68 @@ device therefore occupies at most quota + `--max-concurrent` ×
 ingresses must stream responses (the gateway sends `X-Accel-Buffering: no`).
 
 Every run is recorded in one hash chain per gateway, `audit.jsonl`, with
-`device_id` on each record (`agentssh-gateway audit verify`). Pending approval
-requests live under `devices/<id>/approval/`; operator decisions and the full
-design follow in #19, #20 and `docs/architecture/gateway-mode.md`.
+`device_id` on each record (`agentssh-gateway audit verify`).
+
+**Approvals.** A gateway device's pending requests, resolutions, session and
+task grants and plan manifests live only on the gateway, under
+`devices/<id>/approval/`, and only the gateway authorizes. Devices submit and
+query, and no device endpoint resolves anything:
+
+| Method | Suffix | Answer |
+| --- | --- | --- |
+| POST | `/approvals/status` | `{status, wait_timeout_ms}`: the request as `approval status` prints it, and the device policy's default wait |
+| POST | `/plans/submit` | `{response, exit_code}`: `plan submit`'s preflight against the device's policy and grants; commands carry their stdin identity only, and the device mints the plan ID |
+| POST | `/plans/status` | `{status, wait_timeout_ms}`, as `plan status` prints it |
+| POST | `/authorize` | how each `{host, session, cmd, stdin_sha256}` would be authorized now, with no side effects |
+
+Waits (`approval wait`, `plan wait`, `--wait-approval`) poll these, backing off
+to every 2 s, and after an approval check `/authorize` before rerunning, since a
+resolution is written before its grant. Another device's IDs are not found.
+The gateway's operator decides on the gateway host, from the data directory:
+
+```sh
+agentssh-gateway approval ls [--json]
+agentssh-gateway approval show <approval-id> [--device <id>]
+agentssh-gateway approval grant <approval-id> --once|--session|--task [--device <id>]
+agentssh-gateway approval deny <approval-id> [--device <id>]
+agentssh-gateway plan show <plan-id> [--json] [--device <id>]
+agentssh-gateway plan grant <plan-id> --once|--session|--task [--device <id>]
+agentssh-gateway plan deny <plan-id> [--device <id>]
+```
+
+What a device leaves awaiting a decision stays on the gateway's disk until an
+operator acts, so it is capped per device (`serve --max-pending-approvals`,
+default 1000): unresolved requests, and separately plans that still have one
+(plans with none left are reaped after a day, like resolved requests). A plan
+that does not fit is refused before it creates anything, and a request beyond
+the cap is `429 busy`, on `/exec` and `/plans/submit` alike. Counting and
+creating are one step under a lock beside the device's approval directory, so
+concurrent requests cannot pass the cap together, and a device's plan
+submissions are serialized.
+
+A grant records the stdin size its request stated, and a run whose stdin
+differs in size is refused (`approval/stdin-size-mismatch`, exit 6); zero is a
+size like any other, not "unchecked", so a grant recorded before sizes were
+bound needs approving again for a non-empty stdin. The hash already pins the
+content; the size a device states when submitting a plan is what the operator
+reads, so a misstated one can never authorize the real payload. `/plans/submit`
+also refuses a hash and size that cannot describe one payload (a malformed
+hash, a size without a hash, a size beyond the stdin limit, or zero bytes with
+any hash but the empty payload's).
+
+Plan IDs are minted by devices, so the gateway refuses a submitted plan ID that
+another device already holds (`409`), and a decision by an ID that more than
+one device holds (two submissions racing past that check) is refused until
+`--device` names the device. A decision by ID therefore never lands on another
+device's plan.
+
+Grant lifetimes come from the device's policy; each decision is appended to the
+gateway's audit chain with the device's `device_id` and channel `gateway`. Host
+scope is not offered: it would rewrite the device's pushed policy, which the
+operator edits and pushes with `config push` instead. `plan show` lists the
+commands of the plan's requests, which are what a grant authorizes, before the
+steps as the device described them. A Web UI for operators off the gateway host
+is #20; the full design is in `docs/architecture/gateway-mode.md`.
 
 The other device endpoints answer what a local CLI reads from its own files:
 `GET /hosts` returns the device's hosts and groups as `agentssh hosts --json`
@@ -199,10 +258,14 @@ run, so output and exit codes match local mode; only remediation hints name the
 gateway's administrator instead of the local files. `plan run` keeps its saved
 execution on the device and sends each step as its own `/exec`, so the gateway
 reauthorizes every step, and a step's stdin file is read only when that step is
-sent. Commands that read or change state the device no longer keeps
-(inventory, policy, secret, approval decisions, audit, sessions, TUI) are
-refused with exit 2; `approval status|wait`, `plan submit|status|wait` and
-`--wait-approval` are refused until approvals move to the gateway (#19).
+sent. `approval status|wait`, `plan submit|status|wait` and `--wait-approval`
+work as locally, against the gateway's approvals (below). A saved execution
+records whether its approval plan is on a gateway (`approval_on_gateway`); one
+whose plan is kept where the device no longer runs commands (a local plan after
+enrolling with a gateway, or the reverse) marks it `superseded` and submits the
+remaining steps again. Commands that read or
+change state the device no longer keeps (inventory, policy, secret, approval
+decisions, audit, sessions, TUI) are refused with exit 2.
 
 ## Enrollment
 

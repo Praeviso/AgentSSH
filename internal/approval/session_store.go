@@ -37,6 +37,10 @@ type Grant struct {
 	// approved command had no stdin; a grant never matches a run whose stdin
 	// hash differs from the one the operator approved.
 	StdinSHA256 string `json:"stdin_sha256,omitempty"`
+	// StdinBytes is the stdin size the approved request stated. The hash pins
+	// the content, so a run whose size differs comes from a request that
+	// misstated it; callers refuse such a run (see CheckGrantedStdin).
+	StdinBytes int64 `json:"stdin_bytes,omitempty"`
 	// ClaimReqID/ClaimTS implement two-phase once-grant consumption: Claim marks
 	// the grant as reserved by one run request; Commit deletes it once the command
 	// reached the remote; Release restores it when the command never executed.
@@ -105,7 +109,7 @@ func normalizeGrants(doc *sessionFile) (repaired int, dropped int) {
 	return repaired, dropped
 }
 
-func (s SessionStore) Grant(sessionID string, host string, scope Scope, matcher Matcher, stdinSHA256 string, approvalID string, reqID string, ttl time.Duration, channel string) (Grant, error) {
+func (s SessionStore) Grant(sessionID string, host string, scope Scope, matcher Matcher, stdinSHA256 string, stdinBytes int64, approvalID string, reqID string, ttl time.Duration, channel string) (Grant, error) {
 	if scope != ScopeOnce && scope != ScopeSession && scope != ScopeTask {
 		return Grant{}, fmt.Errorf("session store cannot grant scope %q", scope)
 	}
@@ -133,6 +137,7 @@ func (s SessionStore) Grant(sessionID string, host string, scope Scope, matcher 
 		Channel:     channel,
 		Task:        matcher.Task,
 		StdinSHA256: stdinSHA256,
+		StdinBytes:  stdinBytes,
 	}
 	err := s.withLockedSession(sessionID, func(doc *sessionFile) error {
 		if doc.Version < sessionFileVersion {

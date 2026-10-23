@@ -175,7 +175,7 @@ func grant(t *testing.T, f fixture, sessionID, host, command string, scope appro
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.env.Sessions.Grant(sessionID, host, scope, matcher, "", "ap_0123456789abcdef01234567", "req-grant", time.Hour, approval.ChannelCLI); err != nil {
+	if _, err := f.env.Sessions.Grant(sessionID, host, scope, matcher, "", 0, "ap_0123456789abcdef01234567", "req-grant", time.Hour, approval.ChannelCLI); err != nil {
 		t.Fatal(err)
 	}
 }
