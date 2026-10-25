@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -146,7 +147,7 @@ func TestAnEndedWindowIsRecordedWithoutRequests(t *testing.T) {
 func TestActivationNeedsAWindowWithinTheCap(t *testing.T) {
 	f := enrolledGateway(t)
 	id := f.client.State.DeviceID
-	for _, d := range []time.Duration{0, -time.Minute, gateway.MaxActivation + time.Second} {
+	for _, d := range []time.Duration{0, -time.Minute, 30 * time.Second, gateway.MaxActivation + time.Second} {
 		if _, err := gateway.ActivateDevice(f.dir, f.store, id, d, "local:alice", "", time.Now()); !errors.Is(err, gateway.ErrActivationDuration) {
 			t.Fatalf("activate for %s: %v", d, err)
 		}
@@ -220,5 +221,70 @@ func TestAnInactiveDeviceCanStillCancel(t *testing.T) {
 		if err := call(); !remote.IsInactive(err) {
 			t.Errorf("%s: %v, want device_inactive", name, err)
 		}
+	}
+}
+
+// Reactivating a device whose window ended unnoticed (no request or sweep
+// since) records that end before replacing the window.
+func TestReactivatingRecordsTheEndOfAnUnnoticedWindow(t *testing.T) {
+	f := enrolledGateway(t)
+	id := f.client.State.DeviceID
+	old, err := gateway.ActivateDevice(f.dir, f.store, id, time.Hour, "local:alice", "first", time.Now().Add(-61*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gateway.ActivateDevice(f.dir, f.store, id, time.Hour, "local:alice", "second", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.RecordEndedActivations(f.dir, f.store, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	events := activationEvents(t, f, id)
+	var ended []audit.Record
+	for _, record := range events {
+		if record.Event == audit.EventDeviceActivationEnded {
+			ended = append(ended, record)
+		}
+	}
+	if len(ended) != 1 || ended[0].ActiveUntil != old.Until.UTC().Format(time.RFC3339) || ended[0].Note != "first" {
+		t.Fatalf("ended windows: %+v (want the first window's end)", ended)
+	}
+	if last := events[len(events)-1]; last.Event != audit.EventDeviceActivated || last.Note != "second" {
+		t.Fatalf("the replacement was recorded before the end it replaced: %+v", events)
+	}
+}
+
+// An end whose audit record cannot be written is recorded by a later finder
+// once the audit chain is writable again.
+func TestAnEndThatFailedToRecordIsRetried(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can write a read-only file")
+	}
+	f := enrolledGateway(t)
+	id := f.client.State.DeviceID
+	if _, err := gateway.ActivateDevice(f.dir, f.store, id, time.Minute, "local:alice", "", time.Now().Add(-2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	log := filepath.Join(f.dir, gateway.FileAudit)
+	if err := os.Chmod(log, 0o400); err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.RecordEndedActivations(f.dir, f.store, time.Now()); err == nil {
+		t.Fatal("recording into a read-only audit chain succeeded")
+	}
+	if err := os.Chmod(log, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.RecordEndedActivations(f.dir, f.store, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	ended := 0
+	for _, record := range activationEvents(t, f, id) {
+		if record.Event == audit.EventDeviceActivationEnded {
+			ended++
+		}
+	}
+	if ended != 1 {
+		t.Fatalf("the end was recorded %d times after the audit chain recovered", ended)
 	}
 }

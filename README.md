@@ -418,8 +418,8 @@ agentssh-gateway device activate <dev_id> --for 4h --note 'nightly deploy'
 ```
 
 A device is usable only while an operator has activated it. It starts
-inactive, and `device activate` opens a window of the length you choose (at
-most 24h); when the window ends the device is refused again until it is
+inactive, and `device activate` opens a window of the length you choose (1m
+to 24h); when the window ends the device is refused again until it is
 activated again. `device deactivate <dev_id>` closes the window early. Unlike
 `device revoke`, which is permanent, deactivation and the end of a window can
 be undone by activating again. An inactive device can still enroll, cancel its

@@ -54,7 +54,7 @@ that lies about its plan state gains nothing.
   (argon2id passwords and mandatory TOTP) on a listener the device API never
   shares. No device endpoint can resolve an approval.
 - **When a device may act.** Only inside an activation window an operator
-  opened for a chosen duration (at most 24 h); outside it every device endpoint
+  opened for a chosen duration (1 min to 24 h); outside it every device endpoint
   but cancel refuses it, so a stolen device key is useless while the device is
   inactive. Revocation stays separate and permanent.
 - **What a device still controls.** Inside its window, it chooses which allowed
@@ -192,8 +192,12 @@ Trade-offs:
   `device activate` runs in its own process and could not see `serve`'s flags,
   so a serve-only cap would disagree with what the CLI wrote.
 - An ended window is recorded by the first request or the 30-second sweep that
-  finds it, so its record can come up to that long after the window ended; the
-  record's `active_until` says when it did.
+  finds it, or by the activation that replaces it, so its record can come up to
+  that long after the window ended; the record's `active_until` says when it
+  did. The audit chain, not the table's flag, decides whether an end is already
+  recorded, so a failed append is retried and never duplicated; this is why a
+  window lasts at least a minute, so two windows of a device never end in the
+  same second.
 - A run already started keeps going when its window ends (#34).
 
 ## Limits and what is not provided

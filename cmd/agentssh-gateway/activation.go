@@ -26,8 +26,8 @@ func newDeviceCommand(dir func() (string, error)) *cobra.Command {
 	var note string
 	activate := &cobra.Command{
 		Use:   "activate <device-id> --for <duration>",
-		Short: "Let a device use the gateway for a chosen time, at most 24h.",
-		Long: "Let a device use the gateway for a chosen time, at most 24h. It is inactive again when the time ends.\n" +
+		Short: "Let a device use the gateway for a chosen time, from 1m to 24h.",
+		Long: "Let a device use the gateway for a chosen time, from 1m to 24h. It is inactive again when the time ends.\n" +
 			"Activating an active device sets a new end. Unlike revoke, deactivate and expiry can be undone by activating again.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -46,7 +46,7 @@ func newDeviceCommand(dir func() (string, error)) *cobra.Command {
 			})
 		},
 	}
-	activate.Flags().DurationVar(&window, "for", 0, "how long the device may use the gateway, such as 30m or 4h (at most 24h)")
+	activate.Flags().DurationVar(&window, "for", 0, "how long the device may use the gateway, such as 30m or 4h (1m to 24h)")
 	activate.Flags().StringVar(&note, "note", "", "why, recorded in the audit chain")
 	_ = activate.MarkFlagRequired("for")
 

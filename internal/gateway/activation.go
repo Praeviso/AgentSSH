@@ -26,13 +26,18 @@ CREATE TABLE IF NOT EXISTS device_activations (
 );
 `
 
-// MaxActivation is the longest window one activation opens. The store
-// enforces it, so every way of activating shares one rule.
-const MaxActivation = 24 * time.Hour
+// MinActivation and MaxActivation bound one window. The store enforces them,
+// so every way of activating shares one rule. The minimum also keeps two
+// windows of a device from ending in the same second, which is how an end
+// is identified in the audit chain.
+const (
+	MinActivation = time.Minute
+	MaxActivation = 24 * time.Hour
+)
 
-// ErrActivationDuration refuses a window that is not positive or longer than
-// MaxActivation.
-var ErrActivationDuration = fmt.Errorf("the activation must last more than zero and at most %s", formatWindow(MaxActivation))
+// ErrActivationDuration refuses a window shorter than MinActivation or longer
+// than MaxActivation.
+var ErrActivationDuration = fmt.Errorf("the activation must last at least %s and at most %s", formatWindow(MinActivation), formatWindow(MaxActivation))
 
 // Activation is a device's current window. Until is zero when the device has
 // never been activated.
@@ -73,10 +78,11 @@ func loadActivation(db *sql.DB, deviceID string) (Activation, bool, error) {
 }
 
 // ActivateDevice opens a window of length d from now, replacing any current
-// one. The audit record is written first: if the window cannot be stored
-// afterwards, the device stays inactive.
+// one. A previous window that ended without a record is recorded first, so
+// replacing it never loses its end. The audit record is written before the
+// window is stored: if storing fails, the device stays inactive.
 func ActivateDevice(dir string, store *controlplane.Store, deviceID string, d time.Duration, operator, note string, now time.Time) (Activation, error) {
-	if d <= 0 || d > MaxActivation {
+	if d < MinActivation || d > MaxActivation {
 		return Activation{}, ErrActivationDuration
 	}
 	device, err := store.Device(deviceID)
@@ -85,6 +91,15 @@ func ActivateDevice(dir string, store *controlplane.Store, deviceID string, d ti
 	}
 	if device.Status == remote.DeviceRevoked {
 		return Activation{}, controlplane.ErrDeviceRevoked
+	}
+	previous, recorded, err := loadActivation(store.DB(), deviceID)
+	if err != nil {
+		return Activation{}, err
+	}
+	if !previous.Until.IsZero() && !previous.Active(now) && !recorded {
+		if err := recordActivationEnd(dir, store, previous, now); err != nil {
+			return Activation{}, fmt.Errorf("record the end of the previous window: %w", err)
+		}
 	}
 	a := Activation{DeviceID: deviceID, Until: now.Add(d), SetBy: operator, Note: note, SetAt: now}
 	if _, err := activationAudit(dir).Append(audit.Record{
@@ -178,22 +193,24 @@ func RecordEndedActivations(dir string, store *controlplane.Store, now time.Time
 	return nil
 }
 
-// recordActivationEnd appends the end of window a, found at now, claiming it
-// first so that concurrent requests record it once. The record's time is when
-// it was found; active_until says when the window ended.
+// recordActivationEnd appends the end of window a, found at now. The audit
+// chain decides whether it is already recorded, under its own lock, so
+// concurrent finders add it once; end_recorded is set only after the record
+// is in the chain, so a failed append is retried by the next finder. The
+// record's time is when it was found; active_until says when the window ended.
 func recordActivationEnd(dir string, store *controlplane.Store, a Activation, now time.Time) error {
-	res, err := store.DB().Exec(`UPDATE device_activations SET end_recorded = 1 WHERE device_id = ? AND active_until = ? AND end_recorded = 0`,
-		a.DeviceID, controlplane.FormatTime(a.Until))
+	until := a.Until.UTC().Format(time.RFC3339)
+	_, _, err := activationAudit(dir).AppendUnless(audit.Record{
+		TS: now.UTC().Format(time.RFC3339), Event: audit.EventDeviceActivationEnded, DeviceID: a.DeviceID,
+		Operator: a.SetBy, ActiveUntil: until, Note: a.Note,
+	}, func(existing audit.Record) bool {
+		return existing.Event == audit.EventDeviceActivationEnded && existing.DeviceID == a.DeviceID && existing.ActiveUntil == until
+	})
 	if err != nil {
 		return err
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return nil
-	}
-	_, err = activationAudit(dir).Append(audit.Record{
-		TS: now.UTC().Format(time.RFC3339), Event: audit.EventDeviceActivationEnded, DeviceID: a.DeviceID,
-		Operator: a.SetBy, ActiveUntil: a.Until.UTC().Format(time.RFC3339), Note: a.Note,
-	})
+	_, err = store.DB().Exec(`UPDATE device_activations SET end_recorded = 1 WHERE device_id = ? AND active_until = ?`,
+		a.DeviceID, controlplane.FormatTime(a.Until))
 	return err
 }
 

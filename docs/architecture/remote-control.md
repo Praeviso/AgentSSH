@@ -316,7 +316,7 @@ gateway's log.
 
 **Activation.** A gateway device is usable only inside an activation window.
 It starts inactive; `agentssh-gateway device activate <id> --for <duration>`
-opens a window of that length (at most 24 h, checked when it is stored), and
+opens a window of that length (1 min to 24 h, checked when it is stored), and
 activating an active device sets a new end. `device deactivate <id>` closes it
 at once. Windows live in the gateway's `device_activations` table, not in the
 shared `devices` table, so the managed database is unchanged. Every device
@@ -328,9 +328,12 @@ can enroll before it is activated, see its state and stop its own runs.
 deactivation and the end of a window are records in the audit chain
 (`device_activated`, `device_deactivated`, `device_activation_expired`, with
 `operator`, `active_until` and `note`). An ended window is recorded once, by the
-first request or the 30-second sweep in `serve` that finds it. An activation is
-audited before it is stored and a deactivation after, so a failed write leaves
-the device inactive. Revocation is separate and permanent: a revoked device
+first request or the 30-second sweep in `serve` that finds it, and before a
+new activation replaces it. The audit chain itself decides whether an end is
+already recorded (checked under its lock), and the table's flag is set only
+after the record is in the chain, so concurrent finders record an end once and
+a failed append is retried. An activation is audited before it is stored and a
+deactivation after, so a failed write leaves the device inactive. Revocation is separate and permanent: a revoked device
 cannot be activated.
 
 **Gateway devices.** `agentssh remote enroll <url> --token <t> --mode gateway`

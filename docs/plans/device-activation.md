@@ -14,7 +14,7 @@ Done when:
 - A new device is refused with `device_inactive` until activated. Inside the
   window it runs; after the end it is refused again with no operator action.
   Reactivating works; a revoked device cannot be activated.
-- `device activate <id> --for <d>` needs `--for`, at most 24h; activating an
+- `device activate <id> --for <d>` needs `--for`, from 1m to 24h; activating an
   active device sets a new end. `device deactivate <id>` takes effect on the next request.
 - Activation, deactivation and expiry are records in the gateway's audit chain
   with the operator and note; the chain verifies.
@@ -94,6 +94,23 @@ Examples:
 - [x] Docs: README gateway section, remote-control.md (activation paragraph,
   threat model rows), gateway-mode.md (trust boundary, design, limits); the
   skill's "stop" row names "not activated".
+- [x] PR review follow-up (review of 1031606):
+  - Reactivating a device whose window had ended unnoticed (no request or
+    sweep since, or `serve` stopped) replaced the row and lost that end.
+    `ActivateDevice` now records an unrecorded ended window before replacing
+    it. Test: `TestReactivatingRecordsTheEndOfAnUnnoticedWindow`.
+  - The end was claimed (`end_recorded = 1`) before its audit append, so a
+    failed append lost it for good. The audit chain now decides whether an end
+    is recorded: `audit.Store.AppendUnless` checks for the same end (device and
+    `active_until`) under the chain's lock, and the flag is set only after the
+    record is in the chain, so a failed append is retried and concurrent
+    finders still record it once. Windows last at least a minute, so two
+    windows of a device never end in the same second. Tests:
+    `TestAnEndThatFailedToRecordIsRetried`, `TestAppendUnlessAddsAFactOnce`,
+    and the existing two-finders test.
+  - Mutation checks, each failing its test: no record before replacing; the
+    flag set before the append; no dedupe in the chain; `AppendUnless`
+    ignoring its predicate; no minimum duration.
 - [x] Final validation.
 
 ## Validation
