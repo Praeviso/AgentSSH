@@ -329,3 +329,17 @@ func TestRemaining(t *testing.T) {
 		}
 	}
 }
+
+func TestAPIWait(t *testing.T) {
+	ms := func(v int64) *int64 { return &v }
+	for _, tc := range []struct {
+		in   *int64
+		want time.Duration
+	}{
+		{nil, 20 * time.Second}, {ms(0), 0}, {ms(-5), 0}, {ms(1500), 1500 * time.Millisecond}, {ms(3_600_000), 50 * time.Second},
+	} {
+		if got := apiWait(tc.in); got != tc.want {
+			t.Errorf("apiWait(%v) = %s, want %s", tc.in, got, tc.want)
+		}
+	}
+}

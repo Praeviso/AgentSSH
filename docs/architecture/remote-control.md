@@ -380,6 +380,38 @@ per token: the secret cannot be guessed, and a lockout keyed by the token ID,
 which is part of the token and appears in audit records, would let anyone who
 saw it lock its device out.
 
+A token route authenticates before it reads the body, so an unauthenticated
+client never holds a large upload; a route admitting a large body then gets
+the same upload time as `/exec`.
+
+Token devices run commands with JSON in and out, for callers that cannot read
+`/exec`'s frames or keep a stream open (hosted platforms time out tool calls,
+often within a minute):
+
+| Method | Suffix | Body → answer |
+| --- | --- | --- |
+| POST | `/api/run` | `{host, command, session, session_label?, stdin? (base64), run_id?, wait_ms?}` → the run |
+| POST | `/api/run/output` | `{run_id, offset, wait_ms?}` → the run from `offset` |
+| POST | `/api/run/cancel` | `{run_id}` → `{run_id, cancelled}` (also while inactive) |
+
+The run is the same as an `/exec` run (the same pipeline, spool, idempotency,
+limits and audit, with `token_id` on its records): `/api/run` is `/exec` with
+streaming on, and a call waits up to `wait_ms` (absent: 20 s; 0: not at all;
+at most 50 s, past the server's own response deadline) for it to finish. The
+answer is `{run_id, req_id, state, result, exit_code, truncated, target_kind,
+stdout, stderr, responses, error, next_offset}`: `state` is `running` or
+`finished`; `stdout` and `stderr` are the output streamed since the offset, as
+text (bytes that are not valid UTF-8 read as U+FFFD); `responses` are the
+`run --json` objects written since the offset, which together carry the
+complete filtered output; once finished, `exit_code` has the CLI's meaning
+and `result` names it (`ok`, `failed`, `denied`, `approval_required`,
+`ssh_error`, `usage`), or `result` is `error` with `error` when the run ended
+without a result (the gateway stopped it, for example). `next_offset` is where
+the next read continues, so every byte arrives once; an offset the API did not
+answer is refused with 400. A run's identity for `run_id` is what it runs, not
+how long a call waits. Requests the CLI would reject are `400 usage`, before a
+run starts.
+
 **Gateway devices.** `agentssh remote enroll <url> --token <t> --mode gateway`
 (the default is `managed`) enrolls a device for a gateway. In gateway mode
 `hosts`, `run`, `status` and `plan run|resume` go through these endpoints: the

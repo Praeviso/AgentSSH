@@ -209,11 +209,23 @@ func authenticateToken(store *controlplane.Store, header string) (controlplane.D
 // authenticated and, unless the route allows otherwise, the device is active.
 type TokenHandler func(w http.ResponseWriter, r *http.Request, device controlplane.Device, tokenID string, body []byte)
 
-// tokenRoute authenticates a request's bearer token for next. A route with
-// needsActive set refuses a device outside its activation window, as every
-// signed route but /status does.
-func (s *Server) tokenRoute(method, path string, needsActive bool, next TokenHandler) controlplane.OpenRoute {
-	return controlplane.OpenRoute{Method: method, Path: path, Handler: func(w http.ResponseWriter, r *http.Request, body []byte) {
+// tokenOptions shape a token route.
+type tokenOptions struct {
+	// needsActive refuses a device outside its activation window, as every
+	// signed route but /status does.
+	needsActive bool
+	// maxBody bounds the body (zero means 64 KiB); a larger one gets
+	// controlplane.StreamingBodyTimeout to arrive.
+	maxBody int64
+	// respondWithin, when set, extends the response deadline past the
+	// server's own, for a route that waits on a run.
+	respondWithin time.Duration
+}
+
+// tokenRoute authenticates a request's bearer token, then reads its body,
+// for next.
+func (s *Server) tokenRoute(method, path string, opts tokenOptions, next TokenHandler) controlplane.OpenRoute {
+	return controlplane.OpenRoute{Method: method, Path: path, Handler: func(w http.ResponseWriter, r *http.Request) {
 		device, tokenID, err := authenticateToken(s.Store, r.Header.Get("Authorization"))
 		switch {
 		case errors.Is(err, errBadToken):
@@ -227,7 +239,7 @@ func (s *Server) tokenRoute(method, path string, needsActive bool, next TokenHan
 			controlplane.WriteError(w, http.StatusInternalServerError, remote.CodeInternal, "token check unavailable")
 			return
 		}
-		if needsActive {
+		if opts.needsActive {
 			if _, active, err := deviceActive(s.Dir, s.Store, device.ID, s.now()); err != nil {
 				controlplane.WriteError(w, http.StatusInternalServerError, remote.CodeInternal, "activation state unavailable")
 				return
@@ -236,6 +248,18 @@ func (s *Server) tokenRoute(method, path string, needsActive bool, next TokenHan
 				return
 			}
 		}
+		rc := http.NewResponseController(w)
+		if opts.maxBody > 0 {
+			_ = rc.SetReadDeadline(time.Now().Add(controlplane.StreamingBodyTimeout))
+		}
+		body, err := controlplane.ReadBody(r, opts.maxBody)
+		if err != nil {
+			controlplane.WriteError(w, http.StatusRequestEntityTooLarge, remote.CodeBadRequest, "request body too large or unreadable")
+			return
+		}
+		if opts.respondWithin > 0 {
+			_ = rc.SetWriteDeadline(time.Now().Add(opts.respondWithin))
+		}
 		next(w, r, device, tokenID, body)
 	}}
 }
@@ -243,12 +267,12 @@ func (s *Server) tokenRoute(method, path string, needsActive bool, next TokenHan
 // tokenRoutes are the bearer-token API. /api/status answers like /status,
 // also while the device is inactive; every other route needs it active.
 func (s *Server) tokenRoutes() []controlplane.OpenRoute {
-	return []controlplane.OpenRoute{
-		s.tokenRoute("GET", remote.PathTokenStatus, false, s.handleTokenStatus),
-		s.tokenRoute("GET", remote.PathTokenHosts, true, func(w http.ResponseWriter, r *http.Request, device controlplane.Device, _ string, body []byte) {
+	return append([]controlplane.OpenRoute{
+		s.tokenRoute("GET", remote.PathTokenStatus, tokenOptions{}, s.handleTokenStatus),
+		s.tokenRoute("GET", remote.PathTokenHosts, tokenOptions{needsActive: true}, func(w http.ResponseWriter, r *http.Request, device controlplane.Device, _ string, body []byte) {
 			s.handleHosts(w, r, device, body)
 		}),
-	}
+	}, s.apiRoutes()...)
 }
 
 func (s *Server) handleTokenStatus(w http.ResponseWriter, _ *http.Request, device controlplane.Device, _ string, _ []byte) {

@@ -58,13 +58,25 @@ type API struct {
 	Open []OpenRoute
 }
 
-// OpenRoute is a route that authenticates its own requests. The body reaching
-// Handler is bounded by MaxBody (zero means 64 KiB).
+// OpenRoute is a route that authenticates its own requests. Its handler reads
+// the body itself (ReadBody), after authenticating, so an unauthenticated
+// client never holds a large upload.
 type OpenRoute struct {
 	Method, Path string
-	MaxBody      int64
-	Handler      func(w http.ResponseWriter, r *http.Request, body []byte)
+	Handler      http.HandlerFunc
 }
+
+// ReadBody reads at most limit bytes of r's body (zero means 64 KiB).
+func ReadBody(r *http.Request, limit int64) ([]byte, error) {
+	if limit <= 0 {
+		limit = maxRequestBytes
+	}
+	return requestBytesLimit(r, limit)
+}
+
+// StreamingBodyTimeout is how long a route admitting a large body gives it to
+// arrive, once the request authenticated.
+const StreamingBodyTimeout = streamingBodyTimeout
 
 // Handler serves enrollment, /status, and routes under the configured public
 // base. publicURL is trusted deployment configuration (including a possible
@@ -84,7 +96,7 @@ func (a API) Handler(publicURL string, routes ...Route) (http.Handler, error) {
 		mux.HandleFunc(route.Method+" "+u.Path+route.Path, a.device(base, route))
 	}
 	for _, route := range a.Open {
-		mux.HandleFunc(route.Method+" "+u.Path+route.Path, open(route))
+		mux.HandleFunc(route.Method+" "+u.Path+route.Path, route.Handler)
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
@@ -283,22 +295,6 @@ func (a API) device(base string, route Route) http.HandlerFunc {
 			_ = rc.SetWriteDeadline(time.Time{})
 		}
 		route.Handler(w, r, device, body)
-	}
-}
-
-// open reads a bounded body for a route that authenticates itself.
-func open(route OpenRoute) http.HandlerFunc {
-	limit := route.MaxBody
-	if limit <= 0 {
-		limit = maxRequestBytes
-	}
-	return func(w http.ResponseWriter, r *http.Request) {
-		body, err := requestBytesLimit(r, limit)
-		if err != nil {
-			WriteError(w, http.StatusRequestEntityTooLarge, remote.CodeBadRequest, "request body too large or unreadable")
-			return
-		}
-		route.Handler(w, r, body)
 	}
 }
 

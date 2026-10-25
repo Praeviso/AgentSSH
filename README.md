@@ -435,15 +435,25 @@ agentssh-gateway device create --name hosted-agent --kind token   # prints the t
 agentssh-gateway config push --device <dev_id> --inventory inventory.yaml --policy policy.yaml
 agentssh-gateway device activate <dev_id> --for 1h
 curl -H "Authorization: Bearer agt_..." https://gw.example/agentssh/api/hosts
+curl -H "Authorization: Bearer agt_..." -d '{"host":"web-1","command":"uptime","session":"s_task"}' \
+  https://gw.example/agentssh/api/run
 agentssh-gateway device rotate <dev_id>    # new token; the old one is refused at once
 ```
 
 The gateway keeps only the token's SHA-256. A token device is activated,
 deactivated and revoked like any other, and its token works only inside an
 activation window; unlike a signed request it could be replayed within that
-window if it leaked, so rotate it if in doubt. The API so far answers
-`GET /api/status` (also while inactive) and `GET /api/hosts`; running commands
-over it follows.
+window if it leaked, so rotate it if in doubt.
+
+`POST /api/run` runs a command and waits up to `wait_ms` (default 20 s, at most
+50 s) for it. It answers JSON: the run's `state` (`running` or `finished`),
+the output so far, and once finished `result` (`ok`, `denied`,
+`approval_required`, `ssh_error`, ...), `exit_code` with the CLI's meaning, and
+the `run --json` objects. A run that outlives the wait keeps running; read the
+rest with `POST /api/run/output` from the answer's `next_offset`, and stop it
+with `POST /api/run/cancel`. Sending the same `run_id` again joins the run
+instead of running the command twice. `GET /api/status` (also while inactive)
+and `GET /api/hosts` answer like `agentssh remote status` and `hosts`.
 
 Hosts in the pushed inventory need `addr`, `user` and `identity`, as in managed
 mode; the gateway keeps host keys in its own `known_hosts`, following the

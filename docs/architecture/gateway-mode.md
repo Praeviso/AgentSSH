@@ -225,6 +225,24 @@ Trade-offs:
 - One live token per device: rotation revokes the previous one in the same
   transaction, so there is never a moment with two or none.
 
+### Running commands over the API (#41)
+
+`POST /api/run` starts the same run `/exec` does (one shared start-or-join
+path; `/exec` streams frames from it, the API answers JSON) and waits a
+bounded time for it. A run that outlives the wait is read from offsets into
+its spool with `/api/run/output`, exactly as a device reattaches.
+
+Trade-offs:
+
+- Bounded waits and polling instead of a stream: hosted platforms end tool
+  calls and HTTP actions within about a minute, so no call outlasts 50 s, and
+  the spool and offsets (#16) make polling lossless.
+- Output is returned as text. A chunk boundary can split a multi-byte
+  character, which then reads as U+FFFD; the final `run --json` objects carry
+  the complete filtered output, as for `run --json`.
+- Responses are returned as they are written, not held until the end, so an
+  offset never skips one.
+
 ### Stopping runs that lost standing (#34)
 
 Every 30 s, `serve` checks each live run's device and the identities its
