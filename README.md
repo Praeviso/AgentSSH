@@ -13,8 +13,8 @@ AgentSSH uses standard SSH from the local machine (its built-in Go SSH client by
 
 ```bash
 # 1. Install — static binary, no Go required (see "Install" for macOS / arm64).
-curl -fsSL https://github.com/Praeviso/AgentSSH/releases/download/v0.14.0/agentssh_v0.14.0_linux_amd64.tar.gz \
-  | sudo tar xz --strip-components=1 -C /usr/local/bin agentssh_v0.14.0_linux_amd64/agentssh
+curl -fsSL https://github.com/Praeviso/AgentSSH/releases/download/v0.15.0/agentssh_v0.15.0_linux_amd64.tar.gz \
+  | sudo tar xz --strip-components=1 -C /usr/local/bin agentssh_v0.15.0_linux_amd64/agentssh
 
 # 2. Open the console — this is your main entry point:
 agentssh tui
@@ -229,25 +229,25 @@ Static binaries (`CGO_ENABLED=0`, no runtime deps). Pick your platform; each is 
 
 ```bash
 # Linux x86_64
-curl -fsSL https://github.com/Praeviso/AgentSSH/releases/download/v0.14.0/agentssh_v0.14.0_linux_amd64.tar.gz \
-  | sudo tar xz --strip-components=1 -C /usr/local/bin agentssh_v0.14.0_linux_amd64/agentssh
+curl -fsSL https://github.com/Praeviso/AgentSSH/releases/download/v0.15.0/agentssh_v0.15.0_linux_amd64.tar.gz \
+  | sudo tar xz --strip-components=1 -C /usr/local/bin agentssh_v0.15.0_linux_amd64/agentssh
 
 # Linux arm64
-curl -fsSL https://github.com/Praeviso/AgentSSH/releases/download/v0.14.0/agentssh_v0.14.0_linux_arm64.tar.gz \
-  | sudo tar xz --strip-components=1 -C /usr/local/bin agentssh_v0.14.0_linux_arm64/agentssh
+curl -fsSL https://github.com/Praeviso/AgentSSH/releases/download/v0.15.0/agentssh_v0.15.0_linux_arm64.tar.gz \
+  | sudo tar xz --strip-components=1 -C /usr/local/bin agentssh_v0.15.0_linux_arm64/agentssh
 
 # macOS Apple Silicon (arm64)
-curl -fsSL https://github.com/Praeviso/AgentSSH/releases/download/v0.14.0/agentssh_v0.14.0_darwin_arm64.tar.gz \
-  | sudo tar xz --strip-components=1 -C /usr/local/bin agentssh_v0.14.0_darwin_arm64/agentssh
+curl -fsSL https://github.com/Praeviso/AgentSSH/releases/download/v0.15.0/agentssh_v0.15.0_darwin_arm64.tar.gz \
+  | sudo tar xz --strip-components=1 -C /usr/local/bin agentssh_v0.15.0_darwin_arm64/agentssh
 
 # macOS Intel (amd64)
-curl -fsSL https://github.com/Praeviso/AgentSSH/releases/download/v0.14.0/agentssh_v0.14.0_darwin_amd64.tar.gz \
-  | sudo tar xz --strip-components=1 -C /usr/local/bin agentssh_v0.14.0_darwin_amd64/agentssh
+curl -fsSL https://github.com/Praeviso/AgentSSH/releases/download/v0.15.0/agentssh_v0.15.0_darwin_amd64.tar.gz \
+  | sudo tar xz --strip-components=1 -C /usr/local/bin agentssh_v0.15.0_darwin_amd64/agentssh
 ```
 
-Verify: `agentssh --version`. (Bump `v0.14.0` for a different release; checksums are in `SHA256SUMS.txt` on the Releases page.)
+Verify: `agentssh --version`. (Bump `v0.15.0` for a different release; checksums are in `SHA256SUMS.txt` on the Releases page.)
 
-Each archive also contains the optional control planes, `agentssh-server` (managed mode) and `agentssh-gateway` (gateway mode, in releases after v0.14.0); see [Choose a mode](#choose-a-mode). To install one, replace the trailing `/agentssh` in the command with `/agentssh-server` or `/agentssh-gateway`.
+Each archive also contains the optional control planes, `agentssh-server` (managed mode) and `agentssh-gateway` (gateway mode, since v0.15.0); see [Choose a mode](#choose-a-mode). To install one, replace the trailing `/agentssh` in the command with `/agentssh-server` or `/agentssh-gateway`.
 
 ### From source (needs Go matching the go.mod directive)
 
