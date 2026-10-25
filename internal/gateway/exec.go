@@ -64,10 +64,23 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, device contr
 		return
 	}
 	sum := sha256.Sum256(body)
-	requestSHA256 := hex.EncodeToString(sum[:])
+	s.exec(w, device, req, hex.EncodeToString(sum[:]), func(rn *run) { s.streamRun(w, r.Context(), rn, 0) })
+}
+
+// exec starts req for device, or joins the run its ID already names, and
+// hands the run to serve; when it cannot, it answers the request itself.
+// requestSHA256 identifies the request, so a repeat joins its run and a
+// different request with the same ID is refused.
+func (s *Server) exec(w http.ResponseWriter, device controlplane.Device, req remote.ExecRequest, requestSHA256 string, serve func(*run)) {
+	s.execAs(w, device, "", req, requestSHA256, serve)
+}
+
+// execAs is exec for a request a token device made with tokenID, which its
+// audit records name.
+func (s *Server) execAs(w http.ResponseWriter, device controlplane.Device, tokenID string, req remote.ExecRequest, requestSHA256 string, serve func(*run)) {
 	// A repeated request for a run that already exists joins it, so a client
 	// that lost the first response neither loses the run nor starts it twice.
-	if req.RunID != "" && s.joinRun(w, r, device.ID, req.RunID, requestSHA256) {
+	if req.RunID != "" && s.serveExisting(w, device.ID, req.RunID, requestSHA256, serve) {
 		return
 	}
 	cfg, err := s.Store.Config(device.ID)
@@ -154,7 +167,7 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, device contr
 		case errors.Is(err, errRunExists):
 			// The ID was claimed meanwhile: by a concurrent repeat of this
 			// request, a different request, or a cancel that overtook it.
-			if !s.joinRun(w, r, device.ID, id, requestSHA256) {
+			if !s.serveExisting(w, device.ID, id, requestSHA256, serve) {
 				controlplane.WriteError(w, http.StatusInternalServerError, remote.CodeInternal, "run record changed while starting; retry")
 			}
 		case errors.Is(err, errTooManyRecords):
@@ -174,7 +187,7 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, device contr
 		Approval:  approvalRuntime(device.ID, pol.Approval),
 		Sessions:  stores.Sessions,
 		Pending:   stores.Pending,
-		Audit:     s.deviceAudit(device.ID),
+		Audit:     deviceAudit{log: s.deviceAudit(device.ID).log, deviceID: device.ID, tokenID: tokenID},
 		Executor:  exec,
 		Output:    filter,
 	}
@@ -203,7 +216,7 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, device contr
 		defer func() { _ = exec.Close() }()
 		s.execute(ctx, rn, env, request)
 	}()
-	s.streamRun(w, r.Context(), rn, 0)
+	serve(rn)
 }
 
 // execute runs the pipeline and spools its outcome as response frames and a
@@ -248,12 +261,12 @@ func (s *Server) execute(ctx context.Context, rn *run, env runner.Env, request r
 	rn.finish(remote.FrameResult, payload, s.now())
 }
 
-// joinRun answers a request whose run ID is already claimed: it streams the
-// run to a repeat of the same request, and refuses a different request, an
-// ID cancelled before its request arrived, and an expired or interrupted
-// run. It reports false only when the ID was never claimed, so the caller
-// starts the run.
-func (s *Server) joinRun(w http.ResponseWriter, r *http.Request, deviceID, id, requestSHA256 string) bool {
+// serveExisting answers a request whose run ID is already claimed: it hands
+// the run to serve for a repeat of the same request, and refuses a different
+// request, an ID cancelled before its request arrived, and an expired or
+// interrupted run. It reports false only when the ID was never claimed, so
+// the caller starts the run.
+func (s *Server) serveExisting(w http.ResponseWriter, deviceID, id, requestSHA256 string, serve func(*run)) bool {
 	rn, err := s.lookupRun(deviceID, id)
 	if errors.Is(err, errRunNotFound) {
 		return false
@@ -265,7 +278,7 @@ func (s *Server) joinRun(w http.ResponseWriter, r *http.Request, deviceID, id, r
 		writeRunError(w, err, s.runRetention())
 		return true
 	}
-	s.streamRun(w, r.Context(), rn, 0)
+	serve(rn)
 	return true
 }
 
@@ -407,14 +420,16 @@ func (s *Server) deviceAudit(deviceID string) deviceAudit {
 	return deviceAudit{log: audit.NewStore(filepath.Join(s.Dir, FileAudit)), deviceID: deviceID}
 }
 
-// deviceAudit stamps every record with the device it ran for.
+// deviceAudit stamps every record with the device it ran for, and the token
+// a token device used.
 type deviceAudit struct {
 	log      audit.Store
 	deviceID string
+	tokenID  string
 }
 
 func (a deviceAudit) Append(record audit.Record) (audit.Record, error) {
-	record.DeviceID = a.deviceID
+	record.DeviceID, record.TokenID = a.deviceID, a.tokenID
 	return a.log.Append(record)
 }
 

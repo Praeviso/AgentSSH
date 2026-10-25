@@ -2,6 +2,7 @@ package gateway_test
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/x509"
@@ -43,9 +44,13 @@ func bearer(t *testing.T, f *fixture, path, token string) apiAnswer {
 	return send(t, req)
 }
 
+// send makes one request, failing the test rather than hanging if no answer
+// comes.
 func send(t *testing.T, req *http.Request) apiAnswer {
 	t.Helper()
-	resp, err := http.DefaultTransport.RoundTrip(req)
+	ctx, cancel := context.WithTimeout(req.Context(), 15*time.Second)
+	defer cancel()
+	resp, err := http.DefaultTransport.RoundTrip(req.WithContext(ctx))
 	if err != nil {
 		t.Fatal(err)
 	}
