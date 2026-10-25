@@ -131,8 +131,10 @@ func TestALongCommandIsReadFromOffsets(t *testing.T) {
 		t.Fatalf("streamed %q, last %+v", stdout, last)
 	}
 	// Reading again from the end adds nothing; reading from 0 replays it all.
+	// Reading again from the end adds no output but keeps the run's result.
 	again := runOf(t, apiCall(t, f, issued.Token, remote.PathAPIRunOutput, remote.APIRunOutputRequest{RunID: first.RunID, Offset: offset}))
-	if again.Stdout != "" || len(again.Responses) != 0 || again.State != remote.APIRunFinished || again.NextOffset != offset {
+	if again.Stdout != "" || len(again.Responses) != 0 || again.State != remote.APIRunFinished || again.NextOffset != offset ||
+		again.Result != remote.APIResultOK || again.ExitCode == nil || *again.ExitCode != 0 || again.TargetKind != "host" || again.Error != nil {
 		t.Fatalf("read past the end: %+v", again)
 	}
 	whole := runOf(t, apiCall(t, f, issued.Token, remote.PathAPIRunOutput, remote.APIRunOutputRequest{RunID: first.RunID}))
@@ -157,6 +159,12 @@ func TestCancelStopsAnAPIRun(t *testing.T) {
 	final := runOf(t, apiCall(t, f, issued.Token, remote.PathAPIRunOutput, remote.APIRunOutputRequest{RunID: started.RunID, WaitMS: waitMS(5000)}))
 	if final.State != remote.APIRunFinished {
 		t.Fatalf("after cancel: %+v", final)
+	}
+	// Polling once more from the end answers the same outcome.
+	again := runOf(t, apiCall(t, f, issued.Token, remote.PathAPIRunOutput, remote.APIRunOutputRequest{RunID: started.RunID, Offset: final.NextOffset}))
+	if again.State != final.State || again.Result != final.Result || fmt.Sprint(again.ExitCode != nil) != fmt.Sprint(final.ExitCode != nil) ||
+		(again.ExitCode != nil && *again.ExitCode != *final.ExitCode) || fmt.Sprint(again.Error) != fmt.Sprint(final.Error) {
+		t.Fatalf("re-poll %+v, final %+v", again, final)
 	}
 }
 

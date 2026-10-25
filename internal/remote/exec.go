@@ -225,6 +225,10 @@ func writeFrame(w io.Writer, kind byte, payload []byte) error {
 	return err
 }
 
+// FrameHeaderBytes is a frame's header: its type byte, then its payload
+// length as four big-endian bytes.
+const FrameHeaderBytes = frameHeaderBytes
+
 // ReadFrame reads one frame, enforcing the per-type size limit before
 // allocating. A clean end of stream before a header is io.EOF; a partial
 // frame is io.ErrUnexpectedEOF.

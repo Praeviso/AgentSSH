@@ -54,6 +54,14 @@ Done when:
   device's run, inactive); a wait past the server's one-second response
   deadline in the fixture; `apiWait`.
 - [x] Docs: README, remote-control.md, gateway-mode.md.
+- [x] PR review follow-up (review of the first commit): polling a finished
+  run from its last `next_offset` read no frames, so the answer reported
+  `error` ("output is incomplete") for a run that had succeeded. A run's
+  outcome now comes from its final frame whatever the offset: when the frames
+  read do not include it, `finalFrame` finds it by walking the spool's frame
+  headers. The offsets test and the cancel test now poll once more from the
+  end and require the same result, exit code and error; both failed on the old
+  code.
 - [x] Final validation.
 
 ## Validation

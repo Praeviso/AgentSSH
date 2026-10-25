@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -132,24 +133,64 @@ func (s *Server) answerRun(w http.ResponseWriter, ctx context.Context, rn *run, 
 			stderr = append(stderr, payload...)
 		case remote.FrameResponse:
 			answer.Responses = append(answer.Responses, json.RawMessage(payload))
-		case remote.FrameResult:
-			var final remote.ExecFinal
-			if json.Unmarshal(payload, &final) == nil {
-				answer.State, answer.Result, answer.ExitCode = remote.APIRunFinished, remote.APIResult(final.ExitCode), &final.ExitCode
-				answer.Truncated, answer.TargetKind = final.Truncated, final.TargetKind
-			}
-		case remote.FrameError:
-			var refusal remote.ErrorResponse
-			if json.Unmarshal(payload, &refusal) == nil {
-				answer.State, answer.Result, answer.Error = remote.APIRunFinished, remote.APIResultError, &refusal
-			}
+		case remote.FrameResult, remote.FrameError:
+			applyFinal(&answer, kind, payload)
 		}
 	}
 	if done && answer.State == remote.APIRunRunning {
-		// The run ended without a final frame: its spool failed.
-		answer.State, answer.Result = remote.APIRunFinished, remote.APIResultError
-		answer.Error = &remote.ErrorResponse{Code: remote.CodeInternal, Error: "the run's output is incomplete; see the gateway's audit"}
+		// The final frame lies before offset (the caller read past it
+		// already): the result does not depend on where reading resumes.
+		if kind, payload, ok := finalFrame(file, size); ok {
+			applyFinal(&answer, kind, payload)
+		} else {
+			// The run ended without a final frame: its spool failed.
+			answer.State, answer.Result = remote.APIRunFinished, remote.APIResultError
+			answer.Error = &remote.ErrorResponse{Code: remote.CodeInternal, Error: "the run's output is incomplete; see the gateway's audit"}
+		}
 	}
 	answer.Stdout, answer.Stderr = string(stdout), string(stderr)
 	controlplane.WriteJSON(w, http.StatusOK, answer)
+}
+
+// applyFinal sets a finished run's result from its final frame.
+func applyFinal(answer *remote.APIRun, kind byte, payload []byte) {
+	switch kind {
+	case remote.FrameResult:
+		var final remote.ExecFinal
+		if json.Unmarshal(payload, &final) == nil {
+			answer.State, answer.Result, answer.ExitCode = remote.APIRunFinished, remote.APIResult(final.ExitCode), &final.ExitCode
+			answer.Truncated, answer.TargetKind = final.Truncated, final.TargetKind
+		}
+	case remote.FrameError:
+		var refusal remote.ErrorResponse
+		if json.Unmarshal(payload, &refusal) == nil {
+			answer.State, answer.Result, answer.Error = remote.APIRunFinished, remote.APIResultError, &refusal
+		}
+	}
+}
+
+// finalFrame finds a spool's final (result or error) frame by walking frame
+// headers from the start, without reading the frames in between.
+func finalFrame(spool io.ReaderAt, size int64) (byte, []byte, bool) {
+	var header [remote.FrameHeaderBytes]byte
+	var kind byte
+	at, length := int64(-1), int64(0)
+	for pos := int64(0); pos+remote.FrameHeaderBytes <= size; {
+		if _, err := spool.ReadAt(header[:], pos); err != nil {
+			return 0, nil, false
+		}
+		n := int64(binary.BigEndian.Uint32(header[1:]))
+		if header[0] == remote.FrameResult || header[0] == remote.FrameError {
+			kind, at, length = header[0], pos+remote.FrameHeaderBytes, n
+		}
+		pos += remote.FrameHeaderBytes + n
+	}
+	if at < 0 || length > remote.MaxMessageFrameBytes || at+length > size {
+		return 0, nil, false
+	}
+	payload := make([]byte, length)
+	if _, err := spool.ReadAt(payload, at); err != nil {
+		return 0, nil, false
+	}
+	return kind, payload, true
 }
