@@ -80,14 +80,3 @@ func TestDeviceActivationCommands(t *testing.T) {
 		t.Fatalf("audit verify: %v %q (want the activation and the deactivation)", err, out)
 	}
 }
-
-func TestRemaining(t *testing.T) {
-	now := time.Now()
-	for d, want := range map[time.Duration]string{
-		20 * time.Second: "under 1m", 45 * time.Minute: "45m", 2 * time.Hour: "2h", 90 * time.Minute: "1h30m", 24 * time.Hour: "24h",
-	} {
-		if got := remaining(now.Add(d), now); got != want {
-			t.Errorf("remaining(%s) = %q, want %q", d, got, want)
-		}
-	}
-}

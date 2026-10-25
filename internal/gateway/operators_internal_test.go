@@ -318,3 +318,14 @@ func TestAnEndedWindowFoundTwiceIsRecordedOnce(t *testing.T) {
 		t.Fatalf("the end was recorded %d times", ended)
 	}
 }
+
+func TestRemaining(t *testing.T) {
+	now := time.Now()
+	for d, want := range map[time.Duration]string{
+		20 * time.Second: "under 1m", 45 * time.Minute: "45m", 2 * time.Hour: "2h", 90 * time.Minute: "1h30m", 24 * time.Hour: "24h",
+	} {
+		if got := Remaining(now.Add(d), now); got != want {
+			t.Errorf("Remaining(%s) = %q, want %q", d, got, want)
+		}
+	}
+}

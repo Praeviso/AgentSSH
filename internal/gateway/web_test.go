@@ -504,3 +504,115 @@ func TestWebOrigin(t *testing.T) {
 		}
 	}
 }
+
+// An operator activates a device from the Devices page, which makes its next
+// request succeed, and deactivates it, which refuses the next one; both are
+// audited under the operator's name.
+func TestOperatorActivatesADeviceInTheBrowser(t *testing.T) {
+	w := newWebFixture(t)
+	id := w.client.State.DeviceID
+	if _, err := gateway.DeactivateDevice(w.dir, w.store, id, "local:test", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.client.Exec(context.Background(), execReq("uptime"), io.Discard, io.Discard); !remote.IsInactive(err) {
+		t.Fatalf("run before activation: %v", err)
+	}
+	b := w.browser(t)
+	csrf := b.signIn("alice")
+	if p := b.do(http.MethodGet, "/devices", nil); p.status != http.StatusOK || !strings.Contains(p.body, "agent-vm") || !strings.Contains(p.body, ">Inactive<") {
+		t.Fatalf("devices page: %d\n%.600s", p.status, p.body)
+	}
+	p := b.do(http.MethodPost, "/devices/"+id+"/activate", url.Values{"csrf": {csrf}, "for": {"4h"}, "note": {"nightly deploy"}})
+	if p.status != http.StatusSeeOther || !strings.Contains(p.location, "notice=") {
+		t.Fatalf("activate: %+v", p)
+	}
+	if result, err := w.client.Exec(context.Background(), execReq("uptime"), io.Discard, io.Discard); err != nil || result.ExitCode != 0 {
+		t.Fatalf("run after activation: %+v, %v", result, err)
+	}
+	page := b.do(http.MethodGet, "/devices", nil)
+	if !strings.Contains(page.body, "Active · 4h left") || !strings.Contains(page.body, "activated by web:alice · nightly deploy") || !strings.Contains(page.body, "last activity") {
+		t.Fatalf("devices page while active:\n%.900s", page.body)
+	}
+	if p := b.do(http.MethodPost, "/devices/"+id+"/deactivate", url.Values{"csrf": {csrf}}); p.status != http.StatusSeeOther || !strings.Contains(p.location, "notice=") {
+		t.Fatalf("deactivate: %+v", p)
+	}
+	if _, err := w.client.Exec(context.Background(), execReq("uptime"), io.Discard, io.Discard); !remote.IsInactive(err) {
+		t.Fatalf("run after deactivation: %v", err)
+	}
+	records, err := audit.NewStore(w.dir + "/" + gateway.FileAudit).ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var byWeb []string
+	for _, r := range records {
+		if (r.Event == audit.EventDeviceActivated || r.Event == audit.EventDeviceDeactivated) && r.Operator == "web:alice" {
+			byWeb = append(byWeb, string(r.Event)+":"+r.Note)
+		}
+	}
+	if strings.Join(byWeb, ",") != "device_activated:nightly deploy,device_deactivated:" {
+		t.Fatalf("audit of the operator's changes: %v", byWeb)
+	}
+	if p := b.do(http.MethodGet, "/audit", nil); !strings.Contains(p.body, "device_activated") || !strings.Contains(p.body, "nightly deploy") {
+		t.Fatalf("audit page:\n%.600s", p.body)
+	}
+}
+
+// Activation needs a signed-in operator who passed TOTP, the session's CSRF
+// token and a duration the gateway accepts; a revoked device stays revoked.
+func TestActivationNeedsAnOperatorAndADuration(t *testing.T) {
+	w := newWebFixture(t)
+	id := w.client.State.DeviceID
+	if _, err := gateway.DeactivateDevice(w.dir, w.store, id, "local:test", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	inactive := func(when string) {
+		t.Helper()
+		if a, err := gateway.DeviceActivation(w.store, id); err != nil || a.Active(time.Now()) {
+			t.Fatalf("%s: the device became active: %+v, %v", when, a, err)
+		}
+	}
+	anonymous := w.browser(t)
+	if p := anonymous.do(http.MethodPost, "/devices/"+id+"/activate", url.Values{"for": {"1h"}}); p.status != http.StatusForbidden {
+		t.Fatalf("anonymous activation: %+v", p)
+	}
+	halfway := w.browser(t)
+	if p := halfway.password("alice", operatorPassword); p.status != http.StatusSeeOther {
+		t.Fatalf("password step: %+v", p)
+	}
+	totp := halfway.do(http.MethodGet, "/login/totp", nil)
+	if p := halfway.do(http.MethodPost, "/devices/"+id+"/activate", url.Values{"csrf": {csrfOf(t, totp)}, "for": {"1h"}}); p.status == http.StatusSeeOther && strings.Contains(p.location, "notice=") {
+		t.Fatalf("a password-stage session activated a device: %+v", p)
+	}
+	inactive("password stage")
+	b := w.browser(t)
+	csrf := b.signIn("bob")
+	if p := b.do(http.MethodPost, "/devices/"+id+"/activate", url.Values{"for": {"1h"}}); p.status != http.StatusForbidden {
+		t.Fatalf("activation without the CSRF token: %+v", p)
+	}
+	for name, form := range map[string]url.Values{
+		"no duration":    {"csrf": {csrf}},
+		"too long":       {"csrf": {csrf}, "for": {"48h"}},
+		"too short":      {"csrf": {csrf}, "for": {"10s"}},
+		"not a duration": {"csrf": {csrf}, "for": {"forever"}},
+		"note too long":  {"csrf": {csrf}, "for": {"1h"}, "note": {strings.Repeat("x", 201)}},
+		"unknown device": {"csrf": {csrf}, "for": {"1h"}},
+	} {
+		path := "/devices/" + id + "/activate"
+		if name == "unknown device" {
+			path = "/devices/dev_unknown/activate"
+		}
+		if p := b.do(http.MethodPost, path, form); p.status != http.StatusSeeOther || !strings.Contains(p.location, "error=") {
+			t.Fatalf("%s: %+v", name, p)
+		}
+	}
+	inactive("refused activations")
+	if err := w.store.RevokeDevice(id, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if p := b.do(http.MethodPost, "/devices/"+id+"/activate", url.Values{"csrf": {csrf}, "for": {"1h"}}); !strings.Contains(p.location, "error=") {
+		t.Fatalf("activating a revoked device: %+v", p)
+	}
+	if page := b.do(http.MethodGet, "/devices", nil); !strings.Contains(page.body, ">Revoked<") || strings.Contains(page.body, "/devices/"+id+"/activate") {
+		t.Fatalf("a revoked device offers activation:\n%.600s", page.body)
+	}
+}

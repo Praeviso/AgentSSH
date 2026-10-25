@@ -38,7 +38,7 @@ func newDeviceCommand(dir func() (string, error)) *cobra.Command {
 				case err != nil:
 					return fmt.Errorf("activate %s: %w", args[0], err)
 				}
-				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Activated %s until %s (%s)\n", args[0], a.Until.Local().Format(time.RFC3339), remaining(a.Until, a.SetAt))
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Activated %s until %s (%s)\n", args[0], a.Until.Local().Format(time.RFC3339), gateway.Remaining(a.Until, a.SetAt))
 				return nil
 			})
 		},
@@ -82,23 +82,7 @@ func activationColumn(store *controlplane.Store, device controlplane.Device, now
 	if !a.Active(now) {
 		return "inactive"
 	}
-	return fmt.Sprintf("until %s (%s left)", a.Until.Local().Format(time.RFC3339), remaining(a.Until, now))
-}
-
-// remaining renders the time from now to until, to the minute.
-func remaining(until, now time.Time) string {
-	d := until.Sub(now).Round(time.Minute)
-	if d < time.Minute {
-		return "under 1m"
-	}
-	h, m := int(d.Hours()), int(d.Minutes())%60
-	switch {
-	case h == 0:
-		return fmt.Sprintf("%dm", m)
-	case m == 0:
-		return fmt.Sprintf("%dh", h)
-	}
-	return fmt.Sprintf("%dh%dm", h, m)
+	return fmt.Sprintf("until %s (%s left)", a.Until.Local().Format(time.RFC3339), gateway.Remaining(a.Until, now))
 }
 
 // checkStanding runs until ctx ends. Every StandingCheckEvery it records

@@ -20,9 +20,9 @@
     <td data-label="Device">{{with index $.Names .DeviceID}}{{.}}{{else}}{{.DeviceID}}{{end}}</td>
     <td data-label="Host">{{.Host}}</td>
     <td data-label="Session">{{.SessionID}}</td>
-    <td data-label="Command" class="cmdcell" title="{{.Cmd}}"><code>{{short .Cmd 120}}</code></td>
+    <td data-label="Command" class="cmdcell" title="{{.Cmd}}">{{if .ActiveUntil}}until {{when .ActiveUntil}}{{with .Note}} · {{.}}{{end}}{{else}}<code>{{short .Cmd 120}}</code>{{end}}</td>
     <td data-label="Exit">{{with .ExitCode}}{{.}}{{end}}</td>
-    <td data-label="Decision">{{with .ApprovalScope}}{{.}}{{end}}{{with .Operator}} · {{.}}{{end}}</td>
+    <td data-label="Decision">{{.ApprovalScope}}{{if and .ApprovalScope .Operator}} · {{end}}{{.Operator}}</td>
   </tr>
   {{end}}
   </tbody>

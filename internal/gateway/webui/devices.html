@@ -1,0 +1,42 @@
+{{define "content"}}
+<h1>{{if .Active}}{{.Active}} active{{else}}No device active{{end}}</h1>
+<p class="lead">A device uses the gateway only while active, and turns inactive when its time ends.</p>
+{{if .Notice}}<p class="banner ok" role="status">{{.Notice}}</p>{{end}}
+{{if .Error}}<p class="banner bad" role="alert">{{.Error}}</p>{{end}}
+{{$csrf := .CSRF}}{{$presets := .Presets}}
+{{range .Devices}}
+<section class="card device">
+  <header class="card-head device-head">
+    <h2>{{if .Name}}{{.Name}}{{else}}{{.ID}}{{end}}</h2>
+    {{if .Revoked}}<span class="state revoked">Revoked</span>
+    {{else if .Active}}<span class="state active">Active · {{.Left}} left</span>
+    {{else}}<span class="state">Inactive</span>{{end}}
+  </header>
+  <p class="meta">{{.ID}} · enrolled {{when (fmtTime .CreatedAt)}}{{with .LastActivity}} · last activity {{when .}}{{end}}</p>
+  {{if .Active}}<p class="meta">Until {{when (fmtTime .Activation.Until)}} · activated by {{.Activation.SetBy}}{{with .Activation.Note}} · {{.}}{{end}}</p>{{end}}
+  {{if not .Revoked}}
+  <div class="actions">
+    <form method="post" action="/devices/{{.ID}}/activate" class="activate">
+      <input type="hidden" name="csrf" value="{{$csrf}}">
+      <label>{{if .Active}}New end in{{else}}Activate for{{end}}
+        <select name="for" required>
+          <option value="" disabled selected>Choose…</option>
+          {{range $presets}}<option value="{{.Value}}">{{.Label}}</option>{{end}}
+        </select>
+      </label>
+      <label>Note<input name="note" maxlength="200" placeholder="Optional"></label>
+      <button class="primary">{{if .Active}}Extend{{else}}Activate{{end}}</button>
+    </form>
+    {{if .Active}}
+    <form method="post" action="/devices/{{.ID}}/deactivate">
+      <input type="hidden" name="csrf" value="{{$csrf}}">
+      <button class="danger" data-confirm="Deactivate {{if .Name}}{{.Name}}{{else}}{{.ID}}{{end}} now? Its running commands stop within 30 seconds.">Deactivate</button>
+    </form>
+    {{end}}
+  </div>
+  {{end}}
+</section>
+{{else}}
+<p class="meta">No device has enrolled yet.</p>
+{{end}}
+{{end}}

@@ -453,7 +453,8 @@ agentssh-gateway plan grant <plan-id> --once|--session|--task
 
 A host grant adds an allow rule to that device's policy and pushes it as a new
 configuration version. Operators away from the gateway host can use its Web UI,
-on a listener of its own, with a password and mandatory TOTP:
+on a listener of its own, with a password and mandatory TOTP, to decide
+approvals, activate and deactivate devices, and browse the audit chain:
 
 ```bash
 agentssh-gateway operator add alice    # password from the TTY, or AGENTSSH_GATEWAY_OPERATOR_PASSWORD

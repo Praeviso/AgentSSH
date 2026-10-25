@@ -309,8 +309,13 @@ checks (argon2id, 64 MiB each) run at once across all clients; a sign-in waits
 up to five seconds for one, then is refused as busy without counting as a
 failure. The Approvals page lists plans (approve the remaining steps as a whole
 after denying single ones) and single requests (once, session, task, host,
-deny), warning about commands that use shell syntax; the Audit page browses the
-chain by device, host and session, newest first, with its verification result.
+deny), warning about commands that use shell syntax; the Devices page shows
+each device's activation (active with the time left and who activated it,
+inactive, or revoked) and last activity, and activates a device for a duration
+chosen from 30 minutes to 24 hours (with an optional note) or deactivates it,
+both audited as `web:<name>`; the Audit page browses the chain by device, host
+and session, newest first, with its verification result. The Web UI opens and
+closes windows at the system clock, which the device API checks them against.
 The design and its trade-offs are in [gateway-mode.md](gateway-mode.md).
 
 The other device endpoints answer what a local CLI reads from its own files:

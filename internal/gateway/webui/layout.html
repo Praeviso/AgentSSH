@@ -14,6 +14,7 @@
   <span class="brand">AgentSSH gateway</span>
   <nav>
     <a href="/approvals"{{if eq .Nav "approvals"}} aria-current="page"{{end}}>Approvals</a>
+    <a href="/devices"{{if eq .Nav "devices"}} aria-current="page"{{end}}>Devices</a>
     <a href="/audit"{{if eq .Nav "audit"}} aria-current="page"{{end}}>Audit</a>
   </nav>
   <form method="post" action="/logout" class="who">
