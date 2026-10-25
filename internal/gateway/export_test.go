@@ -63,3 +63,13 @@ func (s *Server) StopRuns() {
 		}
 	}
 }
+
+// OpenRoutes are the method and path of every route that authenticates
+// itself: the token API and its OpenAPI document.
+func (s *Server) OpenRoutes() []string {
+	var routes []string
+	for _, route := range s.tokenRoutes() {
+		routes = append(routes, route.Method+" "+route.Path)
+	}
+	return append(routes, "GET "+remote.PathAPIOpenAPI)
+}

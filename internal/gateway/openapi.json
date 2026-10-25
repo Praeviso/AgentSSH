@@ -1,0 +1,306 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "AgentSSH gateway API",
+    "version": "1",
+    "description": "Runs commands on hosts through an AgentSSH gateway, for agents that cannot run the agentssh CLI. Every call authenticates as a token device with \"Authorization: Bearer <token>\" (agentssh-gateway device create --kind token). The gateway authorizes, runs and audits each command under the device's policy, and answers only while an operator has activated the device. A command that needs approval answers result approval_required with an approval_id: wait for an operator's decision with /api/approval/status, then run the same command again in the same session. Never retry a denied command in another form."
+  },
+  "servers": [{"url": "https://gw.example/agentssh"}],
+  "security": [{"bearer": []}],
+  "paths": {
+    "/api/status": {
+      "get": {
+        "operationId": "status",
+        "summary": "The device's standing and activation window.",
+        "description": "Answers also while the device is inactive.",
+        "responses": {
+          "200": {"description": "The device.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Status"}}}},
+          "default": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/api/hosts": {
+      "get": {
+        "operationId": "hosts",
+        "summary": "The hosts and groups the device may target, as agentssh hosts --json lists them.",
+        "responses": {
+          "200": {"description": "Hosts and groups.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Hosts"}}}},
+          "default": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/api/session": {
+      "post": {
+        "operationId": "newSession",
+        "summary": "A fresh session ID, as agentssh session new prints one.",
+        "description": "Use one session for every command of one task, so the audit groups them and session grants apply.",
+        "responses": {
+          "200": {"description": "The session ID.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Session"}}}},
+          "default": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/api/run": {
+      "post": {
+        "operationId": "run",
+        "summary": "Run a command on a host or group and wait a bounded time for it.",
+        "description": "Waits up to wait_ms (default 20000, at most 50000; 0 does not wait). A run that outlives the wait keeps running: continue with /api/run/output from next_offset. Sending the same run_id again joins the run instead of running the command twice.",
+        "requestBody": {
+          "required": true,
+          "content": {"application/json": {
+            "schema": {"$ref": "#/components/schemas/RunRequest"},
+            "example": {"host": "web-1", "command": "uptime", "session": "s_1a2b3c4d", "wait_ms": 20000}
+          }}
+        },
+        "responses": {
+          "200": {"description": "The run.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Run"}}}},
+          "default": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/api/run/output": {
+      "post": {
+        "operationId": "runOutput",
+        "summary": "Continue a run from an offset its last answer gave.",
+        "requestBody": {
+          "required": true,
+          "content": {"application/json": {
+            "schema": {"$ref": "#/components/schemas/RunOutputRequest"},
+            "example": {"run_id": "rn_0123456789abcdef0123456789abcdef", "offset": 0, "wait_ms": 20000}
+          }}
+        },
+        "responses": {
+          "200": {"description": "The run from the offset.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Run"}}}},
+          "default": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/api/run/cancel": {
+      "post": {
+        "operationId": "cancelRun",
+        "summary": "Stop a run; the remote command receives SIGTERM.",
+        "description": "Answers also while the device is inactive.",
+        "requestBody": {
+          "required": true,
+          "content": {"application/json": {
+            "schema": {"$ref": "#/components/schemas/RunID"},
+            "example": {"run_id": "rn_0123456789abcdef0123456789abcdef"}
+          }}
+        },
+        "responses": {
+          "200": {"description": "Whether a running run was stopped.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Cancelled"}}}},
+          "default": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/api/request/status": {
+      "post": {
+        "operationId": "requestStatus",
+        "summary": "A request's latest state from the audit, as agentssh status --json prints it.",
+        "requestBody": {
+          "required": true,
+          "content": {"application/json": {
+            "schema": {"$ref": "#/components/schemas/RequestStatusRequest"},
+            "example": {"req_id": "1a2b3c"}
+          }}
+        },
+        "responses": {
+          "200": {"description": "The request's latest state.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Response"}}}},
+          "default": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/api/approval/status": {
+      "post": {
+        "operationId": "approvalStatus",
+        "summary": "An approval request's status, as agentssh approval status prints it, waiting while it is pending.",
+        "description": "Waits up to wait_ms (as for runs) for an operator's decision. A wait that ends while pending answers status pending; it is not an approval.",
+        "requestBody": {
+          "required": true,
+          "content": {"application/json": {
+            "schema": {"$ref": "#/components/schemas/ApprovalStatusRequest"},
+            "example": {"approval_id": "ap_0123456789abcdef01234567", "wait_ms": 20000}
+          }}
+        },
+        "responses": {
+          "200": {"description": "The approval request.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ApprovalStatus"}}}},
+          "default": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/api/openapi.json": {
+      "get": {
+        "operationId": "openAPI",
+        "summary": "This document.",
+        "security": [],
+        "responses": {
+          "200": {"description": "The OpenAPI document.", "content": {"application/json": {"schema": {"type": "object"}}}}
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearer": {"type": "http", "scheme": "bearer", "description": "A token device's token: agt_<id>_<secret>."}
+    },
+    "responses": {
+      "Error": {
+        "description": "A refusal: 400 bad_request or usage, 401 unauthenticated, 403 device_inactive or device_revoked, 404 not found, 409 run_conflict, 429 busy.",
+        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "required": ["code", "error"],
+        "properties": {
+          "code": {"type": "string", "description": "device_inactive means an operator must activate the device; do not retry until then."},
+          "error": {"type": "string"}
+        }
+      },
+      "Status": {
+        "type": "object",
+        "required": ["device_id", "status"],
+        "properties": {
+          "device_id": {"type": "string"},
+          "status": {"type": "string", "enum": ["active", "revoked"]},
+          "mode": {"type": "string"},
+          "activation": {
+            "type": "object",
+            "required": ["state"],
+            "properties": {
+              "state": {"type": "string", "enum": ["active", "inactive"]},
+              "until": {"type": "string", "description": "RFC 3339; set while active."}
+            }
+          }
+        }
+      },
+      "Hosts": {
+        "type": "object",
+        "required": ["hosts", "groups"],
+        "properties": {
+          "hosts": {"type": "array", "items": {"$ref": "#/components/schemas/Target"}},
+          "groups": {"type": "array", "items": {"$ref": "#/components/schemas/Target"}}
+        }
+      },
+      "Target": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": {"type": "string"},
+          "tags": {"type": "array", "items": {"type": "string"}}
+        }
+      },
+      "Session": {
+        "type": "object",
+        "required": ["session_id"],
+        "properties": {"session_id": {"type": "string"}}
+      },
+      "RunRequest": {
+        "type": "object",
+        "required": ["host", "command", "session"],
+        "additionalProperties": false,
+        "properties": {
+          "host": {"type": "string", "description": "A host or group from /api/hosts."},
+          "command": {"type": "string", "description": "The command line, run by the remote login shell."},
+          "session": {"type": "string", "description": "The task's session ID."},
+          "session_label": {"type": "string"},
+          "stdin": {"type": ["string", "null"], "description": "Base64; absent or null for no stdin, empty for empty stdin. At most 32 MiB decoded."},
+          "run_id": {"type": "string", "description": "rn_ and 32 hex characters; an idempotency key."},
+          "wait_ms": {"type": "integer", "description": "Default 20000, at most 50000; 0 does not wait."}
+        }
+      },
+      "RunOutputRequest": {
+        "type": "object",
+        "required": ["run_id", "offset"],
+        "additionalProperties": false,
+        "properties": {
+          "run_id": {"type": "string"},
+          "offset": {"type": "integer", "description": "A next_offset this run answered; 0 replays from the start."},
+          "wait_ms": {"type": "integer"}
+        }
+      },
+      "RunID": {
+        "type": "object",
+        "required": ["run_id"],
+        "additionalProperties": false,
+        "properties": {"run_id": {"type": "string"}}
+      },
+      "Cancelled": {
+        "type": "object",
+        "required": ["run_id", "cancelled"],
+        "properties": {"run_id": {"type": "string"}, "cancelled": {"type": "boolean"}}
+      },
+      "Run": {
+        "type": "object",
+        "required": ["run_id", "state", "stdout", "stderr", "responses", "next_offset"],
+        "properties": {
+          "run_id": {"type": "string"},
+          "req_id": {"type": "string", "description": "A single-host run's request ID, for /api/request/status."},
+          "state": {"type": "string", "enum": ["running", "finished"]},
+          "result": {"type": "string", "enum": ["ok", "failed", "denied", "approval_required", "ssh_error", "usage", "error"], "description": "Set once finished. denied: never run this command in another form. approval_required: wait on the approval_id in responses, then run it again unchanged. ssh_error: the command may or may not have run; check before retrying."},
+          "exit_code": {"type": "integer", "description": "Set once finished: 0, 1, 6 denied, 7 approval required, 9 SSH error."},
+          "truncated": {"type": "boolean", "description": "Output was dropped; the result is incomplete."},
+          "target_kind": {"type": "string", "enum": ["host", "group"]},
+          "stdout": {"type": "string", "description": "Output streamed since the offset."},
+          "stderr": {"type": "string"},
+          "responses": {"type": "array", "items": {"$ref": "#/components/schemas/Response"}, "description": "One per target, written since the offset; together the run's result with its complete filtered output."},
+          "error": {"$ref": "#/components/schemas/Error"},
+          "next_offset": {"type": "integer"}
+        }
+      },
+      "Response": {
+        "type": "object",
+        "description": "One target's result, as agentssh run --json prints it.",
+        "required": ["req_id", "session_id", "host", "status", "exit_code", "execution_state", "duration_ms", "stdout", "stderr", "output_truncated", "redactions"],
+        "properties": {
+          "req_id": {"type": "string"},
+          "session_id": {"type": "string"},
+          "host": {"type": "string"},
+          "cmd": {"type": "string"},
+          "status": {"type": "string", "description": "completed, failed, denied, approval_required, not_run, ssh_error, ..."},
+          "exit_code": {"type": "integer"},
+          "execution_state": {"type": "string"},
+          "next_action": {"type": "string"},
+          "duration_ms": {"type": "integer"},
+          "stdout": {"type": "string"},
+          "stderr": {"type": "string"},
+          "output_truncated": {"type": "boolean"},
+          "redactions": {"type": "integer"},
+          "policy_action": {"type": "string"},
+          "policy_rule": {"type": "string"},
+          "approval_id": {"type": "string"},
+          "approval_matcher": {"type": "string"},
+          "proposed_scope": {"type": "array", "items": {"type": "string"}},
+          "grant_scope": {"type": "string"}
+        }
+      },
+      "RequestStatusRequest": {
+        "type": "object",
+        "required": ["req_id"],
+        "additionalProperties": false,
+        "properties": {"req_id": {"type": "string"}}
+      },
+      "ApprovalStatusRequest": {
+        "type": "object",
+        "required": ["approval_id"],
+        "additionalProperties": false,
+        "properties": {
+          "approval_id": {"type": "string"},
+          "wait_ms": {"type": "integer", "description": "Default 20000, at most 50000; 0 does not wait."}
+        }
+      },
+      "ApprovalStatus": {
+        "type": "object",
+        "required": ["id", "status"],
+        "properties": {
+          "id": {"type": "string"},
+          "status": {"type": "string", "enum": ["pending", "approved", "denied"]},
+          "verdict": {"type": "string"},
+          "scope": {"type": "string", "description": "once, session, task or host, once approved."},
+          "request": {"type": "object", "description": "The request as submitted: host, session, command, matcher."}
+        }
+      }
+    }
+  }
+}

@@ -14,6 +14,14 @@ const (
 	PathAPIRun       = "/api/run"
 	PathAPIRunOutput = "/api/run/output"
 	PathAPIRunCancel = "/api/run/cancel"
+	// PathAPIRequestStatus answers like `agentssh status --json`,
+	// PathAPIApprovalStatus like `agentssh approval status`, PathAPISession
+	// like `agentssh session new`; PathAPIOpenAPI serves the API's OpenAPI
+	// document, without authentication.
+	PathAPIRequestStatus  = "/api/request/status"
+	PathAPIApprovalStatus = "/api/approval/status"
+	PathAPISession        = "/api/session"
+	PathAPIOpenAPI        = "/api/openapi.json"
 
 	// DefaultAPIWait is how long a call waits for a run when it names no
 	// wait; MaxAPIWait caps any wait.
@@ -100,4 +108,16 @@ func APIResult(exitCode int) string {
 		return APIResultSSHError
 	}
 	return APIResultFailed
+}
+
+// APIApprovalStatusRequest asks for an approval request's status, waiting up
+// to WaitMS (as for runs) while it is still pending.
+type APIApprovalStatusRequest struct {
+	ApprovalID string `json:"approval_id"`
+	WaitMS     *int64 `json:"wait_ms,omitempty"`
+}
+
+// APISession is a fresh session ID, as `agentssh session new` prints one.
+type APISession struct {
+	SessionID string `json:"session_id"`
 }

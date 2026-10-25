@@ -109,7 +109,15 @@ func (s *Server) Handler(publicURL string) (http.Handler, error) {
 		Now:            s.now,
 		DescribeStatus: s.describeStatus,
 	}
-	api.Open = s.tokenRoutes()
+	base, err := remote.HTTPSBaseURL(publicURL)
+	if err != nil {
+		return nil, err
+	}
+	openAPI, err := openAPIRoute(base)
+	if err != nil {
+		return nil, err
+	}
+	api.Open = append(s.tokenRoutes(), openAPI)
 	routes := slices.Concat(s.execRoutes(), s.deviceRoutes(), s.approvalRoutes())
 	for i := range routes {
 		// Cancelling only stops a run, so a device whose window ended can

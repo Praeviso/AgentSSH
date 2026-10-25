@@ -396,6 +396,10 @@ often within a minute):
 | POST | `/api/run` | `{host, command, session, session_label?, stdin? (base64), run_id?, wait_ms?}` → the run |
 | POST | `/api/run/output` | `{run_id, offset, wait_ms?}` → the run from `offset` |
 | POST | `/api/run/cancel` | `{run_id}` → `{run_id, cancelled}` (also while inactive) |
+| POST | `/api/request/status` | `{req_id}` → the request as `agentssh status --json` prints it |
+| POST | `/api/approval/status` | `{approval_id, wait_ms?}` → the request as `agentssh approval status` prints it, after waiting while it is pending |
+| POST | `/api/session` | → `{session_id}`, as `agentssh session new` mints one |
+| GET | `/api/openapi.json` | the OpenAPI 3.1 document of these routes, no token needed |
 
 The run is the same as an `/exec` run (the same pipeline, spool, idempotency,
 limits and audit, with `token_id` on its records): `/api/run` is `/exec` with
@@ -413,7 +417,15 @@ without a result (the gateway stopped it, for example). `next_offset` is where
 the next read continues, so every byte arrives once; an offset the API did not
 answer is refused with 400. A run's identity for `run_id` is what it runs, not
 how long a call waits. Requests the CLI would reject are `400 usage`, before a
-run starts.
+run starts. An approval status call waits like a run call (`wait_ms`), polling
+the device's approval store, and answers as soon as an operator decides; a
+wait that ends while pending answers `pending`, which is not an approval.
+
+The OpenAPI document is embedded in the binary and served with the gateway's
+public base as its server and the bearer scheme. A test keeps it from drifting:
+the routes it documents must be exactly the routes served, every example must
+fit its schema, and every operation, sent with its example (live IDs in place
+of the examples'), must succeed and answer what its schema says.
 
 **Gateway devices.** `agentssh remote enroll <url> --token <t> --mode gateway`
 (the default is `managed`) enrolls a device for a gateway. In gateway mode
