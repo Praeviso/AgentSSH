@@ -38,6 +38,7 @@ modified `agentssh`.
 | The agent approves its own request | Decisions need operator authentication; a same-user process can edit the approval files | As local | No device endpoint decides; operators decide on the gateway host or in its Web UI |
 | Audit records are altered | The hash chain shows edits, but a same-user process can rewrite the whole file | As local for commands; the control plane's signing log is out of reach | The chain is on the gateway, out of the device's reach |
 | A device key is stolen | No device key | Logins to assigned hosts until the device is revoked | Commands the device's policy allows, only inside an activation window an operator opened, until it is revoked |
+| A token device's token leaks | No tokens | No tokens | It works only inside an activation window, until the token is rotated or the device revoked; unlike a signature it can be replayed within that time |
 | A device is revoked | No device | Its next login is refused; running commands check standing every 30 s and are cancelled | Its next request is refused, as when it is deactivated or its window ends; within 30 s its running commands are stopped (`SIGTERM`), with the reason in the audit |
 | The control plane is down | Not involved | Cached bundle until expiry, but no new logins: commands fail closed | Nothing runs: the gateway is the single point of execution |
 | The control plane is compromised | Not involved | Every host trusting its identities | Every host trusting its identities, and every device's policy and audit |
@@ -350,6 +351,34 @@ after the record is in the chain, so concurrent finders record an end once and
 a failed append is retried. An activation is audited before it is stored and a
 deactivation after, so a failed write leaves the device inactive. Revocation is separate and permanent: a revoked device
 cannot be activated.
+
+**Token devices.** A token device is a gateway device whose credential is a
+bearer token instead of an enrolled key, for agents that cannot run
+`agentssh`. `agentssh-gateway device create --name <n> --kind token` adds one
+(the name avoids `device token create`, which makes enrollment tokens) and
+prints its token once: `agt_<16 hex id>_<43 base64url characters>`, 256 random
+bits of secret. The device is a row in the shared `devices` table with no
+public key, so the signed routes refuse it (`401 unknown device key`); its
+tokens live in the gateway's `device_tokens` table, which keeps only the
+SHA-256 of the secret, compared in constant time. `device rotate <id>` issues
+a new token and revokes the old one in one transaction; `device revoke`
+revokes the device and with it its token. Issuing and revoking a token are
+audit records (`device_token_issued`, `device_token_revoked`) with the device,
+`token_id` and operator.
+
+Token routes live under the same public base, below `/api/`, and are
+registered as routes that authenticate themselves: they get the same
+canonical-target checks (so a token in a query string is refused with 400) and
+headers, never the signature check, and a signature never authenticates them.
+A request carries `Authorization: Bearer <token>`. A malformed, unknown,
+rotated-out or wrong token gets one answer, `401 unauthenticated`
+("invalid bearer token"), whatever was wrong; a revoked device's token gets
+`403 device_revoked`; outside its activation window every route but
+`GET /api/status` answers `403 device_inactive`. `GET /api/status` answers like
+`/status`; `GET /api/hosts` like `/hosts`. Failed tokens are not rate limited
+per token: the secret cannot be guessed, and a lockout keyed by the token ID,
+which is part of the token and appears in audit records, would let anyone who
+saw it lock its device out.
 
 **Gateway devices.** `agentssh remote enroll <url> --token <t> --mode gateway`
 (the default is `managed`) enrolls a device for a gateway. In gateway mode

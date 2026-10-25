@@ -616,3 +616,17 @@ func TestActivationNeedsAnOperatorAndADuration(t *testing.T) {
 		t.Fatalf("a revoked device offers activation:\n%.600s", page.body)
 	}
 }
+
+// The Devices page names each device's kind.
+func TestDevicesPageShowsTheKind(t *testing.T) {
+	w := newWebFixture(t)
+	if _, err := gateway.CreateTokenDevice(w.dir, w.store, "hosted-agent", "local:alice", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	b := w.browser(t)
+	b.signIn("alice")
+	page := b.do(http.MethodGet, "/devices", nil)
+	if !strings.Contains(page.body, "token device · dev_") || !strings.Contains(page.body, "signed device · "+w.client.State.DeviceID) {
+		t.Fatalf("devices page:\n%.900s", page.body)
+	}
+}

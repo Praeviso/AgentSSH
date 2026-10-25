@@ -44,7 +44,7 @@ func Init(dir, master string) error {
 
 // OpenStore opens (creating if needed) the gateway database at path.
 func OpenStore(path string) (*controlplane.Store, error) {
-	return controlplane.OpenStore(path, operatorSchema+activationSchema)
+	return controlplane.OpenStore(path, operatorSchema+activationSchema+tokenSchema)
 }
 
 // Server is the gateway HTTP API.
@@ -109,6 +109,7 @@ func (s *Server) Handler(publicURL string) (http.Handler, error) {
 		Now:            s.now,
 		DescribeStatus: s.describeStatus,
 	}
+	api.Open = s.tokenRoutes()
 	routes := slices.Concat(s.execRoutes(), s.deviceRoutes(), s.approvalRoutes())
 	for i := range routes {
 		// Cancelling only stops a run, so a device whose window ended can

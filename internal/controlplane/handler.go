@@ -51,6 +51,19 @@ type API struct {
 	Now   func() time.Time
 	// DescribeStatus, if set, adds a mode's own standing to /status.
 	DescribeStatus func(device Device, status *remote.StatusResponse)
+	// Open are routes that authenticate requests themselves (the gateway's
+	// bearer-token API). They share the canonical-target checks and response
+	// headers, never the device signature check, and a signature never
+	// authenticates them.
+	Open []OpenRoute
+}
+
+// OpenRoute is a route that authenticates its own requests. The body reaching
+// Handler is bounded by MaxBody (zero means 64 KiB).
+type OpenRoute struct {
+	Method, Path string
+	MaxBody      int64
+	Handler      func(w http.ResponseWriter, r *http.Request, body []byte)
 }
 
 // Handler serves enrollment, /status, and routes under the configured public
@@ -69,6 +82,9 @@ func (a API) Handler(publicURL string, routes ...Route) (http.Handler, error) {
 	routes = append([]Route{{Method: "GET", Path: remote.PathStatus, Handler: a.handleStatus}}, routes...)
 	for _, route := range routes {
 		mux.HandleFunc(route.Method+" "+u.Path+route.Path, a.device(base, route))
+	}
+	for _, route := range a.Open {
+		mux.HandleFunc(route.Method+" "+u.Path+route.Path, open(route))
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
@@ -202,6 +218,11 @@ func (a API) device(base string, route Route) http.HandlerFunc {
 			WriteError(w, 500, remote.CodeInternal, "device lookup failed")
 			return
 		}
+		if device.PublicKey == "" {
+			// A device without a key (a gateway token device) never signs.
+			WriteError(w, 401, remote.CodeUnauthenticated, "unknown device key")
+			return
+		}
 		key, err := remote.DecodePublicKey(device.PublicKey)
 		if err != nil {
 			WriteError(w, 500, remote.CodeInternal, "device key unavailable")
@@ -262,6 +283,22 @@ func (a API) device(base string, route Route) http.HandlerFunc {
 			_ = rc.SetWriteDeadline(time.Time{})
 		}
 		route.Handler(w, r, device, body)
+	}
+}
+
+// open reads a bounded body for a route that authenticates itself.
+func open(route OpenRoute) http.HandlerFunc {
+	limit := route.MaxBody
+	if limit <= 0 {
+		limit = maxRequestBytes
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		body, err := requestBytesLimit(r, limit)
+		if err != nil {
+			WriteError(w, http.StatusRequestEntityTooLarge, remote.CodeBadRequest, "request body too large or unreadable")
+			return
+		}
+		route.Handler(w, r, body)
 	}
 }
 

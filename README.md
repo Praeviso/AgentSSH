@@ -426,6 +426,25 @@ be undone by activating again. An inactive device can still enroll, cancel its
 own runs and see its state in `agentssh remote status`; everything else is
 refused with a hint to ask the gateway's operator.
 
+An agent that cannot run `agentssh` at all (a hosted agent platform, a
+sandbox where no binary or key should live) uses a **token device** instead:
+it calls the gateway's API with a bearer token rather than enrolling.
+
+```bash
+agentssh-gateway device create --name hosted-agent --kind token   # prints the token once
+agentssh-gateway config push --device <dev_id> --inventory inventory.yaml --policy policy.yaml
+agentssh-gateway device activate <dev_id> --for 1h
+curl -H "Authorization: Bearer agt_..." https://gw.example/agentssh/api/hosts
+agentssh-gateway device rotate <dev_id>    # new token; the old one is refused at once
+```
+
+The gateway keeps only the token's SHA-256. A token device is activated,
+deactivated and revoked like any other, and its token works only inside an
+activation window; unlike a signed request it could be replayed within that
+window if it leaked, so rotate it if in doubt. The API so far answers
+`GET /api/status` (also while inactive) and `GET /api/hosts`; running commands
+over it follows.
+
 Hosts in the pushed inventory need `addr`, `user` and `identity`, as in managed
 mode; the gateway keeps host keys in its own `known_hosts`, following the
 inventory's `host_key_policy`. On the device, `hosts`, `run`, `status`, `plan`

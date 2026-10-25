@@ -66,8 +66,65 @@ func newDeviceCommand(dir func() (string, error)) *cobra.Command {
 			})
 		},
 	}
-	cmd.AddCommand(activate, deactivate)
+	cmd.AddCommand(activate, deactivate, newCreateTokenDeviceCommand(dir), newRotateTokenCommand(dir))
 	return cmd
+}
+
+// newCreateTokenDeviceCommand adds a token device: one that authenticates with
+// a bearer token, for agents that cannot run agentssh.
+func newCreateTokenDeviceCommand(dir func() (string, error)) *cobra.Command {
+	var name, kind string
+	cmd := &cobra.Command{
+		Use:   "create --name <name> --kind token",
+		Short: "Add a token device, which authenticates with a bearer token instead of enrolling.",
+		Long: "Add a token device for an agent that cannot run agentssh: it calls the gateway's API with a bearer token.\n" +
+			"The token is printed once and only its hash is kept. The device starts inactive; activate it with device activate.",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if kind != remote.DeviceKindToken {
+				return errors.New("--kind token is required: signed devices enroll with agentssh remote enroll instead")
+			}
+			return withStore(dir, func(d string, store *controlplane.Store) error {
+				issued, err := gateway.CreateTokenDevice(d, store, name, localOperator(), time.Now())
+				if err != nil {
+					return err
+				}
+				_, _ = fmt.Fprintln(cmd.OutOrStdout(), issued.Token)
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Created token device %s (%s). The token above is shown once; send it as \"Authorization: Bearer <token>\".\n"+
+					"The device is inactive until you run: agentssh-gateway device activate %s --for <duration>\n", issued.DeviceID, name, issued.DeviceID)
+				return nil
+			})
+		},
+	}
+	cmd.Flags().StringVar(&name, "name", "", "device name (e.g. hosted-agent)")
+	cmd.Flags().StringVar(&kind, "kind", "", "device kind; only token devices are created here")
+	_ = cmd.MarkFlagRequired("name")
+	_ = cmd.MarkFlagRequired("kind")
+	return cmd
+}
+
+func newRotateTokenCommand(dir func() (string, error)) *cobra.Command {
+	return &cobra.Command{
+		Use:   "rotate <device-id>",
+		Short: "Replace a token device's token; the old one is refused at once.",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return withStore(dir, func(d string, store *controlplane.Store) error {
+				issued, err := gateway.RotateToken(d, store, args[0], localOperator(), time.Now())
+				switch {
+				case errors.Is(err, gateway.ErrNotTokenDevice):
+					return fmt.Errorf("rotate %s: it is a signed device; only token devices have tokens", args[0])
+				case errors.Is(err, controlplane.ErrDeviceRevoked):
+					return fmt.Errorf("rotate %s: it is revoked", args[0])
+				case err != nil:
+					return fmt.Errorf("rotate %s: %w", args[0], err)
+				}
+				_, _ = fmt.Fprintln(cmd.OutOrStdout(), issued.Token)
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Rotated the token of %s; the old one is refused from now on. The token above is shown once.\n", args[0])
+				return nil
+			})
+		},
+	}
 }
 
 // activationColumn is a device's window in device ls.
