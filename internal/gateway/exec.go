@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 	"unicode"
@@ -122,7 +123,14 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, device contr
 	s.makeRoom(device.ID, s.runMaxBytes())
 	// The run outlives this request: a dropped connection only detaches the
 	// device, and /exec/cancel or the timeout stops the command.
-	ctx, cancel := context.WithTimeout(context.Background(), s.execTimeout())
+	base, cancelBase := context.WithCancelCause(context.Background())
+	ctx, stopTimer := context.WithTimeout(base, s.execTimeout())
+	// cancel stops the run; a non-nil cause (lost standing) is named in its
+	// audit record, while the device's own cancel gives none.
+	cancel := func(cause error) {
+		cancelBase(cause)
+		stopTimer()
+	}
 	id := req.RunID
 	if id == "" {
 		id = remote.NewRunID()
@@ -132,7 +140,7 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, device contr
 	reqID := ""
 	if resolved.Kind == inventory.TargetKindHost {
 		if reqID, err = audit.NewReqID(); err != nil {
-			cancel()
+			cancel(nil)
 			s.release(device.ID)
 			controlplane.WriteError(w, http.StatusInternalServerError, remote.CodeInternal, "request id unavailable")
 			return
@@ -140,7 +148,7 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, device contr
 	}
 	rn, err := s.startRun(device.ID, id, requestSHA256, reqID, len(resolved.Targets), cancel)
 	if err != nil {
-		cancel()
+		cancel(nil)
 		s.release(device.ID)
 		switch {
 		case errors.Is(err, errRunExists):
@@ -157,6 +165,7 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, device contr
 		}
 		return
 	}
+	rn.identities = targetIdentities(resolved.Targets)
 	exec := s.executor(inv)
 	stores := s.approvals(device.ID)
 	env := runner.Env{
@@ -190,7 +199,7 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, device contr
 	}
 	go func() {
 		defer s.release(device.ID)
-		defer cancel()
+		defer cancel(nil)
 		defer func() { _ = exec.Close() }()
 		s.execute(ctx, rn, env, request)
 	}()
@@ -206,6 +215,13 @@ func (s *Server) execute(ctx context.Context, rn *run, env runner.Env, request r
 		s.makeRoom(rn.deviceID, 0)
 	}()
 	outcome, err := runner.Run(ctx, env, request)
+	if lost := rn.stoppedFor(); lost.reason != "" {
+		// The device sees why the gateway stopped its command, not the
+		// transport failure the interruption caused.
+		payload, _ := json.Marshal(remote.ErrorResponse{Code: lost.code, Error: "the gateway stopped this command: " + lost.reason})
+		rn.finish(remote.FrameError, payload, s.now())
+		return
+	}
 	if err != nil {
 		code, message := remote.CodeInternal, "execution failed"
 		var usage runner.UsageError
@@ -432,4 +448,16 @@ func (o logObserver) Finished(host string, result executor.Result, _ output.Filt
 }
 func (o logObserver) Warning(message string) {
 	log.Printf("agentssh-gateway: device %s: %s", o.deviceID, message)
+}
+
+// targetIdentities are the identities a run's targets connect with, so the
+// run can be stopped when one is disabled.
+func targetIdentities(targets []inventory.Target) []string {
+	var names []string
+	for _, target := range targets {
+		if target.Host.Identity != "" && !slices.Contains(names, target.Host.Identity) {
+			names = append(names, target.Host.Identity)
+		}
+	}
+	return names
 }

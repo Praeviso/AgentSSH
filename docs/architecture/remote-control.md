@@ -38,7 +38,7 @@ modified `agentssh`.
 | The agent approves its own request | Decisions need operator authentication; a same-user process can edit the approval files | As local | No device endpoint decides; operators decide on the gateway host or in its Web UI |
 | Audit records are altered | The hash chain shows edits, but a same-user process can rewrite the whole file | As local for commands; the control plane's signing log is out of reach | The chain is on the gateway, out of the device's reach |
 | A device key is stolen | No device key | Logins to assigned hosts until the device is revoked | Commands the device's policy allows, only inside an activation window an operator opened, until it is revoked |
-| A device is revoked | No device | Its next login is refused; running commands check standing every 30 s and are cancelled | Its next request is refused, as when it is deactivated or its window ends; a run already started continues until it finishes or `--exec-timeout` |
+| A device is revoked | No device | Its next login is refused; running commands check standing every 30 s and are cancelled | Its next request is refused, as when it is deactivated or its window ends; within 30 s its running commands are stopped (`SIGTERM`), with the reason in the audit |
 | The control plane is down | Not involved | Cached bundle until expiry, but no new logins: commands fail closed | Nothing runs: the gateway is the single point of execution |
 | The control plane is compromised | Not involved | Every host trusting its identities | Every host trusting its identities, and every device's policy and audit |
 | Target hosts must trust | Your keys | The control plane's identities | The gateway's identities, and the gateway must reach them |
@@ -141,10 +141,20 @@ run frame (6, `{run_id}`) followed by the run's frames from the offset,
 following a live run until its final frame. The run does not depend on the
 connection: a dropped request only detaches the device, and the client
 reattaches from the byte offset of the complete frames it has consumed, so
-every frame arrives exactly once and the command runs once. Only
-`POST /exec/cancel {run_id}` or `serve --exec-timeout` (default 30m) stops a
-run; the gateway then sends the remote command `SIGTERM` before closing the SSH
-connection. A device's concurrency slot is held until its run finishes.
+every frame arrives exactly once and the command runs once. A run stops on
+`POST /exec/cancel {run_id}`, on `serve --exec-timeout` (default 30m), or when
+its device loses standing: every 30 s `serve` reads each live run's device and
+identities from the store, and stops the runs of a device that was revoked or
+deactivated or whose activation window ended, and the runs connecting with a
+disabled identity. Only a definitive answer stops a run; a store error is
+logged and the run left alone. In every case the gateway sends the remote
+command `SIGTERM` before closing the SSH connection. A run stopped for lost
+standing ends with an error frame instead of its responses, so the device is
+told why rather than seeing a transport failure: `device_revoked`,
+`device_inactive` or `identity_disabled`, with the message
+`the gateway stopped this command: <reason>`. The reason is also in the run
+record (`cancel_reason`) and in its audit record
+(`cancelled: the device was revoked`, for example). A device's concurrency slot is held until its run finishes.
 
 **Run records.** Each run ID has one record, `runs/<device-id>/<run-id>.json`,
 which is the single source of truth; the frames live beside it in a spool the

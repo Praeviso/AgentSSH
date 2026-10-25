@@ -51,3 +51,15 @@ func TestMinimalResponseFitsItsReserve(t *testing.T) {
 		t.Fatalf("final frame is %d bytes, reserve %d", size, finalReserveBytes)
 	}
 }
+
+// StopRuns cancels every live run, so a test that failed with a run still
+// going (one its revoked device can no longer cancel) can end.
+func (s *Server) StopRuns() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, rn := range s.runs {
+		if rn.cancel != nil {
+			rn.cancel(nil)
+		}
+	}
+}

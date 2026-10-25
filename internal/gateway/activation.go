@@ -22,7 +22,8 @@ CREATE TABLE IF NOT EXISTS device_activations (
 	set_by TEXT NOT NULL,
 	note TEXT NOT NULL DEFAULT '',
 	set_at TEXT NOT NULL,
-	end_recorded INTEGER NOT NULL DEFAULT 0
+	end_recorded INTEGER NOT NULL DEFAULT 0,
+	deactivated_by TEXT NOT NULL DEFAULT ''
 );
 `
 
@@ -47,6 +48,9 @@ type Activation struct {
 	SetBy    string
 	Note     string
 	SetAt    time.Time
+	// DeactivatedBy names the operator who closed the window early; empty
+	// while it is open or after it ended on its own.
+	DeactivatedBy string
 }
 
 // Active reports whether the window is open at now.
@@ -65,8 +69,8 @@ func loadActivation(db *sql.DB, deviceID string) (Activation, bool, error) {
 	a := Activation{DeviceID: deviceID}
 	var until, setAt string
 	var recorded bool
-	err := db.QueryRow(`SELECT active_until, set_by, note, set_at, end_recorded FROM device_activations WHERE device_id = ?`, deviceID).
-		Scan(&until, &a.SetBy, &a.Note, &setAt, &recorded)
+	err := db.QueryRow(`SELECT active_until, set_by, note, set_at, end_recorded, deactivated_by FROM device_activations WHERE device_id = ?`, deviceID).
+		Scan(&until, &a.SetBy, &a.Note, &setAt, &recorded, &a.DeactivatedBy)
 	if errors.Is(err, sql.ErrNoRows) {
 		return a, true, nil
 	}
@@ -108,9 +112,9 @@ func ActivateDevice(dir string, store *controlplane.Store, deviceID string, d ti
 	}); err != nil {
 		return Activation{}, fmt.Errorf("audit the activation: %w", err)
 	}
-	_, err = store.DB().Exec(`INSERT INTO device_activations (device_id, active_until, set_by, note, set_at, end_recorded) VALUES (?, ?, ?, ?, ?, 0)
+	_, err = store.DB().Exec(`INSERT INTO device_activations (device_id, active_until, set_by, note, set_at, end_recorded, deactivated_by) VALUES (?, ?, ?, ?, ?, 0, '')
 		ON CONFLICT(device_id) DO UPDATE SET active_until = excluded.active_until, set_by = excluded.set_by,
-		note = excluded.note, set_at = excluded.set_at, end_recorded = 0`,
+		note = excluded.note, set_at = excluded.set_at, end_recorded = 0, deactivated_by = ''`,
 		deviceID, controlplane.FormatTime(a.Until), operator, note, controlplane.FormatTime(now))
 	if err != nil {
 		return Activation{}, err
@@ -131,8 +135,8 @@ func DeactivateDevice(dir string, store *controlplane.Store, deviceID string, op
 	}
 	// Only the window read above is closed; a newer activation in between
 	// stays open.
-	res, err := store.DB().Exec(`UPDATE device_activations SET active_until = ?, end_recorded = 1 WHERE device_id = ? AND active_until = ?`,
-		controlplane.FormatTime(now), deviceID, controlplane.FormatTime(a.Until))
+	res, err := store.DB().Exec(`UPDATE device_activations SET active_until = ?, end_recorded = 1, deactivated_by = ? WHERE device_id = ? AND active_until = ?`,
+		controlplane.FormatTime(now), operator, deviceID, controlplane.FormatTime(a.Until))
 	if err != nil {
 		return false, err
 	}

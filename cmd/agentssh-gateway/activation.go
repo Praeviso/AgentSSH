@@ -13,9 +13,6 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// activationSweep is how often serve records windows that ended.
-const activationSweep = 30 * time.Second
-
 // newDeviceCommand is the shared device command plus activation: a gateway
 // device is usable only inside a window an operator opens.
 func newDeviceCommand(dir func() (string, error)) *cobra.Command {
@@ -104,10 +101,11 @@ func remaining(until, now time.Time) string {
 	return fmt.Sprintf("%dh%dm", h, m)
 }
 
-// recordEndedActivations records ended windows until ctx ends, so an ended
-// window is in the audit chain even if its device sends nothing more.
-func recordEndedActivations(ctx context.Context, dir string, store *controlplane.Store) {
-	ticker := time.NewTicker(activationSweep)
+// checkStanding runs until ctx ends. Every StandingCheckEvery it records
+// ended windows, so an ended window is in the audit chain even if its device
+// sends nothing more, and stops the runs of devices that may no longer act.
+func checkStanding(ctx context.Context, dir string, store *controlplane.Store, server *gateway.Server) {
+	ticker := time.NewTicker(gateway.StandingCheckEvery)
 	defer ticker.Stop()
 	for {
 		select {
@@ -116,6 +114,9 @@ func recordEndedActivations(ctx context.Context, dir string, store *controlplane
 		case now := <-ticker.C:
 			if err := gateway.RecordEndedActivations(dir, store, now); err != nil {
 				log.Printf("agentssh-gateway: record ended activations: %v", err)
+			}
+			if err := server.CancelRunsWithoutStanding(); err != nil {
+				log.Printf("agentssh-gateway: check running commands' standing: %v", err)
 			}
 		}
 	}
