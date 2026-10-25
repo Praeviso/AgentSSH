@@ -111,7 +111,8 @@ connection only attaches to it. A device whose connection drops reattaches
 from the byte offset it has consumed (`/exec/attach`), so every frame arrives
 once and the command runs once. The client mints the run ID and sends it as an
 idempotency key, so a repeated request whose first response was lost joins the
-existing run. Only `/exec/cancel` or `--exec-timeout` stops a run.
+existing run. `/exec/cancel`, `--exec-timeout`, or the device losing standing
+(#34, below) stops a run.
 
 Trade-offs: the gateway now stores output, so it is bounded on every axis
 (spool per run, finished output per device, run records per device, retention)
@@ -198,7 +199,31 @@ Trade-offs:
   recorded, so a failed append is retried and never duplicated; this is why a
   window lasts at least a minute, so two windows of a device never end in the
   same second.
-- A run already started keeps going when its window ends (#34).
+- When the window ends or the device is deactivated or revoked, its running
+  commands are stopped too (#34, below).
+
+### Stopping runs that lost standing (#34)
+
+Every 30 s, `serve` checks each live run's device and the identities its
+targets connect with, reading them from the store because the CLI changes them
+from another process. A run whose device was revoked or deactivated, whose
+window ended, or which connects with a disabled identity is cancelled as
+`/exec/cancel` cancels it: `SIGTERM`, then the connection closes. The run ends
+with an error frame naming the reason, so the device sees why (and the matching
+hint) instead of an SSH failure, and the reason is recorded in the run record
+and in the run's audit record; the run's context carries it as its
+cancellation cause, which the shared runner writes as `cancelled: <reason>`.
+
+Trade-offs:
+
+- One sweep over the live runs, not a timer per run: one store read per device
+  and per identity each round, so a run stops up to 30 s after the change, as
+  in managed mode.
+- Only a definitive answer stops a run. A store error is logged and the run
+  continues, as managed mode cancels only on a definitive revocation.
+- The stopped run's per-target responses are replaced by the error frame, so
+  output already streamed stays with the device but the final responses (and
+  their request IDs) do not reach it; the audit keeps them.
 
 ## Limits and what is not provided
 
@@ -206,11 +231,8 @@ Trade-offs:
   anything; if it is compromised, every target host trusting its identities is
   exposed. There is no high availability or horizontal scaling.
 - **Reachability.** The gateway, not the device, must reach every target host.
-- **Revocation, deactivation and running commands.** Revoking or
-  deactivating a device, or the end of its window, refuses its next request,
-  but a run the gateway already started continues until it finishes or
-  `--exec-timeout` (30 minutes by default); the device can no longer attach to
-  its output.
+- **Stopping is not immediate.** A run of a device that lost standing stops
+  within the 30-second check, not at once.
 - **Plans** run on one host; multi-host and group plans are not supported.
 - **Notifications.** Operators learn of pending approvals from `approval ls` or
   the Web UI; there is no push to IM or mobile.

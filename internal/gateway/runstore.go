@@ -24,7 +24,6 @@ package gateway
 
 import (
 	"bytes"
-	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -123,6 +122,9 @@ type runRecord struct {
 	Frames string `json:"frames,omitempty"`
 	// Broken means a spool write failed, so the spool lacks its result.
 	Broken bool `json:"broken,omitempty"`
+	// CancelReason says why the gateway stopped a run its device could no
+	// longer run (revoked, deactivated, activation ended, identity disabled).
+	CancelReason string `json:"cancel_reason,omitempty"`
 }
 
 // claimRecord publishes a new record; an existing one fails with os.ErrExist.
@@ -151,7 +153,11 @@ type run struct {
 	done      bool
 	err       error
 	wake      chan struct{}
-	cancel    context.CancelFunc
+	cancel    func(cause error)
+	// identities are the identities the run's targets connect with.
+	identities []string
+	// stopped is why the gateway stopped the run, if it did.
+	stopped lostStanding
 }
 
 func (s *Server) runsDir() string { return filepath.Join(s.Dir, dirRuns) }
@@ -233,7 +239,7 @@ func randomSuffix() string {
 // startRun claims id for deviceID and opens its spool; cancel stops the
 // run's context. errRunExists means the ID is already claimed: by a repeat
 // of this request, a different request, or a cancel that overtook it.
-func (s *Server) startRun(deviceID, id, requestSHA256, reqID string, targets int, cancel context.CancelFunc) (*run, error) {
+func (s *Server) startRun(deviceID, id, requestSHA256, reqID string, targets int, cancel func(cause error)) (*run, error) {
 	if int64(targets) > s.maxRunTargets() {
 		return nil, errRunTooLarge
 	}
@@ -352,7 +358,7 @@ func (s *Server) cancelRun(deviceID, id string) (bool, error) {
 	if rn, live := s.runs[runKey(deviceID, id)]; live {
 		_, done, _, _ := rn.snapshot()
 		if !done && rn.cancel != nil {
-			rn.cancel()
+			rn.cancel(nil)
 		}
 		return !done, nil
 	}

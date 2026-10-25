@@ -325,16 +325,19 @@ func execute(ctx context.Context, env Env, req Request, obs Observer, p plan, si
 }
 
 // interruption names why ctx ended while a command ran, so the audit shows a
-// cancelled or timed-out run rather than a bare transport failure.
+// cancelled or timed-out run rather than a bare transport failure. A cause
+// given when cancelling (context.WithCancelCause) says who stopped it.
 func interruption(ctx context.Context) string {
 	switch {
 	case ctx.Err() == nil:
 		return ""
 	case errors.Is(ctx.Err(), context.DeadlineExceeded):
 		return "timed out"
-	default:
-		return "cancelled"
 	}
+	if cause := context.Cause(ctx); cause != nil && !errors.Is(cause, context.Canceled) {
+		return "cancelled: " + cause.Error()
+	}
+	return "cancelled"
 }
 
 func buildPlans(env Env, req Request) ([]plan, error) {

@@ -435,9 +435,11 @@ for state the device no longer keeps (inventory, policy, secrets, approval
 decisions, audit, the TUI) exit 2 and name the gateway.
 
 A dropped connection does not stop a command: it keeps running on the gateway,
-and the device reattaches and receives the rest of its output. Only Ctrl-C (an
+and the device reattaches and receives the rest of its output. Ctrl-C (an
 explicit cancel) or the gateway's `--exec-timeout` (30 minutes by default)
-stops it.
+stops it, and so does the device losing its standing: within 30 seconds of a
+revocation, a deactivation, the end of its activation window, or a disabled
+identity, the gateway stops its running commands and tells the device why.
 
 Approvals are decided on the gateway, never on the device:
 

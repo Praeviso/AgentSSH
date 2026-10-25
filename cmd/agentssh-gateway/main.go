@@ -156,7 +156,7 @@ func newServeCommand(dir func() (string, error)) *cobra.Command {
 					return err
 				}
 			}
-			go recordEndedActivations(ctx, d, store)
+			go checkStanding(ctx, d, store, server)
 			return program.Serve(ctx, cmd.OutOrStdout(), listen, publicURL, handler)
 		},
 	}
