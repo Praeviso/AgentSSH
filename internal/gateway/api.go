@@ -3,10 +3,12 @@ package gateway
 import (
 	"context"
 	"crypto/sha256"
+	_ "embed"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -14,6 +16,7 @@ import (
 
 	"github.com/Praeviso/AgentSSH/internal/controlplane"
 	"github.com/Praeviso/AgentSSH/internal/remote"
+	"github.com/Praeviso/AgentSSH/internal/session"
 )
 
 // apiRoutes run commands for token devices with JSON in and out (see
@@ -29,6 +32,11 @@ func (s *Server) apiRoutes() []controlplane.OpenRoute {
 		s.tokenRoute("POST", remote.PathAPIRunCancel, tokenOptions{}, func(w http.ResponseWriter, r *http.Request, device controlplane.Device, _ string, body []byte) {
 			s.handleCancel(w, r, device, body)
 		}),
+		s.tokenRoute("POST", remote.PathAPIRequestStatus, tokenOptions{needsActive: true}, func(w http.ResponseWriter, r *http.Request, device controlplane.Device, _ string, body []byte) {
+			s.handleRequestStatus(w, r, device, body)
+		}),
+		s.tokenRoute("POST", remote.PathAPIApprovalStatus, tokenOptions{needsActive: true, respondWithin: respond}, s.handleAPIApprovalStatus),
+		s.tokenRoute("POST", remote.PathAPISession, tokenOptions{needsActive: true}, s.handleAPISession),
 	}
 }
 
@@ -193,4 +201,66 @@ func finalFrame(spool io.ReaderAt, size int64) (byte, []byte, bool) {
 		return 0, nil, false
 	}
 	return kind, payload, true
+}
+
+// handleAPIApprovalStatus answers an approval request's status as `agentssh
+// approval status` prints it, waiting up to wait_ms while it is pending.
+func (s *Server) handleAPIApprovalStatus(w http.ResponseWriter, r *http.Request, device controlplane.Device, _ string, body []byte) {
+	var req remote.APIApprovalStatusRequest
+	if controlplane.DecodeBody(body, &req) != nil {
+		controlplane.WriteError(w, http.StatusBadRequest, remote.CodeBadRequest, "malformed approval status query")
+		return
+	}
+	pending := s.approvals(device.ID).Pending
+	deadline := time.Now().Add(apiWait(req.WaitMS))
+	for {
+		status, err := pending.Status(req.ApprovalID)
+		if err != nil {
+			writeApprovalError(w, err)
+			return
+		}
+		if status.Status != "pending" || !time.Now().Before(deadline) {
+			controlplane.WriteJSON(w, http.StatusOK, status)
+			return
+		}
+		// Decisions are files another process writes; poll them.
+		select {
+		case <-time.After(min(approvalPoll, time.Until(deadline))):
+		case <-r.Context().Done():
+			return
+		}
+	}
+}
+
+// approvalPoll is how often a waiting approval status call looks again.
+const approvalPoll = 250 * time.Millisecond
+
+func (s *Server) handleAPISession(w http.ResponseWriter, _ *http.Request, _ controlplane.Device, _ string, _ []byte) {
+	id, err := session.NewID()
+	if err != nil {
+		controlplane.WriteError(w, http.StatusInternalServerError, remote.CodeInternal, "session id unavailable")
+		return
+	}
+	controlplane.WriteJSON(w, http.StatusOK, remote.APISession{SessionID: id})
+}
+
+//go:embed openapi.json
+var openAPIDocument []byte
+
+// openAPIRoute serves the API's OpenAPI document, with base as its server,
+// to anyone: it describes the API and holds no secret.
+func openAPIRoute(base string) (controlplane.OpenRoute, error) {
+	var doc map[string]any
+	if err := json.Unmarshal(openAPIDocument, &doc); err != nil {
+		return controlplane.OpenRoute{}, fmt.Errorf("openapi document: %w", err)
+	}
+	doc["servers"] = []map[string]string{{"url": base}}
+	served, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return controlplane.OpenRoute{}, err
+	}
+	return controlplane.OpenRoute{Method: "GET", Path: remote.PathAPIOpenAPI, Handler: func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(served)
+	}}, nil
 }

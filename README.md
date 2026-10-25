@@ -452,8 +452,20 @@ the output so far, and once finished `result` (`ok`, `denied`,
 the `run --json` objects. A run that outlives the wait keeps running; read the
 rest with `POST /api/run/output` from the answer's `next_offset`, and stop it
 with `POST /api/run/cancel`. Sending the same `run_id` again joins the run
-instead of running the command twice. `GET /api/status` (also while inactive)
-and `GET /api/hosts` answer like `agentssh remote status` and `hosts`.
+instead of running the command twice.
+
+| Endpoint | Answers like |
+| --- | --- |
+| `GET /api/status` (also while inactive) | `agentssh remote status` |
+| `GET /api/hosts` | `agentssh hosts --json` |
+| `POST /api/session` | `agentssh session new` |
+| `POST /api/run`, `/api/run/output`, `/api/run/cancel` | `agentssh run --json`, continued |
+| `POST /api/request/status` `{req_id}` | `agentssh status --json` |
+| `POST /api/approval/status` `{approval_id, wait_ms?}` | `agentssh approval status`, or `approval wait` with `wait_ms` |
+
+The gateway serves the API's OpenAPI 3.1 document at `GET /api/openapi.json`
+(no token needed), with its own public URL as the server, for platforms that
+import an API from a URL.
 
 Hosts in the pushed inventory need `addr`, `user` and `identity`, as in managed
 mode; the gateway keeps host keys in its own `known_hosts`, following the

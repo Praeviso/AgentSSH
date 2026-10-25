@@ -242,6 +242,13 @@ Trade-offs:
   the complete filtered output, as for `run --json`.
 - Responses are returned as they are written, not held until the end, so an
   offset never skips one.
+- The rest of the agent's commands follow the CLI's answers (#42): hosts,
+  request status, approval status with a bounded wait, and a new session, all
+  described by an OpenAPI 3.1 document served at `/api/openapi.json` for
+  platforms that import an API. The document is checked against the live
+  handlers in tests, not generated from code: no generator dependency, and the
+  descriptions (what to do on `denied` or `approval_required`) are written for
+  the agents that read them.
 
 ### Stopping runs that lost standing (#34)
 
