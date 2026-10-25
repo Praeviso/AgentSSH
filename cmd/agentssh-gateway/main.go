@@ -38,9 +38,11 @@ var program = &admin.Program{
 	OpenStore: func(dir string) (*controlplane.Store, error) {
 		return gateway.OpenStore(filepath.Join(dir, gateway.FileDatabase))
 	},
-	EnrollHint:   "agentssh remote enroll %s --mode gateway --token <token>",
-	RevokeShort:  "Revoke a device; its next request is refused.",
-	DisableShort: "Stop connecting with an identity.",
+	EnrollHint:         "agentssh remote enroll %s --mode gateway --token <token>",
+	RevokeShort:        "Revoke a device for good; its next request is refused.",
+	DisableShort:       "Stop connecting with an identity.",
+	DeviceColumnHeader: "ACTIVATION",
+	DeviceColumn:       activationColumn,
 }
 
 func main() {
@@ -62,7 +64,7 @@ func newRootCommand() *cobra.Command {
 	root.AddCommand(
 		program.InitCommand(dir),
 		newServeCommand(dir),
-		program.DeviceCommand(dir),
+		newDeviceCommand(dir),
 		program.IdentityCommand(dir),
 		program.ConfigCommand(dir),
 		newAuditCommand(dir),
@@ -154,6 +156,7 @@ func newServeCommand(dir func() (string, error)) *cobra.Command {
 					return err
 				}
 			}
+			go recordEndedActivations(ctx, d, store)
 			return program.Serve(ctx, cmd.OutOrStdout(), listen, publicURL, handler)
 		},
 	}

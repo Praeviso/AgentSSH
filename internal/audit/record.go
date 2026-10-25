@@ -26,6 +26,11 @@ const (
 	EventApprovalRequested Event = "approval_requested"
 	EventApprovalGranted   Event = "approval_granted"
 	EventApprovalDenied    Event = "approval_denied"
+	// Gateway device activation: an operator opened or closed a device's
+	// window, or the window ended.
+	EventDeviceActivated       Event = "device_activated"
+	EventDeviceDeactivated     Event = "device_deactivated"
+	EventDeviceActivationEnded Event = "device_activation_expired"
 )
 
 // Record is one append-only JSONL audit entry.
@@ -73,6 +78,10 @@ type Record struct {
 	// Operator names who decided an approval on a gateway ("web:<name>" or
 	// "local:<user>"); omitempty keeps older canonical forms.
 	Operator string `json:"operator,omitempty"`
+	// ActiveUntil and Note describe a gateway device's activation window;
+	// omitempty keeps older canonical forms.
+	ActiveUntil string `json:"active_until,omitempty"`
+	Note        string `json:"note,omitempty"`
 }
 
 const ZeroHash = "0000000000000000000000000000000000000000000000000000000000000000"
@@ -410,6 +419,8 @@ type canonicalRecord struct {
 	RemoteSignID    string `json:"remote_sign_id,omitempty"`
 	DeviceID        string `json:"device_id,omitempty"`
 	Operator        string `json:"operator,omitempty"`
+	ActiveUntil     string `json:"active_until,omitempty"`
+	Note            string `json:"note,omitempty"`
 }
 
 func canonicalJSON(record Record) ([]byte, error) {
@@ -444,5 +455,7 @@ func canonicalJSON(record Record) ([]byte, error) {
 		RemoteSignID:    record.RemoteSignID,
 		DeviceID:        record.DeviceID,
 		Operator:        record.Operator,
+		ActiveUntil:     record.ActiveUntil,
+		Note:            record.Note,
 	})
 }

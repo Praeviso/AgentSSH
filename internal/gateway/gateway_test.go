@@ -129,8 +129,23 @@ func (f *fixture) enroll(t *testing.T, name string) *remoteclient.Client {
 	return client
 }
 
-// enrollHome enrolls another device and returns its home.
+// enrollHome enrolls another device, activates it, and returns its home.
 func (f *fixture) enrollHome(t *testing.T, name string) string {
+	t.Helper()
+	home := f.enrollInactive(t, name)
+	state, err := remoteclient.LoadState(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gateway.ActivateDevice(f.dir, f.store, state.DeviceID, gateway.MaxActivation, "local:test", "", time.Now()); err != nil {
+		t.Fatalf("activate: %v", err)
+	}
+	return home
+}
+
+// enrollInactive enrolls another device, leaving it inactive as enrollment
+// does, and returns its home.
+func (f *fixture) enrollInactive(t *testing.T, name string) string {
 	t.Helper()
 	pub, err := controlplane.LoadBundlePublicKey(f.dir)
 	if err != nil {

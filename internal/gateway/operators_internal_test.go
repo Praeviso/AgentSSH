@@ -3,6 +3,9 @@ package gateway
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/base64"
 	"errors"
 	"io"
 	"net/http"
@@ -15,7 +18,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Praeviso/AgentSSH/internal/audit"
 	"github.com/Praeviso/AgentSSH/internal/controlplane"
+	"github.com/Praeviso/AgentSSH/internal/remote"
 )
 
 // RFC 6238 appendix B: the SHA-1 secret "12345678901234567890" at T=59 is
@@ -273,5 +278,43 @@ func TestBusySignInsAreNotFailures(t *testing.T) {
 	}
 	if status := login(); status != http.StatusSeeOther {
 		t.Fatalf("sign-in once checks were free answered %d", status)
+	}
+}
+
+// Two requests that both find the same window ended record its end once.
+func TestAnEndedWindowFoundTwiceIsRecordedOnce(t *testing.T) {
+	store, _, _ := operatorStore(t)
+	dir := t.TempDir()
+	pub, _, _ := ed25519.GenerateKey(rand.Reader)
+	token, err := store.CreateEnrollToken("agent", "https://gw.example/agentssh", remote.PublicKeyFingerprint(pub), time.Minute, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	device, err := store.RedeemEnrollToken(token.ID, token.Secret, "https://gw.example/agentssh", base64.StdEncoding.EncodeToString(pub), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := ActivateDevice(dir, store, device.ID, time.Minute, "local:alice", "", time.Now().Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Both finders read the window before either claims it.
+	for range 2 {
+		if err := recordActivationEnd(dir, store, a, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	records, err := activationAudit(dir).ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ended := 0
+	for _, record := range records {
+		if record.Event == audit.EventDeviceActivationEnded {
+			ended++
+		}
+	}
+	if ended != 1 {
+		t.Fatalf("the end was recorded %d times", ended)
 	}
 }

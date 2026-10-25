@@ -61,7 +61,7 @@ pending IDs go to stderr. A wait timeout remains pending, not approved.
 | Failed execution or command | Inspect effects and outputs before retrying. |
 | Unknown execution | Never replay automatically; inspect the remote state and audit trail. |
 | Completed execution | Verify the business/application checks requested by the user. |
-| `run`, `plan` or `status` fails with a hint naming the control plane (revoked, unreachable, refused to sign) or "remote configuration unavailable" | Stop and tell the user; only the control plane's administrator can fix it. Do not retry or work around it. |
+| `run`, `plan` or `status` fails with a hint naming the control plane (revoked, not activated, unreachable, refused to sign) or "remote configuration unavailable" | Stop and tell the user; only the control plane's administrator can fix it. Do not retry or work around it. |
 
 ## Read only the detail needed
 

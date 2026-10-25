@@ -264,13 +264,27 @@ func (w *chunkWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// auditRecords are the gateway's records of runs and approvals, without the
+// fixtures' device activations.
 func auditRecords(t *testing.T, f *fixture) []audit.Record {
 	t.Helper()
 	records, err := audit.NewStore(filepath.Join(f.dir, gateway.FileAudit)).ReadAll()
 	if err != nil {
 		t.Fatal(err)
 	}
-	return records
+	return withoutActivations(records)
+}
+
+func withoutActivations(records []audit.Record) []audit.Record {
+	var out []audit.Record
+	for _, record := range records {
+		switch record.Event {
+		case audit.EventDeviceActivated, audit.EventDeviceDeactivated, audit.EventDeviceActivationEnded:
+		default:
+			out = append(out, record)
+		}
+	}
+	return out
 }
 
 func TestExecStreamsAllowedOutputChunkByChunk(t *testing.T) {
@@ -460,8 +474,8 @@ func TestGatewayAuditChainBindsDevice(t *testing.T) {
 		}
 	}
 	log := audit.NewStore(filepath.Join(f.dir, gateway.FileAudit))
-	if result, err := log.Verify(); err != nil || !result.OK || result.Count != 3 {
-		t.Fatalf("verify = %+v, %v (want started, completed, denied)", result, err)
+	if result, err := log.Verify(); err != nil || !result.OK || result.Count != 4 {
+		t.Fatalf("verify = %+v, %v (want activated, started, completed, denied)", result, err)
 	}
 	for _, record := range auditRecords(t, f) {
 		if record.DeviceID != f.client.State.DeviceID {
@@ -565,8 +579,8 @@ func TestExecBoundsWhatReachesTheAudit(t *testing.T) {
 	if _, err := f.client.Exec(context.Background(), execReq("uptime"), io.Discard, io.Discard); err != nil {
 		t.Fatalf("run after the longest command: %v", err)
 	}
-	if result, err := audit.NewStore(filepath.Join(f.dir, gateway.FileAudit)).Verify(); err != nil || !result.OK || result.Count != 3 {
-		t.Fatalf("audit = %+v, %v; want approval_requested, started, completed", result, err)
+	if result, err := audit.NewStore(filepath.Join(f.dir, gateway.FileAudit)).Verify(); err != nil || !result.OK || result.Count != 4 {
+		t.Fatalf("audit = %+v, %v; want activated, approval_requested, started, completed", result, err)
 	}
 }
 

@@ -136,17 +136,19 @@ func runRemoteEnroll(cmd *cobra.Command, serverURL, token, mode string) error {
 }
 
 type remoteStatusJSON struct {
-	ServerURL      string `json:"server_url"`
-	Mode           string `json:"mode"`
-	DeviceID       string `json:"device_id"`
-	Device         string `json:"device"`
-	DeviceError    string `json:"device_error,omitempty"`
-	BundleVersion  int64  `json:"bundle_version,omitempty"`
-	BundleFetched  string `json:"bundle_fetched_at,omitempty"`
-	BundleNotAfter string `json:"bundle_not_after,omitempty"`
-	Hosts          int    `json:"hosts"`
-	LocalDeny      int    `json:"local_deny_rules"`
-	LocalIgnored   int    `json:"local_ignored_rules"`
+	ServerURL   string `json:"server_url"`
+	Mode        string `json:"mode"`
+	DeviceID    string `json:"device_id"`
+	Device      string `json:"device"`
+	DeviceError string `json:"device_error,omitempty"`
+	// Activation is a gateway device's activation window.
+	Activation     *remote.Activation `json:"activation,omitempty"`
+	BundleVersion  int64              `json:"bundle_version,omitempty"`
+	BundleFetched  string             `json:"bundle_fetched_at,omitempty"`
+	BundleNotAfter string             `json:"bundle_not_after,omitempty"`
+	Hosts          int                `json:"hosts"`
+	LocalDeny      int                `json:"local_deny_rules"`
+	LocalIgnored   int                `json:"local_ignored_rules"`
 }
 
 func runRemoteStatus(cmd *cobra.Command, jsonOutput bool) error {
@@ -171,6 +173,7 @@ func runRemoteStatus(cmd *cobra.Command, jsonOutput bool) error {
 		report.DeviceError = err.Error()
 	} else {
 		report.Device = status.Status
+		report.Activation = status.Activation
 	}
 	if client.State.Gateway() {
 		return printRemoteStatus(cmd, report, jsonOutput, healthy)
@@ -204,11 +207,28 @@ func printRemoteStatus(cmd *cobra.Command, report remoteStatusJSON, jsonOutput b
 		out := cmd.OutOrStdout()
 		_, _ = fmt.Fprintf(out, "server   %s\n", report.ServerURL)
 		_, _ = fmt.Fprintf(out, "mode     %s\n", report.Mode)
-		device := report.DeviceID + " (" + report.Device + ")"
+		standing := report.Device
+		if gateway && standing == remote.DeviceActive {
+			// A gateway device's "active" means not revoked; whether it may
+			// act now is its activation, on the access line.
+			standing = "enrolled"
+		}
+		device := report.DeviceID + " (" + standing + ")"
 		if report.DeviceError != "" && report.Device != remote.DeviceRevoked {
 			device += " — " + report.DeviceError
 		}
 		_, _ = fmt.Fprintf(out, "device   %s\n", device)
+		if a := report.Activation; a != nil && report.Device != remote.DeviceRevoked {
+			if a.State == remote.ActivationActive {
+				until := a.Until
+				if t, err := time.Parse(time.RFC3339, a.Until); err == nil {
+					until = t.Local().Format(time.RFC3339)
+				}
+				_, _ = fmt.Fprintf(out, "access   active until %s\n", until)
+			} else {
+				_, _ = fmt.Fprintln(out, "access   inactive · only the gateway's operator can activate this device")
+			}
+		}
 		if gateway {
 			_, _ = fmt.Fprintln(out, "config   kept on the gateway")
 		} else if report.BundleVersion > 0 {

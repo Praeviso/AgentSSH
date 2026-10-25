@@ -45,10 +45,13 @@ const (
 
 // Error codes carried in ErrorResponse.Code.
 const (
-	CodeBadRequest       = "bad_request"
-	CodeUnauthenticated  = "unauthenticated"
-	CodeClockSkew        = "clock_skew"
-	CodeDeviceRevoked    = "device_revoked"
+	CodeBadRequest      = "bad_request"
+	CodeUnauthenticated = "unauthenticated"
+	CodeClockSkew       = "clock_skew"
+	CodeDeviceRevoked   = "device_revoked"
+	// CodeDeviceInactive refuses a gateway device outside its activation
+	// window: an operator must activate it.
+	CodeDeviceInactive   = "device_inactive"
 	CodeTokenInvalid     = "token_invalid"
 	CodeNoConfig         = "no_config"
 	CodeUnknownHost      = "unknown_host"
@@ -69,6 +72,22 @@ type StatusResponse struct {
 	DeviceID string `json:"device_id"`
 	Status   string `json:"status"`
 	Mode     string `json:"mode,omitempty"`
+	// Activation is a gateway device's activation window; a managed control
+	// plane omits it.
+	Activation *Activation `json:"activation,omitempty"`
+}
+
+// Activation states of a gateway device.
+const (
+	ActivationActive   = "active"
+	ActivationInactive = "inactive"
+)
+
+// Activation reports whether a gateway device may use the gateway now, and
+// until when (RFC 3339, set only while active).
+type Activation struct {
+	State string `json:"state"`
+	Until string `json:"until,omitempty"`
 }
 
 // BundleResponse carries the raw signed bundle bytes and their signature.
@@ -110,6 +129,13 @@ func (e *APIError) Error() string {
 		return fmt.Sprintf("control plane refused the request (%s)", e.Code)
 	}
 	return fmt.Sprintf("control plane refused the request: %s", e.Message)
+}
+
+// IsInactive reports whether err is a gateway's refusal because the device is
+// outside its activation window.
+func IsInactive(err error) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && apiErr.Code == CodeDeviceInactive
 }
 
 // IsRevoked reports whether err is a control-plane refusal because the device

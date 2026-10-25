@@ -44,7 +44,7 @@ func Init(dir, master string) error {
 
 // OpenStore opens (creating if needed) the gateway database at path.
 func OpenStore(path string) (*controlplane.Store, error) {
-	return controlplane.OpenStore(path, operatorSchema)
+	return controlplane.OpenStore(path, operatorSchema+activationSchema)
 }
 
 // Server is the gateway HTTP API.
@@ -103,10 +103,44 @@ func (s *Server) now() time.Time {
 // HTTPS base, with the same trust requirements as the managed handler.
 func (s *Server) Handler(publicURL string) (http.Handler, error) {
 	api := controlplane.API{
-		Mode:  remote.ModeGateway,
-		Store: func() *controlplane.Store { return s.Store },
-		Keys:  func() *controlplane.Keys { return s.Keys },
-		Now:   s.now,
+		Mode:           remote.ModeGateway,
+		Store:          func() *controlplane.Store { return s.Store },
+		Keys:           func() *controlplane.Keys { return s.Keys },
+		Now:            s.now,
+		DescribeStatus: s.describeStatus,
 	}
-	return api.Handler(publicURL, slices.Concat(s.execRoutes(), s.deviceRoutes(), s.approvalRoutes())...)
+	routes := slices.Concat(s.execRoutes(), s.deviceRoutes(), s.approvalRoutes())
+	for i := range routes {
+		// Cancelling only stops a run, so a device whose window ended can
+		// still stop its own.
+		if routes[i].Path != remote.PathExecCancel {
+			routes[i].Handler = s.requireActive(routes[i].Handler)
+		}
+	}
+	return api.Handler(publicURL, routes...)
+}
+
+// requireActive refuses a device outside its activation window. Enrollment
+// and /status are not wrapped, so a device can enroll before it is activated
+// and see its state.
+func (s *Server) requireActive(next controlplane.DeviceHandler) controlplane.DeviceHandler {
+	return func(w http.ResponseWriter, r *http.Request, device controlplane.Device, body []byte) {
+		_, active, err := deviceActive(s.Dir, s.Store, device.ID, s.now())
+		if err != nil {
+			controlplane.WriteError(w, http.StatusInternalServerError, remote.CodeInternal, "activation state unavailable")
+			return
+		}
+		if !active {
+			controlplane.WriteError(w, http.StatusForbidden, remote.CodeDeviceInactive, "this device is not activated; an operator must activate it on the gateway")
+			return
+		}
+		next(w, r, device, body)
+	}
+}
+
+func (s *Server) describeStatus(device controlplane.Device, status *remote.StatusResponse) {
+	now := s.now()
+	if a, _, err := deviceActive(s.Dir, s.Store, device.ID, now); err == nil {
+		status.Activation = ActivationStatus(a, now)
+	}
 }

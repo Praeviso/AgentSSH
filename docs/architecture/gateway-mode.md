@@ -53,8 +53,12 @@ that lies about its plan state gains nothing.
   reads the data directory, or from the Web UI, which uses accounts of its own
   (argon2id passwords and mandatory TOTP) on a listener the device API never
   shares. No device endpoint can resolve an approval.
-- **What a device still controls.** It chooses which allowed commands to run
-  and when, and it receives their filtered output. It can submit approval
+- **When a device may act.** Only inside an activation window an operator
+  opened for a chosen duration (at most 24 h); outside it every device endpoint
+  but cancel refuses it, so a stolen device key is useless while the device is
+  inactive. Revocation stays separate and permanent.
+- **What a device still controls.** Inside its window, it chooses which allowed
+  commands to run and when, and it receives their filtered output. It can submit approval
   requests and plans, bounded per device, which only an operator can decide.
 
 ## Design and trade-offs by part
@@ -174,14 +178,33 @@ Trade-offs:
 - The QR encoder is in the repository (byte mode, level M, versions 1–10)
   rather than a new dependency.
 
+### Activation windows (#37)
+
+Every gateway device starts inactive. `device activate <id> --for <duration>`
+opens a window, `device deactivate` closes it early, and the window ends on its
+own. The state is a gateway-only table and every device route checks it on each
+request, except enrollment, `/status` and `/exec/cancel`. Activation,
+deactivation and the end of a window are audit records with the operator.
+
+Trade-offs:
+
+- The cap is a fixed 24 h checked where a window is stored, not a `serve` flag:
+  `device activate` runs in its own process and could not see `serve`'s flags,
+  so a serve-only cap would disagree with what the CLI wrote.
+- An ended window is recorded by the first request or the 30-second sweep that
+  finds it, so its record can come up to that long after the window ended; the
+  record's `active_until` says when it did.
+- A run already started keeps going when its window ends (#34).
+
 ## Limits and what is not provided
 
 - **Single point of execution.** If the gateway is down, no gateway device runs
   anything; if it is compromised, every target host trusting its identities is
   exposed. There is no high availability or horizontal scaling.
 - **Reachability.** The gateway, not the device, must reach every target host.
-- **Revocation and running commands.** Revoking a device refuses its next
-  request, but a run the gateway already started continues until it finishes or
+- **Revocation, deactivation and running commands.** Revoking or
+  deactivating a device, or the end of its window, refuses its next request,
+  but a run the gateway already started continues until it finishes or
   `--exec-timeout` (30 minutes by default); the device can no longer attach to
   its output.
 - **Plans** run on one host; multi-host and group plans are not supported.
