@@ -26,6 +26,7 @@ import (
 	"github.com/Praeviso/AgentSSH/internal/audit"
 	"github.com/Praeviso/AgentSSH/internal/controlplane"
 	"github.com/Praeviso/AgentSSH/internal/qr"
+	"github.com/Praeviso/AgentSSH/internal/remote"
 )
 
 //go:embed webui
@@ -77,12 +78,13 @@ type WebUI struct {
 func NewWebUI(dir string, store *controlplane.Store, keys *controlplane.Keys) (*WebUI, error) {
 	w := &WebUI{Dir: dir, Store: store, Keys: keys, Now: time.Now, pages: map[string]*template.Template{}, limiter: newLoginLimiter()}
 	funcs := template.FuncMap{
-		"when":   func(ts string) string { return formatWhen(ts) },
-		"shell":  hasShellSyntax,
-		"short":  func(s string, n int) string { return shorten(s, n) },
-		"offers": func(scopes []approval.Scope, s string) bool { return offers(scopes, approval.Scope(s)) },
+		"when":    func(ts string) string { return formatWhen(ts) },
+		"shell":   hasShellSyntax,
+		"short":   func(s string, n int) string { return shorten(s, n) },
+		"offers":  func(scopes []approval.Scope, s string) bool { return offers(scopes, approval.Scope(s)) },
+		"fmtTime": func(t time.Time) string { return t.UTC().Format(time.RFC3339) },
 	}
-	for _, page := range []string{"login", "totp", "approvals", "audit"} {
+	for _, page := range []string{"login", "totp", "approvals", "audit", "devices"} {
 		t, err := template.New("layout.html").Funcs(funcs).ParseFS(webAssets, "webui/layout.html", "webui/"+page+".html")
 		if err != nil {
 			return nil, err
@@ -114,6 +116,9 @@ func (w *WebUI) Handler() http.Handler {
 	mux.HandleFunc("POST /approvals/{id}", w.withSession(StageActive, w.decideApproval))
 	mux.HandleFunc("POST /plans/{id}", w.withSession(StageActive, w.decidePlan))
 	mux.HandleFunc("GET /audit", w.withSession(StageActive, w.auditPage))
+	mux.HandleFunc("GET /devices", w.withSession(StageActive, w.devicesPage))
+	mux.HandleFunc("POST /devices/{id}/activate", w.withSession(StageActive, w.activateDevice))
+	mux.HandleFunc("POST /devices/{id}/deactivate", w.withSession(StageActive, w.deactivateDevice))
 	return securityHeaders(formPosts(mux))
 }
 
@@ -640,4 +645,147 @@ func (l *loginLimiter) begin(account, address string, now time.Time) (succeeded 
 			}
 		}
 	}, true
+}
+
+// Devices: each device's activation window, opened for a chosen duration or
+// closed early by an operator.
+
+// activationPresets are the durations the Devices page offers.
+var activationPresets = []struct{ Value, Label string }{
+	{"30m", "30 minutes"}, {"1h", "1 hour"}, {"4h", "4 hours"}, {"8h", "8 hours"}, {"24h", "24 hours"},
+}
+
+// maxNoteBytes bounds an activation note.
+const maxNoteBytes = 200
+
+type deviceView struct {
+	controlplane.Device
+	Activation   Activation
+	Active       bool
+	Revoked      bool
+	Left         string
+	LastActivity string
+}
+
+// deviceEvents are the audit events a device's own requests cause, which
+// make its last activity.
+var deviceEvents = map[audit.Event]bool{
+	audit.EventStarted: true, audit.EventCompleted: true, audit.EventFailed: true,
+	audit.EventDenied: true, audit.EventApprovalRequested: true,
+}
+
+func (w *WebUI) devicesPage(rw http.ResponseWriter, r *http.Request, session WebSession, _ string) {
+	devices, err := w.Store.Devices()
+	if err != nil {
+		http.Error(rw, "device store unavailable", http.StatusInternalServerError)
+		return
+	}
+	last := map[string]string{}
+	if records, err := audit.NewStore(filepath.Join(w.Dir, FileAudit)).ReadAll(); err == nil {
+		for _, rec := range records {
+			if rec.DeviceID != "" && deviceEvents[rec.Event] {
+				last[rec.DeviceID] = rec.TS
+			}
+		}
+	}
+	now := activationNow()
+	views := make([]deviceView, 0, len(devices))
+	active := 0
+	for _, d := range devices {
+		a, err := DeviceActivation(w.Store, d.ID)
+		if err != nil {
+			http.Error(rw, "activation state unavailable", http.StatusInternalServerError)
+			return
+		}
+		v := deviceView{Device: d, Activation: a, Revoked: d.Status == remote.DeviceRevoked, LastActivity: last[d.ID]}
+		if !v.Revoked && a.Active(now) {
+			v.Active, v.Left = true, Remaining(a.Until, now)
+			active++
+		}
+		views = append(views, v)
+	}
+	rank := func(v deviceView) int {
+		switch {
+		case v.Active:
+			return 0
+		case v.Revoked:
+			return 2
+		}
+		return 1
+	}
+	sort.SliceStable(views, func(i, j int) bool {
+		if rank(views[i]) != rank(views[j]) {
+			return rank(views[i]) < rank(views[j])
+		}
+		return views[i].Name < views[j].Name
+	})
+	w.render(rw, http.StatusOK, "devices", map[string]any{
+		"Title": "Devices", "Nav": "devices", "CSRF": session.CSRF, "Operator": session.Operator.Name,
+		"Devices": views, "Active": active, "Presets": activationPresets,
+		"Notice": r.URL.Query().Get("notice"), "Error": r.URL.Query().Get("error"),
+	})
+}
+
+func backToDevices(rw http.ResponseWriter, r *http.Request, key, message string) {
+	http.Redirect(rw, r, "/devices?"+url.Values{key: {message}}.Encode(), http.StatusSeeOther)
+}
+
+func (w *WebUI) activateDevice(rw http.ResponseWriter, r *http.Request, session WebSession, _ string) {
+	id := r.PathValue("id")
+	choice := r.PostFormValue("for")
+	if choice == "" {
+		backToDevices(rw, r, "error", "Choose how long the device may use the gateway.")
+		return
+	}
+	d, err := time.ParseDuration(choice)
+	if err != nil {
+		backToDevices(rw, r, "error", "Choose one of the offered durations.")
+		return
+	}
+	note := strings.TrimSpace(r.PostFormValue("note"))
+	if len(note) > maxNoteBytes {
+		backToDevices(rw, r, "error", fmt.Sprintf("Keep the note under %d characters.", maxNoteBytes))
+		return
+	}
+	a, err := ActivateDevice(w.Dir, w.Store, id, d, operatorLabel(session.Operator.Name), note, activationNow())
+	switch {
+	case errors.Is(err, ErrActivationDuration):
+		backToDevices(rw, r, "error", "Not activated: "+err.Error()+".")
+	case errors.Is(err, controlplane.ErrDeviceRevoked):
+		backToDevices(rw, r, "error", "Not activated: the device is revoked, and a revoked device cannot be activated again.")
+	case errors.Is(err, controlplane.ErrNotFound):
+		backToDevices(rw, r, "error", "No such device.")
+	case err != nil:
+		backToDevices(rw, r, "error", "Not activated: "+err.Error())
+	default:
+		backToDevices(rw, r, "notice", fmt.Sprintf("Activated %s until %s.", w.deviceLabel(id), formatWhen(a.Until.UTC().Format(time.RFC3339))))
+	}
+}
+
+func (w *WebUI) deactivateDevice(rw http.ResponseWriter, r *http.Request, session WebSession, _ string) {
+	id := r.PathValue("id")
+	closed, err := DeactivateDevice(w.Dir, w.Store, id, operatorLabel(session.Operator.Name), activationNow())
+	switch {
+	case errors.Is(err, controlplane.ErrNotFound):
+		backToDevices(rw, r, "error", "No such device.")
+	case err != nil:
+		backToDevices(rw, r, "error", "Not deactivated: "+err.Error())
+	case !closed:
+		backToDevices(rw, r, "notice", w.deviceLabel(id)+" was not active.")
+	default:
+		backToDevices(rw, r, "notice", "Deactivated "+w.deviceLabel(id)+"; its running commands stop within 30 seconds.")
+	}
+}
+
+// activationNow is the time activation windows are opened, closed and shown
+// at: the system clock, which the device API checks them against, not the
+// Web UI's own clock (Now), which tests move to step TOTP codes.
+func activationNow() time.Time { return time.Now() }
+
+// deviceLabel is a device's name, or its ID when it has none.
+func (w *WebUI) deviceLabel(id string) string {
+	if name := w.deviceNames()[id]; name != "" {
+		return name
+	}
+	return id
 }

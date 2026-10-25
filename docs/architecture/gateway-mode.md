@@ -162,7 +162,8 @@ binary (`html/template`, a few lines of vanilla JS, no build step). Operators
 sign in with a password and TOTP enrolled from a QR code at first login.
 Sessions are server side, revocation applies on the next request, and every
 POST needs a CSRF token and a same-origin request. The Approvals page decides
-plans and single requests; the Audit page browses and verifies the chain.
+plans and single requests; the Devices page activates and deactivates devices
+(#38); the Audit page browses and verifies the chain.
 
 Trade-offs:
 

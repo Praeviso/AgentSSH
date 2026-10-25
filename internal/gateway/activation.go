@@ -240,3 +240,20 @@ func formatWindow(d time.Duration) string {
 	}
 	return s
 }
+
+// Remaining renders the time from now to until, to the minute: 45m, 2h,
+// 1h30m, or "under 1m".
+func Remaining(until, now time.Time) string {
+	d := until.Sub(now).Round(time.Minute)
+	if d < time.Minute {
+		return "under 1m"
+	}
+	h, m := int(d.Hours()), int(d.Minutes())%60
+	switch {
+	case h == 0:
+		return fmt.Sprintf("%dm", m)
+	case m == 0:
+		return fmt.Sprintf("%dh", h)
+	}
+	return fmt.Sprintf("%dh%dm", h, m)
+}
