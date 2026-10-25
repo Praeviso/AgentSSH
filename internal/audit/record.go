@@ -26,6 +26,11 @@ const (
 	EventApprovalRequested Event = "approval_requested"
 	EventApprovalGranted   Event = "approval_granted"
 	EventApprovalDenied    Event = "approval_denied"
+	// Gateway device activation: an operator opened or closed a device's
+	// window, or the window ended.
+	EventDeviceActivated       Event = "device_activated"
+	EventDeviceDeactivated     Event = "device_deactivated"
+	EventDeviceActivationEnded Event = "device_activation_expired"
 )
 
 // Record is one append-only JSONL audit entry.
@@ -73,6 +78,10 @@ type Record struct {
 	// Operator names who decided an approval on a gateway ("web:<name>" or
 	// "local:<user>"); omitempty keeps older canonical forms.
 	Operator string `json:"operator,omitempty"`
+	// ActiveUntil and Note describe a gateway device's activation window;
+	// omitempty keeps older canonical forms.
+	ActiveUntil string `json:"active_until,omitempty"`
+	Note        string `json:"note,omitempty"`
 }
 
 const ZeroHash = "0000000000000000000000000000000000000000000000000000000000000000"
@@ -103,19 +112,27 @@ func NewReqID() (string, error) {
 
 // Append adds one record to the hash chain, assigning seq, prev_hash, and hash.
 func (s Store) Append(record Record) (Record, error) {
+	record, _, err := s.AppendUnless(record, nil)
+	return record, err
+}
+
+// AppendUnless appends record unless a record already in the chain satisfies
+// exists, checked under the same lock as the append, so concurrent callers
+// recording the same fact add it once. It reports whether it appended.
+func (s Store) AppendUnless(record Record, exists func(Record) bool) (Record, bool, error) {
 	if err := os.MkdirAll(filepath.Dir(s.Path), 0o700); err != nil {
-		return Record{}, fmt.Errorf("create audit directory: %w", err)
+		return Record{}, false, fmt.Errorf("create audit directory: %w", err)
 	}
 
 	file, err := os.OpenFile(s.Path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o600)
 	if err != nil {
-		return Record{}, fmt.Errorf("open audit log: %w", err)
+		return Record{}, false, fmt.Errorf("open audit log: %w", err)
 	}
 	defer func() {
 		_ = file.Close()
 	}()
 	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX); err != nil {
-		return Record{}, fmt.Errorf("lock audit log: %w", err)
+		return Record{}, false, fmt.Errorf("lock audit log: %w", err)
 	}
 	defer func() {
 		_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
@@ -123,7 +140,14 @@ func (s Store) Append(record Record) (Record, error) {
 
 	records, err := readRecords(file)
 	if err != nil {
-		return Record{}, err
+		return Record{}, false, err
+	}
+	if exists != nil {
+		for _, existing := range records {
+			if exists(existing) {
+				return existing, false, nil
+			}
+		}
 	}
 	prevHash := ZeroHash
 	if len(records) > 0 {
@@ -140,13 +164,13 @@ func (s Store) Append(record Record) (Record, error) {
 
 	line, err := json.Marshal(record)
 	if err != nil {
-		return Record{}, fmt.Errorf("marshal audit record: %w", err)
+		return Record{}, false, fmt.Errorf("marshal audit record: %w", err)
 	}
 	if _, err := file.Write(append(line, '\n')); err != nil {
-		return Record{}, fmt.Errorf("append audit record: %w", err)
+		return Record{}, false, fmt.Errorf("append audit record: %w", err)
 	}
 
-	return record, nil
+	return record, true, nil
 }
 
 // ReadAll reads all audit records. A missing audit log is an empty log.
@@ -410,6 +434,8 @@ type canonicalRecord struct {
 	RemoteSignID    string `json:"remote_sign_id,omitempty"`
 	DeviceID        string `json:"device_id,omitempty"`
 	Operator        string `json:"operator,omitempty"`
+	ActiveUntil     string `json:"active_until,omitempty"`
+	Note            string `json:"note,omitempty"`
 }
 
 func canonicalJSON(record Record) ([]byte, error) {
@@ -444,5 +470,7 @@ func canonicalJSON(record Record) ([]byte, error) {
 		RemoteSignID:    record.RemoteSignID,
 		DeviceID:        record.DeviceID,
 		Operator:        record.Operator,
+		ActiveUntil:     record.ActiveUntil,
+		Note:            record.Note,
 	})
 }

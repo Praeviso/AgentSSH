@@ -255,6 +255,9 @@ func gatewayError(err error) error {
 	if errors.Is(err, context.Canceled) {
 		return err
 	}
+	if remote.IsInactive(err) {
+		return fmt.Errorf("gateway: %w\n  only the gateway's operator can activate this device; agentssh remote status shows its state", err)
+	}
 	var mismatch *remoteclient.ModeMismatchError
 	if errors.As(err, &mismatch) {
 		return fmt.Errorf("gateway: %w\n  the control plane's mode changed since this device enrolled; tell its administrator", err)

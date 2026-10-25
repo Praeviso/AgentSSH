@@ -120,6 +120,9 @@ func newGatewayDevice(t *testing.T) *gatewayDevice {
 		t.Fatalf("enroll: %v", err)
 	}
 	d.deviceID = state.DeviceID
+	if _, err := gateway.ActivateDevice(dir, store, d.deviceID, gateway.MaxActivation, "local:test", "", time.Now()); err != nil {
+		t.Fatalf("activate: %v", err)
+	}
 	if _, err := controlplane.PushConfig(store, d.deviceID, parityInventory, parityPolicy, time.Now()); err != nil {
 		t.Fatalf("push: %v", err)
 	}
@@ -152,13 +155,21 @@ func trustIngress(t *testing.T, ingress *httptest.Server) {
 	t.Cleanup(func() { http.DefaultTransport = original; transport.CloseIdleConnections() })
 }
 
+// audit is the gateway's records of runs and approvals, without the device's
+// activation.
 func (d *gatewayDevice) audit(t *testing.T) []audit.Record {
 	t.Helper()
 	records, err := audit.NewStore(filepath.Join(d.dir, gateway.FileAudit)).ReadAll()
 	if err != nil {
 		t.Fatal(err)
 	}
-	return records
+	var out []audit.Record
+	for _, record := range records {
+		if record.Event != audit.EventDeviceActivated {
+			out = append(out, record)
+		}
+	}
+	return out
 }
 
 // paritySetup returns a local home and a gateway home with the same
@@ -490,7 +501,7 @@ func TestRemoteEnrollChecksTheMode(t *testing.T) {
 		t.Fatalf("gateway enrollment: %+v", got)
 	}
 	got = runIn(t, home, "remote", "status")
-	if got.code != exitOK || !strings.Contains(got.stdout, "mode     gateway\n") || !strings.Contains(got.stdout, "(active)") || !strings.Contains(got.stdout, "config   kept on the gateway") || strings.Contains(got.stdout, "local ") {
+	if got.code != exitOK || !strings.Contains(got.stdout, "mode     gateway\n") || !strings.Contains(got.stdout, "(enrolled)") || !strings.Contains(got.stdout, "access   inactive") || !strings.Contains(got.stdout, "config   kept on the gateway") || strings.Contains(got.stdout, "local ") {
 		t.Fatalf("remote status: %+v", got)
 	}
 	if got := runIn(t, home, "remote", "refresh"); got.code != exitUsage {
@@ -778,5 +789,29 @@ func TestOperatorApprovesInTheWebUIEndToEnd(t *testing.T) {
 		if record.Event == audit.EventApprovalGranted && record.Operator != "web:alice" {
 			t.Fatalf("decision record without the operator: %+v", record)
 		}
+	}
+}
+
+// A device outside its activation window is told that only the gateway's
+// operator can activate it, and remote status shows its window.
+func TestAnInactiveGatewayDeviceIsToldWhoCanActivateIt(t *testing.T) {
+	device := newGatewayDevice(t)
+	t.Setenv("AGENTSSH_SESSION", "s_test")
+	got := runIn(t, device.home, "remote", "status")
+	if got.code != exitOK || !strings.Contains(got.stdout, "access   active until ") {
+		t.Fatalf("remote status while active: %+v", got)
+	}
+	if _, err := gateway.DeactivateDevice(device.dir, device.store, device.deviceID, "local:test", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"hosts"}, {"run", "web-1", "--", "uptime"}} {
+		got := runIn(t, device.home, args...)
+		if got.code != exitRemoteFailed || !strings.Contains(got.err, "this device is not activated") || !strings.Contains(got.err, "only the gateway's operator can activate this device") {
+			t.Fatalf("%v while inactive: %+v", args, got)
+		}
+	}
+	got = runIn(t, device.home, "remote", "status")
+	if got.code != exitOK || !strings.Contains(got.stdout, "access   inactive · only the gateway's operator can activate this device") {
+		t.Fatalf("remote status while inactive: %+v", got)
 	}
 }

@@ -37,8 +37,8 @@ modified `agentssh`.
 | A same-user process bypasses the CLI | Uses the keys and `ssh` directly; nothing constrains it | Requests login signatures with `device.key` and runs anything as the identity's user on its assigned hosts; only the signing log records the logins | Can only call the gateway, which runs what the device's policy and grants authorize and audits it |
 | The agent approves its own request | Decisions need operator authentication; a same-user process can edit the approval files | As local | No device endpoint decides; operators decide on the gateway host or in its Web UI |
 | Audit records are altered | The hash chain shows edits, but a same-user process can rewrite the whole file | As local for commands; the control plane's signing log is out of reach | The chain is on the gateway, out of the device's reach |
-| A device key is stolen | No device key | Logins to assigned hosts until the device is revoked | Commands the device's policy allows, until it is revoked |
-| A device is revoked | No device | Its next login is refused; running commands check standing every 30 s and are cancelled | Its next request is refused; a run already started continues until it finishes or `--exec-timeout` |
+| A device key is stolen | No device key | Logins to assigned hosts until the device is revoked | Commands the device's policy allows, only inside an activation window an operator opened, until it is revoked |
+| A device is revoked | No device | Its next login is refused; running commands check standing every 30 s and are cancelled | Its next request is refused, as when it is deactivated or its window ends; a run already started continues until it finishes or `--exec-timeout` |
 | The control plane is down | Not involved | Cached bundle until expiry, but no new logins: commands fail closed | Nothing runs: the gateway is the single point of execution |
 | The control plane is compromised | Not involved | Every host trusting its identities | Every host trusting its identities, and every device's policy and audit |
 | Target hosts must trust | Your keys | The control plane's identities | The gateway's identities, and the gateway must reach them |
@@ -313,6 +313,28 @@ output streamed into plan events carries it; the result frame's `target_kind`
 (`host` or `group`) decides whether `run --json` prints an object or an array.
 Transport failures reach the device only as `ssh_error`; their cause is in the
 gateway's log.
+
+**Activation.** A gateway device is usable only inside an activation window.
+It starts inactive; `agentssh-gateway device activate <id> --for <duration>`
+opens a window of that length (1 min to 24 h, checked when it is stored), and
+activating an active device sets a new end. `device deactivate <id>` closes it
+at once. Windows live in the gateway's `device_activations` table, not in the
+shared `devices` table, so the managed database is unchanged. Every device
+endpoint except `/exec/cancel` refuses a device outside its window with
+`403 device_inactive`, checked against the store with the gateway's clock on
+each request; enrollment, `/status` and `/exec/cancel` still answer, so a device
+can enroll before it is activated, see its state and stop its own runs.
+`/status` reports `activation: {state: active|inactive, until}`. Activation,
+deactivation and the end of a window are records in the audit chain
+(`device_activated`, `device_deactivated`, `device_activation_expired`, with
+`operator`, `active_until` and `note`). An ended window is recorded once, by the
+first request or the 30-second sweep in `serve` that finds it, and before a
+new activation replaces it. The audit chain itself decides whether an end is
+already recorded (checked under its lock), and the table's flag is set only
+after the record is in the chain, so concurrent finders record an end once and
+a failed append is retried. An activation is audited before it is stored and a
+deactivation after, so a failed write leaves the device inactive. Revocation is separate and permanent: a revoked device
+cannot be activated.
 
 **Gateway devices.** `agentssh remote enroll <url> --token <t> --mode gateway`
 (the default is `managed`) enrolls a device for a gateway. In gateway mode

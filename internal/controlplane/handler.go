@@ -49,6 +49,8 @@ type API struct {
 	Store func() *Store
 	Keys  func() *Keys
 	Now   func() time.Time
+	// DescribeStatus, if set, adds a mode's own standing to /status.
+	DescribeStatus func(device Device, status *remote.StatusResponse)
 }
 
 // Handler serves enrollment, /status, and routes under the configured public
@@ -124,7 +126,11 @@ func requestBytesLimit(r *http.Request, limit int64) ([]byte, error) {
 }
 
 func (a API) handleStatus(w http.ResponseWriter, _ *http.Request, device Device, _ []byte) {
-	WriteJSON(w, http.StatusOK, remote.StatusResponse{DeviceID: device.ID, Status: device.Status, Mode: a.Mode})
+	status := remote.StatusResponse{DeviceID: device.ID, Status: device.Status, Mode: a.Mode}
+	if a.DescribeStatus != nil {
+		a.DescribeStatus(device, &status)
+	}
+	WriteJSON(w, http.StatusOK, status)
 }
 
 func (a API) handleEnroll(w http.ResponseWriter, r *http.Request, base string) {

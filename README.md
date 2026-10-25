@@ -78,8 +78,9 @@ enrolls for that mode.
 - **Gateway.** The device holds no SSH keys and no policy. It can only ask the
   gateway to run commands, and the gateway authorizes, runs and audits each
   one. A same-user process with the device key, or a modified client, can
-  still run what that device's gateway policy allows, until the device is
-  revoked. It cannot get login signatures, reach target hosts with the
+  still run what that device's gateway policy allows, but only while an
+  operator has activated the device, and only until it is revoked. It cannot
+  get login signatures, reach target hosts with the
   gateway's identities, decide its own approvals, or alter the audit. The
   gateway must be able to reach every target host, and it is the single point
   of execution: if it is down, no commands run, and if it is compromised, every
@@ -413,7 +414,17 @@ agentssh-gateway device token create --name ci-runner \
   --public-url https://gw.example/agentssh
 agentssh remote enroll https://gw.example/agentssh --token '<token>' --mode gateway
 agentssh-gateway config push --device <dev_id> --inventory inventory.yaml --policy policy.yaml
+agentssh-gateway device activate <dev_id> --for 4h --note 'nightly deploy'
 ```
+
+A device is usable only while an operator has activated it. It starts
+inactive, and `device activate` opens a window of the length you choose (1m
+to 24h); when the window ends the device is refused again until it is
+activated again. `device deactivate <dev_id>` closes the window early. Unlike
+`device revoke`, which is permanent, deactivation and the end of a window can
+be undone by activating again. An inactive device can still enroll, cancel its
+own runs and see its state in `agentssh remote status`; everything else is
+refused with a hint to ask the gateway's operator.
 
 Hosts in the pushed inventory need `addr`, `user` and `identity`, as in managed
 mode; the gateway keeps host keys in its own `known_hosts`, following the
@@ -455,8 +466,9 @@ the device and the deciding operator:
 
 ```bash
 agentssh-gateway audit verify
-agentssh-gateway device ls
-agentssh-gateway device revoke <dev_id>    # the device's next request is refused
+agentssh-gateway device ls                 # with each device's activation window
+agentssh-gateway device deactivate <dev_id>
+agentssh-gateway device revoke <dev_id>    # for good; the device's next request is refused
 ```
 
 See [gateway mode](docs/architecture/gateway-mode.md) for the design and its
