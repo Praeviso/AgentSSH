@@ -195,7 +195,12 @@ func TestATokenIsNotStoredInClear(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	secret := issued.Token[strings.LastIndex(issued.Token, "_")+1:]
+	// The secret's alphabet includes "_", so split on the two fixed separators.
+	parts := strings.SplitN(issued.Token, "_", 3)
+	if len(parts) != 3 || len(parts[2]) != 43 {
+		t.Fatalf("token %q is not agt_<id>_<43-character secret>", issued.Token)
+	}
+	secret := parts[2]
 	err = filepath.Walk(f.dir, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() {
 			return err

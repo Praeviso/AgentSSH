@@ -55,6 +55,14 @@ Done when:
   `cmd/agentssh-gateway` (`create`, `rotate`, `ls`, audit), Web UI kind.
 - [x] Docs: README, remote-control.md (token devices, API routes, threat-model
   row), gateway-mode.md (design and trade-offs).
+- [x] PR review follow-up (review of 0a38823): the not-in-clear test took
+  the secret as the text after the token's last "_", but "_" is in the
+  base64url alphabet, so a secret containing it left a short suffix that could
+  occur in the data files and fail the test spuriously (11 false reports in 300
+  runs). The test now splits on the two fixed separators and checks the secret
+  is 43 characters (300 of 300 runs pass). The gateway's parser was not
+  affected: it matches the whole token with an anchored pattern, and the ID is
+  hex.
 - [x] Final validation.
 
 ## Validation
