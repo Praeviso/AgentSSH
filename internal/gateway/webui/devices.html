@@ -12,7 +12,7 @@
     {{else if .Active}}<span class="state active">Active · {{.Left}} left</span>
     {{else}}<span class="state">Inactive</span>{{end}}
   </header>
-  <p class="meta">{{.ID}} · enrolled {{when (fmtTime .CreatedAt)}}{{with .LastActivity}} · last activity {{when .}}{{end}}</p>
+  <p class="meta">{{.Kind}} device · {{.ID}} · {{if eq .Kind "token"}}created{{else}}enrolled{{end}} {{when (fmtTime .CreatedAt)}}{{with .LastActivity}} · last activity {{when .}}{{end}}</p>
   {{if .Active}}<p class="meta">Until {{when (fmtTime .Activation.Until)}} · activated by {{.Activation.SetBy}}{{with .Activation.Note}} · {{.}}{{end}}</p>{{end}}
   {{if not .Revoked}}
   <div class="actions">

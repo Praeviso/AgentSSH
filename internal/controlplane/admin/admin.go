@@ -41,10 +41,14 @@ type Program struct {
 	// RevokeShort and DisableShort describe what revoking a device and
 	// disabling an identity stop in this mode.
 	RevokeShort, DisableShort string
-	// DeviceColumn, if set, adds a column headed DeviceColumnHeader to
-	// device ls, with a mode's own standing for each device.
-	DeviceColumnHeader string
-	DeviceColumn       func(store *controlplane.Store, device controlplane.Device, now time.Time) string
+	// DeviceColumns add a mode's own columns to device ls.
+	DeviceColumns []DeviceColumn
+}
+
+// DeviceColumn is one extra column of device ls.
+type DeviceColumn struct {
+	Header string
+	Value  func(store *controlplane.Store, device controlplane.Device, now time.Time) string
 }
 
 // DataDir registers --data on root and returns its resolver.
@@ -204,8 +208,8 @@ func (p *Program) DeviceCommand(dir func() (string, error)) *cobra.Command {
 				}
 				w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
 				header := "ID\tNAME\tSTATUS\tCONFIG\tENROLLED"
-				if p.DeviceColumn != nil {
-					header += "\t" + p.DeviceColumnHeader
+				for _, column := range p.DeviceColumns {
+					header += "\t" + column.Header
 				}
 				_, _ = fmt.Fprintln(w, header)
 				now := time.Now()
@@ -215,8 +219,8 @@ func (p *Program) DeviceCommand(dir func() (string, error)) *cobra.Command {
 						cfgVersion = fmt.Sprintf("v%d", cfg.Version)
 					}
 					row := fmt.Sprintf("%s\t%s\t%s\t%s\t%s", device.ID, device.Name, device.Status, cfgVersion, device.CreatedAt.Local().Format(time.RFC3339))
-					if p.DeviceColumn != nil {
-						row += "\t" + p.DeviceColumn(store, device, now)
+					for _, column := range p.DeviceColumns {
+						row += "\t" + column.Value(store, device, now)
 					}
 					_, _ = fmt.Fprintln(w, row)
 				}

@@ -77,6 +77,19 @@ type StatusResponse struct {
 	Activation *Activation `json:"activation,omitempty"`
 }
 
+// PathTokenStatus is a gateway token device's /status: the same answer, for a
+// bearer token instead of a signed request.
+const PathTokenStatus = "/api/status"
+
+// PathTokenHosts is a gateway token device's hosts, as /hosts answers them.
+const PathTokenHosts = "/api/hosts"
+
+// Device kinds on a gateway.
+const (
+	DeviceKindSigned = "signed"
+	DeviceKindToken  = "token"
+)
+
 // Activation states of a gateway device.
 const (
 	ActivationActive   = "active"

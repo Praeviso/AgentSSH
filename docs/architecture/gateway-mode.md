@@ -203,6 +203,28 @@ Trade-offs:
 - When the window ends or the device is deactivated or revoked, its running
   commands are stopped too (#34, below).
 
+### Token devices (#40)
+
+For agents that cannot install a client, a token device authenticates with a
+bearer token instead of an enrolled key. It is an ordinary device row with no
+public key, so activation, revocation, configuration, approvals and audit all
+apply unchanged, and the signed routes refuse it; its tokens, stored only as
+the SHA-256 of their secret, authenticate the routes below `/api/`, which a
+signature never does.
+
+Trade-offs:
+
+- A bearer token can be replayed while it is valid, unlike a signed request
+  with its single-use nonce. Activation windows bound that to the time an
+  operator chose, rotation replaces a token at once, and TLS (the ingress) is
+  the only transport; tokens are never accepted in a URL.
+- No lockout after failed tokens: a 256-bit secret cannot be guessed, and a
+  lockout keyed by the token ID (part of the token, and in audit records)
+  would let anyone who saw it lock the device out. A failed check costs one
+  SHA-256.
+- One live token per device: rotation revokes the previous one in the same
+  transaction, so there is never a moment with two or none.
+
 ### Stopping runs that lost standing (#34)
 
 Every 30 s, `serve` checks each live run's device and the identities its

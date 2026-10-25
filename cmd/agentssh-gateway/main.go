@@ -38,11 +38,15 @@ var program = &admin.Program{
 	OpenStore: func(dir string) (*controlplane.Store, error) {
 		return gateway.OpenStore(filepath.Join(dir, gateway.FileDatabase))
 	},
-	EnrollHint:         "agentssh remote enroll %s --mode gateway --token <token>",
-	RevokeShort:        "Revoke a device for good; its next request is refused.",
-	DisableShort:       "Stop connecting with an identity.",
-	DeviceColumnHeader: "ACTIVATION",
-	DeviceColumn:       activationColumn,
+	EnrollHint:   "agentssh remote enroll %s --mode gateway --token <token>",
+	RevokeShort:  "Revoke a device for good; its next request is refused.",
+	DisableShort: "Stop connecting with an identity.",
+	DeviceColumns: []admin.DeviceColumn{
+		{Header: "KIND", Value: func(_ *controlplane.Store, device controlplane.Device, _ time.Time) string {
+			return gateway.DeviceKind(device)
+		}},
+		{Header: "ACTIVATION", Value: activationColumn},
+	},
 }
 
 func main() {

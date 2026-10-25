@@ -80,3 +80,44 @@ func TestDeviceActivationCommands(t *testing.T) {
 		t.Fatalf("audit verify: %v %q (want the activation and the deactivation)", err, out)
 	}
 }
+
+func TestTokenDeviceCommands(t *testing.T) {
+	dir, signed := enrolledDevice(t)
+	if _, err := runGatewayCLI(t, "--data", dir, "device", "create", "--name", "hosted-agent"); err == nil || !strings.Contains(err.Error(), `"kind" not set`) {
+		t.Fatalf("create without --kind: %v", err)
+	}
+	if _, err := runGatewayCLI(t, "--data", dir, "device", "create", "--name", "hosted-agent", "--kind", "signed"); err == nil || !strings.Contains(err.Error(), "agentssh remote enroll") {
+		t.Fatalf("create a signed device: %v", err)
+	}
+	first, err := runGatewayCLI(t, "--data", dir, "device", "create", "--name", "hosted-agent", "--kind", "token")
+	if err != nil || !strings.HasPrefix(first, "agt_") {
+		t.Fatalf("create: %v %q", err, first)
+	}
+	out, err := runGatewayCLI(t, "--data", dir, "device", "ls")
+	if err != nil || !strings.Contains(out, "KIND") || !strings.Contains(out, "hosted-agent") {
+		t.Fatalf("ls: %v\n%s", err, out)
+	}
+	var tokenID string
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) > 0 && strings.Contains(line, "hosted-agent") {
+			tokenID = fields[0]
+			if !strings.Contains(line, " token ") || !strings.HasSuffix(line, "inactive") {
+				t.Fatalf("token device row: %q", line)
+			}
+		}
+		if len(fields) > 0 && fields[0] == signed && !strings.Contains(line, " signed ") {
+			t.Fatalf("signed device row: %q", line)
+		}
+	}
+	second, err := runGatewayCLI(t, "--data", dir, "device", "rotate", tokenID)
+	if err != nil || !strings.HasPrefix(second, "agt_") || second == first {
+		t.Fatalf("rotate: %v %q", err, second)
+	}
+	if _, err := runGatewayCLI(t, "--data", dir, "device", "rotate", signed); err == nil || !strings.Contains(err.Error(), "signed device") {
+		t.Fatalf("rotate a signed device: %v", err)
+	}
+	if out, err := runGatewayCLI(t, "--data", dir, "audit", "verify"); err != nil || out != "audit chain ok · records=3\n" {
+		t.Fatalf("audit verify: %v %q (want issued, revoked, issued)", err, out)
+	}
+}

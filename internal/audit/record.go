@@ -31,6 +31,10 @@ const (
 	EventDeviceActivated       Event = "device_activated"
 	EventDeviceDeactivated     Event = "device_deactivated"
 	EventDeviceActivationEnded Event = "device_activation_expired"
+	// A gateway token device's token was issued (created or rotated in) or
+	// revoked (rotated out).
+	EventTokenIssued  Event = "device_token_issued"
+	EventTokenRevoked Event = "device_token_revoked"
 )
 
 // Record is one append-only JSONL audit entry.
@@ -82,6 +86,9 @@ type Record struct {
 	// omitempty keeps older canonical forms.
 	ActiveUntil string `json:"active_until,omitempty"`
 	Note        string `json:"note,omitempty"`
+	// TokenID names the bearer token a gateway token device used or was
+	// issued; omitempty keeps older canonical forms.
+	TokenID string `json:"token_id,omitempty"`
 }
 
 const ZeroHash = "0000000000000000000000000000000000000000000000000000000000000000"
@@ -436,6 +443,7 @@ type canonicalRecord struct {
 	Operator        string `json:"operator,omitempty"`
 	ActiveUntil     string `json:"active_until,omitempty"`
 	Note            string `json:"note,omitempty"`
+	TokenID         string `json:"token_id,omitempty"`
 }
 
 func canonicalJSON(record Record) ([]byte, error) {
@@ -472,5 +480,6 @@ func canonicalJSON(record Record) ([]byte, error) {
 		Operator:        record.Operator,
 		ActiveUntil:     record.ActiveUntil,
 		Note:            record.Note,
+		TokenID:         record.TokenID,
 	})
 }

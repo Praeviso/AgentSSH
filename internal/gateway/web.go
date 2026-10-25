@@ -660,6 +660,7 @@ const maxNoteBytes = 200
 
 type deviceView struct {
 	controlplane.Device
+	Kind         string
 	Activation   Activation
 	Active       bool
 	Revoked      bool
@@ -697,7 +698,7 @@ func (w *WebUI) devicesPage(rw http.ResponseWriter, r *http.Request, session Web
 			http.Error(rw, "activation state unavailable", http.StatusInternalServerError)
 			return
 		}
-		v := deviceView{Device: d, Activation: a, Revoked: d.Status == remote.DeviceRevoked, LastActivity: last[d.ID]}
+		v := deviceView{Device: d, Kind: DeviceKind(d), Activation: a, Revoked: d.Status == remote.DeviceRevoked, LastActivity: last[d.ID]}
 		if !v.Revoked && a.Active(now) {
 			v.Active, v.Left = true, Remaining(a.Until, now)
 			active++
