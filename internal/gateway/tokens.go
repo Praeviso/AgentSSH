@@ -222,31 +222,16 @@ type tokenOptions struct {
 	respondWithin time.Duration
 }
 
-// tokenRoute authenticates a request's bearer token, then reads its body,
-// for next.
+// tokenRoute authenticates a request's bearer token and checks its device's
+// standing, reads the body, then checks both again before next runs: the
+// first check keeps unauthenticated clients from holding an upload, and the
+// second, as the signed routes check after the body, keeps a token rotated
+// or a device revoked or deactivated during a slow upload from running
+// anything.
 func (s *Server) tokenRoute(method, path string, opts tokenOptions, next TokenHandler) controlplane.OpenRoute {
 	return controlplane.OpenRoute{Method: method, Path: path, Handler: func(w http.ResponseWriter, r *http.Request) {
-		device, tokenID, err := authenticateToken(s.Store, r.Header.Get("Authorization"))
-		switch {
-		case errors.Is(err, errBadToken):
-			w.Header().Set("WWW-Authenticate", `Bearer realm="agentssh-gateway"`)
-			controlplane.WriteError(w, http.StatusUnauthorized, remote.CodeUnauthenticated, errBadToken.Error())
+		if _, _, ok := s.admitToken(w, r, opts); !ok {
 			return
-		case errors.Is(err, controlplane.ErrDeviceRevoked):
-			controlplane.WriteError(w, http.StatusForbidden, remote.CodeDeviceRevoked, "this device has been revoked by the control plane")
-			return
-		case err != nil:
-			controlplane.WriteError(w, http.StatusInternalServerError, remote.CodeInternal, "token check unavailable")
-			return
-		}
-		if opts.needsActive {
-			if _, active, err := deviceActive(s.Dir, s.Store, device.ID, s.now()); err != nil {
-				controlplane.WriteError(w, http.StatusInternalServerError, remote.CodeInternal, "activation state unavailable")
-				return
-			} else if !active {
-				controlplane.WriteError(w, http.StatusForbidden, remote.CodeDeviceInactive, "this device is not activated; an operator must activate it on the gateway")
-				return
-			}
 		}
 		rc := http.NewResponseController(w)
 		if opts.maxBody > 0 {
@@ -257,11 +242,43 @@ func (s *Server) tokenRoute(method, path string, opts tokenOptions, next TokenHa
 			controlplane.WriteError(w, http.StatusRequestEntityTooLarge, remote.CodeBadRequest, "request body too large or unreadable")
 			return
 		}
+		device, tokenID, ok := s.admitToken(w, r, opts)
+		if !ok {
+			return
+		}
 		if opts.respondWithin > 0 {
 			_ = rc.SetWriteDeadline(time.Now().Add(opts.respondWithin))
 		}
 		next(w, r, device, tokenID, body)
 	}}
+}
+
+// admitToken authenticates r's bearer token and, for a route that needs it,
+// checks the device is active, answering the request itself when not.
+func (s *Server) admitToken(w http.ResponseWriter, r *http.Request, opts tokenOptions) (controlplane.Device, string, bool) {
+	device, tokenID, err := authenticateToken(s.Store, r.Header.Get("Authorization"))
+	switch {
+	case errors.Is(err, errBadToken):
+		w.Header().Set("WWW-Authenticate", `Bearer realm="agentssh-gateway"`)
+		controlplane.WriteError(w, http.StatusUnauthorized, remote.CodeUnauthenticated, errBadToken.Error())
+		return controlplane.Device{}, "", false
+	case errors.Is(err, controlplane.ErrDeviceRevoked):
+		controlplane.WriteError(w, http.StatusForbidden, remote.CodeDeviceRevoked, "this device has been revoked by the control plane")
+		return controlplane.Device{}, "", false
+	case err != nil:
+		controlplane.WriteError(w, http.StatusInternalServerError, remote.CodeInternal, "token check unavailable")
+		return controlplane.Device{}, "", false
+	}
+	if opts.needsActive {
+		if _, active, err := deviceActive(s.Dir, s.Store, device.ID, s.now()); err != nil {
+			controlplane.WriteError(w, http.StatusInternalServerError, remote.CodeInternal, "activation state unavailable")
+			return controlplane.Device{}, "", false
+		} else if !active {
+			controlplane.WriteError(w, http.StatusForbidden, remote.CodeDeviceInactive, "this device is not activated; an operator must activate it on the gateway")
+			return controlplane.Device{}, "", false
+		}
+	}
+	return device, tokenID, true
 }
 
 // tokenRoutes are the bearer-token API. /api/status answers like /status,

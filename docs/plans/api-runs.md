@@ -62,6 +62,15 @@ Done when:
   headers. The offsets test and the cancel test now poll once more from the
   end and require the same result, exit code and error; both failed on the old
   code.
+- [x] PR review follow-up (P1): a token route checked the token and the
+  device's activation only before reading the body, which may take five
+  minutes, so a caller could start an upload while active and finish it after
+  deactivation and still run the command. The route now checks both again
+  after the body (`admitToken` before and after), as the signed routes check
+  after theirs. Test: `TestStandingIsCheckedAgainAfterTheUpload` slow-uploads
+  through a pipe and deactivates, revokes, or rotates the token mid-upload;
+  each is refused with its code and the command never runs. With the check
+  only before the upload, all three ran the command.
 - [x] Final validation.
 
 ## Validation

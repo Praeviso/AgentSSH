@@ -301,3 +301,62 @@ func TestAWaitOutlastsTheServersResponseDeadline(t *testing.T) {
 		t.Fatalf("cancel: %d %s", got.status, got.raw)
 	}
 }
+
+// A device that loses its standing, or a token rotated out, while a request's
+// body is still uploading runs nothing: the gateway checks again once the
+// body has arrived.
+func TestStandingIsCheckedAgainAfterTheUpload(t *testing.T) {
+	for name, tc := range map[string]struct {
+		change func(t *testing.T, f *fixture, issued gateway.IssuedToken)
+		code   string
+	}{
+		"deactivated": {func(t *testing.T, f *fixture, issued gateway.IssuedToken) {
+			if _, err := gateway.DeactivateDevice(f.dir, f.store, issued.DeviceID, "local:alice", time.Now()); err != nil {
+				t.Fatal(err)
+			}
+		}, remote.CodeDeviceInactive},
+		"revoked": {func(t *testing.T, f *fixture, issued gateway.IssuedToken) {
+			if err := f.store.RevokeDevice(issued.DeviceID, time.Now()); err != nil {
+				t.Fatal(err)
+			}
+		}, remote.CodeDeviceRevoked},
+		"token rotated": {func(t *testing.T, f *fixture, issued gateway.IssuedToken) {
+			if _, err := gateway.RotateToken(f.dir, f.store, issued.DeviceID, "local:alice", time.Now()); err != nil {
+				t.Fatal(err)
+			}
+		}, remote.CodeUnauthenticated},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f, host := execGateway(t)
+			issued := activeTokenDevice(t, f)
+			body, _ := json.Marshal(run("web-1", "uptime"))
+			upload, uploading := io.Pipe()
+			req, err := http.NewRequest(http.MethodPost, f.base+remote.PathAPIRun, upload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.ContentLength = int64(len(body))
+			req.Header.Set("Authorization", "Bearer "+issued.Token)
+			answered := make(chan apiAnswer, 1)
+			go func() { answered <- send(t, req) }()
+			// A pipe write returns once the gateway has read it, so the first
+			// half is in only after the request passed its first check.
+			half := len(body) / 2
+			if _, err := uploading.Write(body[:half]); err != nil {
+				t.Fatal(err)
+			}
+			tc.change(t, f, issued)
+			if _, err := uploading.Write(body[half:]); err != nil {
+				t.Fatal(err)
+			}
+			_ = uploading.Close()
+			got := <-answered
+			if got.body.Code != tc.code {
+				t.Fatalf("answer: %d %s, want %s", got.status, got.raw, tc.code)
+			}
+			if n := host.runs("uptime"); n != 0 {
+				t.Fatalf("uptime ran %d times", n)
+			}
+		})
+	}
+}

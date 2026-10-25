@@ -382,7 +382,10 @@ saw it lock its device out.
 
 A token route authenticates before it reads the body, so an unauthenticated
 client never holds a large upload; a route admitting a large body then gets
-the same upload time as `/exec`.
+the same upload time as `/exec`. Once the body has arrived it checks the token
+and the device's standing again, as the signed routes check after the body, so
+a token rotated or a device revoked or deactivated during a slow upload runs
+nothing.
 
 Token devices run commands with JSON in and out, for callers that cannot read
 `/exec`'s frames or keep a stream open (hosted platforms time out tool calls,
