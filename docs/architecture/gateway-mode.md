@@ -250,6 +250,25 @@ Trade-offs:
   descriptions (what to do on `denied` or `approval_required`) are written for
   the agents that read them.
 
+### A remote MCP endpoint (#43)
+
+Agent platforms that connect to remote MCP servers use `/mcp`: the token API's
+operations as tools, over Streamable HTTP. One table of operations registers
+both the HTTP routes and the tools, and each tool's schema and description
+come from the OpenAPI document, so the two surfaces cannot disagree.
+
+Trade-offs:
+
+- A minimal JSON-RPC implementation instead of the official Go SDK: four
+  methods and JSON answers need no dependency, and the server stays
+  stateless (no session ID, no server stream). Checked with the official
+  TypeScript SDK's client, which negotiated 2025-11-25 and ran the workflow.
+- Denied, approval required and SSH errors are results, not tool errors: the
+  agent must act on them (stop, wait, check), and some clients treat tool
+  errors as transient. Refusals are tool errors.
+- Every MCP request needs the device active, so an inactive device is refused
+  at initialization; cancelling while inactive goes through `/api/run/cancel`.
+
 ### Stopping runs that lost standing (#34)
 
 Every 30 s, `serve` checks each live run's device and the identities its

@@ -19,24 +19,37 @@ import (
 	"github.com/Praeviso/AgentSSH/internal/session"
 )
 
-// apiRoutes run commands for token devices with JSON in and out (see
-// remote.APIRun). Starting and reading need the device active; cancelling
-// does not, as for /exec/cancel.
-func (s *Server) apiRoutes() []controlplane.OpenRoute {
-	// A call may wait up to MaxAPIWait for its run, past the server's own
-	// response deadline.
-	respond := remote.MaxAPIWait + 15*time.Second
-	return []controlplane.OpenRoute{
-		s.tokenRoute("POST", remote.PathAPIRun, tokenOptions{needsActive: true, maxBody: maxExecBody, respondWithin: respond}, s.handleAPIRun),
-		s.tokenRoute("POST", remote.PathAPIRunOutput, tokenOptions{needsActive: true, respondWithin: respond}, s.handleAPIRunOutput),
-		s.tokenRoute("POST", remote.PathAPIRunCancel, tokenOptions{}, func(w http.ResponseWriter, r *http.Request, device controlplane.Device, _ string, body []byte) {
+// apiOperation is one operation of the token API: an HTTP route, and the
+// MCP tool named tool that runs the same handler.
+type apiOperation struct {
+	method, path, tool string
+	opts               tokenOptions
+	handler            TokenHandler
+}
+
+// respondWithin lets a call wait up to MaxAPIWait for its run or approval,
+// past the server's own response deadline.
+const respondWithin = remote.MaxAPIWait + 15*time.Second
+
+// apiOperations are the token API (see remote.APIRun). Every operation but
+// /api/status and cancelling needs the device active; cancelling does not, as
+// for /exec/cancel.
+func (s *Server) apiOperations() []apiOperation {
+	return []apiOperation{
+		{"GET", remote.PathTokenStatus, "status", tokenOptions{}, s.handleTokenStatus},
+		{"GET", remote.PathTokenHosts, "hosts", tokenOptions{needsActive: true}, func(w http.ResponseWriter, r *http.Request, device controlplane.Device, _ string, body []byte) {
+			s.handleHosts(w, r, device, body)
+		}},
+		{"POST", remote.PathAPISession, "new_session", tokenOptions{needsActive: true}, s.handleAPISession},
+		{"POST", remote.PathAPIRun, "run", tokenOptions{needsActive: true, maxBody: maxExecBody, respondWithin: respondWithin}, s.handleAPIRun},
+		{"POST", remote.PathAPIRunOutput, "run_output", tokenOptions{needsActive: true, respondWithin: respondWithin}, s.handleAPIRunOutput},
+		{"POST", remote.PathAPIRunCancel, "cancel_run", tokenOptions{}, func(w http.ResponseWriter, r *http.Request, device controlplane.Device, _ string, body []byte) {
 			s.handleCancel(w, r, device, body)
-		}),
-		s.tokenRoute("POST", remote.PathAPIRequestStatus, tokenOptions{needsActive: true}, func(w http.ResponseWriter, r *http.Request, device controlplane.Device, _ string, body []byte) {
+		}},
+		{"POST", remote.PathAPIRequestStatus, "request_status", tokenOptions{needsActive: true}, func(w http.ResponseWriter, r *http.Request, device controlplane.Device, _ string, body []byte) {
 			s.handleRequestStatus(w, r, device, body)
-		}),
-		s.tokenRoute("POST", remote.PathAPIApprovalStatus, tokenOptions{needsActive: true, respondWithin: respond}, s.handleAPIApprovalStatus),
-		s.tokenRoute("POST", remote.PathAPISession, tokenOptions{needsActive: true}, s.handleAPISession),
+		}},
+		{"POST", remote.PathAPIApprovalStatus, "approval_status", tokenOptions{needsActive: true, respondWithin: respondWithin}, s.handleAPIApprovalStatus},
 	}
 }
 

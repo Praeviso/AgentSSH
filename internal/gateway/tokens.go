@@ -284,12 +284,11 @@ func (s *Server) admitToken(w http.ResponseWriter, r *http.Request, opts tokenOp
 // tokenRoutes are the bearer-token API. /api/status answers like /status,
 // also while the device is inactive; every other route needs it active.
 func (s *Server) tokenRoutes() []controlplane.OpenRoute {
-	return append([]controlplane.OpenRoute{
-		s.tokenRoute("GET", remote.PathTokenStatus, tokenOptions{}, s.handleTokenStatus),
-		s.tokenRoute("GET", remote.PathTokenHosts, tokenOptions{needsActive: true}, func(w http.ResponseWriter, r *http.Request, device controlplane.Device, _ string, body []byte) {
-			s.handleHosts(w, r, device, body)
-		}),
-	}, s.apiRoutes()...)
+	var routes []controlplane.OpenRoute
+	for _, op := range s.apiOperations() {
+		routes = append(routes, s.tokenRoute(op.method, op.path, op.opts, op.handler))
+	}
+	return append(routes, s.mcpRoutes()...)
 }
 
 func (s *Server) handleTokenStatus(w http.ResponseWriter, _ *http.Request, device controlplane.Device, _ string, _ []byte) {

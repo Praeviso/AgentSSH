@@ -421,6 +421,25 @@ run starts. An approval status call waits like a run call (`wait_ms`), polling
 the device's approval store, and answers as soon as an operator decides; a
 wait that ends while pending answers `pending`, which is not an approval.
 
+**MCP.** `POST /mcp` serves the same operations as MCP tools over Streamable
+HTTP: one JSON-RPC message per POST, a request answered with
+`application/json`, a notification or response accepted with 202, and no
+server stream or session (`GET` and `DELETE` are `405`). It negotiates
+protocol revisions 2025-11-25, 2025-06-18 and 2025-03-26 (an unknown request
+gets the newest), refuses an unsupported `MCP-Protocol-Version` header with
+400, and implements `initialize` (with instructions drawn from the agent
+skill), `ping`, `tools/list` and `tools/call`. Each tool runs its `/api`
+operation's handler, so its result is that operation's JSON (as text and as
+`structuredContent`); a tool's input schema, summary and description come from
+the OpenAPI document. A run that is denied, needs approval or fails over SSH
+is a normal result whose `result` says so, because the agent must act on it;
+a refusal (usage, inactive, not found) is a result with `isError`. The
+endpoint is a token route like the others (authenticated before and after the
+body) and needs the device active for every request, initialization included,
+so a device cannot cancel over MCP while inactive (the `/api` cancel can). It
+takes only the bearer token: the Web UI's session cookie authenticates nothing
+here, and the token nothing in the Web UI.
+
 The OpenAPI document is embedded in the binary and served with the gateway's
 public base as its server and the bearer scheme. A test keeps it from drifting:
 the routes it documents must be exactly the routes served, every example must

@@ -467,6 +467,15 @@ The gateway serves the API's OpenAPI 3.1 document at `GET /api/openapi.json`
 (no token needed), with its own public URL as the server, for platforms that
 import an API from a URL.
 
+The same operations are an **MCP server** at `https://gw.example/agentssh/mcp`
+(Streamable HTTP), for agent platforms that connect to remote MCP servers:
+point the client there with the header `Authorization: Bearer agt_...`. Its
+tools are `status`, `hosts`, `new_session`, `run`, `run_output`, `cancel_run`,
+`request_status` and `approval_status`, answering the API's JSON, and its
+instructions tell the agent what the skill teaches: one session per task,
+never retry a denied command, wait for approval and rerun unchanged. Every MCP
+request needs the device active, initialization included.
+
 Hosts in the pushed inventory need `addr`, `user` and `identity`, as in managed
 mode; the gateway keeps host keys in its own `known_hosts`, following the
 inventory's `host_key_policy`. On the device, `hosts`, `run`, `status`, `plan`
