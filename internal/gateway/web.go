@@ -69,6 +69,9 @@ type WebUI struct {
 	// Empty compares a request's Origin header with its Host, which holds
 	// when browsers connect directly or a proxy preserves Host.
 	Origin string
+	// OAuth is the same issuer/resource descriptor as the device API's.
+	// Nil leaves the authorization endpoint unavailable.
+	OAuth *OAuth
 
 	pages   map[string]*template.Template
 	limiter *loginLimiter
@@ -84,7 +87,7 @@ func NewWebUI(dir string, store *controlplane.Store, keys *controlplane.Keys) (*
 		"offers":  func(scopes []approval.Scope, s string) bool { return offers(scopes, approval.Scope(s)) },
 		"fmtTime": func(t time.Time) string { return t.UTC().Format(time.RFC3339) },
 	}
-	for _, page := range []string{"login", "totp", "approvals", "audit", "devices"} {
+	for _, page := range []string{"login", "totp", "approvals", "audit", "devices", "oauth"} {
 		t, err := template.New("layout.html").Funcs(funcs).ParseFS(webAssets, "webui/layout.html", "webui/"+page+".html")
 		if err != nil {
 			return nil, err
@@ -119,6 +122,9 @@ func (w *WebUI) Handler() http.Handler {
 	mux.HandleFunc("GET /devices", w.withSession(StageActive, w.devicesPage))
 	mux.HandleFunc("POST /devices/{id}/activate", w.withSession(StageActive, w.activateDevice))
 	mux.HandleFunc("POST /devices/{id}/deactivate", w.withSession(StageActive, w.deactivateDevice))
+	mux.HandleFunc("GET /oauth/authorize", w.withSession(StageActive, w.oauthPage))
+	mux.HandleFunc("POST /oauth/authorize", w.withSession(StageActive, w.consentOAuth))
+	mux.HandleFunc("POST /devices/{id}/oauth/{grant}/revoke", w.withSession(StageActive, w.revokeOAuthGrant))
 	return securityHeaders(formPosts(mux))
 }
 
@@ -204,6 +210,9 @@ func (w *WebUI) withSession(stage string, next sessionHandler) http.HandlerFunc 
 			case ok:
 				next = "/login/totp"
 			}
+			if r.URL.Path == remote.PathOAuthAuthorize {
+				next = withLoginNext(next, r.URL.RequestURI())
+			}
 			http.Redirect(rw, r, next, http.StatusSeeOther)
 			return
 		}
@@ -250,20 +259,51 @@ func (w *WebUI) render(rw http.ResponseWriter, status int, page string, data map
 // Login: name and password, then TOTP (or its enrollment). A password alone
 // opens only a short password-stage session.
 
+// loginNext accepts only the local OAuth authorization page, never an
+// arbitrary redirect. The OAuth request is validated again after sign-in.
+func loginNext(r *http.Request) string {
+	next := r.URL.Query().Get("next")
+	if r.Method == http.MethodPost {
+		next = r.PostFormValue("next")
+	}
+	if len(next) > 8192 {
+		return ""
+	}
+	u, err := url.Parse(next)
+	if err != nil || u.IsAbs() || u.Host != "" || u.User != nil || u.Opaque != "" || u.Fragment != "" || u.Path != remote.PathOAuthAuthorize || u.RawPath != "" {
+		return ""
+	}
+	return u.RequestURI()
+}
+
+func withLoginNext(path, next string) string {
+	if next == "" {
+		return path
+	}
+	return path + "?" + url.Values{"next": {next}}.Encode()
+}
+
+func afterLogin(r *http.Request) string {
+	if next := loginNext(r); next != "" {
+		return next
+	}
+	return "/approvals"
+}
+
 func (w *WebUI) loginPage(rw http.ResponseWriter, r *http.Request) {
 	if cookie, err := r.Cookie(sessionCookie); err == nil {
 		if session, ok := lookupSession(w.Store, cookie.Value, w.now()); ok && session.Stage == StageActive {
-			http.Redirect(rw, r, "/approvals", http.StatusSeeOther)
+			http.Redirect(rw, r, afterLogin(r), http.StatusSeeOther)
 			return
 		}
 	}
-	w.renderLogin(rw, http.StatusOK, "")
+	w.renderLogin(rw, r, http.StatusOK, "")
 }
 
-func (w *WebUI) renderLogin(rw http.ResponseWriter, status int, message string) {
+func (w *WebUI) renderLogin(rw http.ResponseWriter, r *http.Request, status int, message string) {
 	token := controlplane.RandomHex(16)
 	setCookie(rw, loginCookie, token, int(passwordStageTTL.Seconds()))
-	w.render(rw, status, "login", map[string]any{"Title": "Sign in", "CSRF": token, "Error": message})
+	w.render(rw, status, "login", map[string]any{"Title": "Sign in", "CSRF": token, "Error": message, "Next": loginNext(r)})
 }
 
 func clientAddress(r *http.Request) string {
@@ -277,14 +317,14 @@ func clientAddress(r *http.Request) string {
 func (w *WebUI) login(rw http.ResponseWriter, r *http.Request) {
 	cookie, err := r.Cookie(loginCookie)
 	if err != nil || !w.sameOrigin(r) || !validToken(r.PostFormValue("csrf"), cookie.Value) {
-		w.renderLogin(rw, http.StatusForbidden, "The sign-in form expired; try again.")
+		w.renderLogin(rw, r, http.StatusForbidden, "The sign-in form expired; try again.")
 		return
 	}
 	name, address := strings.TrimSpace(r.PostFormValue("name")), clientAddress(r)
 	now := w.now()
 	succeeded, ok := w.limiter.begin(name, address, now)
 	if !ok {
-		w.renderLogin(rw, http.StatusTooManyRequests, "Too many failed attempts; wait 15 minutes and try again.")
+		w.renderLogin(rw, r, http.StatusTooManyRequests, "Too many failed attempts; wait 15 minutes and try again.")
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), passwordWait)
@@ -293,11 +333,11 @@ func (w *WebUI) login(rw http.ResponseWriter, r *http.Request) {
 	if errors.Is(err, ErrPasswordsBusy) {
 		// The password was never checked, so the attempt is not a failure.
 		succeeded(false)
-		w.renderLogin(rw, http.StatusServiceUnavailable, "The gateway is busy signing others in; try again in a moment.")
+		w.renderLogin(rw, r, http.StatusServiceUnavailable, "The gateway is busy signing others in; try again in a moment.")
 		return
 	}
 	if err != nil {
-		w.renderLogin(rw, http.StatusUnauthorized, "Wrong name or password.")
+		w.renderLogin(rw, r, http.StatusUnauthorized, "Wrong name or password.")
 		return
 	}
 	succeeded(false)
@@ -308,15 +348,15 @@ func (w *WebUI) login(rw http.ResponseWriter, r *http.Request) {
 	}
 	setCookie(rw, loginCookie, "", -1)
 	setCookie(rw, sessionCookie, token, int(passwordStageTTL.Seconds()))
-	http.Redirect(rw, r, "/login/totp", http.StatusSeeOther)
+	http.Redirect(rw, r, withLoginNext("/login/totp", loginNext(r)), http.StatusSeeOther)
 }
 
-func (w *WebUI) totpPage(rw http.ResponseWriter, _ *http.Request, session WebSession, token string) {
-	w.renderTOTP(rw, http.StatusOK, session, token, "")
+func (w *WebUI) totpPage(rw http.ResponseWriter, r *http.Request, session WebSession, token string) {
+	w.renderTOTP(rw, r, http.StatusOK, session, token, "")
 }
 
-func (w *WebUI) renderTOTP(rw http.ResponseWriter, status int, session WebSession, token, message string) {
-	data := map[string]any{"Title": "Verify", "CSRF": session.CSRF, "Operator": session.Operator.Name, "Error": message, "Enroll": !session.Operator.TOTPEnrolled}
+func (w *WebUI) renderTOTP(rw http.ResponseWriter, r *http.Request, status int, session WebSession, token, message string) {
+	data := map[string]any{"Title": "Verify", "CSRF": session.CSRF, "Operator": session.Operator.Name, "Error": message, "Enroll": !session.Operator.TOTPEnrolled, "Next": loginNext(r)}
 	if !session.Operator.TOTPEnrolled {
 		secret, err := pendingTOTP(w.Store, w.Keys, token)
 		if err != nil {
@@ -341,7 +381,7 @@ func (w *WebUI) totp(rw http.ResponseWriter, r *http.Request, session WebSession
 	address := clientAddress(r)
 	succeeded, ok := w.limiter.begin(session.Operator.Name, address, now)
 	if !ok {
-		w.renderTOTP(rw, http.StatusTooManyRequests, session, token, "Too many failed attempts; wait 15 minutes and sign in again.")
+		w.renderTOTP(rw, r, http.StatusTooManyRequests, session, token, "Too many failed attempts; wait 15 minutes and sign in again.")
 		return
 	}
 	code := strings.ReplaceAll(strings.TrimSpace(r.PostFormValue("code")), " ", "")
@@ -355,7 +395,7 @@ func (w *WebUI) totp(rw http.ResponseWriter, r *http.Request, session WebSession
 		}
 	}
 	if err != nil {
-		w.renderTOTP(rw, http.StatusUnauthorized, session, token, "That code did not match; enter the current one.")
+		w.renderTOTP(rw, r, http.StatusUnauthorized, session, token, "That code did not match; enter the current one.")
 		return
 	}
 	succeeded(true)
@@ -369,7 +409,7 @@ func (w *WebUI) totp(rw http.ResponseWriter, r *http.Request, session WebSession
 	}
 	sweepSessions(w.Store, now)
 	setCookie(rw, sessionCookie, active, int(sessionTTL.Seconds()))
-	http.Redirect(rw, r, "/approvals", http.StatusSeeOther)
+	http.Redirect(rw, r, afterLogin(r), http.StatusSeeOther)
 }
 
 func (w *WebUI) logout(rw http.ResponseWriter, r *http.Request, _ WebSession, token string) {
@@ -666,6 +706,7 @@ type deviceView struct {
 	Revoked      bool
 	Left         string
 	LastActivity string
+	Grants       []Grant
 }
 
 // deviceEvents are the audit events a device's own requests cause, which
@@ -680,6 +721,15 @@ func (w *WebUI) devicesPage(rw http.ResponseWriter, r *http.Request, session Web
 	if err != nil {
 		http.Error(rw, "device store unavailable", http.StatusInternalServerError)
 		return
+	}
+	grants, err := Grants(w.Store)
+	if err != nil {
+		http.Error(rw, "OAuth grant store unavailable", http.StatusInternalServerError)
+		return
+	}
+	byDevice := map[string][]Grant{}
+	for _, grant := range grants {
+		byDevice[grant.DeviceID] = append(byDevice[grant.DeviceID], grant)
 	}
 	last := map[string]string{}
 	if records, err := audit.NewStore(filepath.Join(w.Dir, FileAudit)).ReadAll(); err == nil {
@@ -698,7 +748,7 @@ func (w *WebUI) devicesPage(rw http.ResponseWriter, r *http.Request, session Web
 			http.Error(rw, "activation state unavailable", http.StatusInternalServerError)
 			return
 		}
-		v := deviceView{Device: d, Kind: DeviceKind(d), Activation: a, Revoked: d.Status == remote.DeviceRevoked, LastActivity: last[d.ID]}
+		v := deviceView{Device: d, Kind: DeviceKind(d), Activation: a, Revoked: d.Status == remote.DeviceRevoked, LastActivity: last[d.ID], Grants: byDevice[d.ID]}
 		if !v.Revoked && a.Active(now) {
 			v.Active, v.Left = true, Remaining(a.Until, now)
 			active++

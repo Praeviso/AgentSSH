@@ -476,6 +476,22 @@ instructions tell the agent what the skill teaches: one session per task,
 never retry a denied command, wait for approval and rerun unchanged. Every MCP
 request needs the device active, initialization included.
 
+For platforms that require **OAuth**, the gateway is also its own authorization
+server. Run the Web UI with `--web-origin` set to its public HTTPS origin (see
+below), then give the platform the same `/mcp` URL. The platform discovers and
+registers with the gateway automatically. Its authorization link takes an
+operator through password and TOTP sign-in to a consent page showing the client,
+the requested access and its callback. Choose a token device and authorize it,
+or deny the connection. Client names are self-reported; authorize only a
+connection you started and recognize.
+
+Consent binds the client to that device until revoked; it does not activate the
+device. Activate it separately on **Devices** for a chosen duration. OAuth access
+tokens work only on `/mcp`, last at most an hour and never past that window;
+refresh tokens rotate. **Devices → OAuth clients → Revoke access** ends a
+client's access on its next request. The gateway CLI also lists and revokes
+grants with `oauth ls` and `oauth revoke <grant-id>`.
+
 Hosts in the pushed inventory need `addr`, `user` and `identity`, as in managed
 mode; the gateway keeps host keys in its own `known_hosts`, following the
 inventory's `host_key_policy`. On the device, `hosts`, `run`, `status`, `plan`

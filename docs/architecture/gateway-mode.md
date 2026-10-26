@@ -58,7 +58,12 @@ that lies about its plan state gains nothing.
   but cancel refuses it, so a stolen device key is useless while the device is
   inactive. Revocation stays separate and permanent.
 - **MCP client → gateway (OAuth).** Registration is open and grants nothing;
-  only an operator's consent creates a grant, for one token device. Access
+  only an operator's explicit consent after password and TOTP creates a grant,
+  for one chosen token device. Client names are self-reported; the consent page
+  shows the client ID and callback as well as the requested access. Consent and
+  revocation require the Web UI's session, CSRF token and same-origin checks;
+  a device credential cannot authorize a client. Login returns only to the
+  local consent endpoint, where the client request is revalidated. Access
   tokens are bound to `/mcp`, last at most an hour or to the end of the
   activation window, and are refused once the grant or device is revoked; a
   refresh token used twice, or a code used twice with its PKCE verifier,
@@ -275,12 +280,12 @@ Trade-offs:
 - Every MCP request needs the device active, so an inactive device is refused
   at initialization; cancelling while inactive goes through `/api/run/cancel`.
 
-### OAuth for MCP clients (#45)
+### OAuth for MCP clients (#45, #46)
 
 Platforms that connect to remote MCP servers only through OAuth 2.1 get
 tokens from the gateway itself, which is the authorization server for its
 `/mcp` endpoint when `serve` knows the Web UI's origin (`--web-origin`). A
-client registers itself, an operator's consent on the Web UI (#46) binds it to
+client registers itself, an operator's consent on the Web UI binds it to
 one token device as a grant, and the grant's access tokens act as that device
 on `/mcp`. The grant is the long-lived, revocable part; access tokens last an
 hour and never past the device's activation window, and are issued and
@@ -304,6 +309,27 @@ Trade-offs:
   consumed, so the client continues once an operator activates the device;
   a reused one revokes the grant, since someone else holds it.
 - Access tokens are for `/mcp` only (RFC 8707 resource), not `/api`.
+
+The Web UI's `/oauth/authorize` page preserves the client's request through
+password and TOTP sign-in, including retries. It shows the client's name, ID,
+callback and the requested access, then requires an explicit choice of an
+available token device; signed and revoked devices are excluded. Deny needs no
+device and returns `access_denied`, with the client's state and issuer. The
+request is validated again on POST, and an unknown client or unregistered
+callback is refused without redirecting. Consent may bind an inactive device,
+but never activates it: tokens still cannot be issued or used until activation.
+The consent page's CSP allows the validated callback's origin for form redirects;
+other pages retain `form-action 'self'`. Consent forms still post to the Web UI
+and must pass its same-origin and CSRF checks.
+
+The Devices page lists each token device's OAuth grants, with the client ID,
+who consented and when, and a revoke action. Revoked grants remain visible as
+history. A grant can be revoked only under the device it belongs to. Consent
+and revocation use the same authenticated operator, CSRF and same-origin
+checks as approval decisions, and their audit records name `web:<operator>`,
+the client, device and grant. Revoking a grant refuses both access and refresh
+tokens from the next request; other clients' grants and the static device
+token continue to work within the device's activation window.
 
 ### Stopping runs that lost standing (#34)
 

@@ -17,8 +17,9 @@ Done when:
 - A test checks the discovery metadata is what an MCP client needs to start
   the flow.
 
-The consent page is #46: here the authorization request is parsed and
-validated, and consent is a function the page will call.
+The consent page and browser flow are tracked in
+[#46](web-oauth-consent.md): here the authorization request is parsed and
+validated, and consent is a function the page calls.
 
 ## Decisions (the issue's preparation)
 
