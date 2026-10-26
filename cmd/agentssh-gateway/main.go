@@ -41,6 +41,9 @@ var program = &admin.Program{
 	EnrollHint:   "agentssh remote enroll %s --mode gateway --token <token>",
 	RevokeShort:  "Revoke a device for good; its next request is refused.",
 	DisableShort: "Stop connecting with an identity.",
+	RevokeDevice: func(dir string, store *controlplane.Store, deviceID string, now time.Time) error {
+		return gateway.RevokeDevice(dir, store, deviceID, localOperator(), now)
+	},
 	DeviceColumns: []admin.DeviceColumn{
 		{Header: "KIND", Value: func(_ *controlplane.Store, device controlplane.Device, _ time.Time) string {
 			return gateway.DeviceKind(device)

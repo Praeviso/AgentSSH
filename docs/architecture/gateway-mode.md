@@ -214,6 +214,23 @@ Trade-offs:
 - When the window ends or the device is deactivated or revoked, its running
   commands are stopped too (#34, below).
 
+### Device revocation audit (#35 acceptance)
+
+`agentssh-gateway device revoke` records `device_revoked` for both signed and
+token devices, with the device ID, original operator and revocation time.
+The device becomes unusable before audit publication, so an unavailable or
+corrupt audit file cannot keep a compromised credential usable. The command
+reports that the device is revoked but its audit record needs repair.
+
+The gateway-only `device_revocations` table preserves the first actor/time in
+the same SQLite transaction that revokes the device. An audit-completion flag
+is set only after the record is in the chain. A repeated command or `serve`'s
+30-second sweep repairs pending records after a restart. `AppendUnless`
+deduplicates by device ID and event under the audit lock: revocation is
+terminal, so there is only one such transition per device, even across
+concurrent processes. Retrying never replaces the original operator or time.
+Managed mode continues to use the shared store's revocation operation.
+
 ### Token devices (#40)
 
 For agents that cannot install a client, a token device authenticates with a

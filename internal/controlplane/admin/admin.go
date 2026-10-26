@@ -43,6 +43,9 @@ type Program struct {
 	RevokeShort, DisableShort string
 	// DeviceColumns add a mode's own columns to device ls.
 	DeviceColumns []DeviceColumn
+	// RevokeDevice adds a mode's revocation effects. Nil uses the shared
+	// store operation, as managed mode does.
+	RevokeDevice func(dir string, store *controlplane.Store, deviceID string, now time.Time) error
 }
 
 // DeviceColumn is one extra column of device ls.
@@ -233,8 +236,14 @@ func (p *Program) DeviceCommand(dir func() (string, error)) *cobra.Command {
 		Short: p.RevokeShort,
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return p.withStore(dir, func(_ string, store *controlplane.Store) error {
-				if err := store.RevokeDevice(args[0], time.Now()); err != nil {
+			return p.withStore(dir, func(d string, store *controlplane.Store) error {
+				var err error
+				if p.RevokeDevice == nil {
+					err = store.RevokeDevice(args[0], time.Now())
+				} else {
+					err = p.RevokeDevice(d, store, args[0], time.Now())
+				}
+				if err != nil {
 					return fmt.Errorf("revoke %s: %w", args[0], err)
 				}
 				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Revoked %s\n", args[0])

@@ -44,7 +44,7 @@ func Init(dir, master string) error {
 
 // OpenStore opens (creating if needed) the gateway database at path.
 func OpenStore(path string) (*controlplane.Store, error) {
-	return controlplane.OpenStore(path, operatorSchema+activationSchema+tokenSchema+oauthSchema)
+	return controlplane.OpenStore(path, operatorSchema+activationSchema+revocationSchema+tokenSchema+oauthSchema)
 }
 
 // Server is the gateway HTTP API.

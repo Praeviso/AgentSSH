@@ -350,7 +350,12 @@ already recorded (checked under its lock), and the table's flag is set only
 after the record is in the chain, so concurrent finders record an end once and
 a failed append is retried. An activation is audited before it is stored and a
 deactivation after, so a failed write leaves the device inactive. Revocation is separate and permanent: a revoked device
-cannot be activated.
+cannot be activated. On a gateway, `device revoke` appends `device_revoked`
+with the device ID, operator and original revocation time. Revocation and its
+actor/time are committed together before appending: an audit write failure
+still leaves the device revoked, and a retry or the 30-second serve sweep
+repairs the record. The hash-chain lock prevents duplicate records, and the
+first operator/time survive concurrent retries and process restarts.
 
 **Token devices.** A token device is a gateway device whose credential is a
 bearer token instead of an enrolled key, for agents that cannot run

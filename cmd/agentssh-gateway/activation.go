@@ -153,6 +153,9 @@ func checkStanding(ctx context.Context, dir string, store *controlplane.Store, s
 		case <-ctx.Done():
 			return
 		case now := <-ticker.C:
+			if err := gateway.RecordDeviceRevocations(dir, store); err != nil {
+				log.Printf("agentssh-gateway: record device revocations: %v", err)
+			}
 			if err := gateway.RecordEndedActivations(dir, store, now); err != nil {
 				log.Printf("agentssh-gateway: record ended activations: %v", err)
 			}

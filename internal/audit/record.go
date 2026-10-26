@@ -26,11 +26,12 @@ const (
 	EventApprovalRequested Event = "approval_requested"
 	EventApprovalGranted   Event = "approval_granted"
 	EventApprovalDenied    Event = "approval_denied"
-	// Gateway device activation: an operator opened or closed a device's
-	// window, or the window ended.
+	// Gateway device lifecycle: an operator opened or closed a device's
+	// window, the window ended, or the device was revoked permanently.
 	EventDeviceActivated       Event = "device_activated"
 	EventDeviceDeactivated     Event = "device_deactivated"
 	EventDeviceActivationEnded Event = "device_activation_expired"
+	EventDeviceRevoked         Event = "device_revoked"
 	// A gateway token device's token was issued (created or rotated in) or
 	// revoked (rotated out).
 	EventTokenIssued  Event = "device_token_issued"

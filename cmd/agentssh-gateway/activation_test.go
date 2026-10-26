@@ -76,8 +76,8 @@ func TestDeviceActivationCommands(t *testing.T) {
 	if _, err := runGatewayCLI(t, "--data", dir, "device", "activate", id, "--for", "1h"); err == nil || !strings.Contains(err.Error(), "revoked") {
 		t.Fatalf("activate a revoked device: %v", err)
 	}
-	if out, err := runGatewayCLI(t, "--data", dir, "audit", "verify"); err != nil || out != "audit chain ok · records=2\n" {
-		t.Fatalf("audit verify: %v %q (want the activation and the deactivation)", err, out)
+	if out, err := runGatewayCLI(t, "--data", dir, "audit", "verify"); err != nil || out != "audit chain ok · records=3\n" {
+		t.Fatalf("audit verify: %v %q (want activation, deactivation and revocation)", err, out)
 	}
 }
 
