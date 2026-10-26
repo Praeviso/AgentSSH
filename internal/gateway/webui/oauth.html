@@ -1,0 +1,32 @@
+{{define "content"}}
+<h1 class="client-title">Authorize {{.Request.ClientName}}?</h1>
+<p class="lead">Choose the gateway device this client may use.</p>
+{{if .Error}}<p class="banner bad" role="alert">{{.Error}}</p>{{end}}
+<section class="card consent">
+  <h2>Requested access</h2>
+  <p>List the device's hosts, run commands under its policy, read run output and request approvals.</p>
+  <dl class="facts">
+    <dt>Client</dt><dd>{{.Request.ClientName}}</dd>
+    <dt>Client ID</dt><dd><code>{{.Request.ClientID}}</code></dd>
+    <dt>Gateway</dt><dd>{{.Resource}}</dd>
+    <dt>Return to</dt><dd>{{.Request.RedirectURI}}</dd>
+  </dl>
+  <p class="warn">Client names are self-reported. Authorize only a connection you started and recognize.</p>
+  <form method="post" action="{{.Action}}" class="stack consent-form">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    {{if .Devices}}
+    <label>Token device
+      <select name="device" required>
+        <option value="" disabled selected>Choose a device…</option>
+        {{range .Devices}}<option value="{{.ID}}">{{.Name}} · {{.ID}} · {{if .Active}}active{{else}}inactive{{end}}</option>{{end}}
+      </select>
+    </label>
+    {{else}}<p class="hint">No token devices are available. Ask a gateway administrator to create one, then restart this connection.</p>{{end}}
+    <p class="hint">This authorization lasts until revoked. The client can act only while the device is active. Authorizing it does not activate the device or bypass approvals.</p>
+    <div class="actions">
+      {{if .Devices}}<button class="primary" name="decision" value="authorize">Authorize</button>{{end}}
+      <button name="decision" value="deny" formnovalidate>Deny</button>
+    </div>
+  </form>
+</section>
+{{end}}

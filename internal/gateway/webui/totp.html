@@ -11,6 +11,7 @@
 {{if .Error}}<p class="banner bad" role="alert">{{.Error}}</p>{{end}}
 <form method="post" action="/login/totp" class="stack">
   <input type="hidden" name="csrf" value="{{.CSRF}}">
+  {{if .Next}}<input type="hidden" name="next" value="{{.Next}}">{{end}}
   <label>Code<input name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9 ]{6,7}" maxlength="7" required autofocus></label>
   <button class="primary">Verify</button>
 </form>

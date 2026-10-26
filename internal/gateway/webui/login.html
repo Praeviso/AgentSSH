@@ -1,9 +1,10 @@
 {{define "content"}}
 <h1>Sign in</h1>
-<p class="lead">Operators decide gateway devices' approvals here.</p>
+<p class="lead">{{if .Next}}Sign in to review the client's request for access.{{else}}Operators manage gateway devices and approvals here.{{end}}</p>
 {{if .Error}}<p class="banner bad" role="alert">{{.Error}}</p>{{end}}
 <form method="post" action="/login" class="stack">
   <input type="hidden" name="csrf" value="{{.CSRF}}">
+  {{if .Next}}<input type="hidden" name="next" value="{{.Next}}">{{end}}
   <label>Name<input name="name" autocomplete="username" autocapitalize="none" required autofocus></label>
   <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
   <button class="primary">Continue</button>

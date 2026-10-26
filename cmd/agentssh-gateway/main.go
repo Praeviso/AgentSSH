@@ -165,6 +165,13 @@ func newServeCommand(dir func() (string, error)) *cobra.Command {
 					return err
 				}
 				web.Origin = webOrigin
+				if webOrigin != "" {
+					oauth, err := gateway.NewOAuth(publicURL, webOrigin)
+					if err != nil {
+						return err
+					}
+					web.OAuth = &oauth
+				}
 				if err := serveWeb(ctx, cmd.OutOrStdout(), webListen, webCert, webKey, web.Handler()); err != nil {
 					return err
 				}

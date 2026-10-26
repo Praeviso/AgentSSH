@@ -75,6 +75,18 @@ input, select { font: inherit; height: 38px; padding: 0 10px; border: 1px solid 
 .activate button { height: 38px; }
 .device .actions { align-items: end; }
 .device .actions > form:last-child:not(.activate) button { height: 38px; }
+.consent { max-width: 680px; }
+.client-title, .consent h2, .device h2 { overflow-wrap: anywhere; }
+.consent-form { margin: 20px 0 0; }
+.consent-form select { width: 100%; min-width: 0; }
+.consent-form .hint { margin: 0; }
+.consent-form .actions { margin-top: 0; }
+.grants { margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--line); }
+.grants h3 { font-size: 0.9rem; margin: 0 0 8px; }
+.grant { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 0; }
+.grant + .grant { border-top: 1px solid var(--line); }
+.grant-info { min-width: 0; overflow-wrap: anywhere; }
+.grant form { flex-shrink: 0; }
 @media (max-width: 640px) {
   .bar nav { order: 3; flex-basis: 100%; }
   .audit thead { display: none; }
@@ -85,4 +97,7 @@ input, select { font: inherit; height: 38px; padding: 0 10px; border: 1px solid 
   .actions button { flex: 1 1 auto; }
   .activate, .activate label { flex: 1 1 100%; }
   .device .actions > form { flex: 1 1 100%; display: flex; }
+  .grant { align-items: start; flex-wrap: wrap; }
+  .consent .facts { grid-template-columns: 1fr; gap: 2px; }
+  .consent .facts dd { margin-bottom: 8px; }
 }
