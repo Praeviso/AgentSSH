@@ -426,6 +426,12 @@ be undone by activating again. An inactive device can still enroll, cancel its
 own runs and see its state in `agentssh remote status`; everything else is
 refused with a hint to ask the gateway's operator.
 
+Activation, expiry, deactivation and revocation are recorded in the gateway's
+audit chain with the responsible operator. Revocation takes effect even if the
+audit file cannot be written: the command reports the audit failure, and a
+retry or `serve`'s next sweep repairs the record with the original operator and
+time. Repeating a revocation creates no duplicate record.
+
 An agent that cannot run `agentssh` at all (a hosted agent platform, a
 sandbox where no binary or key should live) uses a **token device** instead:
 it calls the gateway's API with a bearer token rather than enrolling.
