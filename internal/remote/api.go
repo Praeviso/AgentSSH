@@ -22,6 +22,9 @@ const (
 	PathAPIApprovalStatus = "/api/approval/status"
 	PathAPISession        = "/api/session"
 	PathAPIOpenAPI        = "/api/openapi.json"
+	// PathMCP is the gateway's MCP endpoint (Streamable HTTP): the token API
+	// as MCP tools.
+	PathMCP = "/mcp"
 
 	// DefaultAPIWait is how long a call waits for a run when it names no
 	// wait; MaxAPIWait caps any wait.

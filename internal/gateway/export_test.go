@@ -64,12 +64,12 @@ func (s *Server) StopRuns() {
 	}
 }
 
-// OpenRoutes are the method and path of every route that authenticates
-// itself: the token API and its OpenAPI document.
+// OpenRoutes are the method and path of the token API's routes and its
+// OpenAPI document (the MCP endpoint is not part of the document).
 func (s *Server) OpenRoutes() []string {
 	var routes []string
-	for _, route := range s.tokenRoutes() {
-		routes = append(routes, route.Method+" "+route.Path)
+	for _, op := range s.apiOperations() {
+		routes = append(routes, op.method+" "+op.path)
 	}
 	return append(routes, "GET "+remote.PathAPIOpenAPI)
 }
