@@ -57,6 +57,12 @@ that lies about its plan state gains nothing.
   opened for a chosen duration (1 min to 24 h); outside it every device endpoint
   but cancel refuses it, so a stolen device key is useless while the device is
   inactive. Revocation stays separate and permanent.
+- **MCP client → gateway (OAuth).** Registration is open and grants nothing;
+  only an operator's consent creates a grant, for one token device. Access
+  tokens are bound to `/mcp`, last at most an hour or to the end of the
+  activation window, and are refused once the grant or device is revoked; a
+  refresh token used twice, or a code used twice with its PKCE verifier,
+  revokes its grant.
 - **What a device still controls.** Inside its window, it chooses which allowed
   commands to run and when, and it receives their filtered output. It can submit approval
   requests and plans, bounded per device, which only an operator can decide.
@@ -269,6 +275,36 @@ Trade-offs:
 - Every MCP request needs the device active, so an inactive device is refused
   at initialization; cancelling while inactive goes through `/api/run/cancel`.
 
+### OAuth for MCP clients (#45)
+
+Platforms that connect to remote MCP servers only through OAuth 2.1 get
+tokens from the gateway itself, which is the authorization server for its
+`/mcp` endpoint when `serve` knows the Web UI's origin (`--web-origin`). A
+client registers itself, an operator's consent on the Web UI (#46) binds it to
+one token device as a grant, and the grant's access tokens act as that device
+on `/mcp`. The grant is the long-lived, revocable part; access tokens last an
+hour and never past the device's activation window, and are issued and
+accepted only while the device is active.
+
+Trade-offs:
+
+- Open dynamic registration, because every OAuth-capable MCP client falls
+  back to it and pre-registration needs a setup step per platform. A client
+  is only a name and redirect URIs (HTTPS, or HTTP on loopback), so
+  registering grants nothing; unconsented clients are capped (1000) and
+  deleted after an hour. Client ID metadata documents are not offered: the
+  gateway would fetch URLs anyone names.
+- Opaque tokens stored hashed, like device tokens: revocation and the
+  device's standing take effect on the next request, which signed tokens
+  would need a lookup for anyway.
+- Token and registration endpoints under the public URL, which the platform's
+  servers reach; the authorization endpoint on the Web UI, which only the
+  operator's browser needs to reach.
+- An inactive device's code or refresh token is refused without being
+  consumed, so the client continues once an operator activates the device;
+  a reused one revokes the grant, since someone else holds it.
+- Access tokens are for `/mcp` only (RFC 8707 resource), not `/api`.
+
 ### Stopping runs that lost standing (#34)
 
 Every 30 s, `serve` checks each live run's device and the identities its
@@ -303,6 +339,10 @@ Trade-offs:
 - **Plans** run on one host; multi-host and group plans are not supported.
 - **Notifications.** Operators learn of pending approvals from `approval ls` or
   the Web UI; there is no push to IM or mobile.
+- **OAuth discovery with a path prefix.** Clients look for the metadata at
+  the origin's root (`/.well-known/oauth-protected-resource/<prefix>/mcp`,
+  `/.well-known/oauth-authorization-server/<prefix>`), so an ingress that
+  forwards only the prefix must route those two paths to the gateway too.
 - **TUI.** The operator TUI does not decide gateway approvals; use the CLI on
   the gateway host or the Web UI.
 

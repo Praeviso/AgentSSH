@@ -37,16 +37,16 @@ const respondWithin = remote.MaxAPIWait + 15*time.Second
 func (s *Server) apiOperations() []apiOperation {
 	return []apiOperation{
 		{"GET", remote.PathTokenStatus, "status", tokenOptions{}, s.handleTokenStatus},
-		{"GET", remote.PathTokenHosts, "hosts", tokenOptions{needsActive: true}, func(w http.ResponseWriter, r *http.Request, device controlplane.Device, _ string, body []byte) {
+		{"GET", remote.PathTokenHosts, "hosts", tokenOptions{needsActive: true}, func(w http.ResponseWriter, r *http.Request, device controlplane.Device, _ credential, body []byte) {
 			s.handleHosts(w, r, device, body)
 		}},
 		{"POST", remote.PathAPISession, "new_session", tokenOptions{needsActive: true}, s.handleAPISession},
 		{"POST", remote.PathAPIRun, "run", tokenOptions{needsActive: true, maxBody: maxExecBody, respondWithin: respondWithin}, s.handleAPIRun},
 		{"POST", remote.PathAPIRunOutput, "run_output", tokenOptions{needsActive: true, respondWithin: respondWithin}, s.handleAPIRunOutput},
-		{"POST", remote.PathAPIRunCancel, "cancel_run", tokenOptions{}, func(w http.ResponseWriter, r *http.Request, device controlplane.Device, _ string, body []byte) {
+		{"POST", remote.PathAPIRunCancel, "cancel_run", tokenOptions{}, func(w http.ResponseWriter, r *http.Request, device controlplane.Device, _ credential, body []byte) {
 			s.handleCancel(w, r, device, body)
 		}},
-		{"POST", remote.PathAPIRequestStatus, "request_status", tokenOptions{needsActive: true}, func(w http.ResponseWriter, r *http.Request, device controlplane.Device, _ string, body []byte) {
+		{"POST", remote.PathAPIRequestStatus, "request_status", tokenOptions{needsActive: true}, func(w http.ResponseWriter, r *http.Request, device controlplane.Device, _ credential, body []byte) {
 			s.handleRequestStatus(w, r, device, body)
 		}},
 		{"POST", remote.PathAPIApprovalStatus, "approval_status", tokenOptions{needsActive: true, respondWithin: respondWithin}, s.handleAPIApprovalStatus},
@@ -68,7 +68,7 @@ func apiWait(ms *int64) time.Duration {
 	return wait
 }
 
-func (s *Server) handleAPIRun(w http.ResponseWriter, r *http.Request, device controlplane.Device, tokenID string, body []byte) {
+func (s *Server) handleAPIRun(w http.ResponseWriter, r *http.Request, device controlplane.Device, cred credential, body []byte) {
 	var req remote.APIRunRequest
 	if controlplane.DecodeBody(body, &req) != nil {
 		controlplane.WriteError(w, http.StatusBadRequest, remote.CodeBadRequest, "malformed run request")
@@ -86,10 +86,10 @@ func (s *Server) handleAPIRun(w http.ResponseWriter, r *http.Request, device con
 	canonical, _ := json.Marshal(exec)
 	sum := sha256.Sum256(canonical)
 	wait := apiWait(req.WaitMS)
-	s.execAs(w, device, tokenID, exec, hex.EncodeToString(sum[:]), func(rn *run) { s.answerRun(w, r.Context(), rn, 0, wait) })
+	s.execAs(w, device, cred, exec, hex.EncodeToString(sum[:]), func(rn *run) { s.answerRun(w, r.Context(), rn, 0, wait) })
 }
 
-func (s *Server) handleAPIRunOutput(w http.ResponseWriter, r *http.Request, device controlplane.Device, _ string, body []byte) {
+func (s *Server) handleAPIRunOutput(w http.ResponseWriter, r *http.Request, device controlplane.Device, _ credential, body []byte) {
 	var req remote.APIRunOutputRequest
 	if controlplane.DecodeBody(body, &req) != nil {
 		controlplane.WriteError(w, http.StatusBadRequest, remote.CodeBadRequest, "malformed output request")
@@ -218,7 +218,7 @@ func finalFrame(spool io.ReaderAt, size int64) (byte, []byte, bool) {
 
 // handleAPIApprovalStatus answers an approval request's status as `agentssh
 // approval status` prints it, waiting up to wait_ms while it is pending.
-func (s *Server) handleAPIApprovalStatus(w http.ResponseWriter, r *http.Request, device controlplane.Device, _ string, body []byte) {
+func (s *Server) handleAPIApprovalStatus(w http.ResponseWriter, r *http.Request, device controlplane.Device, _ credential, body []byte) {
 	var req remote.APIApprovalStatusRequest
 	if controlplane.DecodeBody(body, &req) != nil {
 		controlplane.WriteError(w, http.StatusBadRequest, remote.CodeBadRequest, "malformed approval status query")
@@ -248,7 +248,7 @@ func (s *Server) handleAPIApprovalStatus(w http.ResponseWriter, r *http.Request,
 // approvalPoll is how often a waiting approval status call looks again.
 const approvalPoll = 250 * time.Millisecond
 
-func (s *Server) handleAPISession(w http.ResponseWriter, _ *http.Request, _ controlplane.Device, _ string, _ []byte) {
+func (s *Server) handleAPISession(w http.ResponseWriter, _ *http.Request, _ controlplane.Device, _ credential, _ []byte) {
 	id, err := session.NewID()
 	if err != nil {
 		controlplane.WriteError(w, http.StatusInternalServerError, remote.CodeInternal, "session id unavailable")

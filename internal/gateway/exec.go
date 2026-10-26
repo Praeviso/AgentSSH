@@ -72,12 +72,12 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, device contr
 // requestSHA256 identifies the request, so a repeat joins its run and a
 // different request with the same ID is refused.
 func (s *Server) exec(w http.ResponseWriter, device controlplane.Device, req remote.ExecRequest, requestSHA256 string, serve func(*run)) {
-	s.execAs(w, device, "", req, requestSHA256, serve)
+	s.execAs(w, device, credential{}, req, requestSHA256, serve)
 }
 
-// execAs is exec for a request a token device made with tokenID, which its
+// execAs is exec for a request a token device made with cred, which its
 // audit records name.
-func (s *Server) execAs(w http.ResponseWriter, device controlplane.Device, tokenID string, req remote.ExecRequest, requestSHA256 string, serve func(*run)) {
+func (s *Server) execAs(w http.ResponseWriter, device controlplane.Device, cred credential, req remote.ExecRequest, requestSHA256 string, serve func(*run)) {
 	// A repeated request for a run that already exists joins it, so a client
 	// that lost the first response neither loses the run nor starts it twice.
 	if req.RunID != "" && s.serveExisting(w, device.ID, req.RunID, requestSHA256, serve) {
@@ -187,7 +187,7 @@ func (s *Server) execAs(w http.ResponseWriter, device controlplane.Device, token
 		Approval:  approvalRuntime(device.ID, pol.Approval),
 		Sessions:  stores.Sessions,
 		Pending:   stores.Pending,
-		Audit:     deviceAudit{log: s.deviceAudit(device.ID).log, deviceID: device.ID, tokenID: tokenID},
+		Audit:     deviceAudit{log: s.deviceAudit(device.ID).log, deviceID: device.ID, cred: cred},
 		Executor:  exec,
 		Output:    filter,
 	}
@@ -421,15 +421,15 @@ func (s *Server) deviceAudit(deviceID string) deviceAudit {
 }
 
 // deviceAudit stamps every record with the device it ran for, and the token
-// a token device used.
+// or OAuth grant a token device used.
 type deviceAudit struct {
 	log      audit.Store
 	deviceID string
-	tokenID  string
+	cred     credential
 }
 
 func (a deviceAudit) Append(record audit.Record) (audit.Record, error) {
-	record.DeviceID, record.TokenID = a.deviceID, a.tokenID
+	record.DeviceID, record.TokenID, record.GrantID = a.deviceID, a.cred.tokenID, a.cred.grantID
 	return a.log.Append(record)
 }
 

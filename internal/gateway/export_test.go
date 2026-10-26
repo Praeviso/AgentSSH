@@ -73,3 +73,10 @@ func (s *Server) OpenRoutes() []string {
 	}
 	return append(routes, "GET "+remote.PathAPIOpenAPI)
 }
+
+// SetMaxPendingClients lowers the cap on registered clients awaiting consent.
+func SetMaxPendingClients(n int) (restore func()) {
+	old := maxPendingClients
+	maxPendingClients = n
+	return func() { maxPendingClients = old }
+}

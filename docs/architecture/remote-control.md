@@ -440,6 +440,36 @@ so a device cannot cancel over MCP while inactive (the `/api` cancel can). It
 takes only the bearer token: the Web UI's session cookie authenticates nothing
 here, and the token nothing in the Web UI.
 
+**OAuth.** With `--web-origin`, the gateway is an OAuth 2.1 authorization
+server for `/mcp`. A request to `/mcp` without a valid token is answered 401
+with `WWW-Authenticate: Bearer resource_metadata="..."`, naming the protected
+resource metadata (RFC 9728) at
+`<origin>/.well-known/oauth-protected-resource<path>/mcp`; it lists the public
+URL as the authorization server, whose metadata (RFC 8414) is at
+`<origin>/.well-known/oauth-authorization-server<path>`. Clients register at
+`/oauth/register` (RFC 7591; `none`, `client_secret_basic` or
+`client_secret_post`; secrets kept hashed) and get tokens at `/oauth/token`
+(authorization code with PKCE S256 only, and refresh tokens). The
+authorization endpoint is the Web UI's `/oauth/authorize`; it answers with
+`code`, `state` and `iss` (RFC 9207). The one scope is `agentssh`, and the
+only resource (RFC 8707) is `/mcp`. Codes (`agc_`), access tokens (`ago_`) and
+refresh tokens (`agr_`) are opaque, and only their SHA-256 is stored. Codes
+last 5 minutes and redeem once; access tokens an hour, capped at the end of
+the device's activation window; refresh tokens 30 days, replaced on every
+use. A refresh token presented after it was used revokes the grant, and so
+does a used code presented with its PKCE verifier; without the verifier a
+used code is only refused, since it was in a redirect URL and proves nothing.
+The token endpoint refuses (`invalid_grant`) while the grant's device is
+inactive or revoked, without consuming the code or refresh token; `/mcp`
+refuses an inactive device's access token with 403 `device_inactive`, which
+does not send a client back through authorization. Audit records of runs
+through a grant carry `grant_id` instead of `token_id`; the gateway's chain
+records `oauth_grant_created` (the consenting operator, the client),
+`oauth_refresh_refused` (a refresh token it issued, refused, with the reason)
+and `oauth_grant_revoked` (by an operator, or for a reused code or refresh
+token). `agentssh-gateway oauth ls` and `oauth revoke <grant>` list and revoke
+grants.
+
 The OpenAPI document is embedded in the binary and served with the gateway's
 public base as its server and the bearer scheme. A test keeps it from drifting:
 the routes it documents must be exactly the routes served, every example must
