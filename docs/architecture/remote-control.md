@@ -456,7 +456,9 @@ only resource (RFC 8707) is `/mcp`. Codes (`agc_`), access tokens (`ago_`) and
 refresh tokens (`agr_`) are opaque, and only their SHA-256 is stored. Codes
 last 5 minutes and redeem once; access tokens an hour, capped at the end of
 the device's activation window; refresh tokens 30 days, replaced on every
-use. A code or refresh token presented after it was used revokes the grant.
+use. A refresh token presented after it was used revokes the grant, and so
+does a used code presented with its PKCE verifier; without the verifier a
+used code is only refused, since it was in a redirect URL and proves nothing.
 The token endpoint refuses (`invalid_grant`) while the grant's device is
 inactive or revoked, without consuming the code or refresh token; `/mcp`
 refuses an inactive device's access token with 403 `device_inactive`, which

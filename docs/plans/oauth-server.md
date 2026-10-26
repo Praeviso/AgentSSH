@@ -92,7 +92,8 @@ validated, and consent is a function the page will call.
   client, another redirect URI or resource, an unknown client refused; a
   resource with another case or a trailing slash accepted), a run through the
   access token audited with the grant, the access token refused on `/api`, a
-  reused code revoking the grant; refresh rotation and reuse revoking every
+  reused code revoking the grant only with its verifier (without it, refused
+  and nothing changes); refresh rotation and reuse revoking every
   token of the grant; revocation by an operator and of the device; refusal
   while inactive without consuming the code or refresh token, and the access
   token capped at the window; expiry of codes and access tokens;

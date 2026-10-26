@@ -61,7 +61,8 @@ that lies about its plan state gains nothing.
   only an operator's consent creates a grant, for one token device. Access
   tokens are bound to `/mcp`, last at most an hour or to the end of the
   activation window, and are refused once the grant or device is revoked; a
-  refresh token or code used twice revokes its grant.
+  refresh token used twice, or a code used twice with its PKCE verifier,
+  revokes its grant.
 - **What a device still controls.** Inside its window, it chooses which allowed
   commands to run and when, and it receives their filtered output. It can submit approval
   requests and plans, bounded per device, which only an operator can decide.

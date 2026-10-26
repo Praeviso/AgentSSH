@@ -341,7 +341,14 @@ func TestOAuthCodeFlow(t *testing.T) {
 		t.Fatalf("the access token on /api/status: %d %s", got.status, got.raw)
 	}
 
-	// The code again: someone else has it, so the grant goes.
+	// The used code without its verifier proves nothing (the code was in a
+	// redirect URL) and changes nothing.
+	refused(t, tokenRequest(t, f, exchange(client, code, wrongVerifier)), "invalid_grant", "code_verifier")
+	refused(t, tokenRequest(t, f, exchange(client, code, "")), "invalid_grant", "code_verifier")
+	if r := mcpInit(c); r.status != http.StatusOK {
+		t.Fatalf("after a used code without its verifier: %d %s", r.status, r.raw)
+	}
+	// With it: someone else has both, so the grant goes.
 	refused(t, tokenRequest(t, f, exchange(client, code, verifier)), "invalid_grant", "authorization code reused")
 	if r := mcpInit(c); r.status != http.StatusUnauthorized {
 		t.Fatalf("after the code was reused: %d %s", r.status, r.raw)

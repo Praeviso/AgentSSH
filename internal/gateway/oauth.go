@@ -652,8 +652,8 @@ func (s *Server) grantStanding(grant Grant, now time.Time) (until time.Time, ref
 }
 
 // exchangeCode redeems an authorization code once, with its PKCE verifier.
-// A code redeemed again revokes its grant (RFC 6749 section 4.1.2); a device
-// that is not active leaves the code unredeemed.
+// A code redeemed again with its verifier revokes its grant (RFC 6749
+// section 4.1.2); a device that is not active leaves the code unredeemed.
 func (s *Server) exchangeCode(w http.ResponseWriter, client oauthClient, form url.Values) {
 	now := s.now()
 	code, err := lookupToken(s.Store.DB(), form.Get("code"), kindCode)
@@ -670,21 +670,24 @@ func (s *Server) exchangeCode(w http.ResponseWriter, client oauthClient, form ur
 		oauthError(w, http.StatusInternalServerError, "server_error", "grant lookup failed")
 		return
 	}
+	// A used code is no secret (it was in a redirect URL), so it counts as
+	// reused, revoking the grant, only with its verifier: only the client, or
+	// someone who also stole the verifier, can show it.
 	switch {
 	case grant.ClientID != client.ID:
 		oauthError(w, http.StatusBadRequest, "invalid_grant", "the code was issued to another client")
-		return
-	case code.Used:
-		s.revokeReused(w, grant, code, now)
-		return
-	case !now.Before(code.Expires):
-		oauthError(w, http.StatusBadRequest, "invalid_grant", "the authorization code expired")
 		return
 	case form.Get("redirect_uri") != "" && form.Get("redirect_uri") != code.RedirectURI:
 		oauthError(w, http.StatusBadRequest, "invalid_grant", "redirect_uri differs from the authorization request's")
 		return
 	case !pkceMatches(form.Get("code_verifier"), code.Challenge):
 		oauthError(w, http.StatusBadRequest, "invalid_grant", "code_verifier does not match the code challenge")
+		return
+	case code.Used:
+		s.revokeReused(w, grant, code, now)
+		return
+	case !now.Before(code.Expires):
+		oauthError(w, http.StatusBadRequest, "invalid_grant", "the authorization code expired")
 		return
 	case !grant.RevokedAt.IsZero():
 		oauthError(w, http.StatusBadRequest, "invalid_grant", "the grant was revoked")
