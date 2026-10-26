@@ -168,52 +168,73 @@ func RotateToken(dir string, store *controlplane.Store, deviceID, operator strin
 // part was wrong is not revealed.
 var errBadToken = errors.New("invalid bearer token")
 
-// authenticateToken returns the device and token ID a request's bearer token
-// names. A revoked device is controlplane.ErrDeviceRevoked; anything else
-// that fails is errBadToken.
-func authenticateToken(store *controlplane.Store, header string) (controlplane.Device, string, error) {
+// credential is what a token device's request authenticated with: a device
+// token, or an OAuth access token of a grant.
+type credential struct {
+	tokenID string
+	grantID string
+}
+
+// authenticateToken returns the device and credential a request's bearer
+// token names; an OAuth access token counts only when oauth is set. A revoked
+// device is controlplane.ErrDeviceRevoked; anything else that fails is
+// errBadToken.
+func authenticateToken(store *controlplane.Store, header string, oauth bool, now time.Time) (controlplane.Device, credential, error) {
 	raw, ok := strings.CutPrefix(header, "Bearer ")
 	if !ok {
-		return controlplane.Device{}, "", errBadToken
+		return controlplane.Device{}, credential{}, errBadToken
 	}
-	m := tokenPattern.FindStringSubmatch(raw)
-	if m == nil {
-		return controlplane.Device{}, "", errBadToken
-	}
-	tokenID, secret := m[1], m[2]
-	var deviceID, digest, revoked string
-	err := store.DB().QueryRow(`SELECT device_id, secret_sha256, revoked_at FROM device_tokens WHERE id = ?`, tokenID).Scan(&deviceID, &digest, &revoked)
-	if errors.Is(err, sql.ErrNoRows) {
-		return controlplane.Device{}, "", errBadToken
-	}
-	if err != nil {
-		return controlplane.Device{}, "", err
-	}
-	if subtle.ConstantTimeCompare([]byte(digest), []byte(secretSHA256(secret))) != 1 || revoked != "" {
-		return controlplane.Device{}, "", errBadToken
+	var deviceID string
+	var cred credential
+	if m := tokenPattern.FindStringSubmatch(raw); m != nil {
+		tokenID, secret := m[1], m[2]
+		var digest, revoked string
+		err := store.DB().QueryRow(`SELECT device_id, secret_sha256, revoked_at FROM device_tokens WHERE id = ?`, tokenID).Scan(&deviceID, &digest, &revoked)
+		if errors.Is(err, sql.ErrNoRows) {
+			return controlplane.Device{}, credential{}, errBadToken
+		}
+		if err != nil {
+			return controlplane.Device{}, credential{}, err
+		}
+		if subtle.ConstantTimeCompare([]byte(digest), []byte(secretSHA256(secret))) != 1 || revoked != "" {
+			return controlplane.Device{}, credential{}, errBadToken
+		}
+		cred.tokenID = tokenID
+	} else if oauth {
+		grant, err := accessGrant(store, raw, now)
+		if err != nil {
+			return controlplane.Device{}, credential{}, err
+		}
+		deviceID, cred.grantID = grant.DeviceID, grant.ID
+	} else {
+		return controlplane.Device{}, credential{}, errBadToken
 	}
 	device, err := store.Device(deviceID)
 	if err != nil {
-		return controlplane.Device{}, "", err
+		return controlplane.Device{}, credential{}, err
 	}
 	if DeviceKind(device) != remote.DeviceKindToken {
-		return controlplane.Device{}, "", errBadToken
+		return controlplane.Device{}, credential{}, errBadToken
 	}
 	if device.Status == remote.DeviceRevoked {
-		return controlplane.Device{}, "", controlplane.ErrDeviceRevoked
+		return controlplane.Device{}, credential{}, controlplane.ErrDeviceRevoked
 	}
-	return device, tokenID, nil
+	return device, cred, nil
 }
 
-// TokenHandler serves a token device's request: the device and token are
-// authenticated and, unless the route allows otherwise, the device is active.
-type TokenHandler func(w http.ResponseWriter, r *http.Request, device controlplane.Device, tokenID string, body []byte)
+// TokenHandler serves a token device's request: the device and its
+// credential are authenticated and, unless the route allows otherwise, the
+// device is active.
+type TokenHandler func(w http.ResponseWriter, r *http.Request, device controlplane.Device, cred credential, body []byte)
 
 // tokenOptions shape a token route.
 type tokenOptions struct {
 	// needsActive refuses a device outside its activation window, as every
 	// signed route but /status does.
 	needsActive bool
+	// oauth accepts OAuth access tokens as well as device tokens: only the
+	// MCP endpoint, the resource they are issued for.
+	oauth bool
 	// maxBody bounds the body (zero means 64 KiB); a larger one gets
 	// controlplane.StreamingBodyTimeout to arrive.
 	maxBody int64
@@ -242,43 +263,52 @@ func (s *Server) tokenRoute(method, path string, opts tokenOptions, next TokenHa
 			controlplane.WriteError(w, http.StatusRequestEntityTooLarge, remote.CodeBadRequest, "request body too large or unreadable")
 			return
 		}
-		device, tokenID, ok := s.admitToken(w, r, opts)
+		device, cred, ok := s.admitToken(w, r, opts)
 		if !ok {
 			return
 		}
 		if opts.respondWithin > 0 {
 			_ = rc.SetWriteDeadline(time.Now().Add(opts.respondWithin))
 		}
-		next(w, r, device, tokenID, body)
+		next(w, r, device, cred, body)
 	}}
 }
 
 // admitToken authenticates r's bearer token and, for a route that needs it,
 // checks the device is active, answering the request itself when not.
-func (s *Server) admitToken(w http.ResponseWriter, r *http.Request, opts tokenOptions) (controlplane.Device, string, bool) {
-	device, tokenID, err := authenticateToken(s.Store, r.Header.Get("Authorization"))
+func (s *Server) admitToken(w http.ResponseWriter, r *http.Request, opts tokenOptions) (controlplane.Device, credential, bool) {
+	oauth := opts.oauth && s.oauth != nil
+	device, cred, err := authenticateToken(s.Store, r.Header.Get("Authorization"), oauth, s.now())
 	switch {
 	case errors.Is(err, errBadToken):
-		w.Header().Set("WWW-Authenticate", `Bearer realm="agentssh-gateway"`)
+		challenge := `Bearer realm="agentssh-gateway"`
+		if oauth {
+			// Where an MCP client finds how to get a token (RFC 9728).
+			challenge = fmt.Sprintf(`Bearer resource_metadata=%q, scope=%q`, s.oauth.resourceMetadataURL(), remote.OAuthScope)
+			if r.Header.Get("Authorization") != "" {
+				challenge += `, error="invalid_token"`
+			}
+		}
+		w.Header().Set("WWW-Authenticate", challenge)
 		controlplane.WriteError(w, http.StatusUnauthorized, remote.CodeUnauthenticated, errBadToken.Error())
-		return controlplane.Device{}, "", false
+		return controlplane.Device{}, credential{}, false
 	case errors.Is(err, controlplane.ErrDeviceRevoked):
 		controlplane.WriteError(w, http.StatusForbidden, remote.CodeDeviceRevoked, "this device has been revoked by the control plane")
-		return controlplane.Device{}, "", false
+		return controlplane.Device{}, credential{}, false
 	case err != nil:
 		controlplane.WriteError(w, http.StatusInternalServerError, remote.CodeInternal, "token check unavailable")
-		return controlplane.Device{}, "", false
+		return controlplane.Device{}, credential{}, false
 	}
 	if opts.needsActive {
 		if _, active, err := deviceActive(s.Dir, s.Store, device.ID, s.now()); err != nil {
 			controlplane.WriteError(w, http.StatusInternalServerError, remote.CodeInternal, "activation state unavailable")
-			return controlplane.Device{}, "", false
+			return controlplane.Device{}, credential{}, false
 		} else if !active {
 			controlplane.WriteError(w, http.StatusForbidden, remote.CodeDeviceInactive, "this device is not activated; an operator must activate it on the gateway")
-			return controlplane.Device{}, "", false
+			return controlplane.Device{}, credential{}, false
 		}
 	}
-	return device, tokenID, true
+	return device, cred, true
 }
 
 // tokenRoutes are the bearer-token API. /api/status answers like /status,
@@ -291,7 +321,7 @@ func (s *Server) tokenRoutes() []controlplane.OpenRoute {
 	return append(routes, s.mcpRoutes()...)
 }
 
-func (s *Server) handleTokenStatus(w http.ResponseWriter, _ *http.Request, device controlplane.Device, _ string, _ []byte) {
+func (s *Server) handleTokenStatus(w http.ResponseWriter, _ *http.Request, device controlplane.Device, _ credential, _ []byte) {
 	status := remote.StatusResponse{DeviceID: device.ID, Status: device.Status, Mode: remote.ModeGateway}
 	s.describeStatus(device, &status)
 	controlplane.WriteJSON(w, http.StatusOK, status)

@@ -25,6 +25,14 @@ const (
 	// PathMCP is the gateway's MCP endpoint (Streamable HTTP): the token API
 	// as MCP tools.
 	PathMCP = "/mcp"
+	// The gateway's OAuth 2.1 authorization server, for MCP clients that
+	// connect only through OAuth: registration and tokens under the public
+	// URL, authorization on the Web UI, where the operator consents.
+	PathOAuthRegister  = "/oauth/register"
+	PathOAuthToken     = "/oauth/token"
+	PathOAuthAuthorize = "/oauth/authorize"
+	// OAuthScope is the one scope a grant carries: the device's MCP tools.
+	OAuthScope = "agentssh"
 
 	// DefaultAPIWait is how long a call waits for a run when it names no
 	// wait; MaxAPIWait caps any wait.

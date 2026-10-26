@@ -110,13 +110,13 @@ func (s *Server) mcpRoutes() []controlplane.OpenRoute {
 		controlplane.WriteError(w, http.StatusMethodNotAllowed, remote.CodeBadRequest, "this MCP endpoint takes POST only: no server stream, no session")
 	}
 	return []controlplane.OpenRoute{
-		s.tokenRoute("POST", remote.PathMCP, tokenOptions{needsActive: true, maxBody: maxExecBody, respondWithin: respondWithin}, s.handleMCP),
+		s.tokenRoute("POST", remote.PathMCP, tokenOptions{needsActive: true, oauth: true, maxBody: maxExecBody, respondWithin: respondWithin}, s.handleMCP),
 		{Method: "GET", Path: remote.PathMCP, Handler: refuse},
 		{Method: "DELETE", Path: remote.PathMCP, Handler: refuse},
 	}
 }
 
-func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request, device controlplane.Device, tokenID string, body []byte) {
+func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request, device controlplane.Device, cred credential, body []byte) {
 	if v := r.Header.Get("MCP-Protocol-Version"); v != "" && !slices.Contains(mcpVersions, v) {
 		controlplane.WriteError(w, http.StatusBadRequest, remote.CodeBadRequest, "unsupported MCP-Protocol-Version "+v)
 		return
@@ -161,7 +161,7 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request, device contro
 		}
 		reply(w, msg.ID, map[string]any{"tools": tools}, nil)
 	case "tools/call":
-		s.callTool(w, r, device, tokenID, msg)
+		s.callTool(w, r, device, cred, msg)
 	default:
 		reply(w, msg.ID, nil, &rpcError{rpcMethodNotFound, "unknown method " + msg.Method})
 	}
@@ -172,7 +172,7 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request, device contro
 // approval_required and ssh_error runs included (their result field says
 // so); a refusal (usage, inactive, not found) is a result with isError set,
 // so the agent sees why.
-func (s *Server) callTool(w http.ResponseWriter, r *http.Request, device controlplane.Device, tokenID string, msg rpcMessage) {
+func (s *Server) callTool(w http.ResponseWriter, r *http.Request, device controlplane.Device, cred credential, msg rpcMessage) {
 	var params struct {
 		Name      string          `json:"name"`
 		Arguments json.RawMessage `json:"arguments"`
@@ -196,7 +196,7 @@ func (s *Server) callTool(w http.ResponseWriter, r *http.Request, device control
 		arguments = []byte("{}")
 	}
 	answer := &capturedAnswer{header: http.Header{}, status: http.StatusOK}
-	tools[i].op.handler(answer, r, device, tokenID, arguments)
+	tools[i].op.handler(answer, r, device, cred, arguments)
 	text := strings.TrimSpace(answer.body.String())
 	result := map[string]any{"content": []map[string]any{{"type": "text", "text": text}}, "isError": answer.status != http.StatusOK}
 	var structured map[string]any

@@ -75,6 +75,7 @@ func newRootCommand() *cobra.Command {
 		newApprovalCommand(dir),
 		newPlanCommand(dir),
 		newOperatorCommand(dir),
+		newOAuthCommand(dir),
 	)
 	return root
 }
@@ -144,9 +145,17 @@ func newServeCommand(dir func() (string, error)) *cobra.Command {
 			server.RunQuotaBytes = runQuotaBytes
 			server.RunRecords = runRecords
 			server.MaxPendingApprovals = maxPendingApprovals
+			// OAuth needs the Web UI's address for its authorization page.
+			server.WebOrigin = webOrigin
 			handler, err := server.Handler(publicURL)
 			if err != nil {
 				return err
+			}
+			switch {
+			case webOrigin != "":
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "OAuth for MCP clients: operators authorize them at %s%s\n", webOrigin, remote.PathOAuthAuthorize)
+			case webListen != "":
+				_, _ = fmt.Fprintln(cmd.OutOrStdout(), "OAuth for MCP clients is off: name the Web UI's origin with --web-origin to offer it")
 			}
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer stop()

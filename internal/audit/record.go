@@ -35,6 +35,12 @@ const (
 	// revoked (rotated out).
 	EventTokenIssued  Event = "device_token_issued"
 	EventTokenRevoked Event = "device_token_revoked"
+	// A gateway OAuth grant: an operator's consent bound a client to a token
+	// device, a refresh token the gateway knows was refused, or the grant was
+	// revoked (by an operator, or for a reused code or refresh token).
+	EventOAuthGrantCreated   Event = "oauth_grant_created"
+	EventOAuthRefreshRefused Event = "oauth_refresh_refused"
+	EventOAuthGrantRevoked   Event = "oauth_grant_revoked"
 )
 
 // Record is one append-only JSONL audit entry.
@@ -89,6 +95,10 @@ type Record struct {
 	// TokenID names the bearer token a gateway token device used or was
 	// issued; omitempty keeps older canonical forms.
 	TokenID string `json:"token_id,omitempty"`
+	// GrantID and ClientID name the OAuth grant a gateway token device acted
+	// through, and its client; omitempty keeps older canonical forms.
+	GrantID  string `json:"grant_id,omitempty"`
+	ClientID string `json:"client_id,omitempty"`
 }
 
 const ZeroHash = "0000000000000000000000000000000000000000000000000000000000000000"
@@ -444,6 +454,8 @@ type canonicalRecord struct {
 	ActiveUntil     string `json:"active_until,omitempty"`
 	Note            string `json:"note,omitempty"`
 	TokenID         string `json:"token_id,omitempty"`
+	GrantID         string `json:"grant_id,omitempty"`
+	ClientID        string `json:"client_id,omitempty"`
 }
 
 func canonicalJSON(record Record) ([]byte, error) {
@@ -481,5 +493,7 @@ func canonicalJSON(record Record) ([]byte, error) {
 		ActiveUntil:     record.ActiveUntil,
 		Note:            record.Note,
 		TokenID:         record.TokenID,
+		GrantID:         record.GrantID,
+		ClientID:        record.ClientID,
 	})
 }

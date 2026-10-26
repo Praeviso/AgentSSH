@@ -44,7 +44,7 @@ func Init(dir, master string) error {
 
 // OpenStore opens (creating if needed) the gateway database at path.
 func OpenStore(path string) (*controlplane.Store, error) {
-	return controlplane.OpenStore(path, operatorSchema+activationSchema+tokenSchema)
+	return controlplane.OpenStore(path, operatorSchema+activationSchema+tokenSchema+oauthSchema)
 }
 
 // Server is the gateway HTTP API.
@@ -71,6 +71,10 @@ type Server struct {
 	// Executor, when set, replaces SSH with the gateway's identities for a
 	// device's inventory. Tests use it to drive a fake target.
 	Executor func(inventory.Inventory) executor.Executor
+	// WebOrigin is the Web UI's origin. When set, the gateway is an OAuth
+	// authorization server for its MCP endpoint, with the authorization
+	// endpoint there.
+	WebOrigin string
 
 	mu        sync.Mutex
 	running   map[string]int
@@ -84,6 +88,10 @@ type Server struct {
 	// submits serializes each device's plan submissions, so a plan's
 	// precheck against the approval cap holds while it is submitted.
 	submits sync.Map // device ID → *sync.Mutex
+	// oauth is the authorization server when WebOrigin is set; registerMu
+	// serializes registrations, so the cap on pending clients holds.
+	oauth      *OAuth
+	registerMu sync.Mutex
 }
 
 // NewServer wires a data directory, its store and unlocked keys into an API
@@ -117,7 +125,17 @@ func (s *Server) Handler(publicURL string) (http.Handler, error) {
 	if err != nil {
 		return nil, err
 	}
+	if s.WebOrigin != "" {
+		oauth, err := NewOAuth(publicURL, s.WebOrigin)
+		if err != nil {
+			return nil, err
+		}
+		s.oauth = &oauth
+	}
 	api.Open = append(s.tokenRoutes(), openAPI)
+	if s.oauth != nil {
+		api.Open = append(api.Open, s.oauthRoutes()...)
+	}
 	routes := slices.Concat(s.execRoutes(), s.deviceRoutes(), s.approvalRoutes())
 	for i := range routes {
 		// Cancelling only stops a run, so a device whose window ended can

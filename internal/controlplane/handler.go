@@ -64,6 +64,9 @@ type API struct {
 type OpenRoute struct {
 	Method, Path string
 	Handler      http.HandlerFunc
+	// Root mounts Path at the origin's root instead of under the base, for
+	// well-known URIs (RFC 8615) that clients look for there.
+	Root bool
 }
 
 // ReadBody reads at most limit bytes of r's body (zero means 64 KiB).
@@ -96,7 +99,11 @@ func (a API) Handler(publicURL string, routes ...Route) (http.Handler, error) {
 		mux.HandleFunc(route.Method+" "+u.Path+route.Path, a.device(base, route))
 	}
 	for _, route := range a.Open {
-		mux.HandleFunc(route.Method+" "+u.Path+route.Path, route.Handler)
+		prefix := u.Path
+		if route.Root {
+			prefix = ""
+		}
+		mux.HandleFunc(route.Method+" "+prefix+route.Path, route.Handler)
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
