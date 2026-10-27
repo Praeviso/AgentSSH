@@ -125,6 +125,22 @@ idempotency key, so a repeated request whose first response was lost joins the
 existing run. `/exec/cancel`, `--exec-timeout`, or the device losing standing
 (#34, below) stops a run.
 
+Run creation has one owner in `runstore.go`. Under the server lock it checks
+record and concurrency capacity, creates the attempt's private spool, and
+initializes all live metadata, including a private immutable identity list and
+its cancellation function. The exclusive durable record claim is admission's
+commit point. Only a successful claim consumes a live slot and makes room for
+that run's output. Failed or duplicate requests do not perform request-specific
+quota eviction; private spools from failed claims are removed. Existing TTL and
+eligible-record reclamation retain their independent rules.
+
+Standing snapshots cannot observe a partially initialized run. Completion
+removes the live entry, releases its slot, and settles the finished-output
+quota in the same critical section. The lock order is server lock then run
+lock, never the reverse. File claims arbitrate IDs across processes; live
+scheduling and resource counters belong to one serving process. This does not
+add support for multiple gateway servers sharing an execution directory.
+
 Trade-offs: the gateway now stores output, so it is bounded on every axis
 (spool per run, finished output per device, run records per device, retention)
 and a partial result is marked `truncated` with a non-zero exit code. A run

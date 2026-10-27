@@ -190,6 +190,17 @@ protocol refusals end it. On context cancellation it sends `/exec/cancel`
   reattachable. Mutation checks: removing cancel admission, the precheck, or
   the window condition each fails exactly its test.
 
+## Admission and publication follow-up (#58)
+
+The initial record authority left two request-layer actions outside its
+creation boundary: output eviction before admission and identity initialization
+after publication. [The #58 implementation plan](gateway-run-admission.md)
+completes that boundary. `startRun` owns record/concurrency admission, private
+spool creation, complete metadata initialization, exclusive claim, and
+post-commit output-space arrangement. The server lock publishes the run and its
+slot together; completion releases both and settles the quota together. Normal
+TTL and already-eligible record reclamation keep their existing semantics.
+
 ## Validation
 
 ```

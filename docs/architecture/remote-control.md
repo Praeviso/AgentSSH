@@ -163,7 +163,13 @@ record names. A record appears whole or not at all, and publishing it
 exclusively is the only way to claim an ID, so a start and a cancel that
 overtook its own request race on the same publish and the first wins, durably
 across restarts. Everything an attempt writes before its claim is private and
-removed if the claim fails. States:
+removed if the claim fails. The claim is admission's commit point: the single
+creation entry checks record and concurrency limits, initializes its privately
+owned identity list and cancellation metadata, and publishes a complete live
+run under one server lock. Request-specific quota eviction happens only after
+a successful claim; a rejected attempt never evicts protected retained output
+or consumes a live slot. Completion releases the slot and settles the quota
+under that same lock. States:
 
 | State | Meaning | Answer to attach / a repeated `/exec` |
 | --- | --- | --- |
@@ -198,7 +204,7 @@ in its minimal form (`output_truncated`); the result then says
 `truncated: true` with the exit code raised to at least 1, so a partial result
 never passes for a complete one. A device keeps at most
 `serve --run-quota-bytes` (default 512 MiB) of finished output: before a run
-starts and again when one finishes, its oldest finished runs are evicted. One
+commits and again when one finishes, its oldest finished runs are evicted. One
 device therefore occupies at most quota + `--max-concurrent` ×
 `--run-max-bytes`. The request must arrive within the 60 s proof lifetime;
 ingresses must stream responses (the gateway sends `X-Accel-Buffering: no`).

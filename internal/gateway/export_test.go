@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -47,6 +48,16 @@ func FailNextClaim(err error) (restore func()) {
 	return func() { claimRecord = original }
 }
 
+// FailNextSpool injects a private spool creation failure before a run's claim.
+func FailNextSpool(err error) (restore func()) {
+	original := openRunSpool
+	openRunSpool = func(string) (*os.File, error) {
+		openRunSpool = original
+		return nil, err
+	}
+	return func() { openRunSpool = original }
+}
+
 // SetRecordLifetimes shortens how often records are aged out and how long
 // cancel records and the idempotency window last.
 func SetRecordLifetimes(sweep, cancelTTL, window time.Duration) (restore func()) {
@@ -89,6 +100,19 @@ func (s *Server) StopRuns() {
 			rn.cancel(nil)
 		}
 	}
+}
+
+// LiveRunCount lets tests wait for completion before injecting a new failure.
+func (s *Server) LiveRunCount(deviceID string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	count := 0
+	for _, rn := range s.runs {
+		if rn.deviceID == deviceID {
+			count++
+		}
+	}
+	return count
 }
 
 // OpenRoutes are the method and path of the token API's routes and its
