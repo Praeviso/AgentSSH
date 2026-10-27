@@ -12,7 +12,10 @@ package gateway
 // private and removed if the claim fails, so a failure never leaves a
 // half-made run behind. Later transitions rewrite the record atomically.
 // Memory only caches live runs, for their cancel functions and reader
-// wakeups; s.mu orders that cache against the records.
+// wakeups; s.mu orders that cache against the records. startRun is the only
+// creation entry: all observer metadata is private and complete before publish,
+// and a successful exclusive claim commits admission before quota eviction.
+// s.runs and s.running are updated together when a run starts or ends.
 //
 //	running ──► finished ──► evicted ──► deleted after retention
 //	cancelled (claimed by a cancel that overtook its request) ──► deleted
@@ -32,6 +35,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -94,15 +98,16 @@ var (
 )
 
 var (
-	errRunNotFound    = errors.New("run not found")
-	errRunInterrupted = errors.New("run interrupted")
-	errRunBroken      = errors.New("run spool broken")
-	errRunExists      = errors.New("run already exists")
-	errRunExpired     = errors.New("run output expired")
-	errRunCancelled   = errors.New("run cancelled before it started")
-	errRunConflict    = errors.New("run id reused for a different request")
-	errRunTooLarge    = errors.New("too many targets for the per-run cap")
-	errTooManyRecords = errors.New("too many runs kept for this device")
+	errRunNotFound       = errors.New("run not found")
+	errRunInterrupted    = errors.New("run interrupted")
+	errRunBroken         = errors.New("run spool broken")
+	errRunExists         = errors.New("run already exists")
+	errRunExpired        = errors.New("run output expired")
+	errRunCancelled      = errors.New("run cancelled before it started")
+	errRunConflict       = errors.New("run id reused for a different request")
+	errRunTooLarge       = errors.New("too many targets for the per-run cap")
+	errTooManyRecords    = errors.New("too many runs kept for this device")
+	errTooManyConcurrent = errors.New("too many executions running for this device")
 )
 
 // runRecord is a run's durable state.
@@ -133,6 +138,20 @@ var claimRecord = func(path string, data []byte) error {
 	return fileutil.CreateFileExclusive(path, data, 0o600, ".claim-*.tmp")
 }
 
+// openRunSpool is the private-file boundary; tests inject creation failures.
+var openRunSpool = func(path string) (*os.File, error) {
+	return os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY|os.O_APPEND, 0o600)
+}
+
+// runStart contains everything standing checks and readers need at publication.
+// startRun takes a private copy of identities; callers keep ownership of input.
+type runStart struct {
+	deviceID, id, requestSHA256, reqID string
+	targets                            int
+	identities                         []string
+	cancel                             func(cause error)
+}
+
 // run is one execution's spool. The runner writes frames; any number of
 // device connections tail them.
 type run struct {
@@ -143,6 +162,8 @@ type run struct {
 	requestSHA256 string
 	reqID         string
 	limit         int64
+	// identities is privately owned and immutable once the run is published.
+	identities []string
 
 	mu        sync.Mutex
 	record    runRecord
@@ -154,8 +175,6 @@ type run struct {
 	err       error
 	wake      chan struct{}
 	cancel    func(cause error)
-	// identities are the identities the run's targets connect with.
-	identities []string
 	// stopped is why the gateway stopped the run, if it did.
 	stopped lostStanding
 }
@@ -236,40 +255,60 @@ func randomSuffix() string {
 	return hex.EncodeToString(b[:])
 }
 
-// startRun claims id for deviceID and opens its spool; cancel stops the
-// run's context. errRunExists means the ID is already claimed: by a repeat
-// of this request, a different request, or a cancel that overtook it.
-func (s *Server) startRun(deviceID, id, requestSHA256, reqID string, targets int, cancel func(cause error)) (*run, error) {
-	if int64(targets) > s.maxRunTargets() {
+// startRun owns admission and publication. Before its exclusive record claim,
+// failures leave only private attempt resources to clean up; normal TTL and
+// eligible-record reclamation keep their existing independent semantics. The
+// successful claim is the commit point: only then may this request evict output
+// for its quota, consume a concurrency slot, and publish its complete live run.
+// s.mu serializes local admission, cancellation and readers; the exclusive file
+// claim arbitrates IDs across processes. No caller initializes a published run.
+func (s *Server) startRun(start runStart) (*run, error) {
+	if int64(start.targets) > s.maxRunTargets() {
 		return nil, errRunTooLarge
 	}
+	s.sweepRuns()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	key := runKey(deviceID, id)
+	key := runKey(start.deviceID, start.id)
 	if _, live := s.runs[key]; live {
 		return nil, errRunExists
 	}
-	if err := s.admitLocked(deviceID); err != nil {
+	path := s.recordPath(start.deviceID, start.id)
+	if _, err := os.Stat(path); err == nil {
+		return nil, errRunExists
+	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
-	dir := s.deviceRunsDir(deviceID)
+	if s.running[start.deviceID] >= s.maxConcurrent() {
+		return nil, errTooManyConcurrent
+	}
+	if err := s.admitLocked(start.deviceID); err != nil {
+		return nil, err
+	}
+	dir := s.deviceRunsDir(start.deviceID)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
 	// The spool is private to this attempt until the record names it.
-	frames := id + "." + randomSuffix() + ".frames"
+	frames := start.id + "." + randomSuffix() + ".frames"
 	framesPath := filepath.Join(dir, frames)
-	file, err := os.OpenFile(framesPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY|os.O_APPEND, 0o600)
+	file, err := openRunSpool(framesPath)
 	if err != nil {
 		return nil, err
 	}
 	rec := runRecord{
-		RunID: id, DeviceID: deviceID, State: stateRunning,
-		CreatedAt: controlplane.FormatTime(s.now()), RequestSHA256: requestSHA256, ReqID: reqID, Frames: frames,
+		RunID: start.id, DeviceID: start.deviceID, State: stateRunning,
+		CreatedAt: controlplane.FormatTime(s.now()), RequestSHA256: start.requestSHA256, ReqID: start.reqID, Frames: frames,
+	}
+	rn := &run{
+		id: start.id, deviceID: start.deviceID, recordPath: path, framesPath: framesPath,
+		requestSHA256: start.requestSHA256, reqID: start.reqID, limit: s.runMaxBytes(),
+		record: rec, file: file, pending: start.targets, wake: make(chan struct{}), cancel: start.cancel,
+		identities: slices.Clone(start.identities),
 	}
 	data, err := json.Marshal(rec)
 	if err == nil {
-		err = claimRecord(s.recordPath(deviceID, id), data)
+		err = claimRecord(path, data)
 	}
 	if err != nil {
 		_ = file.Close()
@@ -279,24 +318,36 @@ func (s *Server) startRun(deviceID, id, requestSHA256, reqID string, targets int
 		}
 		return nil, err
 	}
-	rn := &run{
-		id: id, deviceID: deviceID, recordPath: s.recordPath(deviceID, id), framesPath: framesPath,
-		requestSHA256: requestSHA256, reqID: reqID, limit: s.runMaxBytes(),
-		record: rec, file: file, pending: targets, wake: make(chan struct{}), cancel: cancel,
-	}
+	// Committed: subsequent quota work cannot turn this into a rejected start.
+	// Readers and standing snapshots see it only after s.mu is released.
 	if s.runs == nil {
 		s.runs = map[string]*run{}
 	}
+	if s.running == nil {
+		s.running = map[string]int{}
+	}
 	s.runs[key] = rn
-	s.deviceRecords[deviceID]++
+	s.running[start.deviceID]++
+	s.deviceRecords[start.deviceID]++
+	s.makeRoomLocked(start.deviceID, s.runMaxBytes())
 	return rn, nil
 }
 
-// endRun drops a finished run from the live cache; its record now answers.
+// endRun releases a committed run's slot and settles finished output in one
+// critical section. Readers follow s.mu -> run.mu; no code holds run.mu while
+// acquiring s.mu, and identity metadata needs no lock after publication.
 func (s *Server) endRun(rn *run) {
 	s.mu.Lock()
-	delete(s.runs, runKey(rn.deviceID, rn.id))
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+	key := runKey(rn.deviceID, rn.id)
+	if s.runs[key] != rn {
+		return
+	}
+	delete(s.runs, key)
+	if s.running[rn.deviceID]--; s.running[rn.deviceID] <= 0 {
+		delete(s.running, rn.deviceID)
+	}
+	s.makeRoomLocked(rn.deviceID, 0)
 }
 
 // lookupRun returns deviceID's run: live from memory, or finished from disk.
@@ -483,14 +534,10 @@ func (s *Server) storedRunsLocked(deviceID string) []storedRun {
 	return out
 }
 
-// makeRoom evicts deviceID's oldest finished runs until reserve more bytes
-// fit the device's quota: a full run's worth before a run starts, nothing
-// after one finishes. Holding s.mu serializes it, so runs that start together
-// cannot all count the same free space, and the pass after each finish
-// settles any overshoot.
-func (s *Server) makeRoom(deviceID string, reserve int64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+// makeRoomLocked evicts oldest finished output for an already-committed run,
+// or settles the quota after a run finishes. It never admits/rejects a run.
+// Its caller holds s.mu together with live-run and concurrency accounting.
+func (s *Server) makeRoomLocked(deviceID string, reserve int64) {
 	runs := s.storedRunsLocked(deviceID)
 	var total int64
 	for _, run := range runs {

@@ -76,7 +76,9 @@ type Server struct {
 	// endpoint there.
 	WebOrigin string
 
-	mu        sync.Mutex
+	mu sync.Mutex
+	// running counts slots owned by runs; admission and completion update
+	// both maps under mu. Failed attempts never own a slot.
 	running   map[string]int
 	signers   map[string]ssh.Signer
 	runs      map[string]*run

@@ -121,19 +121,6 @@ func (s *Server) execAs(w http.ResponseWriter, device controlplane.Device, cred 
 		controlplane.WriteError(w, http.StatusBadRequest, remote.CodeUsage, fmt.Sprintf("invalid output filter in the gateway policy: %v", err))
 		return
 	}
-	if !s.acquire(device.ID) {
-		controlplane.WriteError(w, http.StatusTooManyRequests, remote.CodeBusy, fmt.Sprintf("this device already has %d executions running", s.maxConcurrent()))
-		return
-	}
-	// Refuse a run that cannot start before making room for it, so a
-	// refused request never evicts retained output.
-	if int64(len(resolved.Targets)) > s.maxRunTargets() {
-		s.release(device.ID)
-		controlplane.WriteError(w, http.StatusBadRequest, remote.CodeUsage, fmt.Sprintf("%s has %d hosts; --run-max-bytes on the gateway allows at most %d per run", req.Host, len(resolved.Targets), s.maxRunTargets()))
-		return
-	}
-	s.sweepRuns()
-	s.makeRoom(device.ID, s.runMaxBytes())
 	// The run outlives this request: a dropped connection only detaches the
 	// device, and /exec/cancel or the timeout stops the command.
 	base, cancelBase := context.WithCancelCause(context.Background())
@@ -154,15 +141,16 @@ func (s *Server) execAs(w http.ResponseWriter, device controlplane.Device, cred 
 	if resolved.Kind == inventory.TargetKindHost {
 		if reqID, err = audit.NewReqID(); err != nil {
 			cancel(nil)
-			s.release(device.ID)
 			controlplane.WriteError(w, http.StatusInternalServerError, remote.CodeInternal, "request id unavailable")
 			return
 		}
 	}
-	rn, err := s.startRun(device.ID, id, requestSHA256, reqID, len(resolved.Targets), cancel)
+	rn, err := s.startRun(runStart{
+		deviceID: device.ID, id: id, requestSHA256: requestSHA256, reqID: reqID,
+		targets: len(resolved.Targets), identities: targetIdentities(resolved.Targets), cancel: cancel,
+	})
 	if err != nil {
 		cancel(nil)
-		s.release(device.ID)
 		switch {
 		case errors.Is(err, errRunExists):
 			// The ID was claimed meanwhile: by a concurrent repeat of this
@@ -170,6 +158,10 @@ func (s *Server) execAs(w http.ResponseWriter, device controlplane.Device, cred 
 			if !s.serveExisting(w, device.ID, id, requestSHA256, serve) {
 				controlplane.WriteError(w, http.StatusInternalServerError, remote.CodeInternal, "run record changed while starting; retry")
 			}
+		case errors.Is(err, errTooManyConcurrent):
+			controlplane.WriteError(w, http.StatusTooManyRequests, remote.CodeBusy, fmt.Sprintf("this device already has %d executions running", s.maxConcurrent()))
+		case errors.Is(err, errRunTooLarge):
+			controlplane.WriteError(w, http.StatusBadRequest, remote.CodeUsage, fmt.Sprintf("%s has %d hosts; --run-max-bytes on the gateway allows at most %d per run", req.Host, len(resolved.Targets), s.maxRunTargets()))
 		case errors.Is(err, errTooManyRecords):
 			writeRunError(w, err, s.runRetention())
 		default:
@@ -178,7 +170,6 @@ func (s *Server) execAs(w http.ResponseWriter, device controlplane.Device, cred 
 		}
 		return
 	}
-	rn.identities = targetIdentities(resolved.Targets)
 	exec := s.executor(inv)
 	stores := s.approvals(device.ID)
 	env := runner.Env{
@@ -211,7 +202,6 @@ func (s *Server) execAs(w http.ResponseWriter, device controlplane.Device, cred 
 		}
 	}
 	go func() {
-		defer s.release(device.ID)
 		defer cancel(nil)
 		defer func() { _ = exec.Close() }()
 		s.execute(ctx, rn, env, request)
@@ -222,11 +212,7 @@ func (s *Server) execAs(w http.ResponseWriter, device controlplane.Device, cred 
 // execute runs the pipeline and spools its outcome as response frames and a
 // result frame (or an error frame).
 func (s *Server) execute(ctx context.Context, rn *run, env runner.Env, request runner.Request) {
-	defer func() {
-		s.endRun(rn)
-		// Settle any quota overshoot now that this run is stored.
-		s.makeRoom(rn.deviceID, 0)
-	}()
+	defer s.endRun(rn)
 	outcome, err := runner.Run(ctx, env, request)
 	if lost := rn.stoppedFor(); lost.reason != "" {
 		// The device sees why the gateway stopped its command, not the
@@ -393,27 +379,6 @@ func (s *Server) maxConcurrent() int {
 		return s.MaxConcurrentPerDevice
 	}
 	return DefaultMaxConcurrentPerDevice
-}
-
-func (s *Server) acquire(deviceID string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.running[deviceID] >= s.maxConcurrent() {
-		return false
-	}
-	if s.running == nil {
-		s.running = map[string]int{}
-	}
-	s.running[deviceID]++
-	return true
-}
-
-func (s *Server) release(deviceID string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.running[deviceID]--; s.running[deviceID] <= 0 {
-		delete(s.running, deviceID)
-	}
 }
 
 func (s *Server) deviceAudit(deviceID string) deviceAudit {
