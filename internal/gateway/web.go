@@ -819,6 +819,8 @@ func (w *WebUI) deactivateDevice(rw http.ResponseWriter, r *http.Request, sessio
 	switch {
 	case errors.Is(err, controlplane.ErrNotFound):
 		backToDevices(rw, r, "error", "No such device.")
+	case isAuditPending(err):
+		backToDevices(rw, r, "error", "The device is inactive; its audit record needs repair. Running commands stop within 30 seconds.")
 	case err != nil:
 		backToDevices(rw, r, "error", "Not deactivated: "+err.Error())
 	case !closed:

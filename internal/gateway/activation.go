@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log"
 	"path/filepath"
 	"time"
 
@@ -28,9 +29,7 @@ CREATE TABLE IF NOT EXISTS device_activations (
 `
 
 // MinActivation and MaxActivation bound one window. The store enforces them,
-// so every way of activating shares one rule. The minimum also keeps two
-// windows of a device from ending in the same second, which is how an end
-// is identified in the audit chain.
+// so every way of activating shares one rule.
 const (
 	MinActivation = time.Minute
 	MaxActivation = 24 * time.Hour
@@ -65,7 +64,7 @@ func DeviceActivation(store *controlplane.Store, deviceID string) (Activation, e
 	return a, err
 }
 
-func loadActivation(db *sql.DB, deviceID string) (Activation, bool, error) {
+func loadActivation(db querier, deviceID string) (Activation, bool, error) {
 	a := Activation{DeviceID: deviceID}
 	var until, setAt string
 	var recorded bool
@@ -81,10 +80,9 @@ func loadActivation(db *sql.DB, deviceID string) (Activation, bool, error) {
 	return a, recorded, nil
 }
 
-// ActivateDevice opens a window of length d from now, replacing any current
-// one. A previous window that ended without a record is recorded first, so
-// replacing it never loses its end. The audit record is written before the
-// window is stored: if storing fails, the device stays inactive.
+// ActivateDevice opens a window of length d from now. Opening access still
+// requires successful audit publication. Replacing an expired window commits
+// its audit fact in the same transaction, so that window cannot be forgotten.
 func ActivateDevice(dir string, store *controlplane.Store, deviceID string, d time.Duration, operator, note string, now time.Time) (Activation, error) {
 	if d < MinActivation || d > MaxActivation {
 		return Activation{}, ErrActivationDuration
@@ -96,82 +94,132 @@ func ActivateDevice(dir string, store *controlplane.Store, deviceID string, d ti
 	if device.Status == remote.DeviceRevoked {
 		return Activation{}, controlplane.ErrDeviceRevoked
 	}
-	previous, recorded, err := loadActivation(store.DB(), deviceID)
+	previous, _, err := loadActivation(store.DB(), deviceID)
 	if err != nil {
 		return Activation{}, err
 	}
-	if !previous.Until.IsZero() && !previous.Active(now) && !recorded {
+	expired := !previous.Until.IsZero() && !previous.Active(now) && previous.DeactivatedBy == ""
+	if expired {
 		if err := recordActivationEnd(dir, store, previous, now); err != nil {
 			return Activation{}, fmt.Errorf("record the end of the previous window: %w", err)
 		}
 	}
 	a := Activation{DeviceID: deviceID, Until: now.Add(d), SetBy: operator, Note: note, SetAt: now}
-	if _, err := activationAudit(dir).Append(audit.Record{
+	// Never hold SQLite's writer lock while waiting on audit-file I/O:
+	// a stalled activation must not prevent another operator restricting access.
+	if err := appendSecurityRecord(dir, audit.Record{
 		TS: now.UTC().Format(time.RFC3339), Event: audit.EventDeviceActivated, DeviceID: deviceID,
 		Operator: operator, ActiveUntil: a.Until.UTC().Format(time.RFC3339), Note: note,
 	}); err != nil {
 		return Activation{}, fmt.Errorf("audit the activation: %w", err)
 	}
-	_, err = store.DB().Exec(`INSERT INTO device_activations (device_id, active_until, set_by, note, set_at, end_recorded, deactivated_by) VALUES (?, ?, ?, ?, ?, 0, '')
+	tx, err := store.DB().Begin()
+	if err != nil {
+		return Activation{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var status string
+	if err := tx.QueryRow(`SELECT status FROM devices WHERE id = ?`, deviceID).Scan(&status); err != nil {
+		return Activation{}, err
+	}
+	if status == remote.DeviceRevoked {
+		return Activation{}, controlplane.ErrDeviceRevoked
+	}
+	current, _, err := loadActivation(tx, deviceID)
+	if err != nil {
+		return Activation{}, err
+	}
+	if current != previous {
+		return Activation{}, errors.New("activation changed while its audit was being recorded; retry activation")
+	}
+	if expired {
+		// Keep the old fact with the replacement too. enqueue is idempotent;
+		// it retains the first observation and any publication completion.
+		if _, err := enqueueActivationEnd(tx, previous, now); err != nil {
+			return Activation{}, err
+		}
+	}
+	_, err = tx.Exec(`INSERT INTO device_activations (device_id, active_until, set_by, note, set_at, end_recorded, deactivated_by) VALUES (?, ?, ?, ?, ?, 0, '')
 		ON CONFLICT(device_id) DO UPDATE SET active_until = excluded.active_until, set_by = excluded.set_by,
 		note = excluded.note, set_at = excluded.set_at, end_recorded = 0, deactivated_by = ''`,
 		deviceID, controlplane.FormatTime(a.Until), operator, note, controlplane.FormatTime(now))
 	if err != nil {
 		return Activation{}, err
 	}
+	if err := tx.Commit(); err != nil {
+		return Activation{}, err
+	}
 	return a, nil
 }
 
-// DeactivateDevice closes a device's window at once; it can be activated
-// again. It reports whether a window was open. The window is closed before
-// the audit record is written, so a failed audit never leaves it open.
+// DeactivateDevice commits the closed window and its pending audit atomically.
+// An AuditPendingError leaves it inactive; a retry or serve repairs the event.
 func DeactivateDevice(dir string, store *controlplane.Store, deviceID string, operator string, now time.Time) (bool, error) {
-	if _, err := store.Device(deviceID); err != nil {
-		return false, err
-	}
-	a, _, err := loadActivation(store.DB(), deviceID)
-	if err != nil || !a.Active(now) {
-		return false, err
-	}
-	// Only the window read above is closed; a newer activation in between
-	// stays open.
-	res, err := store.DB().Exec(`UPDATE device_activations SET active_until = ?, end_recorded = 1, deactivated_by = ? WHERE device_id = ? AND active_until = ?`,
-		controlplane.FormatTime(now), operator, deviceID, controlplane.FormatTime(a.Until))
+	tx, err := store.DB().Begin()
 	if err != nil {
 		return false, err
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
+	defer func() { _ = tx.Rollback() }()
+	var exists string
+	if err := tx.QueryRow(`SELECT id FROM devices WHERE id = ?`, deviceID).Scan(&exists); errors.Is(err, sql.ErrNoRows) {
+		return false, controlplane.ErrNotFound
+	} else if err != nil {
+		return false, err
+	}
+	a, _, err := loadActivation(tx, deviceID)
+	if err != nil {
+		return false, err
+	}
+	if !a.Active(now) {
+		_ = tx.Rollback()
+		if a.DeactivatedBy != "" {
+			return false, pendingAudit("the device is inactive", publishSecurityAudit(dir, store, deactivationKey(a, a.Until)))
+		}
 		return false, nil
 	}
-	if _, err := activationAudit(dir).Append(audit.Record{
-		TS: now.UTC().Format(time.RFC3339), Event: audit.EventDeviceDeactivated, DeviceID: deviceID, Operator: operator,
-	}); err != nil {
-		return true, fmt.Errorf("the device is inactive, but its audit record failed: %w", err)
+	key := deactivationKey(a, now)
+	if _, err := tx.Exec(`UPDATE device_activations SET active_until = ?, end_recorded = 1, deactivated_by = ? WHERE device_id = ?`,
+		controlplane.FormatTime(now), operator, deviceID); err != nil {
+		return false, err
 	}
-	return true, nil
+	if _, err := enqueueSecurityAudit(tx, key, audit.Record{
+		TS: now.UTC().Format(time.RFC3339), Event: audit.EventDeviceDeactivated, DeviceID: deviceID,
+		Operator: operator, ActiveUntil: a.Until.UTC().Format(time.RFC3339),
+	}); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, pendingAudit("the device is inactive", publishSecurityAudit(dir, store, key))
 }
 
-// deviceActive reports whether deviceID may use the gateway at now. A window
-// found ended for the first time is recorded in the audit chain once.
-func deviceActive(dir string, store *controlplane.Store, deviceID string, now time.Time) (Activation, bool, error) {
-	a, recorded, err := loadActivation(store.DB(), deviceID)
-	if err != nil {
-		return Activation{}, false, err
-	}
-	if a.Active(now) {
-		return a, true, nil
-	}
-	if !a.Until.IsZero() && !recorded {
-		if err := recordActivationEnd(dir, store, a, now); err != nil {
-			return Activation{}, false, err
+func deactivationKey(a Activation, closedAt time.Time) string {
+	return "deactivation/" + a.DeviceID + "/" + controlplane.FormatTime(a.SetAt) + "/" + controlplane.FormatTime(closedAt)
+}
+
+// deviceActive only evaluates authoritative state. An audit failure cannot
+// turn a definitive inactive result into unknown standing.
+func deviceActive(store *controlplane.Store, deviceID string, now time.Time) (Activation, bool, error) {
+	a, _, err := loadActivation(store.DB(), deviceID)
+	return a, a.Active(now), err
+}
+
+// checkActivation durably collects an observed expiry without audit-file I/O
+// on the authorization path. Standing uses the read-only check above.
+func (s *Server) checkActivation(deviceID string, now time.Time) (Activation, bool, error) {
+	a, collected, err := loadActivation(s.Store.DB(), deviceID)
+	active := a.Active(now)
+	if err == nil && !collected && !active && !a.Until.IsZero() && a.DeactivatedBy == "" {
+		if err := collectActivationEnd(s.Store, a, now); err != nil {
+			log.Printf("agentssh-gateway: device %s is inactive; collect expiry audit: %v", deviceID, err)
 		}
 	}
-	return a, false, nil
+	return a, active, err
 }
 
-// RecordEndedActivations records every window that has ended without a record
-// yet. serve runs it periodically, so an ended window is recorded even when
-// the device sends nothing more.
+// RecordEndedActivations durably collects expired windows even without device
+// requests, then repairs pending audit events, including replaced windows.
 func RecordEndedActivations(dir string, store *controlplane.Store, now time.Time) error {
 	rows, err := store.DB().Query(`SELECT device_id FROM device_activations WHERE end_recorded = 0`)
 	if err != nil {
@@ -186,36 +234,63 @@ func RecordEndedActivations(dir string, store *controlplane.Store, now time.Time
 		}
 		ids = append(ids, id)
 	}
-	if err := rows.Close(); err != nil {
-		return err
+	err = rows.Err()
+	closeErr := rows.Close()
+	if err != nil || closeErr != nil {
+		return errors.Join(err, closeErr)
 	}
+	var failed error
 	for _, id := range ids {
-		if _, _, err := deviceActive(dir, store, id, now); err != nil {
-			return err
+		a, active, err := deviceActive(store, id, now)
+		if err == nil && !active && !a.Until.IsZero() && a.DeactivatedBy == "" {
+			err = recordActivationEnd(dir, store, a, now)
+		}
+		if err != nil {
+			failed = errors.Join(failed, fmt.Errorf("device %s: %w", id, err))
 		}
 	}
-	return nil
+	return errors.Join(failed, RecordPendingAudits(dir, store))
 }
 
-// recordActivationEnd appends the end of window a, found at now. The audit
-// chain decides whether it is already recorded, under its own lock, so
-// concurrent finders add it once; end_recorded is set only after the record
-// is in the chain, so a failed append is retried by the next finder. The
-// record's time is when it was found; active_until says when the window ended.
-func recordActivationEnd(dir string, store *controlplane.Store, a Activation, now time.Time) error {
-	until := a.Until.UTC().Format(time.RFC3339)
-	_, _, err := activationAudit(dir).AppendUnless(audit.Record{
+func activationEndKey(a Activation) string {
+	return "expiry/" + a.DeviceID + "/" + controlplane.FormatTime(a.SetAt) + "/" + controlplane.FormatTime(a.Until)
+}
+
+func enqueueActivationEnd(tx *sql.Tx, a Activation, now time.Time) (audit.Record, error) {
+	record, err := enqueueSecurityAudit(tx, activationEndKey(a), audit.Record{
 		TS: now.UTC().Format(time.RFC3339), Event: audit.EventDeviceActivationEnded, DeviceID: a.DeviceID,
-		Operator: a.SetBy, ActiveUntil: until, Note: a.Note,
-	}, func(existing audit.Record) bool {
-		return existing.Event == audit.EventDeviceActivationEnded && existing.DeviceID == a.DeviceID && existing.ActiveUntil == until
+		Operator: a.SetBy, ActiveUntil: a.Until.UTC().Format(time.RFC3339), Note: a.Note,
 	})
+	if err != nil {
+		return audit.Record{}, err
+	}
+	// end_recorded now means the fact is durable, not necessarily published.
+	// A stale finder must not mark a newer window as collected.
+	_, err = tx.Exec(`UPDATE device_activations SET end_recorded = 1 WHERE device_id = ? AND active_until = ? AND set_at = ?`,
+		a.DeviceID, controlplane.FormatTime(a.Until), controlplane.FormatTime(a.SetAt))
+	return record, err
+}
+
+func recordActivationEnd(dir string, store *controlplane.Store, a Activation, now time.Time) error {
+	if err := collectActivationEnd(store, a, now); err != nil {
+		return err
+	}
+	return pendingAudit("the activation ended", publishSecurityAudit(dir, store, activationEndKey(a)))
+}
+
+func collectActivationEnd(store *controlplane.Store, a Activation, now time.Time) error {
+	tx, err := store.DB().Begin()
 	if err != nil {
 		return err
 	}
-	_, err = store.DB().Exec(`UPDATE device_activations SET end_recorded = 1 WHERE device_id = ? AND active_until = ?`,
-		a.DeviceID, controlplane.FormatTime(a.Until))
-	return err
+	defer func() { _ = tx.Rollback() }()
+	if _, err := enqueueActivationEnd(tx, a, now); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return nil
 }
 
 func activationAudit(dir string) audit.Store {

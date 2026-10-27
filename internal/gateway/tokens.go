@@ -300,7 +300,7 @@ func (s *Server) admitToken(w http.ResponseWriter, r *http.Request, opts tokenOp
 		return controlplane.Device{}, credential{}, false
 	}
 	if opts.needsActive {
-		if _, active, err := deviceActive(s.Dir, s.Store, device.ID, s.now()); err != nil {
+		if _, active, err := s.checkActivation(device.ID, s.now()); err != nil {
 			controlplane.WriteError(w, http.StatusInternalServerError, remote.CodeInternal, "activation state unavailable")
 			return controlplane.Device{}, credential{}, false
 		} else if !active {

@@ -125,8 +125,12 @@ func (w *WebUI) revokeOAuthGrant(rw http.ResponseWriter, r *http.Request, sessio
 		return
 	}
 	revoked, err := RevokeGrant(w.Dir, w.Store, grant.ID, operatorLabel(session.Operator.Name), w.now())
+	if isAuditPending(err) {
+		backToDevices(rw, r, "error", "The grant is revoked; its tokens are refused and audit repair is pending.")
+		return
+	}
 	if err != nil {
-		backToDevices(rw, r, "error", "Revocation could not be recorded; reload to check the grant's state.")
+		backToDevices(rw, r, "error", "Revocation failed; reload to check the grant's state.")
 		return
 	}
 	if !revoked {

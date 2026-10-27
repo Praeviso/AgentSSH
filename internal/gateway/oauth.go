@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"mime"
 	"net"
 	"net/http"
@@ -434,24 +435,53 @@ func RevokeGrant(dir string, store *controlplane.Store, grantID, operator string
 	if err != nil {
 		return false, err
 	}
-	return revokeGrant(dir, store, grant, operator, "", now)
+	return revokeGrant(dir, store, grant, operator, "", now, "")
 }
 
-func revokeGrant(dir string, store *controlplane.Store, grant Grant, operator, note string, now time.Time) (bool, error) {
-	res, err := store.DB().Exec(`UPDATE oauth_grants SET revoked_at = ?, revoked_by = ? WHERE id = ? AND revoked_at = ''`, oauthTime(now), operator, grant.ID)
+// revokeGrant commits the restriction and its audit facts together. A replay
+// refusal belongs to the same transaction, so its publication cannot prevent
+// revocation. refreshID identifies the reused credential, never its secret.
+func revokeGrant(dir string, store *controlplane.Store, grant Grant, operator, note string, now time.Time, refreshID string) (bool, error) {
+	tx, err := store.DB().Begin()
 	if err != nil {
 		return false, err
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return false, nil
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.Exec(`UPDATE oauth_grants SET revoked_at = ?, revoked_by = ? WHERE id = ? AND revoked_at = ''`, oauthTime(now), operator, grant.ID)
+	if err != nil {
+		return false, err
 	}
-	if _, err := activationAudit(dir).Append(audit.Record{
-		TS: now.UTC().Format(time.RFC3339), Event: audit.EventOAuthGrantRevoked, DeviceID: grant.DeviceID,
-		GrantID: grant.ID, ClientID: grant.ClientID, Operator: operator, Note: note,
-	}); err != nil {
-		return true, fmt.Errorf("the grant was revoked, but its audit record failed: %w", err)
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
 	}
-	return true, nil
+	refusalKey := "refresh-replay/" + refreshID
+	if refreshID != "" {
+		if _, err := enqueueSecurityAudit(tx, refusalKey, audit.Record{
+			TS: now.UTC().Format(time.RFC3339), Event: audit.EventOAuthRefreshRefused,
+			DeviceID: grant.DeviceID, GrantID: grant.ID, ClientID: grant.ClientID, Note: note,
+		}); err != nil {
+			return false, err
+		}
+	}
+	key := "grant-revocation/" + grant.ID
+	if n != 0 {
+		if _, err := enqueueSecurityAudit(tx, key, audit.Record{
+			TS: now.UTC().Format(time.RFC3339), Event: audit.EventOAuthGrantRevoked, DeviceID: grant.DeviceID,
+			GrantID: grant.ID, ClientID: grant.ClientID, Operator: operator, Note: note,
+		}); err != nil {
+			return false, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	var failed error
+	if refreshID != "" {
+		failed = publishSecurityAudit(dir, store, refusalKey)
+	}
+	failed = errors.Join(failed, publishSecurityAudit(dir, store, key))
+	return n != 0, pendingAudit("the grant is revoked", failed)
 }
 
 // issue stores a new code or token of kind for a grant and returns it.
@@ -641,7 +671,7 @@ func (s *Server) grantStanding(grant Grant, now time.Time) (until time.Time, ref
 	if device.Status == remote.DeviceRevoked {
 		return time.Time{}, "the device is revoked", nil
 	}
-	a, active, err := deviceActive(s.Dir, s.Store, device.ID, now)
+	a, active, err := s.checkActivation(device.ID, now)
 	if err != nil {
 		return time.Time{}, "", err
 	}
@@ -775,6 +805,15 @@ func (s *Server) issueTokens(w http.ResponseWriter, grant Grant, used storedToke
 		return
 	}
 	defer func() { _ = tx.Rollback() }()
+	current, err := loadGrant(tx, grant.ID)
+	if err != nil {
+		oauthError(w, http.StatusInternalServerError, "server_error", "grant lookup failed")
+		return
+	}
+	if !current.RevokedAt.IsZero() {
+		oauthError(w, http.StatusBadRequest, "invalid_grant", "the grant was revoked")
+		return
+	}
 	res, err := tx.Exec(`UPDATE oauth_tokens SET used_at = ? WHERE id = ? AND used_at = ''`, oauthTime(now), used.ID)
 	if err == nil {
 		if n, _ := res.RowsAffected(); n == 0 {
@@ -807,16 +846,19 @@ func (s *Server) issueTokens(w http.ResponseWriter, grant Grant, used storedToke
 // revokeReused revokes a grant whose code or refresh token came back after
 // it was used: one of the two holders is not the client.
 func (s *Server) revokeReused(w http.ResponseWriter, grant Grant, used storedToken, now time.Time) {
-	reason := "authorization code reused"
+	reason, refreshID := "authorization code reused", ""
 	if used.Kind == kindRefresh {
-		reason = "refresh token reused"
-		if err := s.auditRefreshRefused(grant, reason, now); err != nil {
-			oauthError(w, http.StatusInternalServerError, "server_error", "audit unavailable")
-			return
-		}
+		reason, refreshID = "refresh token reused", used.ID
 	}
-	if _, err := revokeGrant(s.Dir, s.Store, grant, "", reason, now); err != nil {
-		oauthError(w, http.StatusInternalServerError, "server_error", "revocation failed")
+	if _, err := revokeGrant(s.Dir, s.Store, grant, "", reason, now, refreshID); err != nil {
+		var pending *AuditPendingError
+		if errors.As(err, &pending) {
+			log.Printf("agentssh-gateway: grant %s: %v", grant.ID, err)
+			oauthError(w, http.StatusInternalServerError, "server_error", "the grant is revoked; audit repair is pending")
+		} else {
+			log.Printf("agentssh-gateway: grant %s: revocation failed: %v", grant.ID, err)
+			oauthError(w, http.StatusInternalServerError, "server_error", "revocation failed")
+		}
 		return
 	}
 	oauthError(w, http.StatusBadRequest, "invalid_grant", reason+": the grant is revoked; an operator must authorize the client again")

@@ -86,7 +86,7 @@ func (s *Server) deviceStanding(deviceID string, now time.Time) (lostStanding, e
 	if device.Status == remote.DeviceRevoked {
 		return lostStanding{remote.CodeDeviceRevoked, "the device was revoked"}, nil
 	}
-	a, active, err := deviceActive(s.Dir, s.Store, deviceID, now)
+	a, active, err := deviceActive(s.Store, deviceID, now)
 	switch {
 	case err != nil:
 		return lostStanding{}, err

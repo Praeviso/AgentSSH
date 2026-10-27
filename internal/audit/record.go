@@ -100,6 +100,9 @@ type Record struct {
 	// through, and its client; omitempty keeps older canonical forms.
 	GrantID  string `json:"grant_id,omitempty"`
 	ClientID string `json:"client_id,omitempty"`
+	// EventID identifies a durable gateway lifecycle fact across publication
+	// retries. Appended with omitempty to preserve older canonical forms.
+	EventID string `json:"event_id,omitempty"`
 }
 
 const ZeroHash = "0000000000000000000000000000000000000000000000000000000000000000"
@@ -160,9 +163,15 @@ func (s Store) AppendUnless(record Record, exists func(Record) bool) (Record, bo
 	if err != nil {
 		return Record{}, false, err
 	}
+	if result := verifyRecords(records); !result.OK {
+		return Record{}, false, fmt.Errorf("audit chain is corrupt at record %d (%s); repair it before appending", result.BrokenIndex, result.Reason)
+	}
 	if exists != nil {
 		for _, existing := range records {
 			if exists(existing) {
+				if err := file.Sync(); err != nil {
+					return Record{}, false, fmt.Errorf("sync existing audit record: %w", err)
+				}
 				return existing, false, nil
 			}
 		}
@@ -186,6 +195,9 @@ func (s Store) AppendUnless(record Record, exists func(Record) bool) (Record, bo
 	}
 	if _, err := file.Write(append(line, '\n')); err != nil {
 		return Record{}, false, fmt.Errorf("append audit record: %w", err)
+	}
+	if err := file.Sync(); err != nil {
+		return Record{}, false, fmt.Errorf("sync audit record: %w", err)
 	}
 
 	return record, true, nil
@@ -291,20 +303,24 @@ func (s Store) Verify() (VerifyResult, error) {
 	if err != nil {
 		return VerifyResult{}, err
 	}
+	return verifyRecords(records), nil
+}
+
+func verifyRecords(records []Record) VerifyResult {
 	prevHash := ZeroHash
 	for i, record := range records {
 		if record.Seq != uint64(i) {
-			return VerifyResult{OK: false, BrokenSeq: record.Seq, BrokenIndex: i, Reason: "seq"}, nil
+			return VerifyResult{OK: false, BrokenSeq: record.Seq, BrokenIndex: i, Reason: "seq"}
 		}
 		if record.PrevHash != prevHash {
-			return VerifyResult{OK: false, BrokenSeq: record.Seq, BrokenIndex: i, Reason: "prev_hash"}, nil
+			return VerifyResult{OK: false, BrokenSeq: record.Seq, BrokenIndex: i, Reason: "prev_hash"}
 		}
 		if ComputeHash(record) != record.Hash {
-			return VerifyResult{OK: false, BrokenSeq: record.Seq, BrokenIndex: i, Reason: "hash"}, nil
+			return VerifyResult{OK: false, BrokenSeq: record.Seq, BrokenIndex: i, Reason: "hash"}
 		}
 		prevHash = record.Hash
 	}
-	return VerifyResult{OK: true, Count: len(records)}, nil
+	return VerifyResult{OK: true, Count: len(records)}
 }
 
 // VerifyResult describes audit chain verification.
