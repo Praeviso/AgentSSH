@@ -344,13 +344,20 @@ can enroll before it is activated, see its state and stop its own runs.
 deactivation and the end of a window are records in the audit chain
 (`device_activated`, `device_deactivated`, `device_activation_expired`, with
 `operator`, `active_until` and `note`). An ended window is recorded once, by the
-first request or the 30-second sweep in `serve` that finds it, and before a
-new activation replaces it. The audit chain itself decides whether an end is
-already recorded (checked under its lock), and the table's flag is set only
-after the record is in the chain, so concurrent finders record an end once and
-a failed append is retried. An activation is audited before it is stored and a
-deactivation after, so a failed write leaves the device inactive. Revocation is separate and permanent: a revoked device
-cannot be activated. On a gateway, `device revoke` appends `device_revoked`
+first request or the 30-second audit sweep in `serve` that finds it, and before
+a new activation replaces it. The gateway durably collects each expiry before
+marking its window collected; publication deduplicates by stable `event_id`
+under the audit-file lock. Pending expiry facts survive replacement windows,
+concurrent retries, and process restarts. Deactivation and OAuth grant
+revocation commit state and pending audit facts together, so audit failure
+cannot leave access enabled. A failed publication reports that the restriction
+is effective and audit repair is pending. Activation still requires successful
+audit publication before opening access. Standing enforcement uses a separate
+30-second loop with no audit-file I/O, so audit failure cannot prevent confirmed
+expiry/deactivation from cancelling live runs. See
+[gateway-mode.md](gateway-mode.md#security-state-and-audit-publication-57) for
+recovery and error semantics. Revocation is separate and permanent: a revoked
+device cannot be activated. On a gateway, `device revoke` appends `device_revoked`
 with the device ID, operator and original revocation time. Revocation and its
 actor/time are committed together before appending: an audit write failure
 still leaves the device revoked, and a retry or the 30-second serve sweep

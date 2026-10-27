@@ -142,10 +142,27 @@ func activationColumn(store *controlplane.Store, device controlplane.Device, now
 	return fmt.Sprintf("until %s (%s left)", a.Until.Local().Format(time.RFC3339), gateway.Remaining(a.Until, now))
 }
 
-// checkStanding runs until ctx ends. Every StandingCheckEvery it records
-// ended windows, so an ended window is in the audit chain even if its device
-// sends nothing more, and stops the runs of devices that may no longer act.
-func checkStanding(ctx context.Context, dir string, store *controlplane.Store, server *gateway.Server) {
+// checkStanding performs only state reads and cancellation. Audit-file I/O
+// runs on an independent loop, so even a blocked audit lock cannot delay the
+// next standing check.
+func checkStanding(ctx context.Context, server *gateway.Server) {
+	ticker := time.NewTicker(gateway.StandingCheckEvery)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := server.CancelRunsWithoutStanding(); err != nil {
+				log.Printf("agentssh-gateway: check running commands' standing: %v", err)
+			}
+		}
+	}
+}
+
+// repairAudits collects expired windows and publishes pending lifecycle facts
+// independently of enforcement, including events committed by another process.
+func repairAudits(ctx context.Context, dir string, store *controlplane.Store) {
 	ticker := time.NewTicker(gateway.StandingCheckEvery)
 	defer ticker.Stop()
 	for {
@@ -158,9 +175,6 @@ func checkStanding(ctx context.Context, dir string, store *controlplane.Store, s
 			}
 			if err := gateway.RecordEndedActivations(dir, store, now); err != nil {
 				log.Printf("agentssh-gateway: record ended activations: %v", err)
-			}
-			if err := server.CancelRunsWithoutStanding(); err != nil {
-				log.Printf("agentssh-gateway: check running commands' standing: %v", err)
 			}
 		}
 	}

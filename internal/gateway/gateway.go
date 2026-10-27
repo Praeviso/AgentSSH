@@ -44,7 +44,7 @@ func Init(dir, master string) error {
 
 // OpenStore opens (creating if needed) the gateway database at path.
 func OpenStore(path string) (*controlplane.Store, error) {
-	return controlplane.OpenStore(path, operatorSchema+activationSchema+revocationSchema+tokenSchema+oauthSchema)
+	return controlplane.OpenStore(path, operatorSchema+activationSchema+revocationSchema+tokenSchema+oauthSchema+securityAuditSchema)
 }
 
 // Server is the gateway HTTP API.
@@ -152,7 +152,7 @@ func (s *Server) Handler(publicURL string) (http.Handler, error) {
 // and see its state.
 func (s *Server) requireActive(next controlplane.DeviceHandler) controlplane.DeviceHandler {
 	return func(w http.ResponseWriter, r *http.Request, device controlplane.Device, body []byte) {
-		_, active, err := deviceActive(s.Dir, s.Store, device.ID, s.now())
+		_, active, err := s.checkActivation(device.ID, s.now())
 		if err != nil {
 			controlplane.WriteError(w, http.StatusInternalServerError, remote.CodeInternal, "activation state unavailable")
 			return
@@ -167,7 +167,7 @@ func (s *Server) requireActive(next controlplane.DeviceHandler) controlplane.Dev
 
 func (s *Server) describeStatus(device controlplane.Device, status *remote.StatusResponse) {
 	now := s.now()
-	if a, _, err := deviceActive(s.Dir, s.Store, device.ID, now); err == nil {
+	if a, _, err := s.checkActivation(device.ID, now); err == nil {
 		status.Activation = ActivationStatus(a, now)
 	}
 }

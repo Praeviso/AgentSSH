@@ -6,9 +6,36 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Praeviso/AgentSSH/internal/audit"
 	"github.com/Praeviso/AgentSSH/internal/remote"
 	"github.com/Praeviso/AgentSSH/internal/runner"
 )
+
+// FailSecurityAudit injects a file-publication failure while retaining the real
+// state transaction, durable pending event, and subsequent repair paths.
+func FailSecurityAudit(err error) (restore func()) {
+	original := appendSecurityRecord
+	appendSecurityRecord = func(string, audit.Record) error { return err }
+	return func() { appendSecurityRecord = original }
+}
+
+// PauseActivationAudit models a blocked audit sink while letting concurrent
+// restrictions use the real transaction and publication paths.
+func PauseActivationAudit() (started <-chan struct{}, release func()) {
+	original := appendSecurityRecord
+	entered, resume := make(chan struct{}), make(chan struct{})
+	appendSecurityRecord = func(dir string, record audit.Record) error {
+		if record.Event == audit.EventDeviceActivated {
+			close(entered)
+			<-resume
+		}
+		return original(dir, record)
+	}
+	return entered, func() {
+		close(resume)
+		appendSecurityRecord = original
+	}
+}
 
 // FailNextClaim makes the next run claim fail with err, as a full disk would.
 func FailNextClaim(err error) (restore func()) {

@@ -204,13 +204,13 @@ Trade-offs:
 - The cap is a fixed 24 h checked where a window is stored, not a `serve` flag:
   `device activate` runs in its own process and could not see `serve`'s flags,
   so a serve-only cap would disagree with what the CLI wrote.
-- An ended window is recorded by the first request or the 30-second sweep that
-  finds it, or by the activation that replaces it, so its record can come up to
-  that long after the window ended; the record's `active_until` says when it
-  did. The audit chain, not the table's flag, decides whether an end is already
-  recorded, so a failed append is retried and never duplicated; this is why a
-  window lasts at least a minute, so two windows of a device never end in the
-  same second.
+- The first request or 30-second audit sweep that finds an ended window
+  durably collects its expiry. Requests refuse inactive devices without audit
+  file I/O. Publication follows in the audit sweep or before a replacement
+  activation, with `active_until` identifying when the old window ended.
+  Replacing the window preserves its pending event in the same transaction.
+  The window's collection flag means the fact is durable, even if publication
+  is still pending; audit recovery is independent of activation eligibility.
 - When the window ends or the device is deactivated or revoked, its running
   commands are stopped too (#34, below).
 
@@ -230,6 +230,43 @@ deduplicates by device ID and event under the audit lock: revocation is
 terminal, so there is only one such transition per device, even across
 concurrent processes. Retrying never replaces the original operator or time.
 Managed mode continues to use the shared store's revocation operation.
+
+### Security state and audit publication (#57)
+
+OAuth grant revocation, a refresh-replay refusal accompanying revocation,
+device deactivation, and activation expiry use the gateway-only
+`security_audit_events` outbox. State changes and pending facts commit in one
+SQLite transaction before publication. Expiry is decided from the stored
+window and clock, regardless of whether its event can be collected or appended.
+An expiry collected by a request is published by the audit sweep; a new
+activation also preserves and publishes the previous window's end.
+
+Each event has a stable `event_id`, and its first payload retains the original
+operator, timestamp, reason, and grant/window identity. Publication verifies
+the existing hash chain and deduplicates under its file lock. The append is
+synced before marking the event complete. If the process exits after append
+but before completion, a restarted or concurrent repair finds the existing
+event and does not append it again. Existing audit records keep their canonical
+form because `event_id` is optional and appended to the record schema.
+
+`AuditPendingError` means the access restriction is effective and its audit
+fact is durable; it is distinct from a failed state transaction. CLI and Web UI
+messages make that distinction explicit. OAuth replay returns `server_error`
+when auditing fails, with a description that the grant is revoked and audit
+repair is pending. Its access and refresh tokens are already unusable. The
+independent 30-second audit sweep, or an idempotent operator retry, repairs the
+pending facts after storage is restored. A corrupt chain requires operator
+repair; the gateway neither overwrites it nor silently discards pending facts.
+
+Activation still requires successful audit publication before opening access.
+It holds no database write transaction during audit I/O and rechecks the device
+and window before committing, so a stalled activation cannot block a later
+restriction or overwrite a concurrent deactivation/revocation.
+Token/grant issuance keeps its existing audit requirements. Ordinary refused
+refresh requests keep their existing direct-audit behavior; durable recovery
+of replay's refusal and revocation is part of the same restriction transaction.
+Command execution audit records retain their existing failure semantics; this
+outbox covers the lifecycle events above, not every command record.
 
 ### Token devices (#40)
 
@@ -365,6 +402,10 @@ Trade-offs:
 - One sweep over the live runs, not a timer per run: one store read per device
   and per identity each round, so a run stops up to 30 s after the change, as
   in managed mode.
+- Standing checks perform only state reads and cancellation. Audit collection
+  and publication run on a separate timer, so an unwritable/corrupt audit file
+  or a blocked audit lock cannot delay the next standing check. A confirmed
+  inactive state still cancels the run even when expiry auditing fails.
 - Only a definitive answer stops a run. A store error is logged and the run
   continues, as managed mode cancels only on a definitive revocation.
 - The stopped run's per-target responses are replaced by the error frame, so

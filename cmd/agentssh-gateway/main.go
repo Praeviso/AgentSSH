@@ -179,7 +179,8 @@ func newServeCommand(dir func() (string, error)) *cobra.Command {
 					return err
 				}
 			}
-			go checkStanding(ctx, d, store, server)
+			go checkStanding(ctx, server)
+			go repairAudits(ctx, d, store)
 			return program.Serve(ctx, cmd.OutOrStdout(), listen, publicURL, handler)
 		},
 	}
