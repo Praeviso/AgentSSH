@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"errors"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -36,7 +37,7 @@ func (w *WebUI) oauthRequest(rw http.ResponseWriter, r *http.Request) (Authoriza
 			http.Error(rw, refused.Description, http.StatusBadRequest)
 		}
 	} else {
-		http.Error(rw, "authorization store unavailable", http.StatusInternalServerError)
+		storageError(rw, "Client authorization is temporarily unavailable. Reload this page; if this continues, ask a gateway administrator to check storage.", "authorization store unavailable", err)
 	}
 	return AuthorizationRequest{}, false
 }
@@ -63,7 +64,7 @@ func (w *WebUI) oauthPage(rw http.ResponseWriter, r *http.Request, session WebSe
 func (w *WebUI) renderOAuth(rw http.ResponseWriter, r *http.Request, session WebSession, req AuthorizationRequest, status int, message string) {
 	devices, err := w.Store.Devices()
 	if err != nil {
-		http.Error(rw, "device store unavailable", http.StatusInternalServerError)
+		storageError(rw, "Devices for client authorization are temporarily unavailable. Reload this page; if this continues, ask a gateway administrator to check storage.", "device store unavailable", err)
 		return
 	}
 	var choices []deviceView
@@ -73,7 +74,7 @@ func (w *WebUI) renderOAuth(rw http.ResponseWriter, r *http.Request, session Web
 		}
 		a, err := DeviceActivation(w.Store, device.ID)
 		if err != nil {
-			http.Error(rw, "activation state unavailable", http.StatusInternalServerError)
+			storageError(rw, "Device activation details for client authorization are temporarily unavailable. Reload this page; if this continues, ask a gateway administrator to check storage.", "activation state unavailable", err)
 			return
 		}
 		choices = append(choices, deviceView{Device: device, Active: a.Active(activationNow())})
@@ -105,7 +106,7 @@ func (w *WebUI) consentOAuth(rw http.ResponseWriter, r *http.Request, session We
 			return
 		}
 		if err != nil {
-			http.Error(rw, "authorization could not be recorded; check the device's grants before trying again", http.StatusInternalServerError)
+			storageError(rw, "Could not confirm client authorization. Check the device's grants before trying again; if this continues, ask a gateway administrator to check storage and the audit log.", "authorization recording error", err)
 			return
 		}
 		http.Redirect(rw, r, redirect, http.StatusSeeOther)
@@ -121,7 +122,7 @@ func (w *WebUI) revokeOAuthGrant(rw http.ResponseWriter, r *http.Request, sessio
 		return
 	}
 	if err != nil {
-		http.Error(rw, "OAuth grant store unavailable", http.StatusInternalServerError)
+		storageError(rw, "Client access details are temporarily unavailable. Reload Devices before trying again; if this continues, ask a gateway administrator to check storage.", "OAuth grant store unavailable", err)
 		return
 	}
 	revoked, err := RevokeGrant(w.Dir, w.Store, grant.ID, operatorLabel(session.Operator.Name), w.now())
@@ -130,7 +131,8 @@ func (w *WebUI) revokeOAuthGrant(rw http.ResponseWriter, r *http.Request, sessio
 		return
 	}
 	if err != nil {
-		backToDevices(rw, r, "error", "Revocation failed; reload to check the grant's state.")
+		log.Printf("agentssh-gateway: web: revoke OAuth grant: %v", err)
+		backToDevices(rw, r, "error", "Could not confirm revocation. Reload Devices and check the grant's state before trying again; if this continues, ask a gateway administrator to check storage and the audit log.")
 		return
 	}
 	if !revoked {

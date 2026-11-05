@@ -3,6 +3,7 @@ package gateway_test
 import (
 	"context"
 	"encoding/base32"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
@@ -191,8 +192,14 @@ func TestOperatorDecidesInTheBrowser(t *testing.T) {
 	id := w.grayRun(t)
 	b := w.browser(t)
 	csrf := b.signIn("alice")
-	if page := b.do(http.MethodGet, "/approvals", nil); !strings.Contains(page.body, id) || !strings.Contains(page.body, "1 waiting for a decision") || !strings.Contains(page.body, ">uname</pre>") {
+	page := b.do(http.MethodGet, "/approvals", nil)
+	if !strings.Contains(page.body, id) || !strings.Contains(page.body, "1 waiting for a decision") || !strings.Contains(page.body, ">uname</pre>") {
 		t.Fatalf("approvals page lacks the request:\n%.600s", page.body)
+	}
+	for _, text := range []string{"Approve once", "Approve for this session", "Approve on this host", "permanently?", "comments and formatting are lost"} {
+		if !strings.Contains(page.body, text) {
+			t.Errorf("approval page is missing %q", text)
+		}
 	}
 	p := b.do(http.MethodPost, "/approvals/"+id, url.Values{"csrf": {csrf}, "decision": {"once"}, "device": {w.client.State.DeviceID}})
 	if p.status != http.StatusSeeOther || !strings.Contains(p.location, "notice=") {
@@ -346,6 +353,9 @@ func TestCookiesAndHeaders(t *testing.T) {
 	w := newWebFixture(t)
 	b := w.browser(t)
 	login := b.do(http.MethodGet, "/login", nil)
+	if !strings.Contains(login.body, "Operator name") || strings.Contains(login.body, "Operators manage gateway devices") || strings.Contains(login.body, "client's request") {
+		t.Errorf("ordinary sign-in does not focus on the operator's credentials")
+	}
 	resp := b.password("alice", operatorPassword)
 	for _, p := range []page{login, resp} {
 		for _, cookie := range p.header.Values("Set-Cookie") {
@@ -382,19 +392,63 @@ func TestPlansAreDecidedAsAWholeAfterRowDenials(t *testing.T) {
 	if !strings.Contains(page.body, "Plan · rollout") || !strings.Contains(page.body, "Uses shell syntax") || !strings.Contains(page.body, "restart app\nthen check") || strings.Contains(page.body, `action="/plans/`+planID+`"`) && strings.Contains(page.body, `value="host"`) {
 		t.Fatalf("plan view:\n%.1200s", page.body)
 	}
+	for _, text := range []string{"Approve 2 remaining commands", "Approve once", "Approve for this session", "Approve for this task"} {
+		if !strings.Contains(page.body, text) {
+			t.Errorf("plan page is missing %q", text)
+		}
+	}
 	deny := result.Response.Commands[1].ApprovalID
 	if p := b.do(http.MethodPost, "/approvals/"+deny, url.Values{"csrf": {csrf}, "decision": {"deny"}, "device": {w.client.State.DeviceID}}); p.status != http.StatusSeeOther {
 		t.Fatalf("row deny: %+v", p)
 	}
+	if p := b.do(http.MethodGet, "/approvals", nil); !strings.Contains(p.body, "Approve 1 remaining command</span>") {
+		t.Error("plan page does not identify the one remaining command")
+	}
 	if p := b.do(http.MethodPost, "/plans/"+planID, url.Values{"csrf": {csrf}, "decision": {"host"}}); !strings.Contains(p.location, "error=") {
 		t.Fatalf("whole-plan host scope: %+v", p)
 	}
-	if p := b.do(http.MethodPost, "/plans/"+planID, url.Values{"csrf": {csrf}, "decision": {"session"}, "device": {w.client.State.DeviceID}}); !strings.Contains(p.location, "notice=") {
+	p := b.do(http.MethodPost, "/plans/"+planID, url.Values{"csrf": {csrf}, "decision": {"session"}, "device": {w.client.State.DeviceID}})
+	if !strings.Contains(p.location, "notice=") {
 		t.Fatalf("plan approve: %+v", p)
+	}
+	if result := b.do(http.MethodGet, p.location, nil); !strings.Contains(result.body, "Approved 1 command in plan "+planID+" (session).") {
+		t.Error("plan notice does not identify one command and its session scope")
 	}
 	status, err := w.client.PlanStatus(context.Background(), planID)
 	if err != nil || status.Status.Approved != 1 || status.Status.Denied != 1 || status.Status.Status != "denied" {
 		t.Fatalf("plan status = %+v, %v", status.Status, err)
+	}
+}
+
+func TestPlanDecisionNoticesCountCommands(t *testing.T) {
+	for _, tc := range []struct {
+		choice string
+		count  int
+		want   string
+	}{
+		{"once", 2, "Approved 2 commands in plan %s (once)."},
+		{"task", 2, "Approved 2 commands in plan %s (task)."},
+		{"deny", 1, "Denied 1 command in plan %s."},
+		{"deny", 2, "Denied 2 commands in plan %s."},
+	} {
+		t.Run(fmt.Sprintf("%s/%d", tc.choice, tc.count), func(t *testing.T) {
+			w := newWebFixture(t)
+			planID, _ := approval.NewPlanID()
+			commands := []remote.PlanSubmitCommand{{ID: "a", Cmd: "uname"}, {ID: "b", Cmd: "whoami"}}
+			result, err := w.client.SubmitPlan(context.Background(), remote.PlanSubmitRequest{PlanID: planID, Host: "web-1", Session: "s_test", Commands: commands[:tc.count]})
+			if err != nil || result.Response.Pending != tc.count {
+				t.Fatalf("submit = %+v, %v", result, err)
+			}
+			b := w.browser(t)
+			csrf := b.signIn("alice")
+			p := b.do(http.MethodPost, "/plans/"+planID, url.Values{"csrf": {csrf}, "decision": {tc.choice}, "device": {w.client.State.DeviceID}})
+			if p.status != http.StatusSeeOther || !strings.Contains(p.location, "notice=") {
+				t.Fatalf("plan decision: %+v", p)
+			}
+			if result := b.do(http.MethodGet, p.location, nil); result.status != http.StatusOK || !strings.Contains(result.body, fmt.Sprintf(tc.want, planID)) {
+				t.Fatalf("plan notice is missing %q", fmt.Sprintf(tc.want, planID))
+			}
+		})
 	}
 }
 
@@ -519,10 +573,16 @@ func TestOperatorActivatesADeviceInTheBrowser(t *testing.T) {
 	}
 	b := w.browser(t)
 	csrf := b.signIn("alice")
-	if p := b.do(http.MethodGet, "/devices", nil); p.status != http.StatusOK || !strings.Contains(p.body, "agent-vm") || !strings.Contains(p.body, ">Inactive<") {
+	p := b.do(http.MethodGet, "/devices", nil)
+	if p.status != http.StatusOK || !strings.Contains(p.body, "agent-vm") || !strings.Contains(p.body, ">Inactive<") {
 		t.Fatalf("devices page: %d\n%.600s", p.status, p.body)
 	}
-	p := b.do(http.MethodPost, "/devices/"+id+"/activate", url.Values{"csrf": {csrf}, "for": {"4h"}, "note": {"nightly deploy"}})
+	for _, text := range []string{"<h1>No active devices</h1>", "Activate for", ">Activate</button>"} {
+		if !strings.Contains(p.body, text) {
+			t.Errorf("inactive device page is missing %q", text)
+		}
+	}
+	p = b.do(http.MethodPost, "/devices/"+id+"/activate", url.Values{"csrf": {csrf}, "for": {"4h"}, "note": {"nightly deploy"}})
 	if p.status != http.StatusSeeOther || !strings.Contains(p.location, "notice=") {
 		t.Fatalf("activate: %+v", p)
 	}
@@ -532,6 +592,11 @@ func TestOperatorActivatesADeviceInTheBrowser(t *testing.T) {
 	page := b.do(http.MethodGet, "/devices", nil)
 	if !strings.Contains(page.body, "Active · 4h left") || !strings.Contains(page.body, "activated by web:alice · nightly deploy") || !strings.Contains(page.body, "last activity") {
 		t.Fatalf("devices page while active:\n%.900s", page.body)
+	}
+	for _, text := range []string{"<h1>1 active device</h1>", "New expiry from now", ">Update expiry</button>", "Its running commands stop within 30 seconds."} {
+		if !strings.Contains(page.body, text) {
+			t.Errorf("active device page is missing %q", text)
+		}
 	}
 	if p := b.do(http.MethodPost, "/devices/"+id+"/deactivate", url.Values{"csrf": {csrf}}); p.status != http.StatusSeeOther || !strings.Contains(p.location, "notice=") {
 		t.Fatalf("deactivate: %+v", p)
@@ -554,6 +619,62 @@ func TestOperatorActivatesADeviceInTheBrowser(t *testing.T) {
 	}
 	if p := b.do(http.MethodGet, "/audit", nil); !strings.Contains(p.body, "device_activated") || !strings.Contains(p.body, "nightly deploy") {
 		t.Fatalf("audit page:\n%.600s", p.body)
+	}
+}
+
+func TestActivationNoteByteLimitInTheBrowser(t *testing.T) {
+	w := newWebFixture(t)
+	id := w.client.State.DeviceID
+	b := w.browser(t)
+	csrf := b.signIn("alice")
+	if p := b.do(http.MethodGet, "/devices", nil); p.status != http.StatusOK || !strings.Contains(p.body, "Note (at most 200 UTF-8 bytes)") {
+		t.Errorf("devices page does not explain the note byte limit (status %d)", p.status)
+	}
+	for _, tc := range []struct {
+		name string
+		note string
+		ok   bool
+	}{
+		{"optional empty note", "", true},
+		{"200 ASCII bytes", strings.Repeat("a", 200), true},
+		{"201 ASCII bytes", strings.Repeat("a", 201), false},
+		{"66 Chinese characters", strings.Repeat("中", 66), true},
+		{"67 Chinese characters", strings.Repeat("中", 67), false},
+		{"100 Chinese characters", strings.Repeat("中", 100), false},
+		{"50 emoji", strings.Repeat("🙂", 50), true},
+		{"51 emoji", strings.Repeat("🙂", 51), false},
+		{"trimmed whitespace", " \t" + strings.Repeat("a", 200) + "\n ", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before, err := gateway.DeviceActivation(w.store, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			p := b.do(http.MethodPost, "/devices/"+id+"/activate", url.Values{"csrf": {csrf}, "for": {"1h"}, "note": {tc.note}})
+			if p.status != http.StatusSeeOther {
+				t.Fatalf("activate: %+v", p)
+			}
+			after, err := gateway.DeviceActivation(w.store, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.ok {
+				if !strings.Contains(p.location, "notice=") || after.Note != strings.TrimSpace(tc.note) || !after.Active(time.Now()) {
+					t.Fatalf("note was not accepted: redirect %s, activation %+v", p.location, after)
+				}
+				return
+			}
+			if !strings.Contains(p.location, "error=") {
+				t.Fatalf("oversized note was not rejected: %+v", p)
+			}
+			if after != before {
+				t.Errorf("rejected note changed the activation: before %+v, after %+v", before, after)
+			}
+			result := b.do(http.MethodGet, p.location, nil)
+			if result.status != http.StatusOK || !strings.Contains(result.body, "Keep the note to at most 200 UTF-8 bytes.") {
+				t.Errorf("rejection page does not explain the note byte limit (status %d)", result.status)
+			}
+		})
 	}
 }
 
@@ -620,7 +741,11 @@ func TestActivationNeedsAnOperatorAndADuration(t *testing.T) {
 // The Devices page names each device's kind.
 func TestDevicesPageShowsTheKind(t *testing.T) {
 	w := newWebFixture(t)
-	if _, err := gateway.CreateTokenDevice(w.dir, w.store, "hosted-agent", "local:alice", time.Now()); err != nil {
+	device, err := gateway.CreateTokenDevice(w.dir, w.store, "hosted-agent", "local:alice", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gateway.ActivateDevice(w.dir, w.store, device.DeviceID, time.Hour, "local:alice", "", time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	b := w.browser(t)
@@ -628,5 +753,8 @@ func TestDevicesPageShowsTheKind(t *testing.T) {
 	page := b.do(http.MethodGet, "/devices", nil)
 	if !strings.Contains(page.body, "token device · dev_") || !strings.Contains(page.body, "signed device · "+w.client.State.DeviceID) {
 		t.Fatalf("devices page:\n%.900s", page.body)
+	}
+	if !strings.Contains(page.body, "<h1>2 active devices</h1>") {
+		t.Error("devices heading does not identify both active devices")
 	}
 }

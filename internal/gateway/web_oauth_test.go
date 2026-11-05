@@ -66,6 +66,9 @@ func TestOAuthConsentReturnsThroughPasswordAndTOTP(t *testing.T) {
 		t.Fatalf("start: %+v", start)
 	}
 	login := b.do(http.MethodGet, start.location, nil)
+	if !strings.Contains(login.body, "Operator name") || !strings.Contains(login.body, "Sign in to review the client's request for access.") {
+		t.Error("OAuth sign-in is missing the operator label or client-access context")
+	}
 	if next := formValue(t, login, "next"); next != path {
 		t.Fatalf("login return path %q, want %q", next, path)
 	}

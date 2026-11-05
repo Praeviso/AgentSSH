@@ -34,10 +34,10 @@
   <form method="post" action="/plans/{{.Status.ID}}" class="actions">
     <input type="hidden" name="csrf" value="{{$csrf}}">
     <input type="hidden" name="device" value="{{.DeviceID}}">
-    <span class="label">Approve the {{len .Pending}} remaining</span>
-    <button name="decision" value="once" class="primary">Once</button>
-    <button name="decision" value="session">For the session</button>
-    <button name="decision" value="task">For the task</button>
+    <span class="label">Approve {{len .Pending}} remaining command{{if ne (len .Pending) 1}}s{{end}}</span>
+    <button name="decision" value="once" class="primary">Approve once</button>
+    <button name="decision" value="session">Approve for this session</button>
+    <button name="decision" value="task">Approve for this task</button>
     <button name="decision" value="deny" class="danger" data-confirm="Deny every remaining step of this plan?">Deny all</button>
   </form>
 </section>
@@ -57,11 +57,10 @@
   <form method="post" action="/approvals/{{.ID}}" class="actions">
     <input type="hidden" name="csrf" value="{{$csrf}}">
     <input type="hidden" name="device" value="{{.DeviceID}}">
-    <span class="label">Approve</span>
-    <button name="decision" value="once" class="primary">Once</button>
-    <button name="decision" value="session">For the session</button>
-    {{if offers .ProposedScopes "task"}}<button name="decision" value="task">For the task</button>{{end}}
-    {{if offers .ProposedScopes "host"}}<button name="decision" value="host" data-confirm="Allow this matcher on {{.Host}} permanently? It becomes a rule in the device's policy, pushed as a new configuration version; the policy is rewritten, so its comments and formatting are lost.">On this host</button>{{end}}
+    <button name="decision" value="once" class="primary">Approve once</button>
+    <button name="decision" value="session">Approve for this session</button>
+    {{if offers .ProposedScopes "task"}}<button name="decision" value="task">Approve for this task</button>{{end}}
+    {{if offers .ProposedScopes "host"}}<button name="decision" value="host" data-confirm="Allow this matcher on {{.Host}} permanently? It becomes a rule in the device's policy, pushed as a new configuration version; the policy is rewritten, so its comments and formatting are lost.">Approve on this host</button>{{end}}
     <button name="decision" value="deny" class="danger">Deny</button>
   </form>
 </section>
