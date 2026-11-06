@@ -256,6 +256,13 @@ func (w *WebUI) render(rw http.ResponseWriter, status int, page string, data map
 	}
 }
 
+// storageError gives operators recovery guidance and a stable diagnostic,
+// while keeping the underlying failure available in the gateway log.
+func storageError(rw http.ResponseWriter, message, diagnostic string, err error) {
+	log.Printf("agentssh-gateway: web: %s: %v", diagnostic, err)
+	http.Error(rw, message+"\n\nDiagnostic: "+diagnostic+".", http.StatusInternalServerError)
+}
+
 // Login: name and password, then TOTP (or its enrollment). A password alone
 // opens only a short password-stage session.
 
@@ -343,7 +350,7 @@ func (w *WebUI) login(rw http.ResponseWriter, r *http.Request) {
 	succeeded(false)
 	token, err := newSession(w.Store, op.ID, StagePassword, now)
 	if err != nil {
-		http.Error(rw, "session storage unavailable", http.StatusInternalServerError)
+		storageError(rw, "Sign-in is temporarily unavailable. Try signing in again; if this continues, ask a gateway administrator to check storage.", "session storage unavailable", err)
 		return
 	}
 	setCookie(rw, loginCookie, "", -1)
@@ -360,7 +367,7 @@ func (w *WebUI) renderTOTP(rw http.ResponseWriter, r *http.Request, status int, 
 	if !session.Operator.TOTPEnrolled {
 		secret, err := pendingTOTP(w.Store, w.Keys, token)
 		if err != nil {
-			http.Error(rw, "session storage unavailable", http.StatusInternalServerError)
+			storageError(rw, "Authenticator setup is temporarily unavailable. Reload this page; if this continues, ask a gateway administrator to check storage.", "session storage unavailable", err)
 			return
 		}
 		encoded := strings.TrimRight(base32Encode(secret), "=")
@@ -404,7 +411,7 @@ func (w *WebUI) totp(rw http.ResponseWriter, r *http.Request, session WebSession
 	_ = endSession(w.Store, token)
 	active, err := newSession(w.Store, session.Operator.ID, StageActive, now)
 	if err != nil {
-		http.Error(rw, "session storage unavailable", http.StatusInternalServerError)
+		storageError(rw, "Sign-in could not be completed. Start again from the sign-in page; if this continues, ask a gateway administrator to check storage.", "session storage unavailable", err)
 		return
 	}
 	sweepSessions(w.Store, now)
@@ -444,7 +451,7 @@ func (w *WebUI) deviceNames() map[string]string {
 func (w *WebUI) approvalsPage(rw http.ResponseWriter, r *http.Request, session WebSession, _ string) {
 	requests, err := ListApprovals(w.Dir)
 	if err != nil {
-		http.Error(rw, "approval store unavailable", http.StatusInternalServerError)
+		storageError(rw, "Approvals are temporarily unavailable. Reload this page; if this continues, ask a gateway administrator to check storage.", "approval store unavailable", err)
 		return
 	}
 	names := w.deviceNames()
@@ -497,7 +504,7 @@ func decisionError(err error) string {
 	case errors.Is(err, ErrAmbiguousID):
 		return "More than one device holds this ID; decide it with agentssh-gateway --device."
 	default:
-		return "Not decided: " + err.Error()
+		return "Could not confirm the decision. Reload approvals and check the audit before trying again. Details: " + err.Error()
 	}
 }
 
@@ -540,10 +547,15 @@ func (w *WebUI) decidePlan(rw http.ResponseWriter, r *http.Request, session WebS
 		return
 	}
 	action := "Denied"
+	scopeNote := ""
 	if verdict == approval.VerdictApproved {
-		action = fmt.Sprintf("Approved (%s)", scope)
+		action, scopeNote = "Approved", fmt.Sprintf(" (%s)", scope)
 	}
-	backToApprovals(rw, r, "notice", fmt.Sprintf("%s %d command(s) of plan %s.", action, len(results), id))
+	command := "commands"
+	if len(results) == 1 {
+		command = "command"
+	}
+	backToApprovals(rw, r, "notice", fmt.Sprintf("%s %d %s in plan %s%s.", action, len(results), command, id, scopeNote))
 }
 
 // Audit.
@@ -552,7 +564,7 @@ func (w *WebUI) auditPage(rw http.ResponseWriter, r *http.Request, session WebSe
 	store := audit.NewStore(filepath.Join(w.Dir, FileAudit))
 	records, err := store.ReadAll()
 	if err != nil {
-		http.Error(rw, "audit unavailable", http.StatusInternalServerError)
+		storageError(rw, "The audit log is temporarily unavailable. Reload this page; if this continues, ask a gateway administrator to check storage.", "audit unavailable", err)
 		return
 	}
 	verify, verifyErr := store.Verify()
@@ -719,12 +731,12 @@ var deviceEvents = map[audit.Event]bool{
 func (w *WebUI) devicesPage(rw http.ResponseWriter, r *http.Request, session WebSession, _ string) {
 	devices, err := w.Store.Devices()
 	if err != nil {
-		http.Error(rw, "device store unavailable", http.StatusInternalServerError)
+		storageError(rw, "Devices are temporarily unavailable. Reload this page; if this continues, ask a gateway administrator to check storage.", "device store unavailable", err)
 		return
 	}
 	grants, err := Grants(w.Store)
 	if err != nil {
-		http.Error(rw, "OAuth grant store unavailable", http.StatusInternalServerError)
+		storageError(rw, "Device access details are temporarily unavailable. Reload this page; if this continues, ask a gateway administrator to check storage.", "OAuth grant store unavailable", err)
 		return
 	}
 	byDevice := map[string][]Grant{}
@@ -745,7 +757,7 @@ func (w *WebUI) devicesPage(rw http.ResponseWriter, r *http.Request, session Web
 	for _, d := range devices {
 		a, err := DeviceActivation(w.Store, d.ID)
 		if err != nil {
-			http.Error(rw, "activation state unavailable", http.StatusInternalServerError)
+			storageError(rw, "Device activation details are temporarily unavailable. Reload this page; if this continues, ask a gateway administrator to check storage.", "activation state unavailable", err)
 			return
 		}
 		v := deviceView{Device: d, Kind: DeviceKind(d), Activation: a, Revoked: d.Status == remote.DeviceRevoked, LastActivity: last[d.ID], Grants: byDevice[d.ID]}
@@ -772,7 +784,7 @@ func (w *WebUI) devicesPage(rw http.ResponseWriter, r *http.Request, session Web
 	})
 	w.render(rw, http.StatusOK, "devices", map[string]any{
 		"Title": "Devices", "Nav": "devices", "CSRF": session.CSRF, "Operator": session.Operator.Name,
-		"Devices": views, "Active": active, "Presets": activationPresets,
+		"Devices": views, "Active": active, "Presets": activationPresets, "MaxNoteBytes": maxNoteBytes,
 		"Notice": r.URL.Query().Get("notice"), "Error": r.URL.Query().Get("error"),
 	})
 }
@@ -795,7 +807,7 @@ func (w *WebUI) activateDevice(rw http.ResponseWriter, r *http.Request, session 
 	}
 	note := strings.TrimSpace(r.PostFormValue("note"))
 	if len(note) > maxNoteBytes {
-		backToDevices(rw, r, "error", fmt.Sprintf("Keep the note under %d characters.", maxNoteBytes))
+		backToDevices(rw, r, "error", fmt.Sprintf("Keep the note to at most %d UTF-8 bytes.", maxNoteBytes))
 		return
 	}
 	a, err := ActivateDevice(w.Dir, w.Store, id, d, operatorLabel(session.Operator.Name), note, activationNow())
@@ -807,7 +819,7 @@ func (w *WebUI) activateDevice(rw http.ResponseWriter, r *http.Request, session 
 	case errors.Is(err, controlplane.ErrNotFound):
 		backToDevices(rw, r, "error", "No such device.")
 	case err != nil:
-		backToDevices(rw, r, "error", "Not activated: "+err.Error())
+		backToDevices(rw, r, "error", "Could not confirm the activation. Reload Devices and check the expiry before trying again. Details: "+err.Error())
 	default:
 		backToDevices(rw, r, "notice", fmt.Sprintf("Activated %s until %s.", w.deviceLabel(id), formatWhen(a.Until.UTC().Format(time.RFC3339))))
 	}
@@ -822,7 +834,7 @@ func (w *WebUI) deactivateDevice(rw http.ResponseWriter, r *http.Request, sessio
 	case isAuditPending(err):
 		backToDevices(rw, r, "error", "The device is inactive; its audit record needs repair. Running commands stop within 30 seconds.")
 	case err != nil:
-		backToDevices(rw, r, "error", "Not deactivated: "+err.Error())
+		backToDevices(rw, r, "error", "Could not confirm the deactivation. Reload Devices and check whether the device is inactive before trying again. Details: "+err.Error())
 	case !closed:
 		backToDevices(rw, r, "notice", w.deviceLabel(id)+" was not active.")
 	default:
